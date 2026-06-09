@@ -19,7 +19,7 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | Grader declaration | Yes, use `strategy: none` if no grader runs | `stages.grader.strategy` |
 | Metric declarations | If you want queryable custom metrics | `metrics[].id` plus `metrics[].source` |
 | Event captures | If you want live runtime traces/progress | `stages.agent.events[]` |
-| Runtime env/secrets | If your agent needs them | `--env OPENAI_API_KEY=...` |
+| Runtime env/secrets | If your agent needs them | Local: `--env OPENAI_API_KEY=...`; Cloud: `--secret-ref OPENAI_API_KEY=...` |
 | Compute backend | Yes | `runtime.compute.backend: local-docker` or `modal` |
 | Grader inputs/outputs | If benchmark scoring needs a grader | `stages.grader.inputs`, `stages.grader.outputs` |
 

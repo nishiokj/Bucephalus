@@ -17,6 +17,7 @@ use crate::package::authoring::{
     compute_artifact_content_digest, contains_removed_runtime_template,
     resolve_agent_artifact_path, resolve_existing_public_path_reference,
 };
+use crate::package::compile::{public_package_output_path_ref, public_relative_path_ref};
 use crate::package::sealed::*;
 use crate::package::staging::*;
 use crate::package::validate::*;
@@ -1156,9 +1157,21 @@ pub(crate) fn validate_runtime_env_name(name: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
+fn runtime_env_file_public_ref(index: usize) -> String {
+    format!("runtime-env-file://{}", index + 1)
+}
+
+#[cfg(test)]
 pub(crate) fn parse_runtime_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
+    parse_runtime_env_file_with_ref(path, "runtime-env-file://source")
+}
+
+fn parse_runtime_env_file_with_ref(
+    path: &Path,
+    public_ref: &str,
+) -> Result<BTreeMap<String, String>> {
     let content = fs::read_to_string(path)
-        .map_err(|err| anyhow!("failed to read env file {}: {}", path.display(), err))?;
+        .map_err(|err| anyhow!("failed to read runtime env file {public_ref}: {err}"))?;
     let mut values = BTreeMap::new();
     for (line_no, raw_line) in content.lines().enumerate() {
         let trimmed = raw_line.trim();
@@ -1168,22 +1181,20 @@ pub(crate) fn parse_runtime_env_file(path: &Path) -> Result<BTreeMap<String, Str
         let body = trimmed.strip_prefix("export ").unwrap_or(trimmed);
         let Some((raw_key, raw_value)) = body.split_once('=') else {
             return Err(anyhow!(
-                "invalid env file {}:{} (expected KEY=VALUE)",
-                path.display(),
+                "invalid runtime env file {public_ref}:{} (expected KEY=VALUE)",
                 line_no + 1
             ));
         };
         let key = raw_key.trim();
         if key.is_empty() {
             return Err(anyhow!(
-                "invalid env file {}:{} (empty key)",
-                path.display(),
+                "invalid runtime env file {public_ref}:{} (empty key)",
                 line_no + 1
             ));
         }
         validate_runtime_env_name(
             key,
-            &format!("env file {}:{} key", path.display(), line_no + 1),
+            &format!("runtime env file {public_ref}:{} key", line_no + 1),
         )?;
         let mut value = raw_value.trim().to_string();
         if (value.starts_with('"') && value.ends_with('"'))
@@ -1202,13 +1213,14 @@ pub(crate) fn resolve_runtime_env_inputs(
     let mut resolved = BTreeMap::new();
     let cwd =
         std::env::current_dir().map_err(|err| anyhow!("failed to resolve current dir: {}", err))?;
-    for raw_path in &execution.runtime_env_files {
+    for (idx, raw_path) in execution.runtime_env_files.iter().enumerate() {
         let path = if raw_path.is_absolute() {
             raw_path.clone()
         } else {
             cwd.join(raw_path)
         };
-        let file_values = parse_runtime_env_file(&path)?;
+        let public_ref = runtime_env_file_public_ref(idx);
+        let file_values = parse_runtime_env_file_with_ref(&path, &public_ref)?;
         for (key, value) in file_values {
             resolved.insert(key, value);
         }
@@ -1272,6 +1284,36 @@ fn sanitize_credential_cache_id(id: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn public_runtime_secret_ref(id: &str) -> String {
+    let normalized = id.to_ascii_lowercase();
+    let secret_like = [
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "api_key",
+        "apikey",
+        "private",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    let sanitized = sanitize_credential_cache_id(id);
+    let public_id = if secret_like || sanitized != id {
+        "redacted".to_string()
+    } else {
+        sanitized
+    };
+    format!("runtime-secret://{public_id}")
+}
+
+fn public_runtime_secret_source_ref(id: &str) -> String {
+    format!("{}/source", public_runtime_secret_ref(id))
+}
+
+fn public_runtime_secret_cache_ref(id: &str) -> String {
+    format!("{}/credential-cache", public_runtime_secret_ref(id))
 }
 
 fn credential_cache_host_dir(root: &Path, id: &str) -> PathBuf {
@@ -1338,13 +1380,13 @@ fn resolve_credential_cache_mount(
     })
 }
 
-fn credential_cache_file_is_usable(path: &Path) -> Result<bool> {
+fn credential_cache_file_is_usable(path: &Path, id: &str) -> Result<bool> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(metadata.is_file() && metadata.len() > 0),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(anyhow!(
-            "failed to inspect credential cache file {}: {}",
-            path.display(),
+            "failed to inspect credential cache file\n\ncache_ref: {}\n\nerror: {}",
+            public_runtime_secret_cache_ref(id),
             err
         )),
     }
@@ -1370,16 +1412,18 @@ fn seed_credential_cache_file(source: &Path, cache: &Path, id: &str) -> Result<(
     let _guard = credential_cache_seed_lock()
         .lock()
         .map_err(|_| anyhow!("credential cache seed lock poisoned"))?;
-    if credential_cache_file_is_usable(cache)? {
+    if credential_cache_file_is_usable(cache, id)? {
         return Ok(());
     }
+    let cache_ref = public_runtime_secret_cache_ref(id);
+    let source_ref = public_runtime_secret_source_ref(id);
     let parent = cache
         .parent()
-        .ok_or_else(|| anyhow!("credential cache file has no parent: {}", cache.display()))?;
+        .ok_or_else(|| anyhow!("credential cache file has no parent\n\ncache_ref: {cache_ref}"))?;
     fs::create_dir_all(parent).map_err(|err| {
         anyhow!(
-            "failed to create credential cache directory for secret '{}': {}",
-            id,
+            "failed to create credential cache directory\n\ncache_ref: {}\n\nerror: {}",
+            cache_ref,
             err
         )
     })?;
@@ -1387,31 +1431,30 @@ fn seed_credential_cache_file(source: &Path, cache: &Path, id: &str) -> Result<(
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| {
-            anyhow!(
-                "credential cache file has no file name: {}",
-                cache.display()
-            )
+            anyhow!("credential cache file has no file name\n\ncache_ref: {cache_ref}")
         })?;
     let tmp = credential_cache_seed_tmp_path(parent, file_name);
     if let Err(err) = fs::copy(source, &tmp) {
-        remove_path_if_exists(&tmp).with_context(|| {
-            format!(
-                "remove temporary credential cache {} after copy failure",
-                tmp.display()
+        remove_path_if_exists(&tmp).map_err(|cleanup_err| {
+            anyhow!(
+                "failed to remove temporary credential cache after copy failure\n\ncache_ref: {}\n\nerror: {}",
+                cache_ref,
+                cleanup_err
             )
         })?;
         return Err(anyhow!(
-            "failed to seed credential cache for secret '{}' from {}: {}",
-            id,
-            source.display(),
+            "failed to seed credential cache\n\nsource_ref: {}\ncache_ref: {}\n\nerror: {}",
+            source_ref,
+            cache_ref,
             err
         ));
     }
-    if credential_cache_file_is_usable(cache)? {
-        remove_path_if_exists(&tmp).with_context(|| {
-            format!(
-                "remove temporary credential cache {} after existing cache won race",
-                tmp.display()
+    if credential_cache_file_is_usable(cache, id)? {
+        remove_path_if_exists(&tmp).map_err(|cleanup_err| {
+            anyhow!(
+                "failed to remove temporary credential cache after existing cache won race\n\ncache_ref: {}\n\nerror: {}",
+                cache_ref,
+                cleanup_err
             )
         })?;
         return Ok(());
@@ -1419,24 +1462,23 @@ fn seed_credential_cache_file(source: &Path, cache: &Path, id: &str) -> Result<(
     if cache.exists() {
         fs::remove_file(cache).map_err(|err| {
             anyhow!(
-                "failed to replace empty credential cache for secret '{}' at {}: {}",
-                id,
-                cache.display(),
+                "failed to replace empty credential cache\n\ncache_ref: {}\n\nerror: {}",
+                cache_ref,
                 err
             )
         })?;
     }
     if let Err(err) = fs::rename(&tmp, cache) {
-        remove_path_if_exists(&tmp).with_context(|| {
-            format!(
-                "remove temporary credential cache {} after install failure",
-                tmp.display()
+        remove_path_if_exists(&tmp).map_err(|cleanup_err| {
+            anyhow!(
+                "failed to remove temporary credential cache after install failure\n\ncache_ref: {}\n\nerror: {}",
+                cache_ref,
+                cleanup_err
             )
         })?;
         return Err(anyhow!(
-            "failed to install credential cache for secret '{}' at {}: {}",
-            id,
-            cache.display(),
+            "failed to install credential cache\n\ncache_ref: {}\n\nerror: {}",
+            cache_ref,
             err
         ));
     }
@@ -1910,10 +1952,9 @@ pub(crate) fn reject_packaged_public_path_references(
         let field = format!("trial_runtime.agent.command[{}]", idx);
         if let Some(rel) = resolve_existing_public_path_reference(token, package_dir, &field)? {
             return Err(anyhow!(
-                "{} still contains unresolved package-relative path '{}'; rebuild the sealed package with the build-time runtime path cutover (resolved path: {})",
+                "{} still contains unresolved package-relative path\n\npackage_ref: {}\n\nNext steps:\n  rebuild the sealed package with the build-time runtime path cutover.",
                 field,
-                token,
-                rel.display()
+                public_relative_path_ref("package", &rel)
             ));
         }
     }
@@ -1921,10 +1962,9 @@ pub(crate) fn reject_packaged_public_path_references(
         let field = format!("trial_runtime.agent.env.{}", key);
         if let Some(rel) = resolve_existing_public_path_reference(value, package_dir, &field)? {
             return Err(anyhow!(
-                "{} still contains unresolved package-relative path '{}'; rebuild the sealed package with the build-time runtime path cutover (resolved path: {})",
+                "{} still contains unresolved package-relative path\n\npackage_ref: {}\n\nNext steps:\n  rebuild the sealed package with the build-time runtime path cutover.",
                 field,
-                value,
-                rel.display()
+                public_relative_path_ref("package", &rel)
             ));
         }
     }
@@ -1937,17 +1977,18 @@ pub(crate) fn load_staging_specs_from_package(
 ) -> Result<Vec<DependencyFileStagingSpec>> {
     let manifest_path =
         resolve_package_path_under_root(package_dir, STAGING_MANIFEST_FILE, STAGING_MANIFEST_FILE)?;
+    let manifest_ref = public_package_output_path_ref(package_dir, &manifest_path);
     let manifest_bytes = fs::read(&manifest_path).with_context(|| {
         format!(
             "failed to read runtime staging manifest at {}",
-            manifest_path.display()
+            manifest_ref
         )
     })?;
     let manifest: RuntimePathStagingManifest = serde_json::from_slice(&manifest_bytes)
         .with_context(|| {
             format!(
                 "failed to parse runtime staging manifest JSON at {}",
-                manifest_path.display()
+                manifest_ref
             )
         })?;
     if manifest.schema_version != STAGING_MANIFEST_SCHEMA_VERSION {
@@ -1961,7 +2002,7 @@ pub(crate) fn load_staging_specs_from_package(
         anyhow!(
             "runtime staging manifest missing entries for variant '{}' in {}",
             variant_id,
-            manifest_path.display()
+            manifest_ref
         )
     })?;
     let mut specs = Vec::with_capacity(entries.len());
@@ -1976,8 +2017,8 @@ pub(crate) fn load_staging_specs_from_package(
         )?;
         fs::metadata(&source_from_host).with_context(|| {
             format!(
-                "failed to read packaged runtime staging source '{}' for staging_manifest.variants.{}[{}]",
-                source_from_host.display(),
+                "failed to read packaged runtime staging source {} for staging_manifest.variants.{}[{}]",
+                public_package_output_path_ref(package_dir, &source_from_host),
                 variant_id,
                 idx
             )
@@ -2013,13 +2054,7 @@ pub(crate) fn derive_public_command_path_staging_specs(
             token,
             exp_dir,
             &format!("{}[{}]", field_name, idx),
-        )
-        .with_context(|| {
-            format!(
-                "while deriving public command path staging specs for {}",
-                field_name
-            )
-        })?
+        )?
         else {
             continue;
         };
@@ -2028,13 +2063,11 @@ pub(crate) fn derive_public_command_path_staging_specs(
             continue;
         }
         let source = normalize_path(&exp_dir.join(&rel));
+        let source_ref = public_relative_path_ref("source", &rel);
         fs::metadata(&source).with_context(|| {
             format!(
-                "failed to read {}[{}] public path reference '{}' resolved to '{}'",
-                field_name,
-                idx,
-                token,
-                source.display()
+                "failed to read {}[{}] public path reference\n\nsource_ref: {}\nresolved_ref: {}",
+                field_name, idx, source_ref, source_ref
             )
         })?;
         specs.push(DependencyFileStagingSpec {
@@ -2074,12 +2107,13 @@ pub(crate) fn derive_public_path_staging_specs(
             continue;
         }
         let source = normalize_path(&exp_dir.join(&rel));
+        let source_ref = public_relative_path_ref("source", &rel);
         fs::metadata(&source).with_context(|| {
             format!(
-                "failed to read trial_runtime.agent.env.{} public path reference '{}' resolved to '{}'",
+                "failed to read trial_runtime.agent.env.{} public path reference\n\nsource_ref: {}\nresolved_ref: {}",
                 key_name,
-                value,
-                source.display()
+                source_ref,
+                source_ref
             )
         })?;
         specs.push(DependencyFileStagingSpec {

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 INDEX="${1:-}"
+INDEX_REF="release-asset-index://source"
 
 usage() {
   cat <<'USAGE'
@@ -17,8 +18,13 @@ if [[ -z "${INDEX}" || "${INDEX}" == "-h" || "${INDEX}" == "--help" ]]; then
   exit 2
 fi
 
+if [[ -L "${INDEX}" ]]; then
+  echo "release asset index must not be a symlink" >&2
+  exit 2
+fi
+
 if [[ ! -f "${INDEX}" ]]; then
-  echo "release asset index does not exist: ${INDEX}" >&2
+  echo "release asset index does not exist: ${INDEX_REF}" >&2
   exit 2
 fi
 
@@ -29,10 +35,9 @@ fi
 
 INDEX="${INDEX}" bun -e '
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { lstatSync } from "node:fs";
 
 const indexPath = process.env.INDEX;
-const index = JSON.parse(await Bun.file(indexPath).text());
 const sha256 = /^[a-f0-9]{64}$/;
 const gitSha = /^[a-f0-9]{40}$/;
 const validSchemas = new Map([
@@ -45,24 +50,65 @@ function fail(message) {
   process.exit(1);
 }
 
+function existingRegularFile(path, label) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    fail(`${label} does not exist or cannot be inspected`);
+  }
+  if (stat.isSymbolicLink()) {
+    fail(`${label} must not be a symlink`);
+  }
+  if (!stat.isFile()) {
+    fail(`${label} must be a regular file`);
+  }
+  return true;
+}
+
+function requireRegularFile(path, label) {
+  if (!existingRegularFile(path, label)) {
+    fail(`${label} does not exist`);
+  }
+}
+
 function checkSha(value, label) {
   if (typeof value !== "string" || !sha256.test(value)) {
     fail(`${label} must be a lowercase sha256 digest`);
   }
 }
 
-async function hashFile(path) {
+async function hashFile(path, label) {
+  requireRegularFile(path, label);
   return createHash("sha256").update(Buffer.from(await Bun.file(path).arrayBuffer())).digest("hex");
+}
+
+async function readTextFile(path, label) {
+  requireRegularFile(path, label);
+  return Bun.file(path).text();
 }
 
 function checkArtifactPath(path, label) {
   if (typeof path !== "string" || path.trim() === "" || path.startsWith("/") || path.includes("..") || path.includes("\\")) {
     fail(`${label} must be a stable artifact-local path`);
   }
-  if (/(^|\/)\.env(\.example)?$/.test(path) || /(^|[-_.])latest([-_.]|$)/.test(path)) {
+  if (looksLikeHostPath(path)) {
+    fail(`${label} must not look like a host filesystem path`);
+  }
+  if (/(^|\/)\.env(\.example)?$/.test(path) || /(^|[-_.])latest([-_.]|$)/.test(path) || /(^|[-_.\/])(secret|token|password|credential|api[_-]?key|private)([-_.\/]|$)/i.test(path)) {
     fail(`${label} contains a forbidden release asset name`);
   }
 }
+
+function looksLikeHostPath(path) {
+  const normalized = path.replace(/^\.\//, "");
+  return /^(Users|home|private|tmp|var\/folders|Volumes|Desktop|Documents|Downloads|runner\/work|github\/workspace)\//.test(normalized);
+}
+
+const index = JSON.parse(await readTextFile(indexPath, "release asset index"));
 
 if (index.schema_version !== "bucephalus_release_asset_index_v1") {
   fail("schema_version must be bucephalus_release_asset_index_v1");
@@ -118,6 +164,9 @@ for (const [i, asset] of index.assets.entries()) {
     fail(`${label}.path must point at a .tar.gz archive`);
   }
   checkArtifactPath(asset.path, `${label}.path`);
+  if (asset.name !== asset.path.split("/").pop()) {
+    fail(`${label}.name must match path basename`);
+  }
   if (seenPaths.has(asset.path)) {
     fail(`duplicate asset path: ${asset.path}`);
   }
@@ -158,27 +207,27 @@ for (const [i, asset] of index.assets.entries()) {
   }
   targets.add(asset.provenance.target);
 
-  if (existsSync(asset.path)) {
-    if (await hashFile(asset.path) !== asset.sha256) {
-      fail(`${asset.path} digest does not match index`);
+  if (existingRegularFile(asset.path, `${label}.path file`)) {
+    if (await hashFile(asset.path, `${label}.path file`) !== asset.sha256) {
+      fail(`${label}.path file digest does not match index`);
     }
   }
-  if (existsSync(asset.checksum.path)) {
-    const checksumRaw = await Bun.file(asset.checksum.path).text();
+  if (existingRegularFile(asset.checksum.path, `${label}.checksum.path file`)) {
+    const checksumRaw = await readTextFile(asset.checksum.path, `${label}.checksum.path file`);
     if (!checksumRaw.endsWith("\n") || checksumRaw.slice(0, -1).includes("\n")) {
-      fail(`${asset.checksum.path} must contain exactly one checksum record`);
+      fail(`${label}.checksum.path file must contain exactly one checksum record`);
     }
     const checksumText = checksumRaw.slice(0, -1);
     if (checksumText !== `${asset.checksum.value}  ${asset.name}`) {
-      fail(`${asset.checksum.path} must contain exactly the indexed checksum record`);
+      fail(`${label}.checksum.path file must contain exactly the indexed checksum record`);
     }
-    if (await hashFile(asset.checksum.path) !== asset.checksum.sha256) {
-      fail(`${asset.checksum.path} digest does not match index`);
+    if (await hashFile(asset.checksum.path, `${label}.checksum.path file`) !== asset.checksum.sha256) {
+      fail(`${label}.checksum.path file digest does not match index`);
     }
   }
-  if (existsSync(asset.provenance.path)) {
-    if (await hashFile(asset.provenance.path) !== asset.provenance.sha256) {
-      fail(`${asset.provenance.path} digest does not match index`);
+  if (existingRegularFile(asset.provenance.path, `${label}.provenance.path file`)) {
+    if (await hashFile(asset.provenance.path, `${label}.provenance.path file`) !== asset.provenance.sha256) {
+      fail(`${label}.provenance.path file digest does not match index`);
     }
   }
 }
@@ -205,5 +254,5 @@ for (const kind of ["core", "cloud"]) {
   }
 }
 
-console.log(`verified release asset index ${indexPath}`);
+console.log("verified release asset index release-asset-index://source");
 '

@@ -143,7 +143,16 @@ paths:
                   type: object
                   additionalProperties:
                     type: string
-                  description: Plain environment values supplied for this run.
+                  description: >
+                    Plain environment values supplied for this run. Secret-looking
+                    keys are rejected by default because these values are stored
+                    as run configuration; use `secret_refs` for provider secrets.
+                allow_secret_env:
+                  type: boolean
+                  default: false
+                  description: >
+                    Explicitly allow secret-looking keys in `env` when every
+                    listed value is intentionally non-secret.
                 secret_refs:
                   type: object
                   additionalProperties:
@@ -152,10 +161,10 @@ paths:
                     Environment variable names mapped to provider secret
                     references available to the runner. Supported resolver refs
                     include gcp-secret-manager://projects/<project>/secrets/<secret>/versions/<version>,
-                    aws-secrets-manager://<secret-id>, and env:<NAME> only for
-                    explicitly enabled local development.
+                    and aws-secrets-manager://<secret-id>. Local env refs are
+                    not accepted by the Cloud create-run API.
                 runtime_options:
-                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                  $ref: '#/components/schemas/CreateRunRuntimeOptions'
                   description: >
                     Run-time execution options. Cloud backends use `backend`
                     values such as `runner-docker` or `modal`; `runner-docker`
@@ -936,7 +945,7 @@ components:
             Provider refs currently include GCP Secret Manager and AWS Secrets
             Manager forms; env refs require explicit local-development opt-in.
         runtime_options:
-          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+          $ref: '#/components/schemas/CreateRunRuntimeOptions'
         run_requirements:
           $ref: '#/components/schemas/RunRequirements'
         created_at:
@@ -1421,14 +1430,12 @@ components:
         executors:
           type: array
           items:
-            type: string
-            enum:
-              - runner-docker
-              - modal
+            $ref: '#/components/schemas/CloudExecutorOption'
         resources:
           type: array
           items:
             type: string
+            minLength: 1
           description: >
             VM runner resources available to satisfy run requirements, for
             example core_runner, docker_daemon, registry_pull, modal.
@@ -1436,16 +1443,22 @@ components:
           type: string
           enum:
             - x86_64
+            - x64
+            - amd64
             - arm64
+            - aarch64
         cpu_count:
           type: integer
           minimum: 1
+          maximum: 2147483647
         memory_mb:
           type: integer
           minimum: 1
+          maximum: 2147483647
         disk_mb:
           type: integer
           minimum: 1
+          maximum: 2147483647
         isolation:
           type: array
           items:
@@ -1503,14 +1516,17 @@ components:
               type: string
               enum:
                 - none
+                - allowlist_enforced
             task_sandbox:
               type: string
               enum:
                 - none
+                - allowlist_enforced
             agent:
               type: string
               enum:
                 - none
+                - allowlist_enforced
             egress_hosts:
               type: array
               items:
@@ -1541,12 +1557,15 @@ components:
         cpu_count:
           type: integer
           minimum: 1
+          maximum: 2147483647
         memory_mb:
           type: integer
           minimum: 1
+          maximum: 2147483647
         disk_mb:
           type: integer
           minimum: 1
+          maximum: 2147483647
         isolation:
           type: string
           enum:
@@ -1557,9 +1576,190 @@ components:
             - integer
             - 'null'
           minimum: 1
+          maximum: 2147483647
         max_parallel_trials:
           type: integer
           minimum: 1
+          maximum: 2147483647
+    CreateRunRuntimeOptions:
+      type: object
+      additionalProperties: true
+      properties:
+        backend:
+          $ref: '#/components/schemas/CloudExecutorOption'
+        executor:
+          $ref: '#/components/schemas/CloudExecutorOption'
+        smoke_test:
+          type: boolean
+        materialize:
+          type: string
+          enum:
+            - none
+            - metadata-only
+            - metadata_only
+            - outputs-only
+            - outputs_only
+            - full
+        arch:
+          type: string
+          enum:
+            - x86_64
+            - amd64
+            - arm64
+            - aarch64
+        cpu:
+          $ref: '#/components/schemas/PositiveIntegerOrString'
+        cpu_count:
+          $ref: '#/components/schemas/PositiveIntegerOrString'
+        memory_mb:
+          $ref: '#/components/schemas/PositiveIntegerOrString'
+        disk_mb:
+          $ref: '#/components/schemas/PositiveIntegerOrString'
+        timeout_ms:
+          $ref: '#/components/schemas/PositiveIntegerOrString'
+        max_parallel_trials:
+          $ref: '#/components/schemas/PositiveIntegerOrString'
+        isolation:
+          type: string
+          enum:
+            - reusable_vm
+            - single_use_vm
+        network:
+          $ref: '#/components/schemas/CreateRunNetworkOptions'
+        sidecars:
+          $ref: '#/components/schemas/CloudRequirementAliases'
+        accelerators:
+          $ref: '#/components/schemas/CloudRequirementAliases'
+        trial_runtime:
+          $ref: '#/components/schemas/CreateRunTrialRuntimeOptions'
+      description: >
+        Cloud queue-time runtime options. Known fields are validated before a
+        run is persisted; additional properties are preserved for forward
+        compatibility but may be ignored by current Cloud runners.
+    CloudExecutorOption:
+      type: string
+      enum:
+        - runner-docker
+        - runner_docker
+        - local-docker
+        - local_docker
+        - modal
+    PositiveIntegerOrString:
+      oneOf:
+        - type: integer
+          minimum: 1
+          maximum: 2147483647
+        - type: string
+          pattern: '^(?:[1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])$'
+    CloudRequirementAliases:
+      type: array
+      items:
+        type: string
+        pattern: '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$'
+        minLength: 1
+    CreateRunNetworkOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        default:
+          $ref: '#/components/schemas/CloudNetworkMode'
+        task_sandbox:
+          $ref: '#/components/schemas/CloudNetworkMode'
+        agent:
+          $ref: '#/components/schemas/CloudNetworkMode'
+        egress:
+          type: array
+          items:
+            type: string
+            pattern: '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)*(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$'
+            minLength: 1
+      description: >
+        Cloud network policy request. Ambient network modes such as full,
+        host, bridge, or local are rejected for Cloud runs; allowlist modes
+        require explicit egress hostnames.
+    CloudNetworkMode:
+      type: string
+      enum:
+        - none
+        - allowlist_enforced
+    CreateRunTrialRuntimeOptions:
+      type: object
+      additionalProperties: true
+      properties:
+        agent:
+          type: object
+          additionalProperties: true
+          properties:
+            image:
+              $ref: '#/components/schemas/CloudRuntimeImageRef'
+            sidecars:
+              not: {}
+              description: >
+                Runtime-option trial sidecar authoring is not supported for
+                Cloud run creation. Declare sidecars in package YAML, or use
+                runtime_options.sidecars for Cloud runner requirement aliases.
+            ephemerals:
+              not: {}
+              description: >
+                Runtime-option trial ephemeral authoring is not supported for
+                Cloud run creation. Declare ephemerals in package YAML, or use
+                runtime_options.sidecars for Cloud runner requirement aliases.
+        execution:
+          type: object
+          additionalProperties: true
+          properties:
+            agent_site:
+              type: string
+              not:
+                const: host
+        grader:
+          type: object
+          additionalProperties: true
+          properties:
+            strategy:
+              type: string
+              enum:
+                - none
+                - in_task_runtime
+                - injected
+                - separate
+            sidecars:
+              not: {}
+              description: >
+                Runtime-option trial sidecar authoring is not supported for
+                Cloud run creation. Declare sidecars in package YAML, or use
+                runtime_options.sidecars for Cloud runner requirement aliases.
+            ephemerals:
+              not: {}
+              description: >
+                Runtime-option trial ephemeral authoring is not supported for
+                Cloud run creation. Declare ephemerals in package YAML, or use
+                runtime_options.sidecars for Cloud runner requirement aliases.
+            separate:
+              type: object
+              additionalProperties: true
+              properties:
+                image:
+                  $ref: '#/components/schemas/CloudRuntimeImageRef'
+        task:
+          type: object
+          additionalProperties: true
+          properties:
+            workspace:
+              type: object
+              additionalProperties: true
+              properties:
+                image:
+                  $ref: '#/components/schemas/CloudRuntimeImageRef'
+      description: >
+        Trial runtime overrides visible to Cloud queue-time validation. Cloud
+        runs reject host agent and host grader execution. Runtime image
+        overrides must be digest-pinned remote registry refs.
+    CloudRuntimeImageRef:
+      type: string
+      minLength: 1
+      pattern: '^[^\s]+@sha256:[0-9a-f]{64}$'
+      description: Digest-pinned remote registry image ref accepted for Cloud runtime overrides.
     CreateRunnerPoolRequest:
       type: object
       additionalProperties: false

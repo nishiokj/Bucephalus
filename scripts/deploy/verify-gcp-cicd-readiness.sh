@@ -15,7 +15,7 @@ PROVIDER_ID="github"
 PUBLISHER_ACCOUNT_ID=""
 DEPLOY_ACCOUNT_ID=""
 IMAGE_REPOSITORY=""
-GOOGLE_OAUTH_CLIENT_ID="380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
+GOOGLE_OAUTH_CLIENT_ID=""
 CLOUDFLARE_WORKER_NAME="bucephalus-cloud-ui"
 BUN_BASE_IMAGE="oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4"
 RELEASE_RUN_ID=""
@@ -52,7 +52,7 @@ Options:
   --publisher-account-id <id>    Publisher service account id. Default: <prefix>-<env>-gh-publish.
   --deploy-account-id <id>       Deploy service account id. Default: <prefix>-<env>-gh-deploy.
   --image-repository <prefix>    Image repository prefix. Default: <region>-docker.pkg.dev/<project>/<prefix>-<env>-cloud/bucephalus-cloud.
-  --google-oauth-client-id <id>  Expected Google OAuth client ID for API/UI deploys.
+  --google-oauth-client-id <id>  Expected Google OAuth client ID for API/UI deploys. Required.
   --cloudflare-worker-name <n>   Expected Cloudflare Worker name for UI deploys.
   --bun-base-image <image>       Expected digest-pinned Bun base image for release image builds.
   --release-run-id <id>          Release workflow run that should contain promotion evidence.

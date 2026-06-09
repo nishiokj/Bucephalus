@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INPUT="${1:-}"
 WORK_DIR=""
 RELEASE_DIR=""
+RELEASE_ARCHIVE_INPUT=""
+RELEASE_ROOT_NAME=""
 
 usage() {
   cat <<'USAGE'
@@ -14,6 +16,7 @@ Verifies a Bucephalus cloud release bundle:
   - archive .sha256, when a sibling checksum file exists
   - SHA256SUMS for every bundled file
   - release-manifest.json structure and source input digests
+  - no local absolute path-shaped text in bundled release payloads
   - no retired deployment scripts, service units, or env examples leaked into deploy/
     outside the explicit Path 1 GCP provider surface
 USAGE
@@ -69,6 +72,122 @@ read_archive_checksum() {
   printf '%s\n' "${expected}"
 }
 
+cloud_archive_member_ref() {
+  local raw="$1"
+  local lower public
+  lower="$(printf '%s' "${raw}" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  case "${raw}" in
+    ""|/*|*..*|*"\\"*)
+      printf '%s' "archive-member://redacted"
+      return 0
+      ;;
+  esac
+  case "${lower}" in
+    *secret*|*token*|*password*|*credential*|*api_key*|*private*|.env|*.env|*/.env|*/.env/*)
+      printf '%s' "archive-member://redacted"
+      return 0
+      ;;
+  esac
+  public="$(printf '%s' "${raw}" | LC_ALL=C sed -e 's#[^A-Za-z0-9._/-]#_#g' -e 's#//*#/#g' -e 's#^/*##' -e 's#/*$##')"
+  if [[ -z "${public}" ]]; then
+    public="member"
+  fi
+  printf '%s' "archive-member://${public}"
+}
+
+verify_cloud_archive_members_before_extract() {
+  local archive="$1"
+  local members_file="${WORK_DIR}/cloud-archive-members.txt"
+  local listing_file="${WORK_DIR}/cloud-archive-listing.txt"
+  local duplicate member listing normalized entry_type top rel
+  local root="" saw_root="false" saw_manifest="false" saw_checksums="false"
+
+  tar -tzf "${archive}" > "${members_file}"
+  tar -tvzf "${archive}" > "${listing_file}"
+
+  if [[ ! -s "${members_file}" ]]; then
+    echo "cloud release archive is empty" >&2
+    exit 1
+  fi
+
+  duplicate="$(LC_ALL=C sort "${members_file}" | uniq -d | sed -n '1p')"
+  if [[ -n "${duplicate}" ]]; then
+    echo "cloud release archive contains duplicate tar entry" >&2
+    echo "member_ref: $(cloud_archive_member_ref "${duplicate}")" >&2
+    exit 1
+  fi
+
+  while IFS= read -r member && IFS= read -r listing <&3; do
+    normalized="${member%/}"
+    case "${member}" in
+      ""|/*|*..*|*"\\"*)
+        echo "unsafe cloud release archive member path" >&2
+        echo "member_ref: $(cloud_archive_member_ref "${member}")" >&2
+        exit 1
+        ;;
+    esac
+    entry_type="${listing:0:1}"
+    case "${entry_type}" in
+      -|d) ;;
+      *)
+        echo "cloud release archive contains non-file tar entry" >&2
+        echo "member_ref: $(cloud_archive_member_ref "${member}")" >&2
+        exit 1
+        ;;
+    esac
+    top="${normalized%%/*}"
+    if [[ -z "${top}" ]]; then
+      echo "unsafe cloud release archive member path" >&2
+      echo "member_ref: $(cloud_archive_member_ref "${member}")" >&2
+      exit 1
+    fi
+    if [[ -z "${root}" ]]; then
+      root="${top}"
+    fi
+    if [[ "${top}" != "${root}" ]]; then
+      echo "cloud release archive contains entry outside release directory" >&2
+      echo "member_ref: $(cloud_archive_member_ref "${member}")" >&2
+      exit 1
+    fi
+    if [[ "${normalized}" == "${root}" ]]; then
+      if [[ "${entry_type}" != "d" ]]; then
+        echo "cloud release archive root entry must be a directory" >&2
+        echo "member_ref: $(cloud_archive_member_ref "${member}")" >&2
+        exit 1
+      fi
+      saw_root="true"
+      continue
+    fi
+    rel="${normalized#${root}/}"
+    if [[ -z "${rel}" || "${rel}" == "${normalized}" ]]; then
+      echo "cloud release archive contains entry outside release directory" >&2
+      echo "member_ref: $(cloud_archive_member_ref "${member}")" >&2
+      exit 1
+    fi
+    if [[ "${entry_type}" == "-" && "${rel}" == "release-manifest.json" ]]; then
+      saw_manifest="true"
+    fi
+    if [[ "${entry_type}" == "-" && "${rel}" == "SHA256SUMS" ]]; then
+      saw_checksums="true"
+    fi
+  done < "${members_file}" 3< "${listing_file}"
+
+  if [[ "${saw_root}" != "true" ]]; then
+    echo "cloud release archive is missing release root directory" >&2
+    exit 1
+  fi
+  if [[ "${saw_manifest}" != "true" ]]; then
+    echo "cloud release archive is missing release-manifest.json" >&2
+    exit 1
+  fi
+  if [[ "${saw_checksums}" != "true" ]]; then
+    echo "cloud release archive is missing SHA256SUMS" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "${root}"
+}
+
 verify_checksum_record() {
   local line="$1"
   local line_number="$2"
@@ -87,8 +206,8 @@ verify_checksum_record() {
     echo "unsafe checksum path: ${path}" >&2
     exit 1
   fi
-  if [[ ! -f "${path}" ]]; then
-    echo "checksum path is missing: ${path}" >&2
+  if [[ ! -e "${path}" || -L "${path}" || ! -f "${path}" ]]; then
+    echo "checksum path must be a regular file: ${path}" >&2
     exit 1
   fi
   actual="$(sha256_file "${path}")"
@@ -100,7 +219,11 @@ verify_checksum_record() {
 
 require_command awk
 require_command bun
+require_command sed
+require_command sort
 require_command tar
+require_command tr
+require_command uniq
 
 cleanup() {
   if [[ -n "${WORK_DIR}" ]]; then
@@ -111,7 +234,9 @@ trap cleanup EXIT
 
 if [[ -d "${INPUT}" ]]; then
   RELEASE_DIR="${INPUT}"
+  RELEASE_ROOT_NAME="$(basename "${RELEASE_DIR}")"
 elif [[ -f "${INPUT}" ]]; then
+  RELEASE_ARCHIVE_INPUT="${INPUT}"
   if [[ -f "${INPUT}.sha256" ]]; then
     expected="$(read_archive_checksum "${INPUT}.sha256" "${INPUT}")"
     actual="$(sha256_file "${INPUT}")"
@@ -121,10 +246,11 @@ elif [[ -f "${INPUT}" ]]; then
     fi
   fi
   WORK_DIR="$(mktemp -d)"
+  RELEASE_ROOT_NAME="$(verify_cloud_archive_members_before_extract "${INPUT}")"
   tar -xzf "${INPUT}" -C "${WORK_DIR}"
-  RELEASE_DIR="$(find "${WORK_DIR}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-  if [[ -z "${RELEASE_DIR}" ]]; then
-    echo "archive did not contain a release directory: ${INPUT}" >&2
+  RELEASE_DIR="${WORK_DIR}/${RELEASE_ROOT_NAME}"
+  if [[ ! -d "${RELEASE_DIR}" ]]; then
+    echo "archive did not contain the expected release directory" >&2
     exit 1
   fi
 else
@@ -152,10 +278,13 @@ fi
 VERIFY_JS="${WORK_DIR}/verify-buc-release.mjs"
 cat > "${VERIFY_JS}" <<'JS'
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { gunzipSync } from "node:zlib";
 
 const releaseDir = process.env.RELEASE_DIR;
+const releaseArchiveInput = process.env.RELEASE_ARCHIVE_INPUT || null;
+const releaseRootName = process.env.RELEASE_ROOT_NAME || "";
 const hex64 = /^[0-9a-f]{64}$/;
 const gitSha = /^[0-9a-f]{40}$/;
 
@@ -180,11 +309,13 @@ function listFiles(dir) {
   const out = [];
   for (const name of readdirSync(dir).sort()) {
     const path = join(dir, name);
-    const stat = statSync(path);
+    const stat = lstatSync(path);
     if (stat.isDirectory()) {
       out.push(...listFiles(path));
     } else if (stat.isFile()) {
       out.push(path);
+    } else {
+      fail(`cloud release contains non-regular file: ${relative(releaseDir, path).split("\\").join("/")}`);
     }
   }
   return out;
@@ -196,6 +327,97 @@ function sha256Tree(dir) {
     return `${sha256File(path)}  ${rel}\n`;
   });
   return createHash("sha256").update(lines.join("")).digest("hex");
+}
+
+function cString(block, start, length) {
+  const bytes = block.subarray(start, start + length);
+  const end = bytes.indexOf(0);
+  return bytes.subarray(0, end === -1 ? bytes.length : end).toString("utf8");
+}
+
+function octal(block, start, length) {
+  const text = cString(block, start, length).trim();
+  return text === "" ? 0 : Number.parseInt(text, 8);
+}
+
+function blockIsZero(block) {
+  return block.every((byte) => byte === 0);
+}
+
+function verifyArchiveHeaders(archivePath, rootName) {
+  if (!rootName) {
+    fail("cloud release archive root name is required");
+  }
+  const data = gunzipSync(readFileSync(archivePath));
+  const seen = new Set();
+  let sawRoot = false;
+  let sawManifest = false;
+  let sawChecksums = false;
+
+  for (let offset = 0; offset + 512 <= data.length; offset += 512) {
+    const header = data.subarray(offset, offset + 512);
+    if (blockIsZero(header)) {
+      break;
+    }
+    const name = cString(header, 0, 100);
+    const prefix = cString(header, 345, 155);
+    const path = prefix ? `${prefix}/${name}` : name;
+    const normalizedPath = path.endsWith("/") ? path.slice(0, -1) : path;
+    const type = cString(header, 156, 1) || "0";
+    const uid = octal(header, 108, 8);
+    const gid = octal(header, 116, 8);
+    const size = octal(header, 124, 12);
+    const mtime = octal(header, 136, 12);
+    const uname = cString(header, 265, 32);
+    const gname = cString(header, 297, 32);
+
+    if (path === "" || path.startsWith("/") || path.includes("..") || path.includes("\\")) {
+      fail(`cloud release archive contains unsafe tar entry: ${path}`);
+    }
+    if (seen.has(path)) {
+      fail(`cloud release archive contains duplicate tar entry: ${path}`);
+    }
+    seen.add(path);
+    if (normalizedPath !== rootName && !normalizedPath.startsWith(`${rootName}/`)) {
+      fail(`cloud release archive contains entry outside release directory: ${path}`);
+    }
+    if (!["0", "5"].includes(type)) {
+      fail(`cloud release archive contains non-file tar entry: ${path}`);
+    }
+    if (type === "5" && size !== 0) {
+      fail(`cloud release archive directory entry has non-zero size: ${path}`);
+    }
+    if (uid !== 0 || gid !== 0) {
+      fail(`cloud release archive tar entry ${path} must use uid/gid 0`);
+    }
+    if (!["", "root"].includes(uname) || !["", "root"].includes(gname)) {
+      fail(`cloud release archive tar entry ${path} must not include local owner names`);
+    }
+    if (mtime !== 0) {
+      fail(`cloud release archive tar entry ${path} must use normalized mtime 0`);
+    }
+    if (normalizedPath === rootName) {
+      sawRoot = true;
+    } else if (type === "0") {
+      const relativePath = normalizedPath.slice(rootName.length + 1);
+      if (relativePath === "release-manifest.json") {
+        sawManifest = true;
+      } else if (relativePath === "SHA256SUMS") {
+        sawChecksums = true;
+      }
+    }
+    offset += Math.ceil(size / 512) * 512;
+  }
+
+  if (!sawRoot) {
+    fail(`cloud release archive is missing release root directory: ${rootName}`);
+  }
+  if (!sawManifest) {
+    fail("cloud release archive is missing release-manifest.json");
+  }
+  if (!sawChecksums) {
+    fail("cloud release archive is missing SHA256SUMS");
+  }
 }
 
 function assertSha(value, label) {
@@ -213,6 +435,9 @@ function assertBundledFile(entry, label) {
   }
   assertSha(entry.sha256, `${label}.sha256`);
   const path = join(releaseDir, entry.path);
+  if (!lstatSync(path).isFile()) {
+    fail(`${label}.path must be a regular file: ${entry.path}`);
+  }
   if (sha256File(path) !== entry.sha256) {
     fail(`${label} digest does not match ${entry.path}`);
   }
@@ -255,6 +480,49 @@ function verifyChecksumManifest() {
   }
 }
 
+const localPathPatterns = [
+  { label: "file URL local path", regex: /file:\/\/(?:\/(?:Users|home|private|tmp|var\/folders|Volumes|mnt\/[A-Za-z]\/Users)\/|\/[A-Za-z]:\/|[A-Za-z]:[\\/]|%[A-Z_]*(?:USERPROFILE|HOME|TEMP|TMP|APPDATA|LOCALAPPDATA)[A-Z_]*%[\\/]|~[\\/])/i },
+  { label: "macOS home path", regex: /\/Users\/[^/\s"'`<>{}]+(?:\/[^\s"'`<>{}]*)?/ },
+  { label: "Linux home path", regex: /\/home\/[^/\s"'`<>{}]+(?:\/[^\s"'`<>{}]*)?/ },
+  { label: "Linux temp path", regex: /\/tmp\/[^\s"'`<>{}]+/ },
+  { label: "macOS private temp path", regex: /\/private\/(?:tmp|var)\/[^\s"'`<>{}]+/ },
+  { label: "macOS per-user temp path", regex: /\/var\/folders\/[^\s"'`<>{}]+/ },
+  { label: "macOS mounted volume path", regex: /\/Volumes\/[^\s"'`<>{}]+/ },
+  { label: "WSL mounted Windows user path", regex: /\/mnt\/[A-Za-z]\/Users\/[^\s"'`<>{}]+/ },
+  { label: "Windows drive path", regex: /\b[A-Za-z]:[\\/][^\s"'`<>{}]+/ },
+  { label: "Windows profile env path", regex: /%[A-Z_]*(?:USERPROFILE|HOME|TEMP|TMP|APPDATA|LOCALAPPDATA)[A-Z_]*%[\\/][^\s"'`<>{}]+/i },
+  { label: "home-relative path", regex: /(^|[\s="'`<>{}\[\]()])~[\\/][^\s"'`<>{}]+/ },
+  { label: "GitHub runner workspace path", regex: /\/__w\/[^\s"'`<>{}]+/ },
+];
+
+function isTextLike(data) {
+  if (data.includes(0)) {
+    return false;
+  }
+  const sample = data.subarray(0, Math.min(data.length, 8192)).toString("utf8");
+  return !sample.includes("\uFFFD");
+}
+
+function verifyNoLocalPathContent() {
+  for (const path of listFiles(releaseDir)) {
+    const data = readFileSync(path);
+    if (!isTextLike(data)) {
+      continue;
+    }
+    const text = data.toString("utf8");
+    const rel = relative(releaseDir, path).split("\\").join("/");
+    for (const { label, regex } of localPathPatterns) {
+      if (regex.test(text)) {
+        fail(`${rel} contains ${label}; release text payloads must not embed local absolute paths`);
+      }
+    }
+  }
+}
+
+if (releaseArchiveInput) {
+  verifyArchiveHeaders(releaseArchiveInput, releaseRootName);
+}
+
 const manifest = readJson(join(releaseDir, "release-manifest.json"));
 if (manifest.schema_version !== "bucephalus_release_v1") {
   fail("release-manifest.json schema_version must be bucephalus_release_v1");
@@ -272,6 +540,7 @@ if (typeof manifest.target !== "string" || manifest.target.trim() === "") {
   fail("target is required");
 }
 verifyChecksumManifest();
+verifyNoLocalPathContent();
 
 assertBundledFile(manifest.artifacts?.core_binary, "artifacts.core_binary");
 assertBundledFile(manifest.artifacts?.worker_runner_binary, "artifacts.worker_runner_binary");
@@ -373,7 +642,7 @@ for (const section of sizeReport.sections) {
     }
     assertSha(file.sha256, `release-size-report.json ${file.path}.sha256`);
     const realPath = join(releaseDir, file.path);
-    const stat = statSync(realPath);
+    const stat = lstatSync(realPath);
     if (!stat.isFile()) {
       fail(`release-size-report.json file does not exist: ${file.path}`);
     }
@@ -424,4 +693,4 @@ if (envExamples.length > 0) {
 console.log(`verified ${releaseDir}`);
 JS
 
-RELEASE_DIR="${RELEASE_DIR}" ROOT_DIR="${ROOT_DIR}" bun "${VERIFY_JS}"
+RELEASE_DIR="${RELEASE_DIR}" ROOT_DIR="${ROOT_DIR}" RELEASE_ARCHIVE_INPUT="${RELEASE_ARCHIVE_INPUT}" RELEASE_ROOT_NAME="${RELEASE_ROOT_NAME}" bun "${VERIFY_JS}"

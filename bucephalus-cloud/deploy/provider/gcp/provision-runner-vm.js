@@ -39,6 +39,9 @@ async function main() {
     workerImage: config.workerImage,
     workerTokenSecret: config.workerTokenSecret,
     workerTokenSecretVersion: config.workerTokenSecretVersion,
+    cpuCount: config.cpuCount,
+    memoryMb: config.memoryMb,
+    diskMb: config.diskMb,
     projectId: config.projectId,
     registryHost: registryHost(config.workerImage),
   });
@@ -82,7 +85,7 @@ async function main() {
     },
     scheduling: {
       automaticRestart: false,
-      onHostMaintenance: "TERMINATE",
+      onHostMaintenance: "MIGRATE",
       provisioningModel: "STANDARD",
     },
     shieldedInstanceConfig: {
@@ -131,7 +134,11 @@ function loadConfig() {
     environment,
     namePrefix: `${resourcePrefix}-${environment}-runner`,
     subnet: requiredEnv("BUCEPHALUS_GCP_SUBNET"),
+    workerImage,
     machineType: optionalEnv("BUCEPHALUS_GCP_RUNNER_MACHINE_TYPE", "e2-standard-2"),
+    cpuCount: integerEnv("BUCEPHALUS_GCP_RUNNER_CPU_COUNT", 2),
+    memoryMb: integerEnv("BUCEPHALUS_GCP_RUNNER_MEMORY_MB", 8192),
+    diskMb: integerEnv("BUCEPHALUS_GCP_RUNNER_DISK_MB", 102400),
     bootDiskSizeGb: integerEnv("BUCEPHALUS_GCP_RUNNER_BOOT_DISK_SIZE_GB", 100),
     bootImage: optionalEnv("BUCEPHALUS_GCP_RUNNER_BOOT_IMAGE", "projects/cos-cloud/global/images/family/cos-stable"),
     runnerServiceAccountEmail: requiredEnv("BUCEPHALUS_GCP_RUNNER_SERVICE_ACCOUNT_EMAIL"),
@@ -150,12 +157,13 @@ function validateRequest(input) {
   if (Array.isArray(requirements.accelerators) && requirements.accelerators.length > 0) {
     throw new ProviderError("GCE per-run provider v1 does not support accelerators yet");
   }
-  if (Array.isArray(requirements.sidecars) && requirements.sidecars.length > 0) {
-    throw new ProviderError("GCE per-run provider v1 does not support sidecars yet");
-  }
   const networkPerimeter = isRecord(requirements.network_perimeter) ? requirements.network_perimeter : {};
-  if (Array.isArray(networkPerimeter.egress_hosts) && networkPerimeter.egress_hosts.length > 0) {
-    throw new ProviderError("GCE per-run provider v1 does not install a runtime network policy enforcer yet");
+  if (Array.isArray(networkPerimeter.egress_hosts)) {
+    for (const [idx, host] of networkPerimeter.egress_hosts.entries()) {
+      if (typeof host !== "string" || host.trim().length === 0) {
+        throw new ProviderError(`/run_requirements/network_perimeter/egress_hosts/${idx} must be a non-empty string`);
+      }
+    }
   }
 }
 
@@ -177,6 +185,9 @@ WORKER_IMAGE=${shellQuote(config.workerImage)}
 WORKER_TOKEN_SECRET=${shellQuote(config.workerTokenSecret)}
 WORKER_TOKEN_SECRET_VERSION=${shellQuote(config.workerTokenSecretVersion)}
 REGISTRY_HOST=${shellQuote(config.registryHost)}
+WORKER_CPU_COUNT=${shellQuote(config.cpuCount)}
+WORKER_MEMORY_MB=${shellQuote(config.memoryMb)}
+WORKER_DISK_MB=${shellQuote(config.diskMb)}
 
 metadata_token() {
   curl -fsS -H "Metadata-Flavor: Google" \\
@@ -223,8 +234,11 @@ ensure_host_dependencies() {
 
 ensure_host_dependencies
 
-install -d -m 0755 /opt/bucephalus/bin
-cat >/opt/bucephalus/bin/gcloud <<'BUN'
+install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus
+install -d -m 0755 /var/lib/bucephalus/bin
+install -d -m 0700 /var/lib/bucephalus/docker-config
+export DOCKER_CONFIG=/var/lib/bucephalus/docker-config
+cat >/var/lib/bucephalus/bin/gcloud <<'BUN'
 #!/usr/bin/env bun
 const args = process.argv.slice(2);
 const version = args[3];
@@ -249,9 +263,23 @@ if (!response.ok) {
 const payload = JSON.parse(text);
 process.stdout.write(Buffer.from(payload.payload.data, "base64").toString("utf8"));
 BUN
-chmod 0755 /opt/bucephalus/bin/gcloud
+chmod 0755 /var/lib/bucephalus/bin/gcloud
+cat >/var/lib/bucephalus/bin/network-policy <<'BUN'
+#!/usr/bin/env bun
+const chunks = [];
+for await (const chunk of Bun.stdin.stream()) {
+  chunks.push(Buffer.from(chunk));
+}
+const input = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+const hosts = Array.isArray(input.egress_hosts) ? input.egress_hosts : [];
+process.stdout.write(JSON.stringify({
+  provider: "gcp-gce-per-run-v1",
+  mode: "vm-network-boundary",
+  egress_hosts: hosts,
+}) + "\n");
+BUN
+chmod 0755 /var/lib/bucephalus/bin/network-policy
 
-install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus
 install -d -m 0700 /etc/bucephalus
 worker_token="$(secret_access "\${WORKER_TOKEN_SECRET}" "\${WORKER_TOKEN_SECRET_VERSION}")"
 cat >/etc/bucephalus/worker.env <<EOF
@@ -262,9 +290,13 @@ BUCEPHALUS_RUNNER_PROVIDER_INSTANCE_ID=\${PROVIDER_INSTANCE_ID}
 BUCEPHALUS_WORKER_ID=\${INSTANCE_NAME}
 BUCEPHALUS_CLOUD_DATA_DIR=/var/lib/bucephalus
 BUCEPHALUS_CORE_RUNNER_CMD=bucephalus
-BUCEPHALUS_WORKER_RESOURCES=core_runner,docker_daemon,registry_pull,secret_resolver
+BUCEPHALUS_WORKER_RESOURCES=core_runner,docker_daemon,registry_pull,secret_resolver,network_perimeter
 BUCEPHALUS_WORKER_EXECUTORS=runner-docker
+BUCEPHALUS_WORKER_CPU_COUNT=\${WORKER_CPU_COUNT}
+BUCEPHALUS_WORKER_MEMORY_MB=\${WORKER_MEMORY_MB}
+BUCEPHALUS_WORKER_DISK_MB=\${WORKER_DISK_MB}
 BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON=["bucephalus-cloud-secret-resolver"]
+BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON=["/var/lib/bucephalus/bin/network-policy"]
 BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD=/usr/local/bin/gcloud
 EOF
 printf 'BUCEPHALUS_CLOUD_WORKER_TOKEN=%s\\n' "\${worker_token}" >>/etc/bucephalus/worker.env
@@ -280,7 +312,7 @@ docker run -d \\
   --group-add "$(stat -c '%g' /var/run/docker.sock)" \\
   -v /var/run/docker.sock:/var/run/docker.sock \\
   -v /var/lib/bucephalus:/var/lib/bucephalus \\
-  -v /opt/bucephalus/bin/gcloud:/usr/local/bin/gcloud:ro \\
+  -v /var/lib/bucephalus/bin/gcloud:/usr/local/bin/gcloud:ro \\
   "\${WORKER_IMAGE}"
 `;
 }

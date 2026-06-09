@@ -3,7 +3,7 @@ use chrono::Utc;
 use flate2::read::GzDecoder;
 use lab_core::{
     ensure_dir, sha256_file, BUCEPHALUS_CONTRACT_EVENTS_DIR, BUCEPHALUS_CONTRACT_IN_DIR,
-    BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
+    BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_STATE_DIR, BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
     BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH, BUCEPHALUS_ENV_RESULT_PATH,
     BUCEPHALUS_ENV_TRAJECTORY_PATH, BUCEPHALUS_ENV_TRIAL_INPUT_PATH,
     BUCEPHALUS_EVENTS_DURABLE_PATH,
@@ -19,7 +19,7 @@ use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tar::{Archive, EntryType};
 
-use crate::config::{load_json_file, normalize_path, parse_string_array_field};
+use crate::config::{atomic_write_bytes, load_json_file, normalize_path, parse_string_array_field};
 use crate::experiment::runner::{
     agent_artifact_archive_flag, map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
 };
@@ -560,6 +560,60 @@ struct CapturedTransportOutput {
     format: Option<String>,
 }
 
+fn public_contract_path_ref(path: &str) -> String {
+    let trimmed = path.trim();
+    for (prefix, scheme) in [
+        (BUCEPHALUS_CONTRACT_IN_DIR, "contract://in"),
+        (BUCEPHALUS_CONTRACT_OUT_DIR, "contract://out"),
+        (BUCEPHALUS_CONTRACT_WORKSPACE_DIR, "contract://workspace"),
+        (BUCEPHALUS_CONTRACT_EVENTS_DIR, "contract://events"),
+        (BUCEPHALUS_CONTRACT_STATE_DIR, "contract://state"),
+        ("/bucephalus/tmp", "contract://tmp"),
+    ] {
+        if trimmed == prefix {
+            return scheme.to_string();
+        }
+        if let Some(rel) = trimmed.strip_prefix(&format!("{prefix}/")) {
+            return format!("{scheme}/{rel}");
+        }
+    }
+    "[REDACTED:contract-path]".to_string()
+}
+
+fn public_runtime_output_local_ref(output: &CapturedTransportOutput) -> Option<String> {
+    output
+        .host_path
+        .as_ref()
+        .map(|_| match output.container_path.as_deref() {
+            Some(container_path) => public_contract_path_ref(container_path),
+            None => "[REDACTED:local-path]".to_string(),
+        })
+}
+
+fn captured_transport_output_to_json(output: &CapturedTransportOutput) -> Value {
+    json!({
+        "value": output.value,
+        "local_ref": public_runtime_output_local_ref(output),
+        "container_path": output.container_path,
+        "format": output.format
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn captured_transport_output_json_for_test(
+    value: Value,
+    host_path: Option<PathBuf>,
+    container_path: Option<String>,
+    format: Option<String>,
+) -> Value {
+    captured_transport_output_to_json(&CapturedTransportOutput {
+        value,
+        host_path,
+        container_path,
+        format,
+    })
+}
+
 fn parse_agent_outputs(
     request: &TrialRunRequest<'_>,
 ) -> Result<BTreeMap<String, RuntimeOutputConfig>> {
@@ -572,7 +626,11 @@ fn parse_agent_outputs(
         .map_err(|err| anyhow!("invalid /trial_runtime/agent/outputs: {}", err))
 }
 
-fn read_captured_file_value(host_path: &Path, format: &str) -> Result<Value> {
+fn read_captured_file_value(
+    host_path: &Path,
+    format: &str,
+    container_path: Option<&str>,
+) -> Result<Value> {
     match format {
         "json" => {
             enforce_inline_capture_size(host_path, "json runtime output")?;
@@ -583,7 +641,9 @@ fn read_captured_file_value(host_path: &Path, format: &str) -> Result<Value> {
             Ok(json!(fs::read_to_string(host_path)?))
         }
         "bytes" => Ok(json!({
-            "path": host_path.to_string_lossy(),
+            "path": container_path
+                .map(public_contract_path_ref)
+                .unwrap_or_else(|| "[REDACTED:local-path]".to_string()),
             "sha256": sha256_file(host_path)?,
             "bytes": host_path.metadata()?.len()
         })),
@@ -655,12 +715,146 @@ fn transport_value_to_bytes(value: &Value, json_mode: bool) -> Result<Vec<u8>> {
     }
 }
 
-fn write_host_transport_file(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_runtime_artifact_file(
+    path: &Path,
+    bytes: &[u8],
+    artifact_ref: &str,
+) -> Result<()> {
+    ensure_runtime_artifact_path(path, artifact_ref)?;
+    atomic_write_bytes(path, bytes).with_context(|| {
+        format!("failed to write runtime artifact\n\nartifact_ref: {artifact_ref}")
+    })
+}
+
+fn ensure_runtime_artifact_path(path: &Path, artifact_ref: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(anyhow!(
+                    "refusing to write runtime artifact through symlinked directory\n\nartifact_ref: {artifact_ref}"
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(anyhow!(
+                    "refusing to write runtime artifact because parent is not a directory\n\nartifact_ref: {artifact_ref}"
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                ensure_dir(parent).with_context(|| {
+                    format!(
+                        "failed to create runtime artifact directory\n\nartifact_ref: {artifact_ref}"
+                    )
+                })?;
+            }
+            Err(err) => {
+                return Err(anyhow!(
+                    "failed to inspect runtime artifact directory\n\nartifact_ref: {artifact_ref}\n\nerror: {err}"
+                ));
+            }
+        }
     }
-    fs::write(path, bytes)?;
-    Ok(())
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "refusing to write runtime artifact through symlinked file\n\nartifact_ref: {artifact_ref}"
+        )),
+        Ok(metadata) if metadata.is_dir() => Err(anyhow!(
+            "refusing to write runtime artifact over a directory\n\nartifact_ref: {artifact_ref}"
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => Err(anyhow!(
+            "refusing to write runtime artifact because parent is not a directory\n\nartifact_ref: {artifact_ref}"
+        )),
+        Err(err) => Err(anyhow!(
+            "failed to inspect runtime artifact\n\nartifact_ref: {artifact_ref}\n\nerror: {err}"
+        )),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runtime_artifact_file_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn temp_runtime_artifact_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bucephalus_runtime_artifact_{}_{}_{}",
+            name,
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ))
+    }
+
+    #[test]
+    fn runtime_artifact_writer_refuses_symlinked_file() {
+        let root = temp_runtime_artifact_dir("symlink_file");
+        let outside = temp_runtime_artifact_dir("symlink_file_outside");
+        fs::create_dir_all(&root).expect("root dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let outside_log = outside.join("stdout.log");
+        fs::write(&outside_log, "outside\n").expect("outside log");
+        let link = root.join("stdout.log");
+        symlink(&outside_log, &link).expect("stdout symlink");
+
+        let err = write_runtime_artifact_file(&link, b"new\n", "runtime-log://agent/stdout")
+            .expect_err("symlinked artifact file should be refused");
+        let message = err.to_string();
+
+        assert!(message.contains("symlinked file"));
+        assert!(message.contains("runtime-log://agent/stdout"));
+        assert_eq!(fs::read_to_string(&outside_log).unwrap(), "outside\n");
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "runtime artifact error leaked root path: {message}"
+        );
+        assert!(
+            !message.contains(&outside.display().to_string()),
+            "runtime artifact error leaked outside path: {message}"
+        );
+
+        fs::remove_file(link).ok();
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(outside).ok();
+    }
+
+    #[test]
+    fn runtime_artifact_writer_refuses_symlinked_parent_directory() {
+        let root = temp_runtime_artifact_dir("symlink_parent");
+        let outside = temp_runtime_artifact_dir("symlink_parent_outside");
+        fs::create_dir_all(&root).expect("root dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let link = root.join("agent");
+        symlink(&outside, &link).expect("agent dir symlink");
+        let stdout = link.join("stdout.log");
+
+        let err = write_runtime_artifact_file(&stdout, b"new\n", "runtime-log://agent/stdout")
+            .expect_err("symlinked artifact directory should be refused");
+        let message = err.to_string();
+
+        assert!(message.contains("symlinked directory"));
+        assert!(message.contains("runtime-log://agent/stdout"));
+        assert!(
+            !outside.join("stdout.log").exists(),
+            "runtime artifact write escaped through symlinked parent"
+        );
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "runtime artifact error leaked root path: {message}"
+        );
+        assert!(
+            !message.contains(&outside.display().to_string()),
+            "runtime artifact error leaked outside path: {message}"
+        );
+
+        fs::remove_file(link).ok();
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(outside).ok();
+    }
+}
+
+fn write_host_transport_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_runtime_artifact_file(path, bytes, "runtime-transport://host-file")
 }
 
 fn metric_source_output_id(metric: &crate::model::MetricDefinition) -> Option<&str> {
@@ -880,26 +1074,18 @@ fn write_transport_envelope(
     agent_outputs: &BTreeMap<String, CapturedTransportOutput>,
     grader_outputs: &BTreeMap<String, CapturedTransportOutput>,
 ) -> Result<()> {
-    let output_to_json = |output: &CapturedTransportOutput| {
-        json!({
-            "value": output.value,
-            "host_path": output.host_path.as_ref().map(|path| path.to_string_lossy().to_string()),
-            "container_path": output.container_path,
-            "format": output.format
-        })
-    };
     let envelope = json!({
         "schema_version": "runtime_transport_envelope_v1",
         "agent": {
             "outputs": agent_outputs
                 .iter()
-                .map(|(id, output)| (id.clone(), output_to_json(output)))
+                .map(|(id, output)| (id.clone(), captured_transport_output_to_json(output)))
                 .collect::<serde_json::Map<String, Value>>()
         },
         "grader": {
             "outputs": grader_outputs
                 .iter()
-                .map(|(id, output)| (id.clone(), output_to_json(output)))
+                .map(|(id, output)| (id.clone(), captured_transport_output_to_json(output)))
                 .collect::<serde_json::Map<String, Value>>()
         }
     });
@@ -907,8 +1093,11 @@ fn write_transport_envelope(
         .trial_paths
         .out
         .join("runtime_transport_envelope.json");
-    fs::write(path, serde_json::to_vec_pretty(&envelope)?)?;
-    Ok(())
+    write_runtime_artifact_file(
+        &path,
+        &serde_json::to_vec_pretty(&envelope)?,
+        "runtime-transport://envelope",
+    )
 }
 
 fn parse_transport_output(value: &Value) -> Result<CapturedTransportOutput> {
@@ -1016,14 +1205,8 @@ pub(crate) fn run_host_grader(
     env.extend(transport_env.clone());
     command.envs(env);
     let output = command.output()?;
-    if let Some(parent) = stdout_path.parent() {
-        ensure_dir(parent)?;
-    }
-    if let Some(parent) = stderr_path.parent() {
-        ensure_dir(parent)?;
-    }
-    fs::write(stdout_path, &output.stdout)?;
-    fs::write(stderr_path, &output.stderr)?;
+    write_runtime_artifact_file(stdout_path, &output.stdout, "runtime-log://grader/stdout")?;
+    write_runtime_artifact_file(stderr_path, &output.stderr, "runtime-log://grader/stderr")?;
     Ok(GraderRunOutcome {
         exit_code: output.status.code(),
         signal: signal_from_status(output.status),
@@ -1300,11 +1483,16 @@ fn execute_host_agent_runtime(
         json!({ "exit_code": output.status.code() }),
     )?;
     let ended_at = Utc::now().to_rfc3339();
-    if let Some(parent) = trial_agent_stdout_path(trial_dir).parent() {
-        ensure_dir(parent)?;
-    }
-    fs::write(trial_agent_stdout_path(trial_dir), &output.stdout)?;
-    fs::write(trial_agent_stderr_path(trial_dir), &output.stderr)?;
+    write_runtime_artifact_file(
+        &trial_agent_stdout_path(trial_dir),
+        &output.stdout,
+        "runtime-log://agent/stdout",
+    )?;
+    write_runtime_artifact_file(
+        &trial_agent_stderr_path(trial_dir),
+        &output.stderr,
+        "runtime-log://agent/stderr",
+    )?;
 
     let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
     let trial_output = agent_response.response;
@@ -1451,6 +1639,54 @@ pub(crate) fn agent_artifact_cache_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn ensure_agent_artifact_cache_root(cache_root: &Path) -> Result<()> {
+    match fs::symlink_metadata(cache_root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "refusing to use symlinked trial_runtime.agent.artifact cache directory\n\ncache_ref: artifact-cache://root"
+        )),
+        Ok(metadata) if !metadata.is_dir() => Err(anyhow!(
+            "refusing to use trial_runtime.agent.artifact cache path because it is not a directory\n\ncache_ref: artifact-cache://root"
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            ensure_dir(cache_root).with_context(|| {
+                "failed to create trial_runtime.agent.artifact cache directory\n\ncache_ref: artifact-cache://root"
+            })
+        }
+        Err(err) => Err(anyhow!(
+            "failed to inspect trial_runtime.agent.artifact cache directory\n\ncache_ref: artifact-cache://root\n\nerror: {err}"
+        )),
+    }
+}
+
+fn cached_agent_artifact_is_ready(unpacked_dir: &Path, ready_marker: &Path) -> Result<bool> {
+    match fs::symlink_metadata(unpacked_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "refusing to use symlinked trial_runtime.agent.artifact cache entry\n\ncache_ref: artifact-cache://entry"
+        )),
+        Ok(metadata) if !metadata.is_dir() => Err(anyhow!(
+            "refusing to use trial_runtime.agent.artifact cache entry because it is not a directory\n\ncache_ref: artifact-cache://entry"
+        )),
+        Ok(_) => match fs::symlink_metadata(ready_marker) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+                "refusing to use symlinked trial_runtime.agent.artifact ready marker\n\ncache_ref: artifact-cache://ready-marker"
+            )),
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(anyhow!(
+                "refusing to use trial_runtime.agent.artifact ready marker because it is not a file\n\ncache_ref: artifact-cache://ready-marker"
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(anyhow!(
+                "failed to inspect trial_runtime.agent.artifact ready marker\n\ncache_ref: artifact-cache://ready-marker\n\nerror: {err}"
+            )),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(anyhow!(
+            "failed to inspect trial_runtime.agent.artifact cache entry\n\ncache_ref: artifact-cache://entry\n\nerror: {err}"
+        )),
+    }
+}
+
 fn cleanup_agent_artifact_staging_dirs(
     cache_root: &Path,
     digest_path_component: &str,
@@ -1461,14 +1697,18 @@ fn cleanup_agent_artifact_staging_dirs(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
             return Err(anyhow!(
-                "failed to inspect agent artifact cache {}: {}",
-                cache_root.display(),
+                "failed to inspect trial_runtime.agent.artifact cache\n\ncache_ref: artifact-cache://root\n\nerror: {}",
                 err
             ))
         }
     };
     for entry in entries {
-        let entry = entry?;
+        let entry = entry.map_err(|err| {
+            anyhow!(
+                "failed to inspect trial_runtime.agent.artifact cache entry\n\ncache_ref: artifact-cache://staging\n\nerror: {}",
+                err
+            )
+        })?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !name.starts_with(&prefix) {
@@ -1477,24 +1717,21 @@ fn cleanup_agent_artifact_staging_dirs(
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path).map_err(|err| {
             anyhow!(
-                "failed to inspect stale agent artifact staging path {}: {}",
-                path.display(),
+                "failed to inspect stale trial_runtime.agent.artifact staging path\n\ncache_ref: artifact-cache://staging\n\nerror: {}",
                 err
             )
         })?;
         if metadata.is_dir() {
             fs::remove_dir_all(&path).map_err(|err| {
                 anyhow!(
-                    "failed to remove stale agent artifact staging directory {}: {}",
-                    path.display(),
+                    "failed to remove stale trial_runtime.agent.artifact staging directory\n\ncache_ref: artifact-cache://staging\n\nerror: {}",
                     err
                 )
             })?;
         } else {
             fs::remove_file(&path).map_err(|err| {
                 anyhow!(
-                    "failed to remove stale agent artifact staging file {}: {}",
-                    path.display(),
+                    "failed to remove stale trial_runtime.agent.artifact staging file\n\ncache_ref: artifact-cache://staging\n\nerror: {}",
                     err
                 )
             })?;
@@ -1716,24 +1953,25 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
             )
         })?
         .join(".bucephalus_artifact_cache");
-    ensure_dir(&cache_root)?;
+    ensure_agent_artifact_cache_root(&cache_root)?;
     let unpacked_dir = cache_root.join(&digest_path_component);
     let ready_marker = unpacked_dir.join(".bucephalus_ready");
-    if ready_marker.exists() {
+    if cached_agent_artifact_is_ready(&unpacked_dir, &ready_marker)? {
         return Ok(unpacked_dir);
     }
 
     let _guard = agent_artifact_cache_lock()
         .lock()
         .map_err(|_| anyhow!("agent artifact cache lock poisoned"))?;
-    if ready_marker.exists() {
+    ensure_agent_artifact_cache_root(&cache_root)?;
+    if cached_agent_artifact_is_ready(&unpacked_dir, &ready_marker)? {
         return Ok(unpacked_dir);
     }
     cleanup_agent_artifact_staging_dirs(&cache_root, &digest_path_component)?;
 
-    if unpacked_dir.exists() {
-        fs::remove_dir_all(&unpacked_dir)?;
-    }
+    remove_path_if_exists(&unpacked_dir).with_context(|| {
+        "failed to reset stale trial_runtime.agent.artifact cache entry\n\ncache_ref: artifact-cache://entry"
+    })?;
     let staging_dir = cache_root.join(format!(
         "{}.tmp.{}.{}",
         digest_path_component,
@@ -1742,41 +1980,33 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     ));
     if staging_dir.exists() {
         remove_path_if_exists(&staging_dir).with_context(|| {
-            format!(
-                "failed to remove stale agent artifact staging directory {}",
-                staging_dir.display()
-            )
+            "failed to remove stale trial_runtime.agent.artifact staging directory\n\ncache_ref: artifact-cache://staging"
         })?;
     }
     ensure_dir(&staging_dir)?;
     if let Err(err) = unpack_agent_artifact_archive(&artifact_path, &staging_dir, gzipped) {
         remove_path_if_exists(&staging_dir).with_context(|| {
-            format!(
-                "failed to remove incomplete agent artifact staging directory {}",
-                staging_dir.display()
-            )
+            "failed to remove incomplete trial_runtime.agent.artifact staging directory\n\ncache_ref: artifact-cache://staging"
         })?;
         return Err(anyhow!(
-            "failed to unpack trial_runtime.agent.artifact {}: {}",
-            artifact_path.display(),
+            "failed to unpack trial_runtime.agent.artifact\n\nartifact_ref: artifact://source\ncache_ref: artifact-cache://staging\n\nerror: {}",
             err,
         ));
     }
     if let Err(err) = fs::rename(&staging_dir, &unpacked_dir) {
         remove_path_if_exists(&staging_dir).with_context(|| {
-            format!(
-                "failed to remove unfinalized agent artifact staging directory {}",
-                staging_dir.display()
-            )
+            "failed to remove unfinalized trial_runtime.agent.artifact staging directory\n\ncache_ref: artifact-cache://staging"
         })?;
         return Err(anyhow!(
-            "failed to finalize unpacked trial_runtime.agent.artifact {} into {}: {}",
-            artifact_path.display(),
-            unpacked_dir.display(),
+            "failed to finalize unpacked trial_runtime.agent.artifact\n\nartifact_ref: artifact://source\ncache_ref: artifact-cache://entry\n\nerror: {}",
             err
         ));
     }
-    fs::write(&ready_marker, digest.as_bytes())?;
+    write_runtime_artifact_file(
+        &ready_marker,
+        digest.as_bytes(),
+        "artifact-cache://ready-marker",
+    )?;
     Ok(unpacked_dir)
 }
 

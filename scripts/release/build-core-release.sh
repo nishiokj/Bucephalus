@@ -14,7 +14,9 @@ Usage: scripts/release/build-core-release.sh --version <version> [--out <dir>] [
 Builds the public Bucephalus CLI release archive consumed by scripts/install.sh.
 The archive is named bucephalus-<target>.tar.gz and contains:
   - bucephalus
+  - bucephalus-cloud
   - bucephalus-modal-launcher
+  - install.sh
   - README.md
   - LICENSE
   - release-manifest.json
@@ -82,12 +84,28 @@ sha256_file() {
   printf '%s' "${digest}"
 }
 
+normalize_release_mtimes() {
+  local dir="$1"
+  find "${dir}" -type f -exec env TZ=UTC touch -t 197001010000 {} +
+}
+
+create_normalized_tar_gz() {
+  local archive="$1"
+  shift
+  if tar --version 2>/dev/null | grep -qi "GNU tar"; then
+    COPYFILE_DISABLE=1 tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime="1970-01-01 00:00Z" -czf "${archive}" "$@"
+  else
+    COPYFILE_DISABLE=1 tar --format=ustar --uid 0 --gid 0 --uname root --gname root -czf "${archive}" "$@"
+  fi
+}
+
 require_command cargo
 require_command git
 require_command go
 require_command rustc
 require_command tar
 require_command install
+require_command find
 
 CARGO_BUILD_SUBCOMMAND="${BUCEPHALUS_RELEASE_CARGO_BUILD_SUBCOMMAND:-build}"
 GIT_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
@@ -133,7 +151,7 @@ RELEASE_DIR="${OUT_DIR}/${RELEASE_NAME}"
 ARCHIVE_BASENAME="bucephalus-${TARGET_LABEL}.tar.gz"
 ARCHIVE_PATH="${OUT_DIR}/${ARCHIVE_BASENAME}"
 
-rm -rf "${RELEASE_DIR}" "${ARCHIVE_PATH}" "${ARCHIVE_PATH}.sha256"
+rm -rf "${RELEASE_DIR}" "${ARCHIVE_PATH}" "${ARCHIVE_PATH}.sha256" "${OUT_DIR}/install.sh" "${OUT_DIR}/install.sh.sha256"
 mkdir -p "${RELEASE_DIR}" "${OUT_DIR}"
 
 if [[ -n "${CORE_BIN_INPUT}" ]]; then
@@ -172,10 +190,12 @@ read -r GOOS_VALUE GOARCH_VALUE <<< "$(go_target_env "${TARGET_LABEL}" | sed 's/
 )
 install -m 0644 "${ROOT_DIR}/README.md" "${RELEASE_DIR}/README.md"
 install -m 0644 "${ROOT_DIR}/LICENSE" "${RELEASE_DIR}/LICENSE"
+install -m 0644 "${ROOT_DIR}/scripts/install.sh" "${RELEASE_DIR}/install.sh"
 
 CORE_SHA="$(sha256_file "${RELEASE_DIR}/bucephalus")"
 CLOUD_CLI_SHA="$(sha256_file "${RELEASE_DIR}/bucephalus-cloud")"
 MODAL_LAUNCHER_SHA="$(sha256_file "${RELEASE_DIR}/bucephalus-modal-launcher")"
+INSTALLER_SHA="$(sha256_file "${RELEASE_DIR}/install.sh")"
 cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
 {
   "schema_version": "bucephalus_core_release_v1",
@@ -196,6 +216,10 @@ cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
     "modal_launcher_binary": {
       "path": "bucephalus-modal-launcher",
       "sha256": "${MODAL_LAUNCHER_SHA}"
+    },
+    "installer_script": {
+      "path": "install.sh",
+      "sha256": "${INSTALLER_SHA}"
     }
   }
 }
@@ -204,20 +228,23 @@ EOF
 (
   cd "${RELEASE_DIR}"
   : > SHA256SUMS
-  for file in bucephalus bucephalus-cloud bucephalus-modal-launcher README.md LICENSE release-manifest.json; do
+  for file in bucephalus bucephalus-cloud bucephalus-modal-launcher install.sh README.md LICENSE release-manifest.json; do
     digest="$(sha256_file "${file}")"
     printf "%s  %s\n" "${digest}" "${file}" >> SHA256SUMS
   done
 )
 
 echo "== Archive =="
+normalize_release_mtimes "${RELEASE_DIR}"
 (
   cd "${RELEASE_DIR}"
-  tar -czf "${ARCHIVE_PATH}" bucephalus bucephalus-cloud bucephalus-modal-launcher README.md LICENSE release-manifest.json SHA256SUMS
+  create_normalized_tar_gz "${ARCHIVE_PATH}" bucephalus bucephalus-cloud bucephalus-modal-launcher install.sh README.md LICENSE release-manifest.json SHA256SUMS
 )
 
 ARCHIVE_SHA="$(sha256_file "${ARCHIVE_PATH}")"
 printf "%s  %s\n" "${ARCHIVE_SHA}" "${ARCHIVE_BASENAME}" > "${ARCHIVE_PATH}.sha256"
+install -m 0644 "${RELEASE_DIR}/install.sh" "${OUT_DIR}/install.sh"
+printf "%s  install.sh\n" "${INSTALLER_SHA}" > "${OUT_DIR}/install.sh.sha256"
 
 echo "release_dir=${RELEASE_DIR}"
 echo "archive=${ARCHIVE_PATH}"

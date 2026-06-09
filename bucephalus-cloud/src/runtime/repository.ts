@@ -1,5 +1,6 @@
 import type { Sql } from "../db/client";
 import type { JsonObject, JsonValue } from "../primitives";
+import { publicBoundaryJsonObject, publicBoundaryText } from "../publicBoundary";
 
 export interface RuntimeSummary {
   cloud_run_id: string;
@@ -617,17 +618,21 @@ export function runtimeSnapshotFromWorkerEventPayload(payload: JsonObject): Runt
   if (!coreRunId) {
     return null;
   }
-  const runtimeValues = recordOfJsonObjects(payload.runtime_values);
+  const runtimeValues = recordOfPublicJsonObjects(payload.runtime_values);
   const trialSummaries = Array.isArray(payload.trial_summaries)
     ? payload.trial_summaries.flatMap((item) => {
       if (!isRecord(item)) {
         return [];
       }
       const trialId = stringField(item.trial_id);
-      const summary = isRecord(item.summary) ? item.summary as JsonObject : null;
-      const contractTrace = isRecord(item.contract_trace) ? item.contract_trace as JsonObject : undefined;
+      const summary = isRecord(item.summary) ? publicJsonObject(item.summary as JsonObject) : null;
+      const contractTrace = isRecord(item.contract_trace)
+        ? publicJsonObject(item.contract_trace as JsonObject)
+        : undefined;
       const trialEvents = Array.isArray(item.trial_events)
-        ? item.trial_events.filter((event): event is JsonObject => isRecord(event))
+        ? item.trial_events
+          .filter((event): event is JsonObject => isRecord(event))
+          .map(publicJsonObject)
         : undefined;
       return trialId && summary ? [{
         trial_id: trialId,
@@ -639,14 +644,18 @@ export function runtimeSnapshotFromWorkerEventPayload(payload: JsonObject): Runt
     : [];
   return {
     core_run_id: coreRunId,
-    run_dir_name: stringField(payload.run_dir_name) ?? coreRunId,
+    run_dir_name: publicBoundaryText(stringField(payload.run_dir_name) ?? coreRunId),
     runtime_values: runtimeValues,
     trial_summaries: trialSummaries,
     evidence_records: Array.isArray(payload.evidence_records)
-      ? payload.evidence_records.filter((item): item is JsonObject => isRecord(item))
+      ? payload.evidence_records
+        .filter((item): item is JsonObject => isRecord(item))
+        .map(publicJsonObject)
       : [],
     omitted: Array.isArray(payload.omitted)
-      ? payload.omitted.filter((item): item is string => typeof item === "string")
+      ? payload.omitted
+        .filter((item): item is string => typeof item === "string")
+        .map(publicBoundaryText)
       : [],
   };
 }
@@ -906,6 +915,16 @@ function recordOfJsonObjects(value: unknown): Record<string, JsonObject> {
     }
   }
   return out;
+}
+
+function recordOfPublicJsonObjects(value: unknown): Record<string, JsonObject> {
+  return Object.fromEntries(
+    Object.entries(recordOfJsonObjects(value)).map(([key, item]) => [key, publicJsonObject(item)]),
+  );
+}
+
+function publicJsonObject(value: JsonObject): JsonObject {
+  return publicBoundaryJsonObject(value) ?? {};
 }
 
 function stringField(value: unknown): string | null {

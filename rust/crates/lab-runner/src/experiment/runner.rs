@@ -67,7 +67,52 @@ fn run_id_from_run_dir(run_dir: &Path) -> Result<String> {
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("unable to infer run_id from {}", run_dir.display()))
+        .ok_or_else(|| {
+            anyhow!(
+                "unable to infer run_id from {}",
+                public_run_dir_ref(run_dir)
+            )
+        })
+}
+
+pub(crate) fn public_run_artifact_ref(run_id: &str) -> String {
+    format!("run://{run_id}")
+}
+
+pub(crate) fn public_run_dir_ref(run_dir: &Path) -> String {
+    run_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.starts_with("run_"))
+        .map(public_run_artifact_ref)
+        .unwrap_or_else(|| "[REDACTED:local-path]".to_string())
+}
+
+pub(crate) fn public_package_input_ref(path: &Path) -> String {
+    let package_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|name| *name != "manifest.json")
+        .or_else(|| {
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str())
+        })
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("input");
+    format!("package://{package_name}")
+}
+
+pub(crate) fn run_manifest_json(run_id: &str, behavior: &RunBehavior) -> Value {
+    json!({
+        "schema_version": "manifest_v1",
+        "run_id": run_id,
+        "runner_version": "rust-0.3.0",
+        "created_at": Utc::now().to_rfc3339(),
+        "project_ref": "package://project-root",
+        "run_mode": if behavior.smoke_test { "smoke_test" } else { "full" },
+    })
 }
 
 pub fn continue_run_with_options(
@@ -77,24 +122,37 @@ pub fn continue_run_with_options(
     let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Continue)?;
     let run_dir = run_dir
         .canonicalize()
-        .with_context(|| format!("resolve run directory '{}'", run_dir.display()))?;
+        .with_context(|| format!("resolve run directory {}", public_run_dir_ref(run_dir)))?;
 
     let control = load_run_control(&run_dir)?;
+    let run_id = require_run_control_run_id(&control)?;
     let run_status = run_control_status(&control)?;
     let recovered_active_trials = run_control_active_trials(&control)?;
     match run_status {
         "failed" | "paused" | "interrupted" => {}
-        "completed" => return Err(anyhow!("run already completed — nothing to continue")),
-        "running" => {
+        "completed" => {
             return Err(anyhow!(
-                "run is currently active — cannot continue a running experiment; run `lab recover --run-dir {}` first",
-                run_dir.display()
+                "{} already completed — nothing to continue",
+                public_run_artifact_ref(&run_id)
             ));
         }
-        other => return Err(anyhow!("unexpected run status: {}", other)),
+        "running" => {
+            return Err(anyhow!(
+                "{} is currently active — watch it with `bucephalus views-live {} run_progress`; if the owner is stale, run `bucephalus recover {} --force` before continuing",
+                public_run_artifact_ref(&run_id),
+                run_id,
+                run_id
+            ));
+        }
+        other => {
+            return Err(anyhow!(
+                "unexpected status for {}: {}",
+                public_run_artifact_ref(&run_id),
+                other
+            ));
+        }
     }
 
-    let run_id = require_run_control_run_id(&control)?;
     let (_run_store_writer_guard, run_store_writer) =
         RunStoreWriterGuard::start(&run_dir, &run_id)?;
     let _run_store_writer_scope =
@@ -2478,21 +2536,20 @@ pub(crate) fn run_experiment_with_behavior(
     };
     let (run_id, run_dir) = create_unique_run_dir(run_root)?;
     let run_perf_scope = crate::perf::PerfScope::new(&run_dir, &run_id, None, None, None);
-    emit_run_log(
-        &run_id,
-        format!("created run directory {}", run_dir.display()),
-    );
+    let run_ref = public_run_artifact_ref(&run_id);
+    let package_ref = public_package_input_ref(path);
+    emit_run_log(&run_id, format!("created run directory {}", run_ref));
     crate::perf::record_process_invocation_latency(
         &run_dir,
         &run_id,
         "cli_to_run_dir_created",
-        json!({ "package": path.display().to_string() }),
+        json!({ "package_ref": package_ref.as_str() }),
     )?;
     crate::perf::record_duration(
         run_perf_scope,
         "runner_invocation_to_run_dir_created",
         run_invocation_started,
-        json!({ "package": path.display().to_string() }),
+        json!({ "package_ref": package_ref.as_str() }),
     )?;
     write_run_control(&run_dir, &run_id, "running", &[], None)?;
     write_run_session_state_with_project_root(
@@ -2512,9 +2569,9 @@ pub(crate) fn run_experiment_with_behavior(
 
     copy_verified_package_payload_for_run(&exp_dir, &run_dir).with_context(|| {
         format!(
-            "failed to copy verified sealed package payload from {} into run directory {}",
-            exp_dir.display(),
-            run_dir.display()
+            "failed to copy verified sealed package payload from {} into {}",
+            public_package_input_ref(&exp_dir),
+            public_run_artifact_ref(&run_id)
         )
     })?;
 
@@ -2526,15 +2583,10 @@ pub(crate) fn run_experiment_with_behavior(
         resolved_digest.as_bytes(),
     )?;
 
-    let manifest = json!({
-        "schema_version": "manifest_v1",
-        "run_id": run_id,
-        "runner_version": "rust-0.3.0",
-        "created_at": Utc::now().to_rfc3339(),
-        "project_root": project_root.display().to_string(),
-        "run_mode": if behavior.smoke_test { "smoke_test" } else { "full" },
-    });
-    atomic_write_json_pretty(&run_dir.join("manifest.json"), &manifest)?;
+    atomic_write_json_pretty(
+        &run_dir.join("manifest.json"),
+        &run_manifest_json(&run_id, &behavior),
+    )?;
 
     let dataset_path = resolve_dataset_path_in_package(&json_value, &run_dir)?;
     let tasks = load_tasks(&dataset_path, &json_value)?;
@@ -2583,6 +2635,7 @@ pub(crate) fn run_experiment_with_behavior(
             variants: &variants,
             variant_runtime_profiles: &variant_runtime_profiles,
             executor_kind,
+            preflight_probe_parent: Some(&run_dir),
         });
 
         let preflight = PreflightReport {
@@ -2999,7 +3052,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Recover)?;
     let run_dir = run_dir
         .canonicalize()
-        .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
+        .map_err(|_| anyhow!("run not found: {}", public_run_dir_ref(run_dir)))?;
 
     let control = load_run_control(&run_dir)?;
     let previous_status = run_control_status(&control)?.to_string();
@@ -3256,13 +3309,13 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Replay)?;
     let run_dir = run_dir
         .canonicalize()
-        .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
+        .map_err(|_| anyhow!("run not found: {}", public_run_dir_ref(run_dir)))?;
     let run_id = run_id_from_run_dir(&run_dir)?;
     let resolved_path = run_dir.join("resolved_experiment.json");
     if !resolved_path.exists() {
         return Err(anyhow!(
             "missing resolved_experiment.json in {}",
-            run_dir.display()
+            public_run_artifact_ref(&run_id)
         ));
     }
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
@@ -3535,18 +3588,17 @@ pub(crate) fn fork_trial_inner(
 ) -> Result<ForkResult> {
     let run_dir = run_dir
         .canonicalize()
-        .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
+        .map_err(|_| anyhow!("run not found: {}", public_run_dir_ref(run_dir)))?;
+    let run_id = run_id_from_run_dir(&run_dir)?;
     let resolved_path = run_dir.join("resolved_experiment.json");
     if !resolved_path.exists() {
         return Err(anyhow!(
             "missing resolved_experiment.json in {}",
-            run_dir.display()
+            public_run_artifact_ref(&run_id)
         ));
     }
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let parsed_selector = parse_fork_selector(selector)?;
-
-    let run_id = run_id_from_run_dir(&run_dir)?;
 
     let parent_trial_dir = run_dir.join("trials").join(from_trial);
     let prepared_manifest = load_prepared_task_environment_manifest(&parent_trial_dir)?;
@@ -4075,18 +4127,18 @@ pub(crate) fn ensure_smoke_test_completed(result: RunResult) -> Result<RunResult
     let status = run_control_status(&control)?;
     if status != "completed" {
         return Err(anyhow!(
-            "smoke test did not complete successfully (status={}, run_id={}, run_dir={})",
+            "smoke test did not complete successfully (status={}, run_id={}, run_ref={})",
             status,
             result.run_id,
-            result.run_dir.display()
+            public_run_artifact_ref(&result.run_id)
         ));
     }
     let progress = load_schedule_progress(&result.run_dir)?;
     if progress.completed_slots.len() != progress.total_slots {
         return Err(anyhow!(
-            "smoke test completed scheduler run but did not commit every slot (run_id={}, run_dir={}, completed={}, total={})",
+            "smoke test completed scheduler run but did not commit every slot (run_id={}, run_ref={}, completed={}, total={})",
             result.run_id,
-            result.run_dir.display(),
+            public_run_artifact_ref(&result.run_id),
             progress.completed_slots.len(),
             progress.total_slots
         ));
@@ -4104,9 +4156,9 @@ pub(crate) fn ensure_smoke_test_completed(result: RunResult) -> Result<RunResult
         .collect::<Vec<_>>();
     if !failed_slots.is_empty() {
         return Err(anyhow!(
-            "smoke test completed scheduler run but trial slots failed (run_id={}, run_dir={}, failures={})",
+            "smoke test completed scheduler run but trial slots failed (run_id={}, run_ref={}, failures={})",
             result.run_id,
-            result.run_dir.display(),
+            public_run_artifact_ref(&result.run_id),
             failed_slots.join("; ")
         ));
     }

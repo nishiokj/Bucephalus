@@ -128,11 +128,27 @@ sha256_tree() {
   ) | sha256_text
 }
 
+normalize_release_tree_mtimes() {
+  local dir="$1"
+  find "${dir}" -exec env TZ=UTC touch -t 197001010000 {} +
+}
+
+create_normalized_tar_gz() {
+  local archive="$1"
+  shift
+  if tar --version 2>/dev/null | grep -qi "GNU tar"; then
+    COPYFILE_DISABLE=1 tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime="1970-01-01 00:00Z" -czf "${archive}" "$@"
+  else
+    COPYFILE_DISABLE=1 tar --format=ustar --uid 0 --gid 0 --uname root --gname root -czf "${archive}" "$@"
+  fi
+}
+
 require_command cargo
 require_command bun
 require_command git
 require_command install
 require_command tar
+require_command find
 
 runtime_dist_ready() {
   local dir="$1"
@@ -494,9 +510,10 @@ echo "== Checksums =="
 
 echo "== Archive =="
 mkdir -p "${OUT_DIR}"
+normalize_release_tree_mtimes "${RELEASE_DIR}"
 (
   cd "${OUT_DIR}"
-  tar -czf "${ARCHIVE_BASENAME}" "${RELEASE_NAME}"
+  create_normalized_tar_gz "${ARCHIVE_BASENAME}" "${RELEASE_NAME}"
 )
 
 ARCHIVE_SHA="$(sha256_file "${ARCHIVE_PATH}")"

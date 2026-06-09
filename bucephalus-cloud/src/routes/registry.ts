@@ -1,19 +1,25 @@
 import {
+  decodePathParam,
   HttpError,
   jsonResponse,
   optionalString,
+  queryIntegerParam,
   readJsonObject,
   requireRecord,
   requireString,
 } from "../http";
 import {
   canonicalizeEntity,
+  ENTITY_KINDS,
   normalizationHints,
   resolveRegistryRef,
   type EntityKind,
   type JsonObject,
 } from "../primitives";
 import { RegistryRepository, type AliasReview, type RegistrySearchHit } from "../registry/repository";
+import { publicBoundaryJsonObject, publicBoundaryText, publicBoundaryValue } from "../publicBoundary";
+
+const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
 
 export async function handleRegistryRoute(
   request: Request,
@@ -33,30 +39,34 @@ export async function handleRegistryRoute(
   }
 
   if (request.method === "GET" && url.pathname.startsWith("/v1/registry/objects/")) {
-    const digest = decodeURIComponent(url.pathname.slice("/v1/registry/objects/".length));
+    const digest = requireSha256Digest(
+      decodePathParam(url.pathname.slice("/v1/registry/objects/".length), "/content_digest"),
+      "/content_digest",
+    );
     const object = await repository.getContentObject(digest);
     if (!object) {
       throw new HttpError(404, "not_found", "Content object not found");
     }
     return jsonResponse({
-      object,
-      aliases: await repository.aliasesForDigest(digest),
+      object: contentObjectToWire(object),
+      aliases: (await repository.aliasesForDigest(digest)).map(aliasToWire),
     });
   }
 
   if (request.method === "GET" && url.pathname === "/v1/registry/search") {
     const q = url.searchParams.get("q")?.trim() ?? "";
     const rawKind = url.searchParams.get("kind");
-    const limit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+    const limit = queryIntegerParam(url, "limit", { defaultValue: 50, min: 1, max: 200 });
     const searchOptions = {
       q,
-      limit: Number.isFinite(limit) ? limit : 50,
+      limit,
     };
+    const kind = rawKind === null ? null : requireEntityKind(rawKind, "kind");
     const hits = await repository.search(
-      rawKind ? { ...searchOptions, kind: rawKind as EntityKind } : searchOptions,
+      kind ? { ...searchOptions, kind } : searchOptions,
     );
     return jsonResponse({
-      hits,
+      hits: hits.map(searchHitToWire),
       page: { has_more: false, next_cursor: null },
     });
   }
@@ -74,7 +84,7 @@ export async function handleRegistryRoute(
 
 async function canonicalize(request: Request): Promise<Response> {
   const body = await readJsonObject(request);
-  const kind = requireString(body.kind, "/kind") as EntityKind;
+  const kind = requireEntityKind(body.kind, "/kind");
   const schemaVersion = optionalString(body.schema_version, "/schema_version") ?? "v1";
   const object = requireRecord(body.object, "/object") as JsonObject;
   const canonical = canonicalizeEntity({ kind, schemaVersion, object });
@@ -94,10 +104,10 @@ async function reviewObject(
   repository: RegistryRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
-  const kind = requireString(body.kind, "/kind") as EntityKind;
+  const kind = requireEntityKind(body.kind, "/kind");
   const schemaVersion = optionalString(body.schema_version, "/schema_version") ?? "v1";
   const aliases = parseAliasReviews(body.aliases);
-  const providedDigest = optionalString(body.content_digest, "/content_digest");
+  const providedDigest = optionalSha256Digest(body.content_digest, "/content_digest");
   const inlineObject = body.object === undefined
     ? null
     : (requireRecord(body.object, "/object") as JsonObject);
@@ -124,8 +134,8 @@ async function reviewObject(
   const exactMatch = existing && existing.kind === kind
     ? {
         exists: true,
-        object: existing,
-        aliases: await repository.aliasesForDigest(contentDigest),
+        object: contentObjectToWire(existing),
+        aliases: (await repository.aliasesForDigest(contentDigest)).map(aliasToWire),
       }
     : {
         exists: false,
@@ -167,19 +177,19 @@ async function reviewObject(
       kind,
       schema_version: canonical?.schemaVersion ?? (typeof existing?.schema_version === "string" ? existing.schema_version : schemaVersion),
       content_digest: contentDigest,
-      canonical_json: canonical?.canonicalJson ?? existing?.canonical_json ?? null,
+      canonical_json: publicCanonicalJson(canonical?.canonicalJson ?? existing?.canonical_json ?? null),
       canonical_size_bytes: canonical?.canonicalSizeBytes ?? existing?.canonical_size_bytes ?? null,
       protocol: canonical?.protocol ?? "bucephalus-canonical-json-v1",
     },
     exact_match: exactMatch,
-    alias_reviews: aliasReviews,
-    similar,
-    suggestions: hints?.suggestions ?? [],
+    alias_reviews: aliasReviews.map(aliasReviewToWire),
+    similar: similar.map(searchHitToWire),
+    suggestions: (hints?.suggestions ?? []).map(suggestionToWire),
     suggested_actions: suggestedReviewActions({
       exactExists: exactMatch.exists,
       aliasReviews,
       similar,
-    }),
+    }).map(suggestedActionToWire),
   });
 }
 
@@ -188,10 +198,10 @@ async function registerObject(
   repository: RegistryRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
-  const kind = requireString(body.kind, "/kind") as EntityKind;
+  const kind = requireEntityKind(body.kind, "/kind");
   const schemaVersion = requireString(body.schema_version, "/schema_version");
   const object = requireRecord(body.canonical_json, "/canonical_json") as JsonObject;
-  const expectedDigest = optionalString(body.expected_digest, "/expected_digest");
+  const expectedDigest = optionalSha256Digest(body.expected_digest, "/expected_digest");
   const sourceUri = optionalString(body.source_uri, "/source_uri");
   const canonical = canonicalizeEntity({ kind, schemaVersion, object });
 
@@ -220,8 +230,8 @@ async function registerObject(
   return jsonResponse(
     {
       created,
-      object: objectRow,
-      aliases: await repository.aliasesForDigest(canonical.contentDigest),
+      object: objectRow ? contentObjectToWire(objectRow) : null,
+      aliases: (await repository.aliasesForDigest(canonical.contentDigest)).map(aliasToWire),
     },
     { status: created ? 201 : 200 },
   );
@@ -339,15 +349,42 @@ function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function requireSha256Digest(value: unknown, pointer: string): string {
+  const digest = requireString(value, pointer);
+  if (!SHA256_DIGEST_PATTERN.test(digest)) {
+    throw new HttpError(400, "invalid_digest", `${pointer} must be sha256:<64 lowercase hex chars>`);
+  }
+  return digest;
+}
+
+function optionalSha256Digest(value: unknown, pointer: string): string | null {
+  const digest = optionalString(value, pointer);
+  if (digest !== null && !SHA256_DIGEST_PATTERN.test(digest)) {
+    throw new HttpError(400, "invalid_digest", `${pointer} must be sha256:<64 lowercase hex chars>`);
+  }
+  return digest;
+}
+
+function requireEntityKind(value: unknown, pointer: string): EntityKind {
+  const kind = requireString(value, pointer);
+  if (!ENTITY_KINDS.includes(kind as EntityKind)) {
+    throw new HttpError(400, "invalid_entity_kind", `${pointer} must be one of: ${ENTITY_KINDS.join(", ")}`, {
+      pointer,
+      allowed: [...ENTITY_KINDS],
+    });
+  }
+  return kind as EntityKind;
+}
+
 async function resolveRef(request: Request, repository: RegistryRepository): Promise<Response> {
   const body = await readJsonObject(request);
   const rawRef = requireRecord(body.ref, "/ref");
-  const kind = requireString(rawRef.kind, "/ref/kind") as EntityKind;
+  const kind = requireEntityKind(rawRef.kind, "/ref/kind");
   const inline =
     rawRef.inline === undefined
       ? undefined
       : (requireRecord(rawRef.inline, "/ref/inline") as JsonObject);
-  const digest = optionalString(rawRef.digest, "/ref/digest");
+  const digest = optionalSha256Digest(rawRef.digest, "/ref/digest");
   const alias = optionalString(rawRef.alias, "/ref/alias");
   const schemaVersion =
     optionalString(rawRef.schema_version, "/ref/schema_version") ??
@@ -397,12 +434,76 @@ async function resolveRef(request: Request, repository: RegistryRepository): Pro
 async function createAlias(request: Request, repository: RegistryRepository): Promise<Response> {
   const body = await readJsonObject(request);
   const alias = await repository.createAlias({
-    kind: requireString(body.kind, "/kind") as EntityKind,
+    kind: requireEntityKind(body.kind, "/kind"),
     alias: requireString(body.alias, "/alias"),
-    contentDigest: requireString(body.content_digest, "/content_digest"),
+    contentDigest: requireSha256Digest(body.content_digest, "/content_digest"),
     scopeType: optionalString(body.scope_type, "/scope_type") ?? "global",
     scopeId: optionalString(body.scope_id, "/scope_id"),
     replaceExisting: body.replace_existing === true,
   });
-  return jsonResponse(alias);
+  return jsonResponse(aliasToWire(alias));
+}
+
+function contentObjectToWire(object: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...object,
+    ...(typeof object.created_by === "string" ? { created_by: publicBoundaryText(object.created_by) } : {}),
+    ...(typeof object.source_uri === "string" ? { source_uri: publicBoundaryText(object.source_uri) } : {}),
+    canonical_json: publicCanonicalJson(object.canonical_json),
+  };
+}
+
+function publicCanonicalJson(value: unknown): JsonObject | null {
+  return isJsonObject(value) ? publicBoundaryJsonObject(value) : null;
+}
+
+function aliasToWire(alias: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...alias,
+    ...(typeof alias.alias === "string" ? { alias: publicBoundaryText(alias.alias) } : {}),
+    ...(typeof alias.scope_id === "string" ? { scope_id: publicBoundaryText(alias.scope_id) } : {}),
+  };
+}
+
+function aliasReviewToWire(review: AliasReview): AliasReview {
+  return {
+    ...review,
+    alias: publicBoundaryText(review.alias),
+    scope_id: review.scope_id === null ? null : publicBoundaryText(review.scope_id),
+  };
+}
+
+function searchHitToWire(hit: RegistrySearchHit): RegistrySearchHit {
+  return {
+    ...hit,
+    display_name: publicBoundaryText(hit.display_name),
+    aliases: hit.aliases.map(publicBoundaryText),
+    metadata: publicBoundaryValue(hit.metadata) as Record<string, unknown>,
+  };
+}
+
+function suggestionToWire(suggestion: {
+  severity: string;
+  code: string;
+  message: string;
+  pointer?: string;
+  action?: string;
+  relatedDigest?: string;
+  patchPreview?: JsonObject[];
+}): Record<string, unknown> {
+  return {
+    ...suggestion,
+    severity: publicBoundaryText(suggestion.severity),
+    code: publicBoundaryText(suggestion.code),
+    message: publicBoundaryText(suggestion.message),
+    ...(suggestion.pointer !== undefined ? { pointer: publicBoundaryText(suggestion.pointer) } : {}),
+    ...(suggestion.relatedDigest !== undefined ? { relatedDigest: publicBoundaryText(suggestion.relatedDigest) } : {}),
+    ...(suggestion.patchPreview !== undefined
+      ? { patchPreview: suggestion.patchPreview.map((patch) => publicBoundaryJsonObject(patch) ?? {}) }
+      : {}),
+  };
+}
+
+function suggestedActionToWire(action: Record<string, unknown>): Record<string, unknown> {
+  return publicBoundaryValue(action) as Record<string, unknown>;
 }

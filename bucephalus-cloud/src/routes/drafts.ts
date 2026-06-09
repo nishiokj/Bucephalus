@@ -1,4 +1,4 @@
-import { jsonResponse, readJsonObject, requireRecord } from "../http";
+import { HttpError, jsonResponse, optionalString, readJsonObject, requireRecord } from "../http";
 import {
   canonicalizeDraft,
   exportDraftYaml,
@@ -7,12 +7,18 @@ import {
   validateDraft,
 } from "../drafts/primitives";
 import type { JsonObject } from "../primitives";
+import { publicBoundaryText } from "../publicBoundary";
 import { RegistryRepository } from "../registry/repository";
+
+interface DraftRouteOptions {
+  exportDraftYaml?: (draft: JsonObject) => string;
+}
 
 export async function handleDraftRoute(
   request: Request,
   url: URL,
   repository: RegistryRepository,
+  options: DraftRouteOptions = {},
 ): Promise<Response | null> {
   if (request.method === "POST" && url.pathname === "/v1/drafts/canonicalize") {
     const draft = await draftFromRequest(request);
@@ -34,7 +40,7 @@ export async function handleDraftRoute(
     return jsonResponse({
       resolved_draft: result.resolvedDraft,
       bindings: result.bindings.map(bindingToWire),
-      unresolved: result.unresolved,
+      unresolved: result.unresolved.map(unresolvedToWire),
       issues: issuesToWire(result.issues),
     });
   }
@@ -54,13 +60,17 @@ export async function handleDraftRoute(
 
   if (request.method === "POST" && url.pathname === "/v1/drafts/preview-schedule") {
     const draft = await draftFromRequest(request);
-    return jsonResponse(previewSchedule(draft));
+    const preview = previewSchedule(draft);
+    return jsonResponse({
+      ...preview,
+      warnings: issuesToWire(preview.warnings),
+    });
   }
 
   if (request.method === "POST" && url.pathname === "/v1/drafts/export") {
     const body = await readJsonObject(request);
     const draft = requireRecord(body.draft, "/draft") as JsonObject;
-    const format = typeof body.format === "string" ? body.format : "yaml";
+    const format = draftExportFormat(body.format);
     const result = await validateDraft(draft, {
       hasDigest: (kind, digest) => repository.hasDigest(kind, digest),
       resolveAlias: (kind, alias, scope) => repository.resolveAlias(kind, alias, scope),
@@ -68,13 +78,13 @@ export async function handleDraftRoute(
     if (format === "resolved_json") {
       return jsonResponse({
         format,
-        body: JSON.stringify(draft, null, 2),
+        body: JSON.stringify(result.resolvedDraft, null, 2),
         issues: issuesToWire(result.issues),
       });
     }
     return jsonResponse({
       format: "yaml",
-      body: exportDraftYaml(draft),
+      body: exportDraftYamlForResponse(draft, options.exportDraftYaml ?? exportDraftYaml),
       issues: issuesToWire(result.issues),
     });
   }
@@ -100,8 +110,20 @@ function bindingToWire(binding: {
     kind: binding.kind,
     content_digest: binding.contentDigest,
     resolution: binding.resolution,
-    alias: binding.alias ?? null,
-    display_name: binding.displayName ?? null,
+    alias: binding.alias === undefined || binding.alias === null ? null : publicBoundaryText(binding.alias),
+    display_name: binding.displayName === undefined || binding.displayName === null ? null : publicBoundaryText(binding.displayName),
+  };
+}
+
+function unresolvedToWire(unresolved: {
+  pointer: string;
+  kind: string;
+  reason: string;
+}) {
+  return {
+    pointer: publicBoundaryText(unresolved.pointer),
+    kind: unresolved.kind,
+    reason: publicBoundaryText(unresolved.reason),
   };
 }
 
@@ -115,11 +137,36 @@ function issuesToWire(
   }>,
 ) {
   return issues.map((issue) => ({
-    severity: issue.severity,
-    code: issue.code,
-    message: issue.message,
-    pointer: issue.pointer ?? null,
-    related_digest: issue.relatedDigest ?? null,
+    severity: publicBoundaryText(issue.severity),
+    code: publicBoundaryText(issue.code),
+    message: publicBoundaryText(issue.message),
+    pointer: issue.pointer === undefined || issue.pointer === null ? null : publicBoundaryText(issue.pointer),
+    related_digest: issue.relatedDigest === undefined || issue.relatedDigest === null ? null : publicBoundaryText(issue.relatedDigest),
   }));
 }
 
+function draftExportFormat(value: unknown): "yaml" | "resolved_json" {
+  const format = optionalString(value, "/format") ?? "yaml";
+  if (format === "yaml" || format === "resolved_json") {
+    return format;
+  }
+  throw new HttpError(400, "unsupported_draft_export_format", "/format must be one of: yaml, resolved_json", {
+    allowed: ["yaml", "resolved_json"],
+  });
+}
+
+function exportDraftYamlForResponse(draft: JsonObject, exporter: (draft: JsonObject) => string): string {
+  try {
+    return exporter(draft);
+  } catch {
+    throw new HttpError(
+      503,
+      "draft_export_unavailable",
+      "Draft YAML export is unavailable; retry with format=resolved_json or try again later",
+      {
+        format: "yaml",
+        fallback_format: "resolved_json",
+      },
+    );
+  }
+}

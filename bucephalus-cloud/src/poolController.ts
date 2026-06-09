@@ -156,6 +156,7 @@ export async function reconcileOnce(
   ]);
 
   for (const run of demand) {
+    const requirements = effectiveDemandRequirements(run);
     if (!matchesPool(pool, run)) {
       continue;
     }
@@ -170,7 +171,7 @@ export async function reconcileOnce(
       runnerPoolId: pool.runner_pool_id,
       runId: run.run_id,
       provider: config.provider,
-      requirements: run.run_requirements as unknown as JsonObject,
+      requirements: requirements as unknown as JsonObject,
       metadata: {
         requested_by: "bucephalus-pool-controller",
         requested_at: new Date().toISOString(),
@@ -300,7 +301,7 @@ async function runProvisionCommand(
     runner_pool_id: pool.runner_pool_id,
     provision_request_id: request.provision_request_id,
     run_id: run.run_id,
-    run_requirements: run.run_requirements,
+    run_requirements: request.requirements,
     worker_env: {
       BUCEPHALUS_CLOUD_API_URL: config.apiUrl,
       BUCEPHALUS_RUNNER_POOL_ID: pool.runner_pool_id,
@@ -431,21 +432,93 @@ export function matchesCapabilities(
     isolation?: string;
   },
 ): boolean {
+  if (!validCapabilityShape(capabilities) || !validRequirementShape(requirements)) {
+    return false;
+  }
   return capabilities.executors.includes(requirements.executor)
     && requirements.requires.every((resource) => capabilities.resources.includes(resource))
-    && (!requirements.arch || !capabilities.arch || capabilities.arch === requirements.arch)
-    && (!requirements.cpu_count || !capabilities.cpu_count || capabilities.cpu_count >= requirements.cpu_count)
-    && (!requirements.memory_mb || !capabilities.memory_mb || capabilities.memory_mb >= requirements.memory_mb)
-    && (!requirements.disk_mb || !capabilities.disk_mb || capabilities.disk_mb >= requirements.disk_mb)
+    && (!requirements.arch || (capabilities.arch !== undefined && capabilities.arch !== null && capabilities.arch === requirements.arch))
+    && (!requirements.cpu_count || (capabilities.cpu_count !== undefined && capabilities.cpu_count !== null && capabilities.cpu_count >= requirements.cpu_count))
+    && (!requirements.memory_mb || (capabilities.memory_mb !== undefined && capabilities.memory_mb !== null && capabilities.memory_mb >= requirements.memory_mb))
+    && (!requirements.disk_mb || (capabilities.disk_mb !== undefined && capabilities.disk_mb !== null && capabilities.disk_mb >= requirements.disk_mb))
     && (!requirements.isolation || !capabilities.isolation || capabilities.isolation.length === 0 || capabilities.isolation.includes(requirements.isolation));
 }
 
+function validCapabilityShape(capabilities: {
+  executors: unknown;
+  resources: unknown;
+  arch?: unknown;
+  cpu_count?: unknown;
+  memory_mb?: unknown;
+  disk_mb?: unknown;
+  isolation?: unknown;
+}): boolean {
+  return stringArray(capabilities.executors)
+    && stringArray(capabilities.resources)
+    && optionalStringValue(capabilities.arch)
+    && optionalPositiveNumber(capabilities.cpu_count)
+    && optionalPositiveNumber(capabilities.memory_mb)
+    && optionalPositiveNumber(capabilities.disk_mb)
+    && (capabilities.isolation === undefined || stringArray(capabilities.isolation));
+}
+
+function validRequirementShape(requirements: {
+  executor?: unknown;
+  requires?: unknown;
+  arch?: unknown;
+  cpu_count?: unknown;
+  memory_mb?: unknown;
+  disk_mb?: unknown;
+  isolation?: unknown;
+}): requirements is {
+  executor: string;
+  requires: string[];
+  arch?: string;
+  cpu_count?: number;
+  memory_mb?: number;
+  disk_mb?: number;
+  isolation?: string;
+} {
+  return typeof requirements.executor === "string"
+    && requirements.executor.trim().length > 0
+    && stringArray(requirements.requires)
+    && optionalStringValue(requirements.arch)
+    && optionalPositiveNumber(requirements.cpu_count)
+    && optionalPositiveNumber(requirements.memory_mb)
+    && optionalPositiveNumber(requirements.disk_mb)
+    && optionalStringValue(requirements.isolation);
+}
+
+function stringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim().length > 0);
+}
+
+function optionalStringValue(value: unknown): value is string | undefined | null {
+  return value === undefined || value === null || (typeof value === "string" && value.trim().length > 0);
+}
+
+function optionalPositiveNumber(value: unknown): value is number | undefined | null {
+  return value === undefined || value === null || (typeof value === "number" && Number.isInteger(value) && value > 0);
+}
+
 function matchesPool(pool: RunnerPoolRecord, run: QueuedRunDemandRecord): boolean {
-  return matchesCapabilities(pool.capabilities, run.run_requirements);
+  return matchesCapabilities(pool.capabilities, effectiveDemandRequirements(run));
 }
 
 function hasMatchingInstance(instances: RunnerInstanceRecord[], run: QueuedRunDemandRecord): boolean {
-  return instances.some((instance) => matchesCapabilities(instance.capabilities, run.run_requirements));
+  const requirements = effectiveDemandRequirements(run);
+  return instances.some((instance) => matchesCapabilities(instance.capabilities, requirements));
+}
+
+function effectiveDemandRequirements(run: QueuedRunDemandRecord): QueuedRunDemandRecord["run_requirements"] {
+  const secretRefs = isRecord(run.secret_refs) ? run.secret_refs : {};
+  if (Object.keys(secretRefs).length === 0 || run.run_requirements.requires.includes("secret_resolver")) {
+    return run.run_requirements;
+  }
+  return {
+    ...run.run_requirements,
+    requires: [...run.run_requirements.requires, "secret_resolver"],
+  };
 }
 
 function loadPoolControllerConfig(env: NodeJS.ProcessEnv = process.env): PoolControllerConfig {

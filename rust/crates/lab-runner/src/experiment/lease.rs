@@ -77,21 +77,28 @@ pub(crate) struct RunOperationLease {
 }
 
 fn load_operation_lease_record(path: &Path) -> Result<OperationLeaseRecord> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to read operation lease {}", path.display()))?;
+    load_operation_lease_record_with_label(path, &operation_lease_public_label(path))
+}
+
+fn load_operation_lease_record_with_label(
+    path: &Path,
+    label: &str,
+) -> Result<OperationLeaseRecord> {
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read operation lease {}", label))?;
     serde_json::from_slice::<OperationLeaseRecord>(&bytes)
-        .with_context(|| format!("failed to parse operation lease {}", path.display()))
+        .with_context(|| format!("failed to parse operation lease {}", label))
 }
 
 impl Drop for RunOperationLease {
     fn drop(&mut self) {
+        let lease_label = operation_lease_public_label(&self.path);
         let should_remove = match load_operation_lease_record(&self.path) {
             Ok(record) => record.operation_id == self.operation_id,
             Err(err) => {
                 eprintln!(
                     "warning: failed to inspect run operation lease {}: {}",
-                    self.path.display(),
-                    err
+                    lease_label, err
                 );
                 false
             }
@@ -100,8 +107,7 @@ impl Drop for RunOperationLease {
             if let Err(err) = fs::remove_file(&self.path) {
                 eprintln!(
                     "warning: failed to remove run operation lease {}: {}",
-                    self.path.display(),
-                    err
+                    lease_label, err
                 );
             }
         }
@@ -130,6 +136,35 @@ impl Drop for EngineLeaseGuard {
 
 pub(crate) fn operation_lease_path(run_dir: &Path) -> PathBuf {
     run_dir.join("runtime").join("operation_lease.json")
+}
+
+pub(crate) fn operation_lease_public_label(path: &Path) -> String {
+    path.parent()
+        .and_then(Path::parent)
+        .map(|run_dir| public_run_path_ref(run_dir, path))
+        .unwrap_or_else(|| "[REDACTED:local-path]".to_string())
+}
+
+fn public_run_dir_ref(run_dir: &Path) -> String {
+    run_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.starts_with("run_"))
+        .map(|run_id| format!("run://{run_id}"))
+        .unwrap_or_else(|| "[REDACTED:local-path]".to_string())
+}
+
+fn public_run_path_ref(run_dir: &Path, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(run_dir) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return public_run_dir_ref(run_dir);
+    }
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("run://{rel}")
 }
 
 pub(crate) fn operation_owner_host() -> Result<String> {
@@ -227,10 +262,11 @@ pub(crate) fn acquire_run_operation_lease(
         format!(
             "resolve run directory for {} operation: {}",
             op_type.as_str(),
-            run_dir.display()
+            public_run_dir_ref(run_dir)
         )
     })?;
     let lease_path = operation_lease_path(&run_dir);
+    let lease_label = format!("for {}", public_run_dir_ref(&run_dir));
     if let Some(parent) = lease_path.parent() {
         ensure_dir(parent)?;
     }
@@ -244,16 +280,15 @@ pub(crate) fn acquire_run_operation_lease(
             let bytes = serde_json::to_vec_pretty(&lease)?;
             file.write_all(&bytes)?;
             file.write_all(b"\n")?;
-            file.sync_all().with_context(|| {
-                format!("failed to sync operation lease {}", lease_path.display())
-            })?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync operation lease {}", lease_label))?;
             if let Some(parent) = lease_path.parent() {
                 fs::File::open(parent)
                     .and_then(|dir| dir.sync_all())
                     .with_context(|| {
                         format!(
                             "failed to sync operation lease directory {}",
-                            parent.display()
+                            public_run_path_ref(&run_dir, parent)
                         )
                     })?;
             }
@@ -264,11 +299,14 @@ pub(crate) fn acquire_run_operation_lease(
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let now = Utc::now();
-            let existing = load_operation_lease_record(&lease_path)?;
+            let existing = load_operation_lease_record_with_label(&lease_path, &lease_label)?;
             if operation_lease_is_stale(&existing, now) {
                 let replacement =
                     make_operation_lease_record(op_type, Some(existing.operation_id.clone()))?;
-                atomic_write_json_pretty(&lease_path, &serde_json::to_value(&replacement)?)?;
+                atomic_write_json_pretty(&lease_path, &serde_json::to_value(&replacement)?)
+                    .with_context(|| {
+                        format!("failed to replace stale operation lease {}", lease_label)
+                    })?;
                 return Ok(RunOperationLease {
                     path: lease_path,
                     operation_id: replacement.operation_id,
@@ -278,7 +316,11 @@ pub(crate) fn acquire_run_operation_lease(
                 "operation_in_progress: run is already under control operation"
             ))
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(anyhow!(
+            "failed to create operation lease {}: {}",
+            lease_label,
+            e
+        )),
     }
 }
 

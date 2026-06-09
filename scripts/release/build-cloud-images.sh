@@ -9,6 +9,7 @@ OUT_DIR=""
 PUSH="false"
 WORK_DIR=""
 RELEASE_ARCHIVE_SHA=""
+REGISTRY_CACHE="${BUCEPHALUS_CLOUD_IMAGE_REGISTRY_CACHE:-true}"
 
 usage() {
   cat <<'USAGE'
@@ -24,7 +25,23 @@ The base image must be digest-addressed. Without --push, images are loaded into
 the local Docker daemon and are not valid deploy inputs. With --push, the output
 manifest records the registry digest returned by docker buildx metadata after a
 local image-boundary inspection pass.
+
+Set BUCEPHALUS_CLOUD_IMAGE_REGISTRY_CACHE=false to publish without registry
+cache import/export. This keeps cache availability from becoming part of the
+image publication contract.
 USAGE
+}
+
+public_release_input_ref() {
+  printf '%s\n' "release-input://source"
+}
+
+public_image_build_output_ref() {
+  printf '%s\n' "cloud-image-build://output"
+}
+
+public_image_manifest_output_ref() {
+  printf '%s\n' "cloud-image-build-manifest://output"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -54,7 +71,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "unknown argument: $1" >&2
+      echo "unknown argument" >&2
       usage >&2
       exit 2
       ;;
@@ -136,9 +153,51 @@ copy_context_path() {
   cp -R "${src}" "${dst}"
 }
 
+path_has_parent_component() {
+  local path="$1"
+  [[ "${path}" == ".." || "${path}" == ../* || "${path}" == */.. || "${path}" == */../* ]]
+}
+
+preflight_image_build_output_path() {
+  if path_has_parent_component "${OUT_DIR}"; then
+    echo "refusing image build output path with parent traversal" >&2
+    echo "output_ref: $(public_image_build_output_ref)" >&2
+    exit 1
+  fi
+  if [[ -L "${OUT_DIR}" ]]; then
+    echo "refusing to write image build output through a symlinked path" >&2
+    echo "output_ref: $(public_image_build_output_ref)" >&2
+    exit 1
+  fi
+  if [[ -e "${OUT_DIR}" && ! -d "${OUT_DIR}" ]]; then
+    echo "refusing to write image build output to a non-directory path" >&2
+    echo "output_ref: $(public_image_build_output_ref)" >&2
+    exit 1
+  fi
+}
+
+ensure_image_build_output_dir() {
+  preflight_image_build_output_path
+  if ! mkdir -p "${OUT_DIR}" 2>/dev/null; then
+    echo "failed to prepare image build output directory" >&2
+    echo "output_ref: $(public_image_build_output_ref)" >&2
+    exit 1
+  fi
+}
+
+ensure_context_path_safe() {
+  local path="$1"
+  if [[ -L "${OUT_DIR}/contexts" || -L "${path}" ]]; then
+    echo "refusing to clean image build context through a symlinked path" >&2
+    echo "output_ref: $(public_image_build_output_ref)" >&2
+    exit 1
+  fi
+}
+
 prepare_image_context() {
   local component="$1"
   local context_dir="${OUT_DIR}/contexts/${component}"
+  ensure_context_path_safe "${context_dir}"
   rm -rf "${context_dir}"
   mkdir -p "${context_dir}/bucephalus-cloud/images"
 
@@ -182,6 +241,15 @@ if [[ -z "${RELEASE_INPUT}" || -z "${REPOSITORY}" || -z "${BASE_IMAGE}" ]]; then
   exit 2
 fi
 
+if [[ ! -e "${RELEASE_INPUT}" ]]; then
+  echo "release input does not exist" >&2
+  echo "release_ref: $(public_release_input_ref)" >&2
+  exit 2
+fi
+if [[ -n "${OUT_DIR}" ]]; then
+  preflight_image_build_output_path
+fi
+
 publish_input_args=(
   --repository "${REPOSITORY}"
   --base-image "${BASE_IMAGE}"
@@ -217,7 +285,8 @@ else
 fi
 
 if [[ -z "${RELEASE_DIR}" || ! -f "${RELEASE_DIR}/release-manifest.json" ]]; then
-  echo "could not resolve release directory from ${RELEASE_INPUT}" >&2
+  echo "could not resolve release directory" >&2
+  echo "release_ref: $(public_release_input_ref)" >&2
   exit 1
 fi
 if [[ ! -f "${RELEASE_DIR}/.dockerignore" ]]; then
@@ -242,7 +311,7 @@ RELEASE_MANIFEST_SHA="$(sha256_file "${RELEASE_DIR}/release-manifest.json")"
 DOCKERIGNORE_SHA="$(sha256_file "${RELEASE_DIR}/.dockerignore")"
 TAG_SUFFIX="$(printf "%s-%s-%s" "${VERSION}" "${TARGET}" "${GIT_SHA:0:12}" | tr -c 'A-Za-z0-9_.-' '-')"
 OUT_DIR="${OUT_DIR:-${RELEASE_DIR}/image-build}"
-mkdir -p "${OUT_DIR}"
+ensure_image_build_output_dir
 
 COMPONENTS=(api pool-controller migrations worker)
 ENTRIES_JSONL="${OUT_DIR}/image-entries.jsonl"
@@ -251,7 +320,8 @@ ENTRIES_JSONL="${OUT_DIR}/image-entries.jsonl"
 for component in "${COMPONENTS[@]}"; do
   release_dockerfile="${RELEASE_DIR}/bucephalus-cloud/images/Dockerfile.${component}"
   if [[ ! -f "${release_dockerfile}" ]]; then
-    echo "missing image Dockerfile for ${component}: ${release_dockerfile}" >&2
+    echo "missing image Dockerfile for ${component}" >&2
+    echo "release_ref: $(public_release_input_ref)" >&2
     exit 1
   fi
   context_dir="$(prepare_image_context "${component}")"
@@ -265,6 +335,16 @@ for component in "${COMPONENTS[@]}"; do
   image_ref="${image_repository}:${TAG_SUFFIX}"
   boundary_ref="${image_ref}-boundary-check"
   cache_ref="${image_repository}:buildcache"
+  cache_args=()
+  if [[ "${REGISTRY_CACHE}" == "true" ]]; then
+    cache_args=(
+      --cache-from "type=registry,ref=${cache_ref}"
+      --cache-to "type=registry,ref=${cache_ref},mode=max"
+    )
+  elif [[ "${REGISTRY_CACHE}" != "false" ]]; then
+    echo "BUCEPHALUS_CLOUD_IMAGE_REGISTRY_CACHE must be true or false" >&2
+    exit 2
+  fi
   metadata_file="${OUT_DIR}/${component}.metadata.json"
   boundary_metadata_file="${OUT_DIR}/${component}.boundary.metadata.json"
   metadata_name="${component}.metadata.json"
@@ -293,8 +373,7 @@ for component in "${COMPONENTS[@]}"; do
     inspected_ref="${boundary_ref}"
     step_started_at="${SECONDS}"
     docker "${common_build_args[@]}" \
-      --cache-from "type=registry,ref=${cache_ref}" \
-      --cache-to "type=registry,ref=${cache_ref},mode=max" \
+      "${cache_args[@]}" \
       --tag "${boundary_ref}" \
       --iidfile "${boundary_iid_file}" \
       --metadata-file "${boundary_metadata_file}" \
@@ -406,4 +485,4 @@ JS
 ENTRIES_JSONL="${ENTRIES_JSONL}" MANIFEST_PATH="${MANIFEST_PATH}" RELEASE_MANIFEST_SHA="${RELEASE_MANIFEST_SHA}" DOCKERIGNORE_SHA="${DOCKERIGNORE_SHA}" RELEASE_ARCHIVE_SHA="${RELEASE_ARCHIVE_SHA}" RELEASE_DIR="${RELEASE_DIR}" BASE_IMAGE="${BASE_IMAGE}" PUSH="${PUSH}" BUCEPHALUS_SOURCE_RELEASE_RUN_ID="${BUCEPHALUS_SOURCE_RELEASE_RUN_ID:-}" BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME="${BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME:-}" bun "${WRITE_MANIFEST_JS}"
 
 "${ROOT_DIR}/scripts/release/verify-cloud-image-build-manifest.sh" "${MANIFEST_PATH}" --release "${RELEASE_INPUT}"
-echo "image_manifest=${MANIFEST_PATH}"
+echo "image_manifest=$(public_image_manifest_output_ref)"

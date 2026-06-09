@@ -8,6 +8,13 @@ import {
   type RegistryResolverRepository,
 } from "../primitives";
 
+const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const SCHEDULE_PREVIEW_ISSUE_CODES = new Set([
+  "invalid_case_count",
+  "invalid_max_concurrency",
+  "invalid_matrix_repeats",
+]);
+
 export interface DraftDigestBinding {
   pointer: string;
   kind: EntityKind;
@@ -40,6 +47,7 @@ export interface DraftValidationResult {
   valid: boolean;
   issues: DraftIssue[];
   resolvedRefs: DraftDigestBinding[];
+  resolvedDraft: JsonObject;
 }
 
 export interface SchedulePreview {
@@ -92,6 +100,7 @@ export async function resolveDraftRefs(
     const ref = registryRefFromDraftEntity("variant", variant);
     if (ref) {
       try {
+        validateDraftRegistryRef(ref);
         const resolved = await resolveRegistryRef(ref, repository, {
           registerInlineIfMissing: false,
           defaultSchemaVersion: "variant_v1",
@@ -195,19 +204,21 @@ export async function validateDraft(
     valid: !issues.some((issue) => issue.severity === "error"),
     issues,
     resolvedRefs: resolved.bindings,
+    resolvedDraft: resolved.resolvedDraft,
   };
 }
 
 export function previewSchedule(draft: JsonObject): SchedulePreview {
   const variants = arrayAt(draft, "/matrix/variants").length;
-  const repeats = numberAt(draft, "/matrix/repeats") ?? 1;
+  const repeats = nonNegativeIntegerAt(draft, "/matrix/repeats") ?? 1;
   const seeds = arrayAt(draft, "/matrix/seeds").length || 1;
-  const maxConcurrency = numberAt(draft, "/scheduling/max_concurrency");
+  const maxConcurrency = positiveIntegerAt(draft, "/scheduling/max_concurrency");
   const casesSource = stringAt(draft, "/matrix/cases/source");
-  const casesCount = numberAt(draft, "/matrix/cases/count") ?? null;
+  const casesCount = nonNegativeIntegerAt(draft, "/matrix/cases/count") ?? null;
   const cases = casesCount;
-  const warnings = validationIssues(draft).filter((issue) => issue.severity !== "error");
-  if (casesSource === "file" && casesCount === null) {
+  const warnings = validationIssues(draft)
+    .filter((issue) => issue.severity !== "error" || SCHEDULE_PREVIEW_ISSUE_CODES.has(issue.code));
+  if (casesSource === "file" && casesCount === null && !hasValueAt(draft, "/matrix/cases/count")) {
     warnings.push({
       severity: "info",
       code: "case_count_unknown",
@@ -305,12 +316,36 @@ function validationIssues(draft: JsonObject): DraftIssue[] {
       pointer: "/matrix/cases",
     });
   }
-  if (numberAt(draft, "/matrix/repeats") === null) {
+  const repeatsValue = valueAt(draft, "/matrix/repeats");
+  if (repeatsValue === undefined || repeatsValue === null) {
     issues.push({
       severity: "warning",
       code: "default_repeats",
       message: "/matrix/repeats is absent; Core examples normally set it explicitly",
       pointer: "/matrix/repeats",
+    });
+  } else if (!isNonNegativeIntegerValue(repeatsValue)) {
+    issues.push({
+      severity: "error",
+      code: "invalid_matrix_repeats",
+      message: "/matrix/repeats must be a non-negative integer",
+      pointer: "/matrix/repeats",
+    });
+  }
+  if (hasValueAt(draft, "/matrix/cases/count") && !isNonNegativeIntegerValue(valueAt(draft, "/matrix/cases/count"))) {
+    issues.push({
+      severity: "error",
+      code: "invalid_case_count",
+      message: "/matrix/cases/count must be a non-negative integer",
+      pointer: "/matrix/cases/count",
+    });
+  }
+  if (hasValueAt(draft, "/scheduling/max_concurrency") && !isPositiveIntegerValue(valueAt(draft, "/scheduling/max_concurrency"))) {
+    issues.push({
+      severity: "error",
+      code: "invalid_max_concurrency",
+      message: "/scheduling/max_concurrency must be a positive integer",
+      pointer: "/scheduling/max_concurrency",
     });
   }
   return issues;
@@ -335,6 +370,15 @@ function registryRefFromDraftEntity(kind: EntityKind, value: JsonObject) {
     alias ? { alias } : {},
     inline ? { inline } : {},
   );
+}
+
+function validateDraftRegistryRef(ref: ReturnType<typeof registryRefFromDraftEntity>): void {
+  if (!ref?.digest) {
+    return;
+  }
+  if (!SHA256_DIGEST_PATTERN.test(ref.digest)) {
+    throw new Error("registry.digest must be sha256:<64 lowercase hex chars>");
+  }
 }
 
 function resolutionToBinding(resolution: string): DraftDigestBinding["resolution"] {
@@ -370,9 +414,27 @@ function stringAt(root: JsonObject, pointer: string): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-function numberAt(root: JsonObject, pointer: string): number | null {
+function nonNegativeIntegerAt(root: JsonObject, pointer: string): number | null {
   const value = valueAt(root, pointer);
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+  return isNonNegativeIntegerValue(value) ? value : null;
+}
+
+function positiveIntegerAt(root: JsonObject, pointer: string): number | null {
+  const value = valueAt(root, pointer);
+  return isPositiveIntegerValue(value) ? value : null;
+}
+
+function isNonNegativeIntegerValue(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPositiveIntegerValue(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function hasValueAt(root: JsonObject, pointer: string): boolean {
+  const value = valueAt(root, pointer);
+  return value !== undefined && value !== null;
 }
 
 function valueAt(root: JsonObject, pointer: string): unknown {

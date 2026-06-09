@@ -34,7 +34,10 @@ bucephalus setup uninstall
 `setup status` reports daemon service state, daemon readiness, MCP registration,
 and Cloud auth readiness. Local Core smoke fixtures do not require Cloud auth;
 Cloud benchmark resolution and upload require `BUCEPHALUS_CLOUD_USER_TOKEN` or
-a token file at `<BUCEPHALUS_HOME>/auth/cloud_user_token`.
+a token file at `<BUCEPHALUS_HOME>/auth/cloud_user_token`. Use
+`bucephalus login` to cache Cloud tokens, and `bucephalus logout` to remove the
+cached token files. If `BUCEPHALUS_CLOUD_USER_TOKEN` is set, unset that
+environment variable too.
 
 Create a local demo manifest:
 
@@ -87,9 +90,10 @@ The MCP adapter presents the host workflow as a dispatch surface:
 }
 ```
 
-The MCP response returns a `dispatch_id` and `paths.live_view`. It does not
-return daemon job ids, socket paths, manifest paths, or run roots. Those are
-internal local runtime details.
+The MCP response returns a `dispatch_id`, `dispatch_ref`, and refs such as
+`paths.live_view_ref`. It does not return daemon job ids, socket paths, manifest
+paths, run roots, or host filesystem paths. Those are internal local runtime
+details.
 
 For non-local benchmarks, `dispatch_benchmark` calls the Cloud latch resolver at
 `POST /v1/latch/resolve`. The resolver returns a `latch_manifest_v1` plus
@@ -109,9 +113,51 @@ The public dispatch lifecycle reports:
 | `submission` | Cloud submission status for the completed local latch result archive, including upload and semantic latch submission ids. |
 | `grading` | Host latch grading outcome from `latch_result.json`, including pass/fail/error/declined counts when graders are declared. |
 
+The uploaded latch result archive is curated. It includes dispatch metadata,
+resolved manifests, run/case result summaries, declared JSON result artifacts,
+and candidate patch evidence, with local paths, local commands, environment
+fields, and secret-looking keys redacted. It does not upload raw stdout/stderr
+logs, full workspaces, runtime state, temp files, event streams, materialization
+logs, or agent-visible trial input directories.
+
 Low-level latch MCP calls are disabled by default. For local debugging only,
 start the MCP server with `BUCEPHALUS_MCP_DEBUG_LATCH_TOOLS=1` to allow the
 legacy manifest/job controls.
+
+## Recoverable outcomes
+
+A recoverable condition is never returned as a JSON-RPC protocol error. Instead
+the tool result is marked `isError: true` and its `structuredContent` carries a
+guided body so the caller can self-correct without leaving the tool:
+
+```json
+{
+  "status": "blocked",
+  "because": "cloud_auth_required",
+  "summary": "Cloud benchmark 'X' requires Bucephalus Cloud sign-in; local fixtures do not.",
+  "next_actions": [
+    { "type": "cli_command", "command": "bucephalus login", "description": "..." },
+    { "type": "mcp_tool", "tool": "dispatch_benchmark", "arguments": {}, "description": "..." }
+  ],
+  "details": {},
+  "docs": "docs/user/latch.md"
+}
+```
+
+Every guided body names exactly one `because` code and at least one next action,
+so a response is always either a result or a way forward — never a dead end.
+
+| `because` | Meaning | Primary next action |
+| --- | --- | --- |
+| `headless_command_required` | `dispatch_benchmark` was called without `headless_command.argv`. | Resubmit with the agent's headless command. |
+| `cloud_auth_required` | A non-local benchmark was requested while signed out. | `bucephalus login`, or rehearse with `local:file-edit-smoke`. |
+| `daemon_unavailable` | The local runtime could not be reached to start the dispatch. | `bucephalus setup`, then `bucephalus setup status`. |
+| `dispatch_id_required` | `dispatch_status` was called without a `dispatch_id`. | Call `status` to list recent dispatches. |
+| `dispatch_not_found` | The supplied `dispatch_id` does not exist on this host. | Call `status` to list recent dispatches. |
+
+`status` returns `recent_dispatches` (newest first, with `dispatch_id`, `status`,
+`label`, `benchmark`, and timestamps). It is the re-orientation surface: call it
+to recover a lost `dispatch_id` or to see what can be polled.
 
 For local UX rehearsal, `dispatch_benchmark` still supports the explicit
 `local:file-edit-smoke` fixture. It resolves into a normal `latch_manifest_v1`,

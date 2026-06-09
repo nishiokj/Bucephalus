@@ -6,11 +6,17 @@ import * as tar from "tar";
 import {
   applyRuntimeNetworkPolicy,
   collectRuntimeSnapshot,
+  coreRunnerFailureMessage,
+  coreRunnerCommand,
   coreRunnerEnv,
   discoverCoreRunIdsFromRunRoot,
   loadWorkerConfig,
   materializeAttemptSecrets,
   materializePackage,
+  materializedPackageEventPayload,
+  redactedProcessTail,
+  redactedWorkerErrorMessage,
+  runnerMetadata,
 } from "../src/worker";
 import { canonicalJsonStringify, sha256Digest, type JsonObject } from "../src/primitives";
 
@@ -158,6 +164,42 @@ describe("worker lifecycle cleanup helpers", () => {
     }
   });
 
+  test("omits malformed runtime JSON without dropping the whole snapshot", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-malformed-"));
+    try {
+      const runRoot = join(root, "run-root");
+      const coreRunId = "run_20260529_000001_000001_000001";
+      const runtimeDir = join(runRoot, coreRunId, "runtime");
+      const badTrialDir = join(runRoot, coreRunId, "trials", "trial-bad");
+      const goodTrialDir = join(runRoot, coreRunId, "trials", "trial-good");
+      await mkdir(runtimeDir, { recursive: true });
+      await mkdir(badTrialDir, { recursive: true });
+      await mkdir(goodTrialDir, { recursive: true });
+      await writeFile(join(runtimeDir, "run_control.json"), "{not-json");
+      await writeFile(join(runtimeDir, "schedule_progress.json"), JSON.stringify({ committed: 1, total: 2 }));
+      await writeFile(join(badTrialDir, "summary.json"), "{not-json");
+      await writeFile(join(goodTrialDir, "summary.json"), JSON.stringify({ outcome: "success" }));
+
+      const snapshot = await collectRuntimeSnapshot(runRoot, coreRunId);
+      const text = JSON.stringify(snapshot);
+
+      expect(snapshot.runtime_values.run_control_v2).toBeUndefined();
+      expect(snapshot.runtime_values.schedule_progress_v2).toEqual({ committed: 1, total: 2 });
+      expect(snapshot.trial_summaries).toEqual([
+        {
+          trial_id: "trial-good",
+          summary: { outcome: "success" },
+        },
+      ]);
+      expect(snapshot.omitted).toContain("runtime/run_control.json");
+      expect(snapshot.omitted).toContain("trials/trial-bad/summary.json");
+      expect(text).not.toContain("{not-json");
+      expect(text).not.toContain(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("redacts secret-looking fields from worker runtime snapshots", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-redact-"));
     try {
@@ -172,35 +214,61 @@ describe("worker lifecycle cleanup helpers", () => {
         status: "completed",
         access_token: "worker-token-value",
       }));
+      await writeFile(join(runtimeDir, "run_session_state.json"), JSON.stringify({
+        schema_version: "run_session_state_v1",
+        run_id: coreRunId,
+        project_root: root,
+        execution: {
+          executor: "local-docker",
+          run_root_path: join(root, "run-root"),
+        },
+      }));
       await writeFile(join(trialDir, "summary.json"), JSON.stringify({
         outcome: "success",
+        workspace: root,
         metrics: {
           value: 1,
           api_key: "sk-secretsecretsecretsecretsecret",
         },
       }));
-      await writeFile(join(trialDir, "agent", "events.jsonl"), `${JSON.stringify({
-        event_type: "step",
-        message: "safe message",
-        secret_ref: "gcp-secret-manager://projects/acme/secrets/openai/versions/1",
-      })}\n`);
+      await writeFile(join(trialDir, "agent", "events.jsonl"), [
+        JSON.stringify({
+          event_type: "step",
+          message: "safe message",
+          secret_ref: "gcp-secret-manager://projects/acme/secrets/openai/versions/1",
+          path: join(root, "agent", "events.jsonl"),
+        }),
+        `not-json secret=sk-secretsecretsecretsecretsecret path=${root}`,
+        "",
+      ].join("\n"));
 
       const snapshot = await collectRuntimeSnapshot(runRoot, coreRunId);
       const text = JSON.stringify(snapshot);
 
       expect(snapshot.runtime_values.run_control_v2?.access_token).toBe("[redacted]");
+      expect(snapshot.runtime_values.run_session_state_v1?.project_root).toBe("[redacted]");
+      expect((snapshot.runtime_values.run_session_state_v1?.execution as JsonObject).run_root_path).toBe("[redacted]");
       expect(snapshot.trial_summaries[0]?.summary.metrics).toMatchObject({
         value: 1,
         api_key: "[redacted]",
       });
+      expect(snapshot.trial_summaries[0]?.summary.workspace).toBe("[redacted]");
       expect(snapshot.trial_summaries[0]?.trial_events?.[0]).toMatchObject({
         event_type: "step",
         message: "safe message",
         secret_ref: "[redacted]",
+        path: "[redacted]",
+      });
+      expect(snapshot.trial_summaries[0]?.trial_events?.[1]).toMatchObject({
+        event_type: "trajectory_parse_error",
+        error: "event line is not valid JSON",
+        raw_line_omitted: true,
       });
       expect(text).not.toContain("worker-token-value");
       expect(text).not.toContain("sk-secret");
       expect(text).not.toContain("gcp-secret-manager://");
+      expect(text).not.toContain(root);
+      expect(text).not.toContain("not-json");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -219,12 +287,54 @@ describe("worker lifecycle cleanup helpers", () => {
     expect(config.capabilities.resources).not.toContain("network_perimeter");
   });
 
+  test("runner config normalizes advertised executor aliases", () => {
+    const config = loadWorkerConfig({
+      BUCEPHALUS_CLOUD_API_URL: "https://cloud.example",
+      BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
+      BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
+      BUCEPHALUS_WORKER_EXECUTORS: "runner_docker,local-docker,modal",
+      BUCEPHALUS_WORKER_MIN_FREE_BYTES: "1",
+    });
+
+    expect(config.capabilities.executors).toEqual(["modal", "runner-docker"]);
+    expect(() => loadWorkerConfig({
+      BUCEPHALUS_CLOUD_API_URL: "https://cloud.example",
+      BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
+      BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
+      BUCEPHALUS_WORKER_EXECUTORS: "kubernetes",
+      BUCEPHALUS_WORKER_MIN_FREE_BYTES: "1",
+    })).toThrow("Unsupported runner executor 'kubernetes'");
+  });
+
   test("runner config requires an explicit Cloud API URL", () => {
     expect(() => loadWorkerConfig({
       BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
       BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
       BUCEPHALUS_WORKER_MIN_FREE_BYTES: "1",
     })).toThrow("BUCEPHALUS_CLOUD_API_URL is required");
+  });
+
+  test("runner metadata reports capacity without host data directory paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-metadata-"));
+    try {
+      const config = loadWorkerConfig({
+        BUCEPHALUS_CLOUD_API_URL: "https://cloud.example",
+        BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
+        BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
+        BUCEPHALUS_CLOUD_DATA_DIR: root,
+        BUCEPHALUS_WORKER_MIN_FREE_BYTES: "1",
+      });
+
+      const metadata = await runnerMetadata(config);
+      const text = JSON.stringify(metadata);
+
+      expect((metadata.resources as JsonObject).data_dir).toBe("worker_data_dir");
+      expect((metadata.resources as JsonObject).data_dir_free_bytes).toBeGreaterThan(0);
+      expect(text).not.toContain(root);
+      expect(text).not.toContain("/var/folders");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("worker verifies downloaded package digest before using extracted content", async () => {
@@ -370,6 +480,94 @@ describe("worker lifecycle cleanup helpers", () => {
     }
   });
 
+  test("network policy application rejects malformed persisted Cloud perimeter requirements", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-network-"));
+    try {
+      for (const [run_requirements, message] of [
+        [
+          {
+            executor: "runner-docker",
+            requires: ["network_perimeter"],
+            image_refs: [],
+          },
+          "/run_requirements/network_perimeter is required",
+        ],
+        [
+          {
+            executor: "runner-docker",
+            requires: ["network_perimeter"],
+            image_refs: [],
+            network_perimeter: "allowlist",
+          },
+          "/run_requirements/network_perimeter must be an object",
+        ],
+        [
+          {
+            executor: "runner-docker",
+            requires: ["network_perimeter"],
+            image_refs: [],
+            network_perimeter: {
+              default: "full",
+              egress_hosts: ["api.openai.com"],
+            },
+          },
+          "/run_requirements/network_perimeter/default must be 'none' or 'allowlist_enforced'",
+        ],
+        [
+          {
+            executor: "runner-docker",
+            requires: ["network_perimeter"],
+            image_refs: [],
+            network_perimeter: {
+              default: "allowlist_enforced",
+              egress_hosts: "api.openai.com",
+            },
+          },
+          "/run_requirements/network_perimeter/egress_hosts must be an array",
+        ],
+        [
+          {
+            executor: "runner-docker",
+            requires: ["network_perimeter"],
+            image_refs: [],
+            network_perimeter: {
+              default: "allowlist_enforced",
+              egress_hosts: ["api.openai.com", ""],
+            },
+          },
+          "/run_requirements/network_perimeter/egress_hosts/1 must be a non-empty string",
+        ],
+        [
+          {
+            executor: "runner-docker",
+            requires: ["network_perimeter"],
+            image_refs: [],
+            network_perimeter: {
+              default: "allowlist_enforced",
+              egress_hosts: [],
+            },
+          },
+          "allowlist_enforced network modes require egress hosts",
+        ],
+      ] as const) {
+        await expect(applyRuntimeNetworkPolicy(
+          {
+            networkPolicyCommand: null,
+            workerId: "worker-1",
+            runnerInstanceId: "runner-instance-1",
+          },
+          claim({ run_requirements }),
+          {
+            workspaceDir: root,
+            runRootDir: join(root, "run-root"),
+          },
+        )).rejects.toThrow(message);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("Core child environment strips direct database runtime store variables", () => {
     const previous = {
       BUCEPHALUS_CLOUD_API_URL: process.env.BUCEPHALUS_CLOUD_API_URL,
@@ -431,6 +629,26 @@ describe("worker lifecycle cleanup helpers", () => {
     }
   });
 
+  test("secret refs reject malformed persisted maps before resolver setup", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-secrets-malformed-"));
+    try {
+      for (const [secret_refs, message] of [
+        [null, "/secret_refs must be an object"],
+        ["OPENAI_API_KEY=ref", "/secret_refs must be an object"],
+        [["OPENAI_API_KEY=ref"], "/secret_refs must be an object"],
+        [{ OPENAI_API_KEY: 7 }, "/secret_refs/OPENAI_API_KEY must be a string"],
+      ] as const) {
+        await expect(materializeAttemptSecrets(
+          { secretResolverCommand: null },
+          claim({ secret_refs }),
+          root,
+        )).rejects.toThrow(message);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("secret resolver materializes declared refs under attempt workspace", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-worker-secrets-"));
     try {
@@ -442,6 +660,420 @@ describe("worker lifecycle cleanup helpers", () => {
 
       expect(Object.keys(files)).toEqual(["OPENAI_API_KEY"]);
       expect(files.OPENAI_API_KEY).toBe(join(root, "secrets", "OPENAI_API_KEY.secret"));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("secret resolver helper failures omit stdout and stderr from worker errors", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-secret-fail-"));
+    try {
+      await expect(materializeAttemptSecrets(
+        { secretResolverCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/failingSecretResolver.ts")] },
+        claimWithSecrets({
+          OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/1",
+        }),
+        root,
+      )).rejects.toThrow("configured worker helper command exited 42; stdout/stderr omitted");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("worker materialized event payload does not expose local workspace paths or secret refs", () => {
+    const payload = materializedPackageEventPayload({
+      manifestJson: {
+        resolved_experiment: {
+          experiment: {
+            id: "exp-1",
+          },
+        },
+      },
+      secretFiles: {
+        OPENAI_API_KEY: "/tmp/attempt/secrets/OPENAI_API_KEY.secret",
+      },
+    });
+    const text = JSON.stringify(payload);
+
+    expect(payload).toMatchObject({
+      workspace: "attempt_workspace",
+      package_archive: "package.tgz",
+      extracted_package: "package",
+      run_root: "run-root",
+      manifest_experiment_id: "exp-1",
+      secret_file_count: 1,
+    });
+    expect(text).not.toContain("/tmp/attempt");
+    expect(text).not.toContain("gcp-secret-manager://");
+  });
+
+  test("Core command event args redact workspace paths, env values, and secret refs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-command-"));
+    try {
+      const materialized = {
+        workspaceDir: root,
+        packageArchivePath: join(root, "package.tgz"),
+        extractedDir: join(root, "package"),
+        runRootDir: join(root, "run-root"),
+        manifestJson: {},
+        secretFiles: {
+          OPENAI_API_KEY: join(root, "secrets", "OPENAI_API_KEY.secret"),
+        },
+      };
+      const command = coreRunnerCommand(
+        {
+          coreRunnerCommand: "bucephalus",
+        } as never,
+        {
+          claimed: true,
+          run: {
+            ...claimWithSecrets({
+              OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/1",
+            }).run,
+            env: {
+              PUBLIC_FLAG: "user-visible-value",
+            },
+            runtime_options: {
+              materialize: "metadata-only",
+            },
+          },
+          attempt: {
+            attempt_id: "attempt-1",
+            attempt_token: "attempt-token",
+          },
+        },
+        materialized,
+      );
+
+      expect(command.args).toContain(join(root, "package"));
+      expect(command.args).toContain("PUBLIC_FLAG=user-visible-value");
+      expect(command.args).toContain(`OPENAI_API_KEY=${join(root, "secrets", "OPENAI_API_KEY.secret")}`);
+      const redacted = JSON.stringify(command.redactedArgs);
+      expect(redacted).not.toContain(root);
+      expect(redacted).not.toContain("user-visible-value");
+      expect(redacted).not.toContain("gcp-secret-manager://");
+      expect(redacted).not.toContain("OPENAI_API_KEY.secret");
+      expect(command.redactedArgs).toContain("PUBLIC_FLAG=<env>");
+      expect(command.redactedArgs).toContain("OPENAI_API_KEY=<secret-file>");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("Core command normalizes Cloud executor aliases and materialize modes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-command-normalize-"));
+    try {
+      const materialized = {
+        workspaceDir: root,
+        packageArchivePath: join(root, "package.tgz"),
+        extractedDir: join(root, "package"),
+        runRootDir: join(root, "run-root"),
+        manifestJson: {},
+        secretFiles: {},
+      };
+      const command = coreRunnerCommand(
+        {
+          coreRunnerCommand: "bucephalus",
+        } as never,
+        claim({
+          runtime_options: {
+            executor: "runner-docker",
+            materialize: "metadata-only",
+          },
+          run_requirements: {
+            executor: "runner-docker",
+          },
+        }),
+        materialized,
+      );
+
+      expect(command.args).toContain("--executor");
+      expect(command.args).toContain("local_docker");
+      expect(command.args).not.toContain("runner-docker");
+      expect(command.args).toContain("--materialize");
+      expect(command.args).toContain("metadata_only");
+      expect(command.args).not.toContain("metadata-only");
+      expect(command.redactedArgs).toContain("local_docker");
+      expect(command.redactedArgs).toContain("metadata_only");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("Core command rejects invalid Cloud executor and materialize spellings before launch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-command-invalid-"));
+    try {
+      const materialized = {
+        workspaceDir: root,
+        packageArchivePath: join(root, "package.tgz"),
+        extractedDir: join(root, "package"),
+        runRootDir: join(root, "run-root"),
+        manifestJson: {},
+        secretFiles: {},
+      };
+
+      expect(() => coreRunnerCommand(
+        {
+          coreRunnerCommand: "bucephalus",
+        } as never,
+        claim({
+          runtime_options: {
+            executor: "docker",
+          },
+        }),
+        materialized,
+      )).toThrow("Unsupported Cloud/Core runner executor");
+
+      expect(() => coreRunnerCommand(
+        {
+          coreRunnerCommand: "bucephalus",
+        } as never,
+        claim({
+          runtime_options: {
+            materialize: "metadata",
+          },
+        }),
+        materialized,
+      )).toThrow("Unsupported Core materialize mode");
+
+      expect(() => coreRunnerCommand(
+        {
+          coreRunnerCommand: "bucephalus",
+        } as never,
+        claim({
+          runtime_options: {
+            backend: "modal",
+            executor: "runner-docker",
+          },
+          run_requirements: {
+            executor: "modal",
+          },
+        }),
+        materialized,
+      )).toThrow("runtime_options.backend and runtime_options.executor");
+
+      expect(() => coreRunnerCommand(
+        {
+          coreRunnerCommand: "bucephalus",
+        } as never,
+        claim({
+          runtime_options: {
+            executor: "modal",
+          },
+          run_requirements: {
+            executor: "runner-docker",
+          },
+        }),
+        materialized,
+      )).toThrow("runtime_options executor does not match the queued Cloud runner executor");
+
+      expect(() => coreRunnerCommand(
+        {
+          coreRunnerCommand: "bucephalus",
+        } as never,
+        claim({
+          runtime_options: {
+            backend: "runner-docker",
+          },
+          run_requirements: {
+            executor: "modal",
+          },
+        }),
+        materialized,
+      )).toThrow("runtime_options executor does not match the queued Cloud runner executor");
+
+      for (const runtime_options of [null, ["executor=modal"], "executor=modal"]) {
+        expect(() => coreRunnerCommand(
+          {
+            coreRunnerCommand: "bucephalus",
+          } as never,
+          claim({
+            runtime_options: runtime_options as never,
+          }),
+          materialized,
+        )).toThrow("/runtime_options must be an object");
+      }
+
+      for (const [env, message] of [
+        [null, "/env must be an object"],
+        ["MODEL=gpt-4.1", "/env must be an object"],
+        [["MODEL=gpt-4.1"], "/env must be an object"],
+        [{ MODEL: 7 }, "/env/MODEL must be a string"],
+      ] as const) {
+        expect(() => coreRunnerCommand(
+          {
+            coreRunnerCommand: "bucephalus",
+          } as never,
+          claim({ env }),
+          materialized,
+        )).toThrow(message);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("Core process output tails redact local paths, env values, and secret refs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-output-"));
+    try {
+      const materialized = {
+        workspaceDir: root,
+        packageArchivePath: join(root, "package.tgz"),
+        extractedDir: join(root, "package"),
+        runRootDir: join(root, "run-root"),
+        secretFiles: {
+          OPENAI_API_KEY: join(root, "secrets", "OPENAI_API_KEY.secret"),
+        },
+      };
+      const claimForOutput = {
+        run: {
+          ...claimWithSecrets({
+            OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/1",
+          }).run,
+          env: {
+            PUBLIC_FLAG: "user-visible-value",
+          },
+        },
+        attempt: {
+          attempt_token: "attempt-token-value",
+        },
+      };
+      const redacted = redactedProcessTail(
+        [
+          `workspace=${root}`,
+          `package=${join(root, "package")}`,
+          `secret_path=${join(root, "secrets", "OPENAI_API_KEY.secret")}`,
+          "ref=gcp-secret-manager://projects/acme/secrets/openai/versions/1",
+          "env=user-visible-value",
+          "attempt=attempt-token-value",
+          "token=sk-abcdefghijklmnopqrstuvwx",
+        ].join("\n"),
+        materialized,
+        claimForOutput,
+      );
+
+      expect(redacted).toContain("<attempt-workspace>");
+      expect(redacted).toContain("<package-dir>");
+      expect(redacted).toContain("<secret-file:OPENAI_API_KEY>");
+      expect(redacted).toContain("<secret-ref:OPENAI_API_KEY>");
+      expect(redacted).toContain("<env:PUBLIC_FLAG>");
+      expect(redacted).toContain("<attempt-token>");
+      expect(redacted).toContain("[redacted]");
+      expect(redacted).not.toContain(root);
+      expect(redacted).not.toContain("user-visible-value");
+      expect(redacted).not.toContain("gcp-secret-manager://");
+      expect(redacted).not.toContain("attempt-token-value");
+      expect(redacted).not.toContain("sk-abcdefghijklmnopqrstuvwx");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("Core failure messages redact output before durable run error storage", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-failure-"));
+    try {
+      const materialized = {
+        workspaceDir: root,
+        packageArchivePath: join(root, "package.tgz"),
+        extractedDir: join(root, "package"),
+        runRootDir: join(root, "run-root"),
+        secretFiles: {
+          OPENAI_API_KEY: join(root, "secrets", "OPENAI_API_KEY.secret"),
+        },
+      };
+      const claimForFailure = {
+        run: {
+          ...claimWithSecrets({
+            OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/1",
+          }).run,
+          env: {
+            PUBLIC_FLAG: "user-visible-value",
+          },
+        },
+        attempt: {
+          attempt_token: "attempt-token-value",
+        },
+      };
+
+      const message = coreRunnerFailureMessage(
+        2,
+        "",
+        [
+          `workspace=${root}`,
+          `run_root=${join(root, "run-root")}`,
+          `secret_path=${join(root, "secrets", "OPENAI_API_KEY.secret")}`,
+          "ref=gcp-secret-manager://projects/acme/secrets/openai/versions/1",
+          "env=user-visible-value",
+          "attempt=attempt-token-value",
+        ].join("\n"),
+        materialized,
+        claimForFailure,
+      );
+
+      expect(message).toContain("Core runner exited with 2");
+      expect(message).toContain("<attempt-workspace>");
+      expect(message).toContain("<run-root>");
+      expect(message).toContain("<secret-file:OPENAI_API_KEY>");
+      expect(message).toContain("<secret-ref:OPENAI_API_KEY>");
+      expect(message).toContain("<env:PUBLIC_FLAG>");
+      expect(message).toContain("<attempt-token>");
+      expect(message).not.toContain(root);
+      expect(message).not.toContain("OPENAI_API_KEY.secret");
+      expect(message).not.toContain("gcp-secret-manager://");
+      expect(message).not.toContain("user-visible-value");
+      expect(message).not.toContain("attempt-token-value");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("worker error messages redact attempt paths and secret material", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-error-"));
+    try {
+      const materialized = {
+        workspaceDir: root,
+        packageArchivePath: join(root, "package.tgz"),
+        extractedDir: join(root, "package"),
+        runRootDir: join(root, "run-root"),
+        secretFiles: {
+          OPENAI_API_KEY: join(root, "secrets", "OPENAI_API_KEY.secret"),
+        },
+      };
+      const claimForError = {
+        run: {
+          ...claimWithSecrets({
+            OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/1",
+          }).run,
+          env: {
+            PUBLIC_FLAG: "user-visible-value",
+          },
+        },
+        attempt: {
+          attempt_token: "attempt-token-value",
+        },
+      };
+
+      const message = redactedWorkerErrorMessage(
+        new Error([
+          `cleanup failed for ${join(root, "run-root")}`,
+          `secret=${join(root, "secrets", "OPENAI_API_KEY.secret")}`,
+          "ref=gcp-secret-manager://projects/acme/secrets/openai/versions/1",
+          "env=user-visible-value",
+          "attempt=attempt-token-value",
+        ].join(" ")),
+        materialized,
+        claimForError,
+      );
+
+      expect(message).toContain("<run-root>");
+      expect(message).toContain("<secret-file:OPENAI_API_KEY>");
+      expect(message).toContain("<secret-ref:OPENAI_API_KEY>");
+      expect(message).toContain("<env:PUBLIC_FLAG>");
+      expect(message).toContain("<attempt-token>");
+      expect(message).not.toContain(root);
+      expect(message).not.toContain("gcp-secret-manager://");
+      expect(message).not.toContain("user-visible-value");
+      expect(message).not.toContain("attempt-token-value");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -471,16 +1103,25 @@ function claimWithNetwork(egressHosts: string[]) {
 }
 
 function claim(overrides: {
-  secret_refs?: Record<string, string>;
+  env?: unknown;
+  secret_refs?: unknown;
+  runtime_options?: unknown;
   run_requirements?: Record<string, unknown>;
 } = {}) {
   return {
+    claimed: true as const,
     run: {
       run_id: "run-1",
       package_digest: "sha256:test",
-      env: {},
-      secret_refs: overrides.secret_refs ?? {},
-      runtime_options: {},
+      env: Object.prototype.hasOwnProperty.call(overrides, "env")
+        ? overrides.env as Record<string, string>
+        : {},
+      secret_refs: Object.prototype.hasOwnProperty.call(overrides, "secret_refs")
+        ? overrides.secret_refs as Record<string, string>
+        : {},
+      runtime_options: Object.prototype.hasOwnProperty.call(overrides, "runtime_options")
+        ? overrides.runtime_options as Record<string, unknown>
+        : {},
       run_requirements: {
         executor: "runner-docker",
         requires: [],

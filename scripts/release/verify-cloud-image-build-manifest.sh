@@ -19,6 +19,14 @@ release artifact or directory.
 USAGE
 }
 
+public_image_manifest_input_ref() {
+  printf '%s\n' "cloud-image-build-manifest://input"
+}
+
+public_release_input_ref() {
+  printf '%s\n' "release-input://source"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --release)
@@ -34,7 +42,7 @@ while [[ $# -gt 0 ]]; do
         MANIFEST="$1"
         shift
       else
-        echo "unknown argument: $1" >&2
+        echo "unknown argument" >&2
         usage >&2
         exit 2
       fi
@@ -48,7 +56,8 @@ if [[ -z "${MANIFEST}" ]]; then
 fi
 
 if [[ ! -f "${MANIFEST}" ]]; then
-  echo "manifest does not exist: ${MANIFEST}" >&2
+  echo "image build manifest does not exist" >&2
+  echo "image_manifest_ref: $(public_image_manifest_input_ref)" >&2
   exit 2
 fi
 
@@ -89,15 +98,18 @@ if [[ -n "${RELEASE_INPUT}" ]]; then
     tar -xzf "${RELEASE_INPUT}" -C "${WORK_DIR}"
     RELEASE_DIR="$(find "${WORK_DIR}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
     if [[ -z "${RELEASE_DIR}" ]]; then
-      echo "archive did not contain a release directory: ${RELEASE_INPUT}" >&2
+      echo "archive did not contain a release directory" >&2
+      echo "release_ref: $(public_release_input_ref)" >&2
       exit 1
     fi
   else
-    echo "release input does not exist: ${RELEASE_INPUT}" >&2
+    echo "release input does not exist" >&2
+    echo "release_ref: $(public_release_input_ref)" >&2
     exit 2
   fi
   if [[ ! -f "${RELEASE_DIR}/release-manifest.json" ]]; then
-    echo "release input is missing release-manifest.json: ${RELEASE_INPUT}" >&2
+    echo "release input is missing release-manifest.json" >&2
+    echo "release_ref: $(public_release_input_ref)" >&2
     exit 1
   fi
 fi
@@ -462,5 +474,5 @@ if (releaseDir) {
     }
   }
 }
-console.log(`verified image build manifest ${path}`);
+console.log("verified image build manifest cloud-image-build-manifest://input");
 ' "${MANIFEST}"

@@ -351,6 +351,31 @@ if (cleanupWorkflowText.includes("terraform destroy")) {
   fail(`${cleanupWorkflowPath} must not expose full substrate destroy as a routine cleanup action`);
 }
 
+const deployTfvarsWriterText = read("scripts/deploy/write-gcp-deploy-tfvars.sh");
+if (!/mktemp "\$\{OUT_DIR\}\/\.gcp-deploy\.tfvars\.XXXXXX"/.test(deployTfvarsWriterText)) {
+  fail("scripts/deploy/write-gcp-deploy-tfvars.sh must write deploy tfvars through a same-directory temporary file");
+}
+if (!/deploy tfvars output must not be a symlink/.test(deployTfvarsWriterText) || !/deploy tfvars output directory must not contain symlinks/.test(deployTfvarsWriterText)) {
+  fail("scripts/deploy/write-gcp-deploy-tfvars.sh must reject symlinked deploy tfvars output paths");
+}
+if (/tfvars=\$\{process\.env\.OUT\}/.test(deployTfvarsWriterText)) {
+  fail("scripts/deploy/write-gcp-deploy-tfvars.sh must not print raw local deploy tfvars paths");
+}
+if (!/tfvars:\/\/gcp-deploy/.test(deployTfvarsWriterText)) {
+  fail("scripts/deploy/write-gcp-deploy-tfvars.sh must identify deploy tfvars with a stable public ref");
+}
+
+const gcpCicdResolverText = read("scripts/deploy/resolve-gcp-cicd-secret.sh");
+if (!/lstatSync/.test(gcpCicdResolverText) || !/must not be a symlink/.test(gcpCicdResolverText)) {
+  fail("scripts/deploy/resolve-gcp-cicd-secret.sh must inspect GitHub output/env files without following symlinks");
+}
+if (/resolved \$\{mode\} GCP CI\/CD identity for \$\{account\}/.test(gcpCicdResolverText)) {
+  fail("scripts/deploy/resolve-gcp-cicd-secret.sh must not print raw service account identities");
+}
+if (!/resolved \$\{mode\} GCP CI\/CD identity/.test(gcpCicdResolverText)) {
+  fail("scripts/deploy/resolve-gcp-cicd-secret.sh must print a stable CI/CD identity resolution message");
+}
+
 const permissions = releaseWorkflow.permissions ?? {};
 if (permissions.contents !== "read" || permissions["id-token"] !== "none") {
   fail(`${releaseWorkflowPath} top-level permissions must default to contents: read and id-token: none`);
@@ -671,6 +696,12 @@ if (!buildLinux) {
   if (coreUploadStep?.with?.name !== "core-${{ matrix.target }}") {
     fail(`${releaseWorkflowPath} Linux core archives must still upload as core-target artifacts`);
   }
+  const coreUploadPaths = String(coreUploadStep?.with?.path ?? "");
+  for (const requiredPath of ["dist/releases/install.sh", "dist/releases/install.sh.sha256"]) {
+    if (!coreUploadPaths.includes(requiredPath)) {
+      fail(`${releaseWorkflowPath} Linux core artifact upload is missing ${requiredPath}`);
+    }
+  }
   const uploadStep = steps.find((step) => step.name === "Upload release bundle");
   const uploadPaths = String(uploadStep?.with?.path ?? "");
   const expandedBundlePattern = /dist\/releases\/bucephalus-\$\{\{\s*steps\.version\.outputs\.version\s*\}\}-\$\{\{\s*matrix\.target\s*\}\}(?:\n|$)/;
@@ -731,6 +762,12 @@ if (!buildMacosCore) {
   if (coreUploadStep?.with?.name !== "core-${{ matrix.target }}") {
     fail(`${releaseWorkflowPath} macOS core archives must upload as core-target artifacts`);
   }
+  const coreUploadPaths = String(coreUploadStep?.with?.path ?? "");
+  for (const requiredPath of ["dist/releases/install.sh", "dist/releases/install.sh.sha256"]) {
+    if (!coreUploadPaths.includes(requiredPath)) {
+      fail(`${releaseWorkflowPath} macOS core artifact upload is missing ${requiredPath}`);
+    }
+  }
 }
 const publishRelease = releaseJobs["publish-github-release"];
 if (!publishRelease) {
@@ -764,8 +801,14 @@ if (!publishRelease) {
     }
   }
   const attachStep = steps.find((step) => step.name === "Attach release archives to GitHub release");
-  if (!String(attachStep?.with?.files ?? "").includes("dist/release-assets.json")) {
+  const attachFiles = String(attachStep?.with?.files ?? "");
+  if (!attachFiles.includes("dist/release-assets.json")) {
     fail(`${releaseWorkflowPath} GitHub release must attach dist/release-assets.json`);
+  }
+  for (const requiredPath of ["dist/core-assets/install.sh", "dist/core-assets/install.sh.sha256"]) {
+    if (!attachFiles.includes(requiredPath)) {
+      fail(`${releaseWorkflowPath} GitHub release must attach ${requiredPath}`);
+    }
   }
   const indexStep = steps.find((step) => step.name === "Write release asset index");
   const indexRun = String(indexStep?.run ?? "");
@@ -1089,6 +1132,27 @@ for (const script of [
   if (/--require-ready/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
     fail(`${script} must require configured registry auth before pushed buildx runs`);
   }
+  if (/release-input:\/\/source/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
+    fail(`${script} must report release inputs with a stable public ref`);
+  }
+  if (/cloud-image-build:\/\/output/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
+    fail(`${script} must report image build output directories with a stable public ref`);
+  }
+  if (/cloud-image-build-manifest:\/\/output/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
+    fail(`${script} must log generated image build manifests with a stable public output ref`);
+  }
+  if (/refusing to write image build output through a symlinked path/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
+    fail(`${script} must reject symlinked image build output paths`);
+  }
+  if (/refusing to clean image build context through a symlinked path/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
+    fail(`${script} must reject symlinked image build context paths before cleanup`);
+  }
+  if (/echo "image_manifest=\$\{MANIFEST_PATH\}"/.test(text) && script === "scripts/release/build-cloud-images.sh") {
+    fail(`${script} must not print raw local image manifest output paths`);
+  }
+  if (/unknown argument: \$1/.test(text) && script === "scripts/release/build-cloud-images.sh") {
+    fail(`${script} must not echo unknown raw arguments`);
+  }
   if (/image_context_ignore/.test(text) === false && script === "scripts/release/build-buc-release.sh") {
     fail(`${script} must record the release image context ignore file in the manifest`);
   }
@@ -1103,6 +1167,29 @@ for (const script of [
   }
   if (/\.dockerignore is missing required image context exclusion/.test(text) === false && script === "scripts/release/verify-buc-release.sh") {
     fail(`${script} must verify required image context exclusions`);
+  }
+  if (/verifyNoLocalPathContent/.test(text) === false && (script === "scripts/release/verify-core-release.sh" || script === "scripts/release/verify-buc-release.sh")) {
+    fail(`${script} must scan text release payloads for local absolute path leakage`);
+  }
+  if (/must not embed local absolute paths/.test(text) === false && (script === "scripts/release/verify-core-release.sh" || script === "scripts/release/verify-buc-release.sh")) {
+    fail(`${script} must fail without echoing leaked local path content`);
+  }
+  if (
+    script === "scripts/release/verify-core-release.sh"
+    || script === "scripts/release/verify-buc-release.sh"
+  ) {
+    for (const label of [
+      "Linux temp path",
+      "macOS mounted volume path",
+      "WSL mounted Windows user path",
+      "Windows drive path",
+      "Windows profile env path",
+      "home-relative path",
+    ]) {
+      if (!text.includes(label)) {
+        fail(`${script} must scan release text payloads for ${label}`);
+      }
+    }
   }
   if (/gcloud auth configure-docker/.test(text) === false && script === "scripts/release/configure-gcp-artifact-registry-auth.sh") {
     fail(`${script} must configure Docker with the gcloud Artifact Registry credential helper`);
@@ -1131,6 +1218,21 @@ for (const script of [
   if (/pushed images require an approved base image policy entry/.test(text) === false && script === "scripts/release/verify-cloud-base-image-policy.sh") {
     fail(`${script} must block pushed images until the base digest is approved`);
   }
+  if (/base-image:\/\/input/.test(text) === false && script === "scripts/release/verify-cloud-base-image-policy.sh") {
+    fail(`${script} must report base image inputs with a stable public ref`);
+  }
+  if (/base-image-policy:\/\/input/.test(text) === false && script === "scripts/release/verify-cloud-base-image-policy.sh") {
+    fail(`${script} must report base image policy paths with a stable public ref`);
+  }
+  if (/refusing to read base image policy through a symlinked path/.test(text) === false && script === "scripts/release/verify-cloud-base-image-policy.sh") {
+    fail(`${script} must reject symlinked base image policy paths`);
+  }
+  if (/unknown argument: \$1/.test(text) && script === "scripts/release/verify-cloud-base-image-policy.sh") {
+    fail(`${script} must not echo unknown raw arguments`);
+  }
+  if (/base image policy does not exist: \$\{POLICY\}|approved base image policy entry: \$\{?baseImage/.test(text) && script === "scripts/release/verify-cloud-base-image-policy.sh") {
+    fail(`${script} must not print raw local policy paths or base image refs`);
+  }
   if (text.includes("const digestRef = /^[^\\s]+@sha256:[a-f0-9]{64}$/;") === false && script === "scripts/release/verify-cloud-base-image-policy.sh") {
     fail(`${script} must parse digest-addressed base images without over-escaped whitespace classes`);
   }
@@ -1143,6 +1245,18 @@ for (const script of [
   if (/--base-image must not be a tag, URL, or latest reference/.test(text) === false && script === "scripts/release/verify-cloud-image-publish-inputs.sh") {
     fail(`${script} must reject mutable or URL-shaped base image inputs`);
   }
+  if (/image-repository:\/\/input/.test(text) === false && script === "scripts/release/verify-cloud-image-publish-inputs.sh") {
+    fail(`${script} must report image repository inputs with a stable public ref`);
+  }
+  if (/base-image:\/\/input/.test(text) === false && script === "scripts/release/verify-cloud-image-publish-inputs.sh") {
+    fail(`${script} must report base image inputs with a stable public ref`);
+  }
+  if (/unknown argument: \$1/.test(text) && script === "scripts/release/verify-cloud-image-publish-inputs.sh") {
+    fail(`${script} must not echo unknown raw arguments`);
+  }
+  if (/echo [^\n]*(?:\$\{REPOSITORY\}|\$\{BASE_IMAGE\})/.test(text) && script === "scripts/release/verify-cloud-image-publish-inputs.sh") {
+    fail(`${script} must not print raw image repository or base image inputs`);
+  }
   if (/GCP Artifact Registry/.test(text) === false && script === "scripts/release/verify-cloud-image-publish-inputs.sh") {
     fail(`${script} must require GCP Artifact Registry shape for pushed image publication`);
   }
@@ -1154,6 +1268,9 @@ for (const script of [
   }
   if (/GOOGLE_APPLICATION_CREDENTIALS/.test(text) === false && script === "scripts/release/verify-cloud-registry-auth-boundary.sh") {
     fail(`${script} must reject static credential surfaces for pushed publication`);
+  }
+  if (/unknown argument: \$1/.test(text) && script === "scripts/release/verify-cloud-registry-auth-boundary.sh") {
+    fail(`${script} must not echo unknown raw arguments`);
   }
   if (/bucephalus_cloud_path2_signing_policy_v1/.test(text) === false && script === "scripts/release/verify-cloud-signing-policy.sh") {
     fail(`${script} must validate the Path 2 signing policy schema`);
@@ -1245,6 +1362,18 @@ for (const script of [
   if (/local builder must not claim/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must reject local image manifests that claim GitHub Actions identity fields`);
   }
+  if (/cloud-image-build-manifest:\/\/input/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must log verified image build manifests with a stable public input ref`);
+  }
+  if (/release-input:\/\/source/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must report release inputs with a stable public ref`);
+  }
+  if (/manifest does not exist: \$\{MANIFEST\}|release input does not exist: \$\{RELEASE_INPUT\}|release input is missing release-manifest\.json: \$\{RELEASE_INPUT\}|archive did not contain a release directory: \$\{RELEASE_INPUT\}/.test(text) && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must not print raw local image manifest or release input paths`);
+  }
+  if (/unknown argument: \$1/.test(text) && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must not echo unknown raw arguments`);
+  }
   if (/release\.manifest_sha256 does not match release manifest/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must tie image manifests to the release manifest when a release is provided`);
   }
@@ -1266,6 +1395,15 @@ for (const script of [
   if (/verify-gcp-image-tfvars\.sh/.test(text) === false && script === "scripts/release/write-gcp-image-tfvars.sh") {
     fail(`${script} must verify generated deploy tfvars`);
   }
+  if (/cloud-image-build-manifest:\/\/input/.test(text) === false && script === "scripts/release/write-gcp-image-tfvars.sh") {
+    fail(`${script} must report source image manifests with a stable public ref`);
+  }
+  if (/tfvars:\/\/gcp-image-digests/.test(text) === false && script === "scripts/release/write-gcp-image-tfvars.sh") {
+    fail(`${script} must report generated tfvars with a stable public ref`);
+  }
+  if (/unknown argument: \$1/.test(text) && script === "scripts/release/write-gcp-image-tfvars.sh") {
+    fail(`${script} must not echo unknown raw arguments`);
+  }
   if (/unexpected tfvars variable/.test(text) === false && script === "scripts/release/verify-gcp-image-tfvars.sh") {
     fail(`${script} must reject deploy tfvars with unexpected variables`);
   }
@@ -1278,11 +1416,74 @@ for (const script of [
   if (/worker_image_digest/.test(text) === false && script === "scripts/release/verify-gcp-image-tfvars.sh") {
     fail(`${script} must require the worker image digest as a deploy input`);
   }
+  if (/cloud-image-build-manifest:\/\/input/.test(text) === false && script === "scripts/release/verify-gcp-image-tfvars.sh") {
+    fail(`${script} must report source image manifests with a stable public ref`);
+  }
+  if (/tfvars:\/\/gcp-image-digests/.test(text) === false && script === "scripts/release/verify-gcp-image-tfvars.sh") {
+    fail(`${script} must report tfvars inputs with a stable public ref`);
+  }
+  if (/unknown argument: \$1/.test(text) && script === "scripts/release/verify-gcp-image-tfvars.sh") {
+    fail(`${script} must not echo unknown raw arguments`);
+  }
+  if (/image manifest does not exist: \$\{MANIFEST\}|tfvars file does not exist: \$\{TFVARS\}/.test(text) && script === "scripts/release/verify-gcp-image-tfvars.sh") {
+    fail(`${script} must not print raw local image manifest or tfvars paths`);
+  }
   if (/must use the \$\{component\} image_repository/.test(text) === false && script === "scripts/release/write-gcp-image-tfvars.sh") {
     fail(`${script} must write only component repository digest refs`);
   }
+  if (/lstatSync/.test(text) === false && (script === "scripts/release/write-gcp-image-tfvars.sh" || script === "scripts/release/verify-gcp-image-tfvars.sh")) {
+    fail(`${script} must inspect GCP image tfvars handoff files without following symlinks`);
+  }
+  if (/must not be a symlink/.test(text) === false && (script === "scripts/release/write-gcp-image-tfvars.sh" || script === "scripts/release/verify-gcp-image-tfvars.sh")) {
+    fail(`${script} must reject symlinked GCP image tfvars handoff paths`);
+  }
+  if (/tfvars=\$\{process\.env\.OUT_PATH\}/.test(text) && script === "scripts/release/write-gcp-image-tfvars.sh") {
+    fail(`${script} must not print raw local tfvars output paths`);
+  }
+  if (/verified GCP image tfvars \$\{process\.env\.TFVARS\}/.test(text) && script === "scripts/release/verify-gcp-image-tfvars.sh") {
+    fail(`${script} must not print raw local tfvars paths`);
+  }
+  if (/unsupported tfvars line \$\{lineNumber \+ 1\}:/.test(text) && script === "scripts/release/verify-gcp-image-tfvars.sh") {
+    fail(`${script} must not echo malformed tfvars line content`);
+  }
   if (/promotion evidence requires a pushed image manifest/.test(text) === false && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
     fail(`${script} must reject local image manifests as promotion evidence`);
+  }
+  if (/cloud-image-build-manifest:\/\/input/.test(text) === false && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
+    fail(`${script} must report promotion image manifests with a stable public ref`);
+  }
+  if (/release-provenance:\/\/input/.test(text) === false && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
+    fail(`${script} must report promotion image provenance with a stable public ref`);
+  }
+  if (/tfvars:\/\/gcp-image-digests/.test(text) === false && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
+    fail(`${script} must report promotion tfvars with a stable public ref`);
+  }
+  if (/unknown argument: \$1/.test(text) && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
+    fail(`${script} must not echo unknown raw arguments`);
+  }
+  if (/promotion evidence file (?:does not exist|must not be a symlink)/.test(text) && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
+    fail(`${script} must identify missing/symlinked promotion evidence inputs by typed public refs`);
+  }
+  if (/lstatSync/.test(text) === false && (script === "scripts/release/verify-gcp-image-promotion-evidence.sh" || script === "scripts/release/write-cloud-image-promotion-evidence-index.sh" || script === "scripts/release/verify-cloud-image-promotion-evidence-index.sh")) {
+    fail(`${script} must inspect promotion evidence handoff files without following symlinks`);
+  }
+  if (/must not be a symlink/.test(text) === false && (script === "scripts/release/verify-gcp-image-promotion-evidence.sh" || script === "scripts/release/write-cloud-image-promotion-evidence-index.sh" || script === "scripts/release/verify-cloud-image-promotion-evidence-index.sh")) {
+    fail(`${script} must reject symlinked promotion evidence handoff paths`);
+  }
+  if (/existsSync/.test(text) && script === "scripts/release/verify-cloud-image-promotion-evidence-index.sh") {
+    fail(`${script} must not use existsSync before promotion evidence digest rechecks`);
+  }
+  if (/unsupported promotion tfvars line \$\{lineNumber \+ 1\}:/.test(text) && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
+    fail(`${script} must not echo malformed promotion tfvars line content`);
+  }
+  if (/verified GCP image promotion evidence \$\{manifestPath\}/.test(text) && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
+    fail(`${script} must not print raw local promotion manifest paths`);
+  }
+  if (/wrote cloud image promotion evidence index \$\{out\}/.test(text) && script === "scripts/release/write-cloud-image-promotion-evidence-index.sh") {
+    fail(`${script} must not print raw local promotion evidence output paths`);
+  }
+  if (/verified cloud image promotion evidence index \$\{indexPath\}/.test(text) && script === "scripts/release/verify-cloud-image-promotion-evidence-index.sh") {
+    fail(`${script} must not print raw local promotion evidence index paths`);
   }
   if (/does not match between manifest and provenance/.test(text) === false && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
     fail(`${script} must tie image manifest and image-build provenance together`);
@@ -1371,8 +1572,26 @@ for (const script of [
   if (/artifactPath\(imageManifestPath, "image_build\.manifest_path"\)/.test(text) === false && script === "scripts/release/write-cloud-release-provenance.sh") {
     fail(`${script} must write artifact-local image manifest paths in image build provenance`);
   }
+  if (/process\.env\.ROOT_DIR/.test(text) === false && script === "scripts/release/write-cloud-release-provenance.sh") {
+    fail(`${script} must derive public artifact paths from the repository root`);
+  }
   if (/verify-cloud-release-provenance\.sh" "\$\{OUT_PATH\}" --release "\$\{RELEASE_INPUT\}"/.test(text) === false && script === "scripts/release/write-cloud-release-provenance.sh") {
     fail(`${script} must verify generated provenance against the release input`);
+  }
+  if (/release-provenance:\/\/output/.test(text) === false && script === "scripts/release/write-cloud-release-provenance.sh") {
+    fail(`${script} must log generated provenance with a stable public output ref`);
+  }
+  if (/release-input:\/\/source/.test(text) === false && script === "scripts/release/write-cloud-release-provenance.sh") {
+    fail(`${script} must report release inputs with a stable public ref`);
+  }
+  if (/cloud-image-build-manifest:\/\/source/.test(text) === false && script === "scripts/release/write-cloud-release-provenance.sh") {
+    fail(`${script} must report image build manifest inputs with a stable public ref`);
+  }
+  if (/refusing to write provenance through a symlinked output path/.test(text) === false && script === "scripts/release/write-cloud-release-provenance.sh") {
+    fail(`${script} must reject symlinked provenance output paths`);
+  }
+  if (/echo "provenance=\$\{OUT_PATH\}"/.test(text) && script === "scripts/release/write-cloud-release-provenance.sh") {
+    fail(`${script} must not print raw local provenance output paths`);
   }
   if (/const isGithubActions = process\.env\.GITHUB_ACTIONS === "true"/.test(text) === false && script === "scripts/release/write-cloud-release-provenance.sh") {
     fail(`${script} must only write GitHub builder fields for GitHub Actions runs`);
@@ -1392,11 +1611,49 @@ for (const script of [
   if (/local builder must not claim/.test(text) === false && script === "scripts/release/verify-core-release-provenance.sh") {
     fail(`${script} must reject local core provenance that claims GitHub Actions identity fields`);
   }
+  if (/release-provenance:\/\/input/.test(text) === false && script === "scripts/release/verify-cloud-release-provenance.sh") {
+    fail(`${script} must log verified provenance with a stable public input ref`);
+  }
+  if (/release-input:\/\/source/.test(text) === false && script === "scripts/release/verify-cloud-release-provenance.sh") {
+    fail(`${script} must report release inputs with a stable public ref`);
+  }
+  if (/release-provenance:\/\/input/.test(text) === false && script === "scripts/release/verify-core-release-provenance.sh") {
+    fail(`${script} must log verified core provenance with a stable public input ref`);
+  }
+  if (/release-input:\/\/source/.test(text) === false && script === "scripts/release/verify-core-release-provenance.sh") {
+    fail(`${script} must report core release inputs with a stable public ref`);
+  }
+  if (/provenance does not exist: \$\{PROVENANCE\}|release input does not exist: \$\{RELEASE_INPUT\}|release input is missing release-manifest\.json: \$\{RELEASE_INPUT\}|archive did not contain a release directory: \$\{RELEASE_INPUT\}/.test(text) && (script === "scripts/release/verify-cloud-release-provenance.sh" || script === "scripts/release/verify-core-release-provenance.sh")) {
+    fail(`${script} must not print raw local provenance or release input paths`);
+  }
   if (/const isGithubActions = process\.env\.GITHUB_ACTIONS === "true"/.test(text) === false && script === "scripts/release/write-core-release-provenance.sh") {
     fail(`${script} must only write GitHub builder fields for GitHub Actions runs`);
   }
   if (/verify-core-release-provenance\.sh" "\$\{OUT_PATH\}" --release "\$\{RELEASE_INPUT\}"/.test(text) === false && script === "scripts/release/write-core-release-provenance.sh") {
     fail(`${script} must verify generated core provenance against the release input`);
+  }
+  if (/release-provenance:\/\/output/.test(text) === false && script === "scripts/release/write-core-release-provenance.sh") {
+    fail(`${script} must log generated core provenance with a stable public output ref`);
+  }
+  if (/release-input:\/\/source/.test(text) === false && script === "scripts/release/write-core-release-provenance.sh") {
+    fail(`${script} must report core release inputs with a stable public ref`);
+  }
+  if (/refusing to write provenance through a symlinked output path/.test(text) === false && script === "scripts/release/write-core-release-provenance.sh") {
+    fail(`${script} must reject symlinked core provenance output paths`);
+  }
+  if (/echo "provenance=\$\{OUT_PATH\}"/.test(text) && script === "scripts/release/write-core-release-provenance.sh") {
+    fail(`${script} must not print raw local core provenance output paths`);
+  }
+  if (/unknown argument: \$1/.test(text) && (
+    script === "scripts/release/write-cloud-release-provenance.sh"
+    || script === "scripts/release/write-core-release-provenance.sh"
+    || script === "scripts/release/verify-cloud-release-provenance.sh"
+    || script === "scripts/release/verify-core-release-provenance.sh"
+  )) {
+    fail(`${script} must not echo unknown raw arguments`);
+  }
+  if (/verify_core_archive_members_before_extract "\$\{INPUT\}"/.test(text) === false && script === "scripts/release/verify-core-release.sh") {
+    fail(`${script} must verify archive members before extracting release tarballs`);
   }
   if (/malformed bundled checksum line/.test(text) === false && (script === "scripts/release/verify-core-release.sh" || script === "scripts/release/verify-buc-release.sh")) {
     fail(`${script} must reject malformed bundled SHA256SUMS records`);
@@ -1431,10 +1688,55 @@ for (const script of [
   if (/must be a stable artifact-local path/.test(text) === false && script === "scripts/release/write-release-asset-index.sh") {
     fail(`${script} must write only artifact-local release asset index paths`);
   }
+  if (/release-asset-index:\/\/source/.test(text) === false && script === "scripts/release/verify-release-asset-index.sh") {
+    fail(`${script} must report the release asset index using a public source ref`);
+  }
+  if (/release-asset-index:\/\/output/.test(text) === false && script === "scripts/release/write-release-asset-index.sh") {
+    fail(`${script} must report the written release asset index using a public output ref`);
+  }
+  if (/secret\|token\|password\|credential\|api/.test(text) === false && (script === "scripts/release/write-release-asset-index.sh" || script === "scripts/release/verify-release-asset-index.sh")) {
+    fail(`${script} must reject secret-like release asset names`);
+  }
+  if (/lstatSync/.test(text) === false && (script === "scripts/release/write-release-asset-index.sh" || script === "scripts/release/verify-release-asset-index.sh")) {
+    fail(`${script} must inspect release asset index files without following symlinks`);
+  }
+  if (/must not be a symlink/.test(text) === false && (script === "scripts/release/write-release-asset-index.sh" || script === "scripts/release/verify-release-asset-index.sh")) {
+    fail(`${script} must reject symlinked release asset index paths`);
+  }
+  if (/[^A-Za-z0-9_]statSync\(/.test(text) && (script === "scripts/release/write-release-asset-index.sh" || script === "scripts/release/verify-release-asset-index.sh")) {
+    fail(`${script} must not follow symlinks with statSync when inspecting release assets`);
+  }
+  if (/existsSync/.test(text) && script === "scripts/release/verify-release-asset-index.sh") {
+    fail(`${script} must not use existsSync before digest rechecks because it follows symlinks`);
+  }
+  if (/process\.env\.ROOT_DIR/.test(text) === false && script === "scripts/release/write-release-asset-index.sh") {
+    fail(`${script} must derive public release asset paths from the repository root`);
+  }
+  if (/process\.env\.ROOT_DIR/.test(text) === false && script === "scripts/release/write-cloud-image-promotion-evidence-index.sh") {
+    fail(`${script} must derive public promotion evidence paths from the repository root`);
+  }
+  if (/process\.cwd\(\)/.test(text) && (script === "scripts/release/write-cloud-release-provenance.sh" || script === "scripts/release/write-release-asset-index.sh" || script === "scripts/release/write-cloud-image-promotion-evidence-index.sh")) {
+    fail(`${script} must not derive public artifact paths from the caller current directory`);
+  }
+  if (/must not look like a host filesystem path/.test(text) === false && (script === "scripts/release/write-cloud-release-provenance.sh" || script === "scripts/release/write-release-asset-index.sh" || script === "scripts/release/write-cloud-image-promotion-evidence-index.sh" || script === "scripts/release/verify-cloud-release-provenance.sh" || script === "scripts/release/verify-release-asset-index.sh" || script === "scripts/release/verify-cloud-image-promotion-evidence-index.sh")) {
+    fail(`${script} must reject host-looking filesystem paths in public provenance indexes`);
+  }
+  if (/must match path basename/.test(text) === false && (script === "scripts/release/verify-release-asset-index.sh" || script === "scripts/release/verify-cloud-image-promotion-evidence-index.sh")) {
+    fail(`${script} must keep indexed public names aligned with their artifact paths`);
+  }
 }
 
 if (!/malformed checksum file/.test(installScriptText) || !/\$expected  \$asset/.test(installScriptText)) {
   fail(`${installScriptPath} must verify exact single-record archive checksum files`);
+}
+if (/\.bucephalus-install-staging\.\$\$/.test(installScriptText)) {
+  fail(`${installScriptPath} must not use predictable process-id install staging directories`);
+}
+if (!/mktemp -d "\$\{install_dir\}\/\.bucephalus-install-staging\.XXXXXX"/.test(installScriptText)) {
+  fail(`${installScriptPath} must create an install-dir-local random staging directory`);
+}
+if (!/chmod 700 "\$staging_dir"/.test(installScriptText)) {
+  fail(`${installScriptPath} must make install staging private before copying artifacts`);
 }
 
 for (const dockerfile of listFiles("bucephalus-cloud/images")) {
@@ -1553,3 +1855,333 @@ if [[ ! "${resolved_version}" =~ ^[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$
 fi
 
 ROOT_DIR="${ROOT_DIR}" bun "${VERIFY_JS}"
+
+mkdir -p "${WORK_DIR}/private"
+
+publish_bad_base_log="${WORK_DIR}/publish-bad-base.log"
+if "${ROOT_DIR}/scripts/release/verify-cloud-image-publish-inputs.sh" \
+  --repository "local/bucephalus-cloud" \
+  --base-image "ghp_raw-image-build-token" >"${publish_bad_base_log}" 2>&1; then
+  echo "image publish input verifier unexpectedly accepted an invalid base image" >&2
+  cat "${publish_bad_base_log}" >&2
+  exit 1
+fi
+if ! grep -Fq -- "--base-image must be digest-addressed" "${publish_bad_base_log}" || ! grep -Fq "base_image_ref: base-image://input" "${publish_bad_base_log}"; then
+  echo "image publish input verifier did not report invalid base images with a public ref" >&2
+  cat "${publish_bad_base_log}" >&2
+  exit 1
+fi
+if grep -Fq "ghp_raw-image-build-token" "${publish_bad_base_log}"; then
+  echo "image publish input verifier leaked a raw base image input" >&2
+  cat "${publish_bad_base_log}" >&2
+  exit 1
+fi
+
+publish_bad_repo_log="${WORK_DIR}/publish-bad-repo.log"
+if "${ROOT_DIR}/scripts/release/verify-cloud-image-publish-inputs.sh" \
+  --repository "https://user:raw-repo-token@example.com/repo" \
+  --base-image "example.com/bun@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  --push >"${publish_bad_repo_log}" 2>&1; then
+  echo "image publish input verifier unexpectedly accepted an invalid repository" >&2
+  cat "${publish_bad_repo_log}" >&2
+  exit 1
+fi
+if ! grep -Fq -- "--repository must be an image repository prefix" "${publish_bad_repo_log}" || ! grep -Fq "repository_ref: image-repository://input" "${publish_bad_repo_log}"; then
+  echo "image publish input verifier did not report invalid repositories with a public ref" >&2
+  cat "${publish_bad_repo_log}" >&2
+  exit 1
+fi
+if grep -Fq "raw-repo-token" "${publish_bad_repo_log}" || grep -Fq "example.com/repo" "${publish_bad_repo_log}"; then
+  echo "image publish input verifier leaked a raw repository input" >&2
+  cat "${publish_bad_repo_log}" >&2
+  exit 1
+fi
+
+base_policy_missing="${WORK_DIR}/private/base-policy-token.json"
+base_policy_missing_log="${WORK_DIR}/base-policy-missing.log"
+if "${ROOT_DIR}/scripts/release/verify-cloud-base-image-policy.sh" \
+  --base-image "example.com/bun@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  --policy "${base_policy_missing}" >"${base_policy_missing_log}" 2>&1; then
+  echo "base image policy verifier unexpectedly accepted a missing policy" >&2
+  cat "${base_policy_missing_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "base image policy does not exist" "${base_policy_missing_log}" || ! grep -Fq "policy_ref: base-image-policy://input" "${base_policy_missing_log}"; then
+  echo "base image policy verifier did not report missing policies with a public ref" >&2
+  cat "${base_policy_missing_log}" >&2
+  exit 1
+fi
+if grep -Fq "${WORK_DIR}" "${base_policy_missing_log}" || grep -Fq "base-policy-token" "${base_policy_missing_log}"; then
+  echo "base image policy verifier leaked a local policy path" >&2
+  cat "${base_policy_missing_log}" >&2
+  exit 1
+fi
+
+base_policy_target="${WORK_DIR}/private/base-policy-target.json"
+base_policy_link="${WORK_DIR}/private/base-policy-token-link.json"
+: > "${base_policy_target}"
+ln -s "${base_policy_target}" "${base_policy_link}"
+base_policy_symlink_log="${WORK_DIR}/base-policy-symlink.log"
+if "${ROOT_DIR}/scripts/release/verify-cloud-base-image-policy.sh" \
+  --base-image "example.com/bun@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  --policy "${base_policy_link}" >"${base_policy_symlink_log}" 2>&1; then
+  echo "base image policy verifier unexpectedly accepted a symlinked policy" >&2
+  cat "${base_policy_symlink_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "refusing to read base image policy through a symlinked path" "${base_policy_symlink_log}" || ! grep -Fq "policy_ref: base-image-policy://input" "${base_policy_symlink_log}"; then
+  echo "base image policy verifier did not reject symlinked policies with a public ref" >&2
+  cat "${base_policy_symlink_log}" >&2
+  exit 1
+fi
+if grep -Fq "${WORK_DIR}" "${base_policy_symlink_log}" || grep -Fq "base-policy-token-link" "${base_policy_symlink_log}"; then
+  echo "base image policy verifier leaked a local symlink policy path" >&2
+  cat "${base_policy_symlink_log}" >&2
+  exit 1
+fi
+
+missing_image_manifest="${WORK_DIR}/private/customer-token-cloud-image-build-manifest.json"
+missing_image_manifest_log="${WORK_DIR}/missing-image-manifest.log"
+if "${ROOT_DIR}/scripts/release/verify-cloud-image-build-manifest.sh" "${missing_image_manifest}" >"${missing_image_manifest_log}" 2>&1; then
+  echo "image build manifest verifier unexpectedly accepted a missing manifest" >&2
+  cat "${missing_image_manifest_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "image build manifest does not exist" "${missing_image_manifest_log}" || ! grep -Fq "image_manifest_ref: cloud-image-build-manifest://input" "${missing_image_manifest_log}"; then
+  echo "image build manifest verifier did not report missing manifests with a public ref" >&2
+  cat "${missing_image_manifest_log}" >&2
+  exit 1
+fi
+if grep -Fq "${WORK_DIR}" "${missing_image_manifest_log}" || grep -Fq "customer-token-cloud-image-build-manifest" "${missing_image_manifest_log}"; then
+  echo "image build manifest verifier leaked a local missing-manifest path" >&2
+  cat "${missing_image_manifest_log}" >&2
+  exit 1
+fi
+
+missing_image_release="${WORK_DIR}/private/customer-token-cloud-release.tar.gz"
+missing_image_release_log="${WORK_DIR}/missing-image-release.log"
+if "${ROOT_DIR}/scripts/release/build-cloud-images.sh" \
+  --release "${missing_image_release}" \
+  --repository "local/bucephalus-cloud" \
+  --base-image "example.com/bun@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  --out "${WORK_DIR}/private/image-build-token-output" >"${missing_image_release_log}" 2>&1; then
+  echo "cloud image builder unexpectedly accepted a missing release input" >&2
+  cat "${missing_image_release_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "release input does not exist" "${missing_image_release_log}" || ! grep -Fq "release_ref: release-input://source" "${missing_image_release_log}"; then
+  echo "cloud image builder did not report missing release inputs with a public ref" >&2
+  cat "${missing_image_release_log}" >&2
+  exit 1
+fi
+if grep -Fq "${WORK_DIR}" "${missing_image_release_log}" || grep -Fq "customer-token-cloud-release" "${missing_image_release_log}" || grep -Fq "image-build-token-output" "${missing_image_release_log}"; then
+  echo "cloud image builder leaked a local missing-release or output path" >&2
+  cat "${missing_image_release_log}" >&2
+  exit 1
+fi
+
+symlink_image_release="${WORK_DIR}/existing-release.tar.gz"
+symlink_image_target="${WORK_DIR}/private/outside-image-build-target"
+symlink_image_out="${WORK_DIR}/private/image-build-token-link"
+mkdir -p "${symlink_image_target}"
+: > "${symlink_image_release}"
+ln -s "${symlink_image_target}" "${symlink_image_out}"
+symlink_image_out_log="${WORK_DIR}/symlink-image-out.log"
+if "${ROOT_DIR}/scripts/release/build-cloud-images.sh" \
+  --release "${symlink_image_release}" \
+  --repository "local/bucephalus-cloud" \
+  --base-image "example.com/bun@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  --out "${symlink_image_out}" >"${symlink_image_out_log}" 2>&1; then
+  echo "cloud image builder unexpectedly accepted a symlinked output path" >&2
+  cat "${symlink_image_out_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "refusing to write image build output through a symlinked path" "${symlink_image_out_log}" || ! grep -Fq "output_ref: cloud-image-build://output" "${symlink_image_out_log}"; then
+  echo "cloud image builder did not reject symlinked output paths with a public ref" >&2
+  cat "${symlink_image_out_log}" >&2
+  exit 1
+fi
+if grep -Fq "${WORK_DIR}" "${symlink_image_out_log}" || grep -Fq "image-build-token-link" "${symlink_image_out_log}" || grep -Fq "outside-image-build-target" "${symlink_image_out_log}"; then
+  echo "cloud image builder leaked a local symlink output path" >&2
+  cat "${symlink_image_out_log}" >&2
+  exit 1
+fi
+
+image_build_unknown_arg_log="${WORK_DIR}/image-build-unknown-arg.log"
+if "${ROOT_DIR}/scripts/release/build-cloud-images.sh" --token=raw-image-build-token >"${image_build_unknown_arg_log}" 2>&1; then
+  echo "cloud image builder unexpectedly accepted an unknown argument" >&2
+  cat "${image_build_unknown_arg_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "unknown argument" "${image_build_unknown_arg_log}" || grep -Fq "raw-image-build-token" "${image_build_unknown_arg_log}"; then
+  echo "cloud image builder unknown-argument output was not public-safe" >&2
+  cat "${image_build_unknown_arg_log}" >&2
+  exit 1
+fi
+
+tfvars_manifest="${WORK_DIR}/private/cloud-image-build-manifest-token.json"
+: > "${tfvars_manifest}"
+tfvars_missing="${WORK_DIR}/private/gcp-image-digests-token.tfvars"
+tfvars_missing_log="${WORK_DIR}/tfvars-missing.log"
+if "${ROOT_DIR}/scripts/release/verify-gcp-image-tfvars.sh" \
+  --image-manifest "${tfvars_manifest}" \
+  --tfvars "${tfvars_missing}" >"${tfvars_missing_log}" 2>&1; then
+  echo "GCP image tfvars verifier unexpectedly accepted a missing tfvars file" >&2
+  cat "${tfvars_missing_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "tfvars file does not exist" "${tfvars_missing_log}" || ! grep -Fq "tfvars_ref: tfvars://gcp-image-digests" "${tfvars_missing_log}"; then
+  echo "GCP image tfvars verifier did not report missing tfvars with a public ref" >&2
+  cat "${tfvars_missing_log}" >&2
+  exit 1
+fi
+if grep -Fq "${WORK_DIR}" "${tfvars_missing_log}" || grep -Fq "gcp-image-digests-token" "${tfvars_missing_log}" || grep -Fq "cloud-image-build-manifest-token" "${tfvars_missing_log}"; then
+  echo "GCP image tfvars verifier leaked a local tfvars or manifest path" >&2
+  cat "${tfvars_missing_log}" >&2
+  exit 1
+fi
+
+tfvars_out_target="${WORK_DIR}/private/tfvars-outside-target"
+tfvars_out_link="${WORK_DIR}/private/gcp-image-digests-token-link.tfvars"
+: > "${tfvars_out_target}"
+ln -s "${tfvars_out_target}" "${tfvars_out_link}"
+tfvars_out_log="${WORK_DIR}/tfvars-output-symlink.log"
+if "${ROOT_DIR}/scripts/release/write-gcp-image-tfvars.sh" \
+  --image-manifest "${tfvars_manifest}" \
+  --out "${tfvars_out_link}" >"${tfvars_out_log}" 2>&1; then
+  echo "GCP image tfvars writer unexpectedly accepted a symlinked output path" >&2
+  cat "${tfvars_out_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "tfvars output must not be a symlink" "${tfvars_out_log}" || ! grep -Fq "tfvars_ref: tfvars://gcp-image-digests" "${tfvars_out_log}"; then
+  echo "GCP image tfvars writer did not reject symlinked output with a public ref" >&2
+  cat "${tfvars_out_log}" >&2
+  exit 1
+fi
+if grep -Fq "${WORK_DIR}" "${tfvars_out_log}" || grep -Fq "gcp-image-digests-token-link" "${tfvars_out_log}" || grep -Fq "tfvars-outside-target" "${tfvars_out_log}"; then
+  echo "GCP image tfvars writer leaked a local output path" >&2
+  cat "${tfvars_out_log}" >&2
+  exit 1
+fi
+
+promotion_manifest="${WORK_DIR}/private/promotion-manifest-token.json"
+promotion_tfvars="${WORK_DIR}/private/promotion-tfvars-token.tfvars"
+promotion_provenance="${WORK_DIR}/private/promotion-provenance-token.json"
+: > "${promotion_manifest}"
+: > "${promotion_tfvars}"
+promotion_missing_log="${WORK_DIR}/promotion-missing-provenance.log"
+if "${ROOT_DIR}/scripts/release/verify-gcp-image-promotion-evidence.sh" \
+  --image-manifest "${promotion_manifest}" \
+  --image-provenance "${promotion_provenance}" \
+  --tfvars "${promotion_tfvars}" >"${promotion_missing_log}" 2>&1; then
+  echo "GCP image promotion verifier unexpectedly accepted a missing provenance file" >&2
+  cat "${promotion_missing_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "image provenance does not exist" "${promotion_missing_log}" || ! grep -Fq "image_provenance_ref: release-provenance://input" "${promotion_missing_log}"; then
+  echo "GCP image promotion verifier did not report missing provenance with a public ref" >&2
+  cat "${promotion_missing_log}" >&2
+  exit 1
+fi
+if grep -Fq "${WORK_DIR}" "${promotion_missing_log}" || grep -Fq "promotion-provenance-token" "${promotion_missing_log}" || grep -Fq "promotion-manifest-token" "${promotion_missing_log}" || grep -Fq "promotion-tfvars-token" "${promotion_missing_log}"; then
+  echo "GCP image promotion verifier leaked a local evidence path" >&2
+  cat "${promotion_missing_log}" >&2
+  exit 1
+fi
+
+promotion_tfvars_target="${WORK_DIR}/private/promotion-tfvars-target"
+promotion_tfvars_link="${WORK_DIR}/private/promotion-tfvars-token-link.tfvars"
+: > "${promotion_tfvars_target}"
+ln -s "${promotion_tfvars_target}" "${promotion_tfvars_link}"
+promotion_tfvars_link_log="${WORK_DIR}/promotion-tfvars-link.log"
+if "${ROOT_DIR}/scripts/release/verify-gcp-image-promotion-evidence.sh" \
+  --image-manifest "${promotion_manifest}" \
+  --image-provenance "${promotion_manifest}" \
+  --tfvars "${promotion_tfvars_link}" >"${promotion_tfvars_link_log}" 2>&1; then
+  echo "GCP image promotion verifier unexpectedly accepted a symlinked tfvars file" >&2
+  cat "${promotion_tfvars_link_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "promotion tfvars must not be a symlink" "${promotion_tfvars_link_log}" || ! grep -Fq "tfvars_ref: tfvars://gcp-image-digests" "${promotion_tfvars_link_log}"; then
+  echo "GCP image promotion verifier did not reject symlinked tfvars with a public ref" >&2
+  cat "${promotion_tfvars_link_log}" >&2
+  exit 1
+fi
+if grep -Fq "${WORK_DIR}" "${promotion_tfvars_link_log}" || grep -Fq "promotion-tfvars-token-link" "${promotion_tfvars_link_log}" || grep -Fq "promotion-tfvars-target" "${promotion_tfvars_link_log}"; then
+  echo "GCP image promotion verifier leaked a local symlink tfvars path" >&2
+  cat "${promotion_tfvars_link_log}" >&2
+  exit 1
+fi
+
+missing_index="${WORK_DIR}/private/customer-token-release-assets.json"
+missing_index_log="${WORK_DIR}/missing-index.log"
+if "${ROOT_DIR}/scripts/release/verify-release-asset-index.sh" "${missing_index}" >"${missing_index_log}" 2>&1; then
+  echo "release asset index verifier unexpectedly accepted a missing index" >&2
+  cat "${missing_index_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "release asset index does not exist: release-asset-index://source" "${missing_index_log}"; then
+  echo "release asset index verifier did not report missing indexes with a public ref" >&2
+  cat "${missing_index_log}" >&2
+  exit 1
+fi
+if grep -Fq "${WORK_DIR}" "${missing_index_log}" || grep -Fq "customer-token-release-assets" "${missing_index_log}"; then
+  echo "release asset index verifier leaked a local missing-index path" >&2
+  cat "${missing_index_log}" >&2
+  exit 1
+fi
+
+unsafe_index="${WORK_DIR}/unsafe-index.json"
+UNSAFE_INDEX="${unsafe_index}" bun -e '
+import { createHash } from "node:crypto";
+const digest = "a".repeat(64);
+const record = {
+  schema_version: "bucephalus_release_asset_index_v1",
+  predicate_type: "https://bucephalus.dev/provenance/release-assets/v1",
+  generated_at: "2026-06-09T00:00:00.000Z",
+  asset_roots: ["dist/releases"],
+  required_targets: { core: [], cloud: [] },
+  assets: [{
+    kind: "core",
+    name: "token-secret-release.tar.gz",
+    path: "dist/releases/token-secret-release.tar.gz",
+    sha256: digest,
+    checksum: {
+      path: "dist/releases/token-secret-release.tar.gz.sha256",
+      value: digest,
+      sha256: digest,
+    },
+    provenance: {
+      path: "dist/releases/token-secret-release.provenance.json",
+      sha256: digest,
+      schema_version: "bucephalus_core_release_provenance_v1",
+      predicate_type: "https://bucephalus.dev/provenance/core-release/v1",
+      version: "0.0.0-test",
+      target: "x86_64-unknown-linux-gnu",
+      git_sha: "b".repeat(40),
+      git_dirty: false,
+      signature_status: "unsigned",
+    },
+  }],
+  signature: { status: "unsigned" },
+  index_sha256: null,
+};
+record.index_sha256 = createHash("sha256").update(JSON.stringify(record)).digest("hex");
+await Bun.write(process.env.UNSAFE_INDEX, `${JSON.stringify(record, null, 2)}\n`);
+'
+unsafe_index_log="${WORK_DIR}/unsafe-index.log"
+if "${ROOT_DIR}/scripts/release/verify-release-asset-index.sh" "${unsafe_index}" >"${unsafe_index_log}" 2>&1; then
+  echo "release asset index verifier unexpectedly accepted a secret-like asset name" >&2
+  cat "${unsafe_index_log}" >&2
+  exit 1
+fi
+if ! grep -Fq "assets[0].path contains a forbidden release asset name" "${unsafe_index_log}"; then
+  echo "release asset index verifier did not reject secret-like asset names clearly" >&2
+  cat "${unsafe_index_log}" >&2
+  exit 1
+fi
+if grep -Fq "${WORK_DIR}" "${unsafe_index_log}" || grep -Fq "token-secret-release" "${unsafe_index_log}"; then
+  echo "release asset index verifier leaked a local path or secret-like asset name" >&2
+  cat "${unsafe_index_log}" >&2
+  exit 1
+fi

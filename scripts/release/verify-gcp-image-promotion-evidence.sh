@@ -17,6 +17,18 @@ image tfvars all describe the same digest-addressed promotion input set.
 USAGE
 }
 
+public_image_manifest_input_ref() {
+  printf '%s\n' "cloud-image-build-manifest://input"
+}
+
+public_image_provenance_input_ref() {
+  printf '%s\n' "release-provenance://input"
+}
+
+public_tfvars_input_ref() {
+  printf '%s\n' "tfvars://gcp-image-digests"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --image-manifest)
@@ -36,7 +48,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "unknown argument: $1" >&2
+      echo "unknown argument" >&2
       usage >&2
       exit 2
       ;;
@@ -48,12 +60,25 @@ if [[ -z "${MANIFEST}" || -z "${PROVENANCE}" || -z "${TFVARS}" ]]; then
   exit 2
 fi
 
-for file in "${MANIFEST}" "${PROVENANCE}" "${TFVARS}"; do
-  if [[ ! -f "${file}" ]]; then
-    echo "promotion evidence file does not exist: ${file}" >&2
+verify_promotion_input_file() {
+  local file="$1"
+  local label="$2"
+  local ref="$3"
+  if [[ -L "${file}" ]]; then
+    echo "${label} must not be a symlink" >&2
+    echo "${ref}" >&2
     exit 2
   fi
-done
+  if [[ ! -f "${file}" ]]; then
+    echo "${label} does not exist" >&2
+    echo "${ref}" >&2
+    exit 2
+  fi
+}
+
+verify_promotion_input_file "${MANIFEST}" "image manifest" "image_manifest_ref: $(public_image_manifest_input_ref)"
+verify_promotion_input_file "${PROVENANCE}" "image provenance" "image_provenance_ref: $(public_image_provenance_input_ref)"
+verify_promotion_input_file "${TFVARS}" "promotion tfvars" "tfvars_ref: $(public_tfvars_input_ref)"
 
 if ! command -v bun >/dev/null 2>&1; then
   echo "required command not found: bun" >&2
@@ -66,13 +91,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 MANIFEST="${MANIFEST}" PROVENANCE="${PROVENANCE}" TFVARS="${TFVARS}" bun -e '
 import { createHash } from "node:crypto";
+import { lstatSync } from "node:fs";
 
 const manifestPath = process.env.MANIFEST;
 const provenancePath = process.env.PROVENANCE;
 const tfvarsPath = process.env.TFVARS;
-const manifest = JSON.parse(await Bun.file(manifestPath).text());
-const provenance = JSON.parse(await Bun.file(provenancePath).text());
-const tfvarsText = await Bun.file(tfvarsPath).text();
 const digestRef = /^.+@sha256:[a-f0-9]{64}$/;
 const digest = /^sha256:[a-f0-9]{64}$/;
 const zeroDigestRef = /^.+@sha256:0{64}$/;
@@ -91,9 +114,34 @@ function fail(message) {
   process.exit(1);
 }
 
-async function hashFile(path) {
+function requireRegularFile(path, label) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    fail(`${label} does not exist or cannot be inspected`);
+  }
+  if (stat.isSymbolicLink()) {
+    fail(`${label} must not be a symlink`);
+  }
+  if (!stat.isFile()) {
+    fail(`${label} must be a regular file`);
+  }
+}
+
+async function readTextFile(path, label) {
+  requireRegularFile(path, label);
+  return Bun.file(path).text();
+}
+
+async function hashFile(path, label) {
+  requireRegularFile(path, label);
   return createHash("sha256").update(Buffer.from(await Bun.file(path).arrayBuffer())).digest("hex");
 }
+
+const manifest = JSON.parse(await readTextFile(manifestPath, "image manifest"));
+const provenance = JSON.parse(await readTextFile(provenancePath, "image provenance"));
+const tfvarsText = await readTextFile(tfvarsPath, "promotion tfvars");
 
 function parseTfvars(text) {
   const assignments = new Map();
@@ -104,7 +152,7 @@ function parseTfvars(text) {
     }
     const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]+)"$/);
     if (!match) {
-      fail(`unsupported promotion tfvars line ${lineNumber + 1}: ${rawLine}`);
+      fail(`unsupported promotion tfvars line ${lineNumber + 1}`);
     }
     const [, name, value] = match;
     if (!deployVariables.has(name)) {
@@ -141,7 +189,7 @@ if (manifest.pushed !== true) {
 if (provenance.image_build?.pushed !== true) {
   fail("promotion evidence requires pushed image provenance");
 }
-if (provenance.image_build.manifest_sha256 !== await hashFile(manifestPath)) {
+if (provenance.image_build.manifest_sha256 !== await hashFile(manifestPath, "image manifest")) {
   fail("image provenance manifest_sha256 does not match image manifest");
 }
 if (provenance.release?.version !== manifest.release.version) {
@@ -241,7 +289,7 @@ if (provenance.signature?.status !== "unsigned") {
   fail("image build provenance must remain unsigned until signing is configured");
 }
 
-console.log(`verified GCP image promotion evidence ${manifestPath}`);
+console.log("verified GCP image promotion evidence promotion-evidence://gcp-image-promotion");
 '
 
 "${ROOT_DIR}/scripts/release/verify-gcp-image-tfvars.sh" \

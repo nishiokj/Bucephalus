@@ -10,17 +10,68 @@ use crate::config::{apply_experiment_overrides, find_project_root, normalize_pat
 use crate::model::LoadedExperimentInput;
 use crate::package::cas::should_include_agent_artifact_path;
 
+fn public_build_input_ref(_path: &Path) -> &'static str {
+    "workspace://experiment"
+}
+
+fn public_experiment_dir_ref(_path: &Path) -> &'static str {
+    "workspace://experiment-dir"
+}
+
+fn public_project_root_ref(_path: &Path) -> &'static str {
+    "workspace://project-root"
+}
+
+fn public_ref_path_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "item".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn public_authoring_source_ref(rel: &str) -> String {
+    let parts = rel
+        .replace('\\', "/")
+        .split('/')
+        .filter_map(|part| match part {
+            "" | "." => None,
+            ".." => Some("parent".to_string()),
+            value => Some(public_ref_path_component(value)),
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "source://input".to_string()
+    } else {
+        format!("source://{}", parts.join("/"))
+    }
+}
+
 pub(crate) fn load_authoring_input_for_build(
     path: &Path,
     overrides_path: Option<&Path>,
 ) -> Result<LoadedExperimentInput> {
     let canonical = path
         .canonicalize()
-        .with_context(|| format!("resolve build input path '{}'", path.display()))?;
+        .with_context(|| {
+            format!(
+                "resolve build input path\n\ntarget_ref: {}\n\nNext steps:\n  bucephalus init <workspace-dir>\n  bucephalus build <experiment-yaml> --out <package-dir>",
+                public_build_input_ref(path)
+            )
+        })?;
     if canonical.is_dir() {
         return Err(anyhow!(
-            "build_input_invalid_kind: expected v1 experiment YAML file, got directory '{}'",
-            canonical.display()
+            "build_input_invalid_kind: expected v1 experiment YAML file, got directory\n\ntarget_ref: {}\n\nRun `bucephalus build <experiment-yaml> --out <package-dir>` from an experiment YAML file, or create one with `bucephalus init <workspace-dir>`.",
+            public_build_input_ref(&canonical)
         ));
     }
 
@@ -38,11 +89,19 @@ pub(crate) fn load_authoring_input_for_build(
         .parent()
         .ok_or_else(|| anyhow!("build input has no parent directory"))?
         .canonicalize()
-        .with_context(|| format!("resolve experiment directory for '{}'", canonical.display()))?;
+        .with_context(|| {
+            format!(
+                "resolve experiment directory\n\ntarget_ref: {}",
+                public_experiment_dir_ref(&canonical)
+            )
+        })?;
     let project_root = find_project_root(&exp_dir);
-    let project_root = project_root
-        .canonicalize()
-        .with_context(|| format!("resolve project root '{}'", project_root.display()))?;
+    let project_root = project_root.canonicalize().with_context(|| {
+        format!(
+            "resolve project root\n\nproject_ref: {}",
+            public_project_root_ref(&project_root)
+        )
+    })?;
     let raw_yaml = fs::read_to_string(&canonical)?;
     let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
     let json_value: Value = serde_json::to_value(yaml_value)?;
@@ -527,14 +586,29 @@ pub(crate) fn resolve_agent_artifact_path(raw: &str, exp_dir: &Path) -> Result<P
     Ok(normalize_path(&direct))
 }
 
+pub(crate) fn public_agent_artifact_ref(_path: &Path) -> &'static str {
+    "artifact://source"
+}
+
+fn public_agent_artifact_path_ref(root: &Path, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return "artifact://outside-root".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return "artifact://.".to_string();
+    }
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    format!("artifact://{rel}")
+}
+
 pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
     if path.is_file() {
         return sha256_file(path);
     }
     if !path.is_dir() {
         return Err(anyhow!(
-            "artifact path must be a file or directory: {}",
-            path.display()
+            "artifact path must be a file or directory\n\nartifact_ref: {}",
+            public_agent_artifact_ref(path)
         ));
     }
 
@@ -553,8 +627,8 @@ pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
             .with_context(|| {
                 format!(
                     "artifact entry {} escaped root {}",
-                    p.display(),
-                    path.display()
+                    public_agent_artifact_path_ref(path, p),
+                    public_agent_artifact_path_ref(path, path)
                 )
             })?
             .to_string_lossy()
@@ -562,7 +636,12 @@ pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
         let meta = fs::symlink_metadata(p)?;
         if meta.file_type().is_symlink() {
             let target = fs::read_link(p)
-                .with_context(|| format!("read artifact symlink target {}", p.display()))?
+                .with_context(|| {
+                    format!(
+                        "read artifact symlink target {}",
+                        public_agent_artifact_path_ref(path, p)
+                    )
+                })?
                 .to_string_lossy()
                 .to_string();
             lines.push(format!("L {} -> {}", rel, target));
@@ -596,26 +675,28 @@ pub(crate) fn resolve_existing_public_path_reference(
         return Ok(None);
     }
     let rel = validate_public_authoring_relpath(trimmed, field_name)?;
+    let source_ref = public_authoring_source_ref(&rel);
     let resolved = normalize_path(&exp_dir.join(&rel));
     match fs::metadata(&resolved) {
         Ok(_) => Ok(Some(PathBuf::from(rel))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if trimmed.starts_with("./") || trimmed.contains('/') {
                 return Err(anyhow!(
-                    "{} public path '{}' resolved to missing source '{}'",
+                    "package build missing {} public path reference\n\nsource_ref: {}\nresolved_ref: {}\n\nNext steps:\n  Create the referenced file under the experiment workspace, or remove it from {}.",
                     field_name,
-                    trimmed,
-                    resolved.display()
+                    source_ref,
+                    source_ref,
+                    field_name
                 ));
             }
             Ok(None)
         }
         Err(err) => Err(err).with_context(|| {
             format!(
-                "failed to read {} public path reference '{}' resolved to '{}'",
+                "package build failed to read {} public path reference\n\nsource_ref: {}\nresolved_ref: {}",
                 field_name,
-                trimmed,
-                resolved.display()
+                source_ref,
+                source_ref
             )
         }),
     }
@@ -653,6 +734,20 @@ pub(crate) fn validate_public_authoring_relpath(raw: &str, field_name: &str) -> 
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "bucephalus_authoring_{}_{}_{}",
+            label,
+            std::process::id(),
+            nanos
+        ))
+    }
 
     #[test]
     fn normalizes_case_stage_ephemeral_authoring_nouns() {
@@ -842,6 +937,48 @@ mod tests {
             json!({"traces": { "source": "protocol" }, "stages": { "agent": { "command": ["agent"] } }}),
             "/traces.source=protocol requires agent.protocol",
         );
+    }
+
+    #[test]
+    fn public_path_reference_missing_source_uses_public_refs() {
+        let root = temp_dir("missing_public_path_ref");
+        let exp_dir = root.join("private-workspace");
+        fs::create_dir_all(&exp_dir).expect("experiment dir");
+        let raw_ref = "./support/private-config.json";
+
+        let err = resolve_existing_public_path_reference(
+            raw_ref,
+            &exp_dir,
+            "trial_runtime.agent.command[1]",
+        )
+        .expect_err("missing explicit public path should fail");
+        let message = err.to_string();
+
+        assert!(message.contains(
+            "package build missing trial_runtime.agent.command[1] public path reference"
+        ));
+        assert!(message.contains("source_ref: source://support/private-config.json"));
+        assert!(message.contains("resolved_ref: source://support/private-config.json"));
+        assert!(message.contains("Create the referenced file under the experiment workspace"));
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "public path error leaked fixture root: {message}"
+        );
+        assert!(
+            !message.contains(
+                &exp_dir
+                    .join("support/private-config.json")
+                    .display()
+                    .to_string()
+            ),
+            "public path error leaked resolved host path: {message}"
+        );
+        assert!(
+            !message.contains("resolved to missing source"),
+            "public path error should not use raw resolved-path wording: {message}"
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]

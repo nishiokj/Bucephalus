@@ -17,6 +17,18 @@ signed by the registry/promotion system once that boundary exists.
 USAGE
 }
 
+public_release_input_ref() {
+  printf '%s\n' "release-input://source"
+}
+
+public_provenance_output_ref() {
+  printf '%s\n' "release-provenance://output"
+}
+
+public_image_manifest_ref() {
+  printf '%s\n' "cloud-image-build-manifest://source"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --release)
@@ -36,7 +48,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "unknown argument: $1" >&2
+      echo "unknown argument" >&2
       usage >&2
       exit 2
       ;;
@@ -78,6 +90,24 @@ fi
 require_command bun
 require_command tar
 
+if [[ ! -e "${RELEASE_INPUT}" ]]; then
+  echo "release input does not exist" >&2
+  echo "release_ref: $(public_release_input_ref)" >&2
+  exit 2
+fi
+
+if [[ -n "${IMAGE_MANIFEST}" && ! -e "${IMAGE_MANIFEST}" ]]; then
+  echo "image build manifest does not exist" >&2
+  echo "image_manifest_ref: $(public_image_manifest_ref)" >&2
+  exit 2
+fi
+
+if [[ -L "${OUT_PATH}" ]]; then
+  echo "refusing to write provenance through a symlinked output path" >&2
+  echo "provenance_ref: $(public_provenance_output_ref)" >&2
+  exit 1
+fi
+
 "${ROOT_DIR}/scripts/release/verify-buc-release.sh" "${RELEASE_INPUT}"
 
 RELEASE_ARCHIVE_SHA=""
@@ -93,7 +123,8 @@ else
 fi
 
 if [[ -z "${RELEASE_DIR}" || ! -f "${RELEASE_DIR}/release-manifest.json" ]]; then
-  echo "could not resolve release directory from ${RELEASE_INPUT}" >&2
+  echo "could not resolve release directory" >&2
+  echo "release_ref: $(public_release_input_ref)" >&2
   exit 1
 fi
 
@@ -103,14 +134,24 @@ if [[ -n "${IMAGE_MANIFEST}" ]]; then
   IMAGE_MANIFEST_SHA="$(sha256_file "${IMAGE_MANIFEST}")"
 fi
 
-mkdir -p "$(dirname "${OUT_PATH}")"
+if [[ -e "${OUT_PATH}" && ! -f "${OUT_PATH}" ]]; then
+  echo "refusing to write provenance to a non-file output path" >&2
+  echo "provenance_ref: $(public_provenance_output_ref)" >&2
+  exit 1
+fi
+
+if ! mkdir -p "$(dirname "${OUT_PATH}")" 2>/dev/null; then
+  echo "failed to prepare provenance output directory" >&2
+  echo "provenance_ref: $(public_provenance_output_ref)" >&2
+  exit 1
+fi
 if [[ -z "${WORK_DIR}" ]]; then
   WORK_DIR="$(mktemp -d)"
 fi
 WRITE_JS="${WORK_DIR}/write-cloud-release-provenance.mjs"
 cat > "${WRITE_JS}" <<'JS'
 import { createHash } from "node:crypto";
-import { relative } from "node:path";
+import { relative, resolve } from "node:path";
 
 const releaseManifestPath = `${process.env.RELEASE_DIR}/release-manifest.json`;
 const releaseManifest = JSON.parse(await Bun.file(releaseManifestPath).text());
@@ -120,6 +161,7 @@ const imageManifest = imageManifestPath
   : null;
 const sourceRelease = imageManifest?.source_release ?? null;
 const isGithubActions = process.env.GITHUB_ACTIONS === "true";
+const rootDir = resolve(process.env.ROOT_DIR);
 
 function sha256Text(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -129,12 +171,21 @@ function artifactPath(path, label) {
   if (path === "") {
     return "";
   }
-  const normalized = relative(process.cwd(), path).split("\\").join("/");
+  const normalized = relative(rootDir, resolve(path)).split("\\").join("/");
   if (normalized === "" || normalized.startsWith("/") || normalized.includes("..") || normalized.includes("\\")) {
     console.error(`${label} must be a stable artifact-local path`);
     process.exit(1);
   }
+  if (looksLikeHostPath(normalized)) {
+    console.error(`${label} must not look like a host filesystem path`);
+    process.exit(1);
+  }
   return normalized;
+}
+
+function looksLikeHostPath(value) {
+  const normalized = value.replace(/^\.\//, "");
+  return /^(Users|home|private|tmp|var\/folders|Volumes|Desktop|Documents|Downloads|runner\/work|github\/workspace)\//.test(normalized);
 }
 
 const provenance = {
@@ -211,8 +262,9 @@ RELEASE_ARCHIVE_SHA="${RELEASE_ARCHIVE_SHA}" \
 RELEASE_MANIFEST_SHA="$(sha256_file "${RELEASE_DIR}/release-manifest.json")" \
 IMAGE_MANIFEST="${IMAGE_MANIFEST}" \
 IMAGE_MANIFEST_SHA="${IMAGE_MANIFEST_SHA}" \
+ROOT_DIR="${ROOT_DIR}" \
 OUT_PATH="${OUT_PATH}" \
 bun "${WRITE_JS}"
 
 "${ROOT_DIR}/scripts/release/verify-cloud-release-provenance.sh" "${OUT_PATH}" --release "${RELEASE_INPUT}"
-echo "provenance=${OUT_PATH}"
+echo "provenance=$(public_provenance_output_ref)"

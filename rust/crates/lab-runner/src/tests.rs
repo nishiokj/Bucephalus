@@ -101,8 +101,9 @@ mod tests {
     use crate::experiment::control::*;
     use crate::experiment::lease::{
         acquire_run_operation_lease, engine_lease_is_stale, operation_lease_is_stale,
-        operation_lease_path, start_engine_lease_heartbeat_with_writer, EngineLeaseRecord,
-        OperationLeaseRecord, RunOperationType,
+        operation_lease_path, operation_lease_public_label,
+        start_engine_lease_heartbeat_with_writer, EngineLeaseRecord, OperationLeaseRecord,
+        RunOperationType,
     };
     use crate::experiment::preflight::*;
     use crate::experiment::runner::*;
@@ -155,13 +156,15 @@ mod tests {
         modal_launch_spec_with_grading_for_test, modal_launcher_go_source_for_test,
         modal_launcher_log_tail_bytes_for_test, modal_launcher_command_for_test,
         parse_modal_sandbox_result_for_test, planned_modal_active_sandbox_units_for_test,
-        read_captured_file_value_for_test, read_modal_launcher_log_tail_for_test,
-        record_modal_sandbox_cleanup, run_modal_launcher_command_for_test, ModalExecutionBackend,
+        read_captured_file_value_for_test, read_captured_file_value_with_container_for_test,
+        read_modal_launcher_log_tail_for_test, record_modal_sandbox_cleanup,
+        run_modal_cleanup_for_test, run_modal_launcher_command_for_test, ModalExecutionBackend,
         S3CompatibleRuntimeSync, BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
+        write_modal_launch_specs_for_test,
     };
     use crate::trial::execution::{
-        map_container_path_to_host, persist_attempt_state, resolve_agent_artifact_mount_dir,
-        run_host_grader, validate_container_workspace_path,
+        captured_transport_output_json_for_test, map_container_path_to_host, persist_attempt_state,
+        resolve_agent_artifact_mount_dir, run_host_grader, validate_container_workspace_path,
     };
     use crate::trial::grade::grading_retry_inputs;
     use crate::trial::layout::*;
@@ -1156,6 +1159,218 @@ mod tests {
     }
 
     #[test]
+    fn modal_persisted_launch_spec_redacts_local_paths() {
+        let root = TempDirGuard::new("bucephalus_modal_persisted_launch_ref");
+        let modal_dir = root.path.join("trial").join("modal");
+        let private = json!({
+            "runtime_transfer_archive": root.path.join("private").join("runtime_transfer.tar.gz"),
+            "runtime_files": [{
+                "local_path": root.path.join("private").join("in"),
+                "remote_path": BUCEPHALUS_CONTRACT_IN_DIR,
+                "priority": "runtime_transfer"
+            }],
+            "execs": [{
+                "stdout": {
+                    "remote_path": "/bucephalus/out/stdout.log",
+                    "local_path": root.path.join("private").join("stdout.log")
+                }
+            }],
+            "result": {
+                "remote_path": BUCEPHALUS_RESULT_PATH,
+                "local_path": root.path.join("private").join("result.json")
+            },
+            "events": {
+                "scratch_path": BUCEPHALUS_TRAJECTORY_PATH,
+                "local_path": root.path.join("private").join("events.jsonl")
+            },
+            "transport_envelope": {
+                "remote_path": "/bucephalus/out/runtime_transport_envelope.json",
+                "local_path": root.path.join("private").join("runtime_transport_envelope.json")
+            }
+        });
+
+        let (public, private_spec_cleaned) =
+            write_modal_launch_specs_for_test(&modal_dir, &private).expect("write launch specs");
+        let encoded = public.to_string();
+
+        assert!(
+            private_spec_cleaned,
+            "private Modal launch spec was not cleaned up"
+        );
+        assert!(public.get("runtime_transfer_archive").is_none());
+        assert_eq!(
+            public.pointer("/runtime_transfer_archive_ref"),
+            Some(&json!("modal://runtime-transfer-archive"))
+        );
+        assert!(public.pointer("/runtime_files/0/local_path").is_none());
+        assert_eq!(
+            public.pointer("/runtime_files/0/local_ref"),
+            Some(&json!("contract://in"))
+        );
+        assert!(public.pointer("/result/local_path").is_none());
+        assert_eq!(
+            public.pointer("/result/local_ref"),
+            Some(&json!("contract://out/result.json"))
+        );
+        assert_eq!(
+            public.pointer("/events/local_ref"),
+            Some(&json!("contract://events/trajectory.jsonl"))
+        );
+        assert!(
+            !encoded.contains(&root.path.display().to_string()),
+            "persisted Modal launch spec leaked fixture root: {encoded}"
+        );
+        assert!(
+            !encoded.contains("private"),
+            "persisted Modal launch spec leaked private path segment: {encoded}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modal_launch_spec_writer_refuses_symlinked_public_spec() {
+        let root = TempDirGuard::new("bucephalus_modal_public_spec_symlink");
+        let modal_dir = root.path.join("trial").join("modal");
+        ensure_dir(&modal_dir).expect("modal dir");
+        let outside = root.path.join("outside");
+        ensure_dir(&outside).expect("outside dir");
+        let outside_spec = outside.join("launch.json");
+        fs::write(&outside_spec, "{}\n").expect("outside spec");
+        symlink(&outside_spec, modal_dir.join("launch.json")).expect("public spec symlink");
+
+        let err = write_modal_launch_specs_for_test(
+            &modal_dir,
+            &json!({
+                "runtime_files": [],
+                "result": {
+                    "remote_path": BUCEPHALUS_RESULT_PATH,
+                    "local_path": root.path.join("private").join("result.json")
+                }
+            }),
+        )
+        .expect_err("symlinked public Modal launch spec should be refused");
+        let msg = err.to_string();
+
+        assert!(msg.contains("symlinked file"));
+        assert!(msg.contains("artifact_ref: modal://launch-spec/public"));
+        assert_eq!(fs::read_to_string(&outside_spec).unwrap(), "{}\n");
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "public Modal launch spec error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&outside.display().to_string()),
+            "public Modal launch spec error leaked symlink target: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modal_launch_spec_writer_refuses_symlinked_private_spec() {
+        let root = TempDirGuard::new("bucephalus_modal_private_spec_symlink");
+        let modal_dir = root.path.join("trial").join("modal");
+        ensure_dir(&modal_dir).expect("modal dir");
+        let outside = root.path.join("outside");
+        ensure_dir(&outside).expect("outside dir");
+        let outside_spec = outside.join("launch.private.json");
+        fs::write(&outside_spec, "{\"secret\":true}\n").expect("outside spec");
+        symlink(&outside_spec, modal_dir.join("launch.private.json"))
+            .expect("private spec symlink");
+
+        let err = write_modal_launch_specs_for_test(
+            &modal_dir,
+            &json!({
+                "runtime_files": [],
+                "result": {
+                    "remote_path": BUCEPHALUS_RESULT_PATH,
+                    "local_path": root.path.join("private").join("result.json")
+                }
+            }),
+        )
+        .expect_err("symlinked private Modal launch spec should be refused");
+        let msg = err.to_string();
+
+        assert!(msg.contains("symlinked file"));
+        assert!(msg.contains("artifact_ref: modal://launch-spec/private"));
+        assert_eq!(
+            fs::read_to_string(&outside_spec).unwrap(),
+            "{\"secret\":true}\n"
+        );
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "private Modal launch spec error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&outside.display().to_string()),
+            "private Modal launch spec error leaked symlink target: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modal_cleanup_writer_refuses_symlinked_cleanup_spec() {
+        let root = TempDirGuard::new("bucephalus_modal_cleanup_spec_symlink");
+        let trial_dir = root.path.join("trial");
+        let modal_dir = trial_dir.join("modal");
+        ensure_dir(&modal_dir).expect("modal dir");
+        let outside = root.path.join("outside");
+        ensure_dir(&outside).expect("outside dir");
+        let outside_spec = outside.join("cleanup.json");
+        fs::write(&outside_spec, "{\"sandbox_ids\":[]}\n").expect("outside spec");
+        symlink(&outside_spec, modal_dir.join("cleanup.json")).expect("cleanup spec symlink");
+
+        let worker_ids = vec!["sb-1".to_string()];
+        let err = run_modal_cleanup_for_test(Path::new("unused-launcher"), &trial_dir, &worker_ids)
+            .expect_err("symlinked Modal cleanup spec should be refused before launch");
+        let msg = err.to_string();
+
+        assert!(msg.contains("symlinked file"));
+        assert!(msg.contains("artifact_ref: modal://cleanup-spec"));
+        assert_eq!(
+            fs::read_to_string(&outside_spec).unwrap(),
+            "{\"sandbox_ids\":[]}\n"
+        );
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "Modal cleanup spec error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&outside.display().to_string()),
+            "Modal cleanup spec error leaked symlink target: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modal_cleanup_missing_marker_uses_log_ref() -> Result<()> {
+        let root = TempDirGuard::new("bucephalus_modal_cleanup_missing_marker");
+        let trial_dir = root.path.join("trial");
+        ensure_dir(&trial_dir)?;
+        let launcher = root.path.join("cleanup-launcher.sh");
+        fs::write(&launcher, "#!/bin/sh\nprintf 'cleanup without marker\\n'\n")?;
+        let mut permissions = fs::metadata(&launcher)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&launcher, permissions)?;
+
+        let worker_ids = vec!["sb-1".to_string()];
+        let err = run_modal_cleanup_for_test(&launcher, &trial_dir, &worker_ids)
+            .expect_err("cleanup without marker should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("modal cleanup launcher did not emit BUCEPHALUS_MODAL_CLEANUP"));
+        assert!(msg.contains("log_ref: modal-log://cleanup/stdout"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "Modal cleanup missing-marker error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&trial_dir.display().to_string()),
+            "Modal cleanup missing-marker error leaked trial dir: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn modal_launch_spec_omits_agent_transfer_when_runtime_image_is_prepared() {
         let (root, paths) = create_trial_paths_fixture("bucephalus_modal_prepared_runtime_image");
         let mut runtime = legacy_contract_runtime_fixture();
@@ -1327,6 +1542,37 @@ mod tests {
             }
         }
         assert!(found, "payload missing from modal runtime transfer archive");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modal_runtime_transfer_archive_refuses_symlinked_archive_target() -> Result<()> {
+        let (root, paths) = create_trial_paths_fixture("bucephalus_modal_archive_target_link");
+        let modal_dir = paths.trial_dir.join("modal");
+        ensure_dir(&modal_dir)?;
+        let outside = root.path.join("outside");
+        ensure_dir(&outside)?;
+        let outside_archive = outside.join("runtime_transfer.tar.gz");
+        fs::write(&outside_archive, "outside\n")?;
+        symlink(&outside_archive, modal_dir.join("runtime_transfer.tar.gz"))?;
+
+        let err =
+            build_modal_runtime_transfer_archive_for_test(&modal_dir, json!({ "runtime_files": [] }))
+                .expect_err("symlinked Modal runtime transfer archive should be refused");
+        let msg = err.to_string();
+
+        assert!(msg.contains("symlinked file"));
+        assert!(msg.contains("artifact_ref: modal://runtime-transfer-archive"));
+        assert_eq!(fs::read_to_string(&outside_archive)?, "outside\n");
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "Modal archive target error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&outside.display().to_string()),
+            "Modal archive target error leaked symlink target: {msg}"
+        );
         Ok(())
     }
 
@@ -1744,6 +1990,70 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn modal_launcher_command_refuses_symlinked_stdout_log() -> Result<()> {
+        let (root, run_dir) = create_run_dir("bucephalus_modal_stdout_log_symlink", "run_1");
+        let modal_dir = run_dir.join("modal");
+        ensure_dir(&modal_dir)?;
+        let outside = root.path.join("outside");
+        ensure_dir(&outside)?;
+        let outside_log = outside.join("sandbox_stdout.log");
+        fs::write(&outside_log, "outside\n")?;
+        symlink(&outside_log, modal_dir.join("sandbox_stdout.log"))?;
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("printf 'should not run\\n'");
+
+        let err = run_modal_launcher_command_for_test(command, &modal_dir, "sandbox")
+            .expect_err("symlinked Modal stdout log should be refused before launch");
+        let msg = err.to_string();
+
+        assert!(msg.contains("symlinked file"));
+        assert!(msg.contains("artifact_ref: modal-log://sandbox/stdout"));
+        assert_eq!(fs::read_to_string(&outside_log)?, "outside\n");
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "Modal stdout log error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&outside.display().to_string()),
+            "Modal stdout log error leaked symlink target: {msg}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modal_launcher_command_refuses_symlinked_stderr_log() -> Result<()> {
+        let (root, run_dir) = create_run_dir("bucephalus_modal_stderr_log_symlink", "run_1");
+        let modal_dir = run_dir.join("modal");
+        ensure_dir(&modal_dir)?;
+        let outside = root.path.join("outside");
+        ensure_dir(&outside)?;
+        let outside_log = outside.join("sandbox_stderr.log");
+        fs::write(&outside_log, "outside\n")?;
+        symlink(&outside_log, modal_dir.join("sandbox_stderr.log"))?;
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("printf 'should not run\\n' >&2");
+
+        let err = run_modal_launcher_command_for_test(command, &modal_dir, "sandbox")
+            .expect_err("symlinked Modal stderr log should be refused before launch");
+        let msg = err.to_string();
+
+        assert!(msg.contains("symlinked file"));
+        assert!(msg.contains("artifact_ref: modal-log://sandbox/stderr"));
+        assert_eq!(fs::read_to_string(&outside_log)?, "outside\n");
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "Modal stderr log error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&outside.display().to_string()),
+            "Modal stderr log error leaked symlink target: {msg}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn modal_launcher_command_uses_packaged_helper_without_go_run() {
         let (_root, run_dir) = create_run_dir("bucephalus_modal_packaged_helper", "run_1");
@@ -1786,6 +2096,66 @@ mod tests {
 
         let bytes_value = read_captured_file_value_for_test(&output_path, "bytes")?;
         assert_eq!(bytes_value.get("bytes").and_then(Value::as_u64), Some(64));
+        assert_eq!(
+            bytes_value.get("path"),
+            Some(&json!("[REDACTED:local-path]"))
+        );
+        assert!(
+            !bytes_value
+                .to_string()
+                .contains(&root.path.display().to_string()),
+            "byte capture value leaked fixture root: {bytes_value}"
+        );
+
+        let bytes_value = read_captured_file_value_with_container_for_test(
+            &output_path,
+            "bytes",
+            "/bucephalus/out/screenshot.txt",
+        )?;
+        assert_eq!(
+            bytes_value.get("path"),
+            Some(&json!("contract://out/screenshot.txt"))
+        );
+        assert!(
+            !bytes_value
+                .to_string()
+                .contains(&root.path.display().to_string()),
+            "contract byte capture value leaked fixture root: {bytes_value}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_transport_output_json_uses_public_local_ref() -> Result<()> {
+        let root = TempDirGuard::new("bucephalus_transport_output_ref");
+        let host_path = root.path.join("private").join("artifact.bin");
+        let value = captured_transport_output_json_for_test(
+            json!({
+                "path": "contract://out/artifact.bin",
+                "bytes": 64
+            }),
+            Some(host_path),
+            Some("/bucephalus/out/artifact.bin".to_string()),
+            Some("bytes".to_string()),
+        );
+
+        assert!(value.get("host_path").is_none());
+        assert_eq!(
+            value.get("local_ref"),
+            Some(&json!("contract://out/artifact.bin"))
+        );
+        assert_eq!(
+            value.get("container_path"),
+            Some(&json!("/bucephalus/out/artifact.bin"))
+        );
+        assert!(
+            !value.to_string().contains(&root.path.display().to_string()),
+            "transport output leaked fixture root: {value}"
+        );
+        assert!(
+            !value.to_string().contains("private"),
+            "transport output leaked private path segment: {value}"
+        );
         Ok(())
     }
 
@@ -3759,6 +4129,52 @@ mod tests {
     }
 
     #[test]
+    fn prepared_runtime_image_missing_artifact_uses_public_ref() {
+        let root = TempDirGuard::new("prepared_image_missing_artifact_ref");
+        let artifact = root.path.join("private").join("agent.tgz");
+
+        let err = ensure_prepared_runtime_agent_artifact_exists(&artifact)
+            .expect_err("missing prepared runtime artifact should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("agent artifact for prepared runtime image is missing"));
+        assert!(msg.contains("artifact_ref: artifact://source"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "prepared image missing artifact error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("agent.tgz"),
+            "prepared image missing artifact error leaked private artifact name: {msg}"
+        );
+    }
+
+    #[test]
+    fn prepared_runtime_image_artifact_stage_error_uses_public_refs() {
+        let root = TempDirGuard::new("prepared_image_stage_artifact_ref");
+        let artifact = root.path.join("private").join("agent.tgz");
+        let context = root.path.join("scratch");
+        ensure_dir(&context).expect("context dir");
+        let dest = context.join("agent_artifact");
+
+        let err = hard_link_or_copy(&artifact, &dest)
+            .expect_err("missing artifact should fail context staging");
+        let msg = err.to_string();
+
+        assert!(msg.contains("failed to stage agent artifact into docker build context"));
+        assert!(msg.contains("artifact_ref: artifact://source"));
+        assert!(msg.contains("context_ref: build-context://agent-artifact"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "prepared image stage error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("agent.tgz"),
+            "prepared image stage error leaked private artifact name: {msg}"
+        );
+    }
+
+    #[test]
     fn prepared_task_environment_schema_accepts_case_materialization_plan() {
         let manifest = json!({
             "schema_version": "prepared_task_environment_v1",
@@ -3920,6 +4336,108 @@ mod tests {
                 err
             );
         }
+    }
+
+    #[test]
+    fn continue_run_active_status_uses_run_id_guidance() {
+        let (_root, run_dir) = create_run_dir("bucephalus_continue_active_public_ref", "run_1");
+        write_test_run_control(&run_dir, "run_1", "running", None, None);
+
+        let err = continue_run(&run_dir).expect_err("active run should not continue");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("run://run_1 is currently active"),
+            "unexpected continue error: {msg}"
+        );
+        assert!(
+            msg.contains("bucephalus views-live run_1 run_progress"),
+            "continue error should guide watch flow: {msg}"
+        );
+        assert!(
+            msg.contains("bucephalus recover run_1 --force"),
+            "continue error should guide stale-owner recovery: {msg}"
+        );
+        assert!(
+            !msg.contains(&run_dir.display().to_string()),
+            "continue error must not leak the run directory: {msg}"
+        );
+    }
+
+    #[test]
+    fn recover_run_missing_directory_uses_public_run_ref() {
+        let root = TempDirGuard::new("bucephalus_recover_missing_public_ref");
+        let missing = root.path.join("run_missing");
+
+        let err = recover_run(&missing, true).expect_err("missing run should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resolve run directory for recover operation: run://run_missing"),
+            "unexpected recover error: {msg}"
+        );
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "recover error must not leak the parent temp directory: {msg}"
+        );
+    }
+
+    #[test]
+    fn replay_trial_missing_resolved_experiment_uses_run_ref() {
+        let (_root, run_dir) =
+            create_run_dir("bucephalus_replay_missing_resolved_public_ref", "run_1");
+
+        let err = replay_trial(&run_dir, "trial_1", false)
+            .expect_err("missing resolved experiment should fail replay");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing resolved_experiment.json in run://run_1"),
+            "unexpected replay error: {msg}"
+        );
+        assert!(
+            !msg.contains(&run_dir.display().to_string()),
+            "replay error must not leak the run directory: {msg}"
+        );
+    }
+
+    #[test]
+    fn fork_trial_missing_resolved_experiment_uses_run_ref() {
+        let (_root, run_dir) =
+            create_run_dir("bucephalus_fork_missing_resolved_public_ref", "run_1");
+
+        let err = fork_trial_inner(&run_dir, "trial_1", "base", &BTreeMap::new(), false)
+            .expect_err("missing resolved experiment should fail fork");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing resolved_experiment.json in run://run_1"),
+            "unexpected fork error: {msg}"
+        );
+        assert!(
+            !msg.contains(&run_dir.display().to_string()),
+            "fork error must not leak the run directory: {msg}"
+        );
+    }
+
+    #[test]
+    fn smoke_test_completion_errors_use_run_ref() {
+        let (_root, run_dir) =
+            create_run_dir("bucephalus_smoke_completion_public_ref", "run_1");
+        write_test_run_control(&run_dir, "run_1", "failed", None, None);
+        let result = RunResult {
+            run_id: "run_1".to_string(),
+            run_dir: run_dir.clone(),
+            account_db_path: run_dir.join(".bucephalus").join("bucephalus.sqlite"),
+        };
+
+        let err = ensure_smoke_test_completed(result)
+            .expect_err("failed smoke test should produce completion error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("run_ref=run://run_1"),
+            "unexpected smoke completion error: {msg}"
+        );
+        assert!(
+            !msg.contains(&run_dir.display().to_string()),
+            "smoke completion error must not leak the run directory: {msg}"
+        );
     }
 
     #[test]
@@ -4429,6 +4947,107 @@ mod tests {
     }
 
     #[test]
+    fn resolve_packaged_agent_runtime_rejects_unstaged_package_relative_command_paths() {
+        let root = TempDirGuard::new("bucephalus_packaged_command_path_cutover");
+        let package_dir = root.path.join("package");
+        ensure_dir(&package_dir.join("agent_builds").join("build_0001"))
+            .expect("package artifact dir");
+        ensure_dir(&package_dir.join("runtime_assets")).expect("runtime assets dir");
+        fs::write(package_dir.join("runtime_assets").join("config.json"), "{}\n")
+            .expect("runtime config");
+        let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
+            "trial_runtime": {
+                "agent": {
+                    "command": ["agentctl", "runtime_assets/config.json"],
+                    "mount": {
+                        "source": "agent_builds/build_0001",
+                        "mount": {
+                            "path": "/opt/custom-agent",
+                            "read_only": true
+                        }
+                    },
+                    "image": "debian:bookworm-slim"
+                },
+                "execution": {
+                    "agent_site": "agent_container"
+                }
+            }
+        });
+
+        let err = match resolve_packaged_agent_runtime(&spec, &package_dir, "base") {
+            Ok(_) => panic!("sealed package command must use runner-staged runtime paths"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("trial_runtime.agent.command[1] still contains unresolved package-relative path"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("rebuild the sealed package with the build-time runtime path cutover"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("package_ref: package://runtime_assets/config.json"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "unstaged command path error leaked fixture root: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_packaged_agent_runtime_rejects_unstaged_package_relative_env_paths() {
+        let root = TempDirGuard::new("bucephalus_packaged_env_path_cutover");
+        let package_dir = root.path.join("package");
+        ensure_dir(&package_dir.join("agent_builds").join("build_0001"))
+            .expect("package artifact dir");
+        ensure_dir(&package_dir.join("runtime_assets")).expect("runtime assets dir");
+        fs::write(package_dir.join("runtime_assets").join("config.json"), "{}\n")
+            .expect("runtime config");
+        let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
+            "trial_runtime": {
+                "agent": {
+                    "command": ["agentctl"],
+                    "env": {
+                        "AGENT_CONFIG": "runtime_assets/config.json"
+                    },
+                    "mount": {
+                        "source": "agent_builds/build_0001",
+                        "mount": {
+                            "path": "/opt/custom-agent",
+                            "read_only": true
+                        }
+                    },
+                    "image": "debian:bookworm-slim"
+                },
+                "execution": {
+                    "agent_site": "agent_container"
+                }
+            }
+        });
+
+        let err = match resolve_packaged_agent_runtime(&spec, &package_dir, "base") {
+            Ok(_) => panic!("sealed package env must use runner-staged runtime paths"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("trial_runtime.agent.env.AGENT_CONFIG still contains unresolved package-relative path"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("rebuild the sealed package with the build-time runtime path cutover"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("package_ref: package://runtime_assets/config.json"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "unstaged env path error leaked fixture root: {msg}"
+        );
+    }
+
+    #[test]
     fn resolve_agent_runtime_parses_output_mounts() {
         let root = TempDirGuard::new("bucephalus_output_mount_parse");
         let exp_dir = root.path.join("exp");
@@ -4774,6 +5393,21 @@ mod tests {
     }
 
     #[test]
+    fn run_operation_lease_public_label_omits_local_parent_paths() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_1 token=raw-run-token");
+        let lease_path = operation_lease_path(&run_dir);
+        let label = operation_lease_public_label(&lease_path);
+
+        assert_eq!(label, "run://runtime/operation_lease.json");
+        for forbidden in ["/Users/alice", "raw-run-token", "run_1 token"] {
+            assert!(
+                !label.contains(forbidden),
+                "operation lease label leaked forbidden text: {forbidden}\n{label}"
+            );
+        }
+    }
+
+    #[test]
     fn fork_selector_parser_accepts_supported_kinds() {
         match parse_fork_selector("checkpoint:ckpt_a").expect("checkpoint selector") {
             ForkSelector::Checkpoint(v) => assert_eq!(v, "ckpt_a"),
@@ -5081,6 +5715,59 @@ mod tests {
     }
 
     #[test]
+    fn pause_run_missing_directory_uses_public_run_ref() {
+        let root = TempDirGuard::new("bucephalus_pause_missing_public_ref");
+        let missing = root.path.join("run_missing");
+
+        let err = pause_run(&missing, None, Some("pause"), 1)
+            .expect_err("missing run should fail pause");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resolve run directory for pause operation: run://run_missing"),
+            "unexpected pause error: {msg}"
+        );
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "pause error must not leak the parent temp directory: {msg}"
+        );
+    }
+
+    #[test]
+    fn pause_run_non_running_uses_run_ref() {
+        let (_root, run_dir) = create_run_dir("bucephalus_pause_non_running_public_ref", "run_1");
+        write_test_run_control(&run_dir, "run_1", "paused", None, None);
+
+        let err = pause_run(&run_dir, None, Some("pause"), 1)
+            .expect_err("non-running run should not pause");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pause_non_running: run://run_1 status is paused"),
+            "unexpected pause error: {msg}"
+        );
+        assert!(
+            !msg.contains(&run_dir.display().to_string()),
+            "pause error must not leak the run directory: {msg}"
+        );
+    }
+
+    #[test]
+    fn kill_run_terminal_status_uses_run_ref() {
+        let (_root, run_dir) = create_run_dir("bucephalus_kill_completed_public_ref", "run_1");
+        write_test_run_control(&run_dir, "run_1", "completed", None, None);
+
+        let err = kill_run(&run_dir).expect_err("completed run should not kill");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("kill_terminal_status: run://run_1 is already 'completed'"),
+            "unexpected kill error: {msg}"
+        );
+        assert!(
+            !msg.contains(&run_dir.display().to_string()),
+            "kill error must not leak the run directory: {msg}"
+        );
+    }
+
+    #[test]
     fn control_operations_require_run_control_run_id() {
         let (_pause_root, pause_dir) = create_run_dir("bucephalus_pause_missing_run_id", "run_1");
         write_run_control_without_run_id(&pause_dir, "running");
@@ -5137,8 +5824,14 @@ mod tests {
         let err = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
             .expect_err("resume should fail for non-paused run");
         assert!(
-            err.to_string().contains("resume_non_paused"),
+            err.to_string()
+                .contains("resume_non_paused: run://run_1 status is running"),
             "unexpected error: {}",
+            err
+        );
+        assert!(
+            !err.to_string().contains(&run_dir.display().to_string()),
+            "resume error must not leak the run directory: {}",
             err
         );
     }
@@ -6029,6 +6722,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_response_loader_parse_error_uses_contract_ref() {
+        let root = TempDirGuard::new("agent_response_loader_parse_ref");
+        let result_dir = root.path.join("private").join("agent");
+        ensure_dir(&result_dir).expect("result dir");
+        let result_path = result_dir.join("result.json");
+        fs::write(&result_path, "{not-json").expect("write malformed result");
+
+        let loaded = crate::trial::artifacts::load_agent_response_resilient(&result_path)
+            .expect("malformed response should be captured");
+        let msg = loaded.parse_error.expect("parse error");
+
+        assert!(msg.contains("failed to parse agent response JSON"));
+        assert!(msg.contains("contract://out/result.json"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "agent response parse error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("private/agent"),
+            "agent response parse error leaked private path segment: {msg}"
+        );
+    }
+
+    #[test]
     fn artifact_type_from_trial_input_requires_explicit_supported_type() {
         let missing = crate::trial::artifacts::artifact_type_from_trial_input(&json!({
             "schema_version": "trial_input_v1"
@@ -6051,6 +6768,44 @@ mod tests {
                 .to_string()
                 .contains("artifact_type 'answer' is not supported"),
             "unexpected error: {unknown}"
+        );
+    }
+
+    #[test]
+    fn artifact_type_from_trial_input_path_errors_use_contract_ref() {
+        let root = TempDirGuard::new("trial_input_artifact_type_path_ref");
+        let input_dir = root.path.join("private").join("trial");
+        ensure_dir(&input_dir).expect("input dir");
+        let malformed = input_dir.join("trial_input.json");
+        fs::write(&malformed, "{not-json").expect("malformed trial input");
+
+        let err = crate::trial::artifacts::artifact_type_from_trial_input_path(&malformed)
+            .expect_err("malformed trial input should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to parse trial input JSON contract://in/trial_input.json"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "trial input parse error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("private/trial"),
+            "trial input parse error leaked private path segment: {msg}"
+        );
+
+        let missing = input_dir.join("missing").join("trial_input.json");
+        let err = crate::trial::artifacts::artifact_type_from_trial_input_path(&missing)
+            .expect_err("missing trial input should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to read trial input contract://in/trial_input.json"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "trial input read error leaked fixture root: {msg}"
         );
     }
 
@@ -10245,6 +11000,21 @@ mod tests {
     }
 
     #[test]
+    fn preflight_probe_root_uses_configured_shared_parent() {
+        let root = TempDirGuard::new("bucephalus_preflight_shared_parent");
+        let probe = create_preflight_probe_root("variant/image:latest", Some(&root.path))
+            .expect("create probe root");
+        let expected_parent = root.path.join(".preflight-probes");
+
+        assert!(
+            probe.path().starts_with(&expected_parent),
+            "probe root {} should be under {}",
+            probe.path().display(),
+            expected_parent.display()
+        );
+    }
+
+    #[test]
     fn preflight_agent_runtime_reachable_reports_missing_required_env_var() {
         let root = TempDirGuard::new("bucephalus_preflight_missing_required_env");
         let variant = preflight_test_variant();
@@ -10259,6 +11029,7 @@ mod tests {
             None,
             &root.path,
             &root.path,
+            None,
         );
 
         assert_eq!(check.name, "agent_runtime_reachable");
@@ -10552,6 +11323,49 @@ mod tests {
     }
 
     #[test]
+    fn runtime_secret_file_source_errors_do_not_echo_host_paths() {
+        let root = TempDirGuard::new("bucephalus_runtime_secret_file_private_path");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
+        let spec = inv07_spec_with_runtime_secret_files();
+        let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
+        let mut execution = RunExecutionOptions::default();
+        execution
+            .runtime_env
+            .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+        execution.secret_files.insert(
+            "codex_oauth".to_string(),
+            root.path.join("private").join("codex-auth.json"),
+        );
+
+        let err = match resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &exp_dir,
+            &RunBehavior::default(),
+            &execution,
+        ) {
+            Ok(_) => panic!("missing host secret source should fail"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("failed to read secret file 'codex_oauth'"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "secret source error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("private"),
+            "secret source error leaked private path segment: {msg}"
+        );
+        assert!(
+            !msg.contains("codex-auth.json"),
+            "secret source error leaked private filename: {msg}"
+        );
+    }
+
+    #[test]
     fn runtime_secret_files_reject_workspace_target() {
         let root = TempDirGuard::new("bucephalus_runtime_secret_workspace_target");
         let exp_dir = root.path.join("exp");
@@ -10789,6 +11603,72 @@ mod tests {
         let err = seed_credential_cache_file_for_test(&source, &root.path.join("cache/.."), "id")
             .unwrap_err();
         assert!(err.to_string().contains("has no file name"));
+        Ok(())
+    }
+
+    #[test]
+    fn credential_cache_seed_copy_error_uses_public_refs() -> Result<()> {
+        let root = TempDirGuard::new("bucephalus_credential_cache_copy_error");
+        let source = root
+            .path
+            .join("private")
+            .join("customer-a")
+            .join("codex-oauth.json");
+        let cache = root.path.join("cache").join("auth.json");
+        let err = seed_credential_cache_file_for_test(
+            &source,
+            &cache,
+            "OPENAI_API_KEY token=raw-id-token",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("failed to seed credential cache"));
+        assert!(msg.contains("source_ref: runtime-secret://redacted/source"));
+        assert!(msg.contains("cache_ref: runtime-secret://redacted/credential-cache"));
+        for forbidden in [
+            root.path.display().to_string(),
+            "private/customer-a".to_string(),
+            "codex-oauth.json".to_string(),
+            "OPENAI_API_KEY".to_string(),
+            "raw-id-token".to_string(),
+        ] {
+            assert!(
+                !msg.contains(&forbidden),
+                "credential cache copy error leaked forbidden text {forbidden}: {msg}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn credential_cache_seed_inspect_error_uses_public_cache_ref() -> Result<()> {
+        let root = TempDirGuard::new("bucephalus_credential_cache_inspect_error");
+        let source = root.path.join("auth.json");
+        let blocked_parent = root.path.join("blocked-cache-parent");
+        fs::write(&source, "{}\n")?;
+        fs::write(&blocked_parent, "not a directory\n")?;
+
+        let err = seed_credential_cache_file_for_test(
+            &source,
+            &blocked_parent.join("auth.json"),
+            "codex_oauth",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("failed to inspect credential cache file"));
+        assert!(msg.contains("cache_ref: runtime-secret://codex_oauth/credential-cache"));
+        for forbidden in [
+            root.path.display().to_string(),
+            "blocked-cache-parent".to_string(),
+            "auth.json".to_string(),
+        ] {
+            assert!(
+                !msg.contains(&forbidden),
+                "credential cache inspect error leaked forbidden text {forbidden}: {msg}"
+            );
+        }
         Ok(())
     }
 
@@ -11530,6 +12410,35 @@ mod tests {
     }
 
     #[test]
+    fn load_task_rows_for_build_missing_dataset_uses_public_refs() {
+        let root = TempDirGuard::new("bucephalus_missing_dataset_public_ref");
+        let dataset_path = root.path.join("private").join("task_rows.jsonl");
+        let spec = json!({
+            "matrix": { "tasks": { "source": "file", "path": "/Users/alice/private/task_rows.jsonl" } }
+        });
+
+        let err = load_task_rows_for_build(&dataset_path, &spec)
+            .expect_err("missing dataset should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("failed to open dataset file"));
+        assert!(msg.contains("dataset_ref: dataset://resolved"));
+        assert!(msg.contains("configured_ref: dataset://input"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "dataset open error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("/Users/alice"),
+            "dataset open error leaked configured absolute path: {msg}"
+        );
+        assert!(
+            !msg.contains("task_rows.jsonl"),
+            "dataset open error leaked private dataset file name: {msg}"
+        );
+    }
+
+    #[test]
     fn load_task_rows_for_build_rejects_reserved_contract_workdir() {
         let root = TempDirGuard::new("bucephalus_task_row_reserved_workdir");
         let dataset_path = root.path.join("task_rows.jsonl");
@@ -11926,6 +12835,95 @@ mod tests {
         assert!(
             !stale_staging.exists(),
             "stale same-digest artifact staging dir should be cleaned before unpack"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_artifact_mount_cache_refuses_symlinked_cache_root() -> Result<()> {
+        let root = TempDirGuard::new("bucephalus_artifact_mount_cache_root_link");
+        let artifact_src = root.path.join("artifact_src");
+        ensure_dir(&artifact_src)?;
+        fs::write(artifact_src.join("agent.txt"), "agent payload")?;
+        let artifact_tar = root.path.join("agent-runtime.tar.gz");
+        let tar_status = Command::new("tar")
+            .args([
+                "-czf",
+                artifact_tar.to_string_lossy().as_ref(),
+                "-C",
+                artifact_src.to_string_lossy().as_ref(),
+                ".",
+            ])
+            .status()?;
+        assert!(tar_status.success(), "failed to create artifact tarball");
+
+        let outside = root.path.join("outside-cache-target");
+        ensure_dir(&outside)?;
+        symlink(&outside, root.path.join(".bucephalus_artifact_cache"))?;
+
+        let err = resolve_agent_artifact_mount_dir(&artifact_tar)
+            .expect_err("symlinked artifact cache root should be refused");
+        let msg = err.to_string();
+
+        assert!(msg.contains("symlinked trial_runtime.agent.artifact cache directory"));
+        assert!(msg.contains("cache_ref: artifact-cache://root"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "artifact cache root error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&outside.display().to_string()),
+            "artifact cache root error leaked symlink target: {msg}"
+        );
+        assert!(
+            fs::read_dir(&outside)?.next().is_none(),
+            "artifact cache root symlink target should not receive unpacked files"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_artifact_mount_cache_refuses_symlinked_ready_entry() -> Result<()> {
+        let root = TempDirGuard::new("bucephalus_artifact_mount_cache_entry_link");
+        let artifact_src = root.path.join("artifact_src");
+        ensure_dir(&artifact_src)?;
+        fs::write(artifact_src.join("agent.txt"), "agent payload")?;
+        let artifact_tar = root.path.join("agent-runtime.tar.gz");
+        let tar_status = Command::new("tar")
+            .args([
+                "-czf",
+                artifact_tar.to_string_lossy().as_ref(),
+                "-C",
+                artifact_src.to_string_lossy().as_ref(),
+                ".",
+            ])
+            .status()?;
+        assert!(tar_status.success(), "failed to create artifact tarball");
+
+        let digest = sha256_file(&artifact_tar)?;
+        let digest_path_component = digest.replace(':', "_");
+        let cache_root = root.path.join(".bucephalus_artifact_cache");
+        ensure_dir(&cache_root)?;
+        let outside = root.path.join("outside-ready-entry");
+        ensure_dir(&outside)?;
+        fs::write(outside.join(".bucephalus_ready"), &digest)?;
+        symlink(&outside, cache_root.join(&digest_path_component))?;
+
+        let err = resolve_agent_artifact_mount_dir(&artifact_tar)
+            .expect_err("symlinked ready artifact cache entry should be refused");
+        let msg = err.to_string();
+
+        assert!(msg.contains("symlinked trial_runtime.agent.artifact cache entry"));
+        assert!(msg.contains("cache_ref: artifact-cache://entry"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "artifact cache entry error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&outside.display().to_string()),
+            "artifact cache entry error leaked symlink target: {msg}"
         );
         Ok(())
     }
@@ -12459,6 +13457,20 @@ mod tests {
         .expect("host grader capability manifest");
     }
 
+    fn assert_no_package_build_tmp_siblings(root: &Path, final_name: &str) {
+        let prefix = format!(".{}.package-build-tmp.", final_name);
+        for entry in fs::read_dir(root).expect("read fixture root") {
+            let entry = entry.expect("read fixture entry");
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with(&prefix),
+                "staged build temp directory was not cleaned up: {}",
+                entry.path().display()
+            );
+        }
+    }
+
     #[test]
     fn build_experiment_package_rewrites_runtime_sources() {
         let root = create_dx_authoring_fixture("bucephalus_build_package");
@@ -12556,6 +13568,139 @@ mod tests {
         let summary = experiment_summary(&build.package_dir).expect("load experiment summary");
         assert_eq!(summary.exp_id, "eval_suite_multi_build");
         assert_eq!(summary.task_count, 1);
+    }
+
+    #[test]
+    fn build_experiment_package_missing_command_path_uses_public_refs_and_cleans_temp() {
+        let root = create_dx_authoring_fixture("bucephalus_build_missing_command_path_ref");
+        let mut spec = minimal_dx_spec();
+        let command = spec
+            .pointer_mut("/trial_runtime/agent/command")
+            .and_then(Value::as_array_mut)
+            .expect("agent command");
+        command[4] = json!("./support/private-config.json");
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let out_dir = root.path.join("package");
+        let err = build_experiment_package(&spec_path, None, Some(&out_dir))
+            .expect_err("missing command path should fail package build");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains(
+                "package build missing trial_runtime.agent.command[4] public path reference"
+            ),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("source_ref: source://support/private-config.json"));
+        assert!(msg.contains("resolved_ref: source://support/private-config.json"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "missing command path error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&root.path.join("support/private-config.json").display().to_string()),
+            "missing command path error leaked resolved host path: {msg}"
+        );
+        assert!(
+            !out_dir.exists(),
+            "failed staged build should not publish the final output directory"
+        );
+        assert_no_package_build_tmp_siblings(&root.path, "package");
+    }
+
+    #[test]
+    fn build_experiment_package_file_output_uses_public_ref() {
+        let root = create_dx_authoring_fixture("bucephalus_build_file_output_ref");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let out_dir = root.path.join("package");
+        fs::write(&out_dir, "not a directory\n").expect("file output");
+
+        let err = build_experiment_package(&spec_path, None, Some(&out_dir))
+            .expect_err("file output should be rejected");
+        let msg = err.to_string();
+
+        assert!(msg.contains("build output target exists and is not a directory"));
+        assert!(msg.contains("output_ref: build-output://target"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "build output error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&out_dir.display().to_string()),
+            "build output error leaked output path: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_experiment_package_symlink_output_uses_public_ref_without_writing_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = create_dx_authoring_fixture("bucephalus_build_symlink_output_ref");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let out_dir = root.path.join("package");
+        let outside = root.path.join("outside-package-target");
+        fs::create_dir_all(&outside).expect("outside target");
+        symlink(&outside, &out_dir).expect("symlink output");
+
+        let err = build_experiment_package(&spec_path, None, Some(&out_dir))
+            .expect_err("symlink output should be rejected");
+        let msg = err.to_string();
+
+        assert!(msg.contains("build output target is a symlink"));
+        assert!(msg.contains("output_ref: build-output://target"));
+        assert!(
+            !outside.join("manifest.json").exists(),
+            "build wrote package files through symlinked output"
+        );
+        assert!(
+            fs::symlink_metadata(&out_dir)
+                .expect("output symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "build should leave symlinked output untouched"
+        );
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "build symlink output error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&out_dir.display().to_string()),
+            "build symlink output error leaked output path: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_experiment_package_non_empty_output_uses_public_ref() {
+        let root = create_dx_authoring_fixture("bucephalus_build_non_empty_output_ref");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let out_dir = root.path.join("package");
+        fs::create_dir_all(&out_dir).expect("output dir");
+        fs::write(out_dir.join("notes.txt"), "existing work\n").expect("existing output");
+
+        let err = build_experiment_package(&spec_path, None, Some(&out_dir))
+            .expect_err("non-empty output should be rejected");
+        let msg = err.to_string();
+
+        assert!(msg.contains("build output target directory must be empty"));
+        assert!(msg.contains("output_ref: build-output://target"));
+        assert!(msg.contains("Move or remove the existing contents"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "build output error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&out_dir.display().to_string()),
+            "build output error leaked output path: {msg}"
+        );
     }
 
     #[test]
@@ -12897,6 +14042,31 @@ mod tests {
     }
 
     #[test]
+    fn runtime_asset_missing_source_uses_public_refs() {
+        let root = TempDirGuard::new("bucephalus_runtime_asset_missing_source_ref");
+        let package_dir = root.path.join(".lab").join("builds").join("pkg");
+        ensure_dir(&package_dir).expect("package dir");
+        let source = root.path.join("missing_asset");
+        let destination = package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR).join("asset");
+
+        let err = copy_runtime_asset_into_package(&source, &destination, &package_dir)
+            .expect_err("missing runtime asset source should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("expected a runtime asset file or directory source"));
+        assert!(msg.contains("source_ref: source://input"));
+        assert!(msg.contains("package_ref: package://runtime_assets/asset"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "runtime asset missing-source error leaked root path: {msg}"
+        );
+        assert!(
+            !msg.contains("missing_asset"),
+            "runtime asset missing-source error leaked source name: {msg}"
+        );
+    }
+
+    #[test]
     fn runtime_asset_symlink_outside_source_tree_is_rejected() {
         let root = TempDirGuard::new("bucephalus_runtime_asset_symlink_escape");
         let package_dir = root.path.join(".lab").join("builds").join("pkg");
@@ -12910,11 +14080,19 @@ mod tests {
 
         let err = copy_runtime_asset_into_package(&source_dir, &destination, &package_dir)
             .expect_err("escaping runtime asset symlink should fail");
+        let msg = err.to_string();
 
+        assert!(msg.contains("resolves outside its source tree"), "{msg}");
+        assert!(msg.contains("source_ref: source://escape.txt"), "{msg}");
+        assert!(msg.contains("source_root_ref: source://."), "{msg}");
+        assert!(msg.contains("resolved_ref: source://outside-tree"), "{msg}");
         assert!(
-            err.to_string().contains("resolves outside source tree"),
-            "{}",
-            err
+            !msg.contains(&root.path.display().to_string()),
+            "runtime asset symlink error leaked root path: {msg}"
+        );
+        assert!(
+            !msg.contains(&external.display().to_string()),
+            "runtime asset symlink error leaked external path: {msg}"
         );
     }
 
@@ -12931,12 +14109,17 @@ mod tests {
 
         let err = copy_runtime_asset_into_package(&source_dir, &destination, &package_dir)
             .expect_err("directory symlink should fail");
+        let msg = err.to_string();
 
         assert!(
-            err.to_string()
-                .contains("runtime asset directory symlink is not supported"),
-            "{}",
-            err
+            msg.contains("runtime asset directory symlink is not supported"),
+            "{msg}"
+        );
+        assert!(msg.contains("source_ref: source://linked_dir"), "{msg}");
+        assert!(msg.contains("resolved_ref: source://nested"), "{msg}");
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "runtime asset directory symlink error leaked root path: {msg}"
         );
     }
 
@@ -13076,6 +14259,56 @@ mod tests {
             err.to_string().contains("host grader files cannot be staged"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn rewrite_grader_paths_for_package_absolute_host_path_uses_public_ref() {
+        let root = TempDirGuard::new("bucephalus_host_grader_absolute_path_ref");
+        let exp_dir = root.path.join("exp");
+        let package_dir = root.path.join("package");
+        ensure_dir(&exp_dir).expect("exp dir");
+        ensure_dir(&package_dir).expect("package dir");
+        write_test_host_grader_capability_manifest(&exp_dir);
+        let private_path = root
+            .path
+            .join("Users")
+            .join("alice")
+            .join("secret-grader.py");
+
+        let mut evaluation_root = json!({
+            "grader": {
+                "strategy": "host",
+                "host": { "capability": "host_eval_capability" },
+                "command": ["python3", private_path.to_string_lossy().to_string()]
+            }
+        });
+        let mut file_copies = BTreeMap::new();
+        let mut file_counter = 0usize;
+        let mut public_path_copies = BTreeMap::new();
+        let mut staging_manifest_entries = Vec::new();
+
+        let err = rewrite_grader_paths_for_package(
+            evaluation_root.pointer_mut("/grader").expect("grader"),
+            &exp_dir,
+            &package_dir,
+            &mut file_copies,
+            &mut file_counter,
+            &mut public_path_copies,
+            &mut staging_manifest_entries,
+        )
+        .expect_err("host grader absolute paths must be rejected");
+        let msg = err.to_string();
+
+        assert!(msg.contains("references an absolute host path source://input"));
+        assert!(msg.contains("trial_runtime.grader.host.capability"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "absolute host path error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("secret-grader.py"),
+            "absolute host path error leaked private file name: {msg}"
         );
     }
 
@@ -13473,6 +14706,52 @@ mod tests {
     }
 
     #[test]
+    fn build_experiment_package_preserves_cloud_policy_sizing_and_scheduling() {
+        let root = create_dx_authoring_fixture("bucephalus_build_cloud_policy_sizing");
+        let mut spec = minimal_new_dx_spec();
+        spec["runtime"]["network"] = json!({
+            "task_sandbox": "none",
+            "agent": "none"
+        });
+        spec["runtime"]["compute"]["config"] = json!({
+            "max_parallel": 2
+        });
+        spec["scheduling"] = json!({
+            "max_concurrency": 3
+        });
+        spec["policy"]["timeout_ms"] = json!(450000);
+        spec["policy"]["task_sandbox"]["resources"] = json!({
+            "cpu_count": 8,
+            "memory_mb": 32768
+        });
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package with Cloud-relevant policy sizing");
+        let resolved = load_json_file(&build.package_dir.join("resolved_experiment.json"))
+            .expect("resolved experiment");
+
+        assert_eq!(
+            resolved.pointer("/policy/task_sandbox/resources/cpu_count"),
+            Some(&json!(8))
+        );
+        assert_eq!(
+            resolved.pointer("/policy/task_sandbox/resources/memory_mb"),
+            Some(&json!(32768))
+        );
+        assert_eq!(resolved.pointer("/policy/timeout_ms"), Some(&json!(450000)));
+        assert_eq!(
+            resolved.pointer("/scheduling/max_concurrency"),
+            Some(&json!(3))
+        );
+        assert_eq!(
+            resolved.pointer("/runtime/compute/config/max_parallel"),
+            Some(&json!(2))
+        );
+    }
+
+    #[test]
     fn build_experiment_package_seals_task_case_file_inputs_from_dataset_dir() {
         let root = create_dx_authoring_fixture("bucephalus_build_task_case_assets");
         let data_dir = root
@@ -13611,7 +14890,68 @@ mod tests {
             .expect_err("missing case asset should fail the package build");
         let msg = err.to_string();
         assert!(msg.contains("CASE001"), "unexpected error: {msg}");
-        assert!(msg.contains("images/missing.png"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("asset_ref: case-asset://images/missing.png"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("resolved_ref: dataset://images/missing.png"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "missing case asset error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("resolved from"),
+            "missing case asset error should not print raw resolved-from text: {msg}"
+        );
+        assert!(
+            !root.path.join("package").exists(),
+            "failed build must not publish a partial package directory"
+        );
+        assert_no_package_build_tmp_siblings(&root.path, "package");
+    }
+
+    #[test]
+    fn build_experiment_package_failure_leaves_existing_empty_out_retryable() {
+        let root = create_dx_authoring_fixture("bucephalus_build_failure_retryable_out");
+        let data_dir = root
+            .path
+            .join(".lab")
+            .join("experiments")
+            .join("data");
+        fs::write(
+            data_dir.join("eval_suite.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/missing.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("task case dataset");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let out_dir = root.path.join("package");
+        ensure_dir(&out_dir).expect("empty out dir");
+
+        let err = build_experiment_package(&spec_path, None, Some(&out_dir))
+            .expect_err("missing case asset should fail the package build");
+        let msg = err.to_string();
+        assert!(msg.contains("CASE001"), "unexpected error: {msg}");
+        assert!(msg.contains("case-asset://images/missing.png"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "missing case asset error leaked fixture root: {msg}"
+        );
+        assert!(
+            fs::read_dir(&out_dir)
+                .expect("read out dir")
+                .next()
+                .is_none(),
+            "failed build must leave the pre-existing output directory empty"
+        );
+        assert_no_package_build_tmp_siblings(&root.path, "package");
     }
 
     #[test]
@@ -13643,7 +14983,18 @@ mod tests {
             msg.contains("declares type=directory"),
             "unexpected error: {msg}"
         );
-        assert!(msg.contains("not_a_directory.txt"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("asset_ref: case-asset://not_a_directory.txt"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("resolved_ref: dataset://not_a_directory.txt"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "case asset kind mismatch error leaked fixture root: {msg}"
+        );
     }
 
     #[test]
@@ -14843,6 +16194,81 @@ mod tests {
             msg.contains("portable environment variable name"),
             "unexpected error: {msg}"
         );
+        assert!(
+            msg.contains("runtime-env-file://source:2 key"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&guard.path.display().to_string()),
+            "env file validation error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("env.list"),
+            "env file validation error leaked private filename: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_env_inputs_uses_public_refs_for_file_read_errors() {
+        let guard = TempDirGuard::new("runtime_env_file_missing_private_path");
+        let mut execution = RunExecutionOptions::default();
+        execution
+            .runtime_env_files
+            .push(guard.path.join("private").join("secrets.env"));
+
+        let err = resolve_runtime_env_inputs(&execution)
+            .expect_err("missing env file should fail without echoing host paths");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to read runtime env file runtime-env-file://1"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&guard.path.display().to_string()),
+            "env file read error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("private"),
+            "env file read error leaked private path segment: {msg}"
+        );
+        assert!(
+            !msg.contains("secrets.env"),
+            "env file read error leaked private filename: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_env_inputs_numbers_public_refs_for_file_parse_errors() {
+        let guard = TempDirGuard::new("runtime_env_file_numbered_refs");
+        let private = guard.path.join("private");
+        ensure_dir(&private).expect("private dir");
+        let first = private.join("first.env");
+        let second = private.join("second.env");
+        fs::write(&first, "GOOD=value\n").expect("first env file");
+        fs::write(&second, "MISSING_EQUALS\n").expect("second env file");
+        let mut execution = RunExecutionOptions::default();
+        execution.runtime_env_files.push(first);
+        execution.runtime_env_files.push(second);
+
+        let err = resolve_runtime_env_inputs(&execution)
+            .expect_err("malformed env file should fail with numbered public ref");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid runtime env file runtime-env-file://2:1"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&guard.path.display().to_string()),
+            "env file parse error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("private"),
+            "env file parse error leaked private path segment: {msg}"
+        );
+        assert!(
+            !msg.contains("second.env"),
+            "env file parse error leaked private filename: {msg}"
+        );
     }
 
     #[test]
@@ -15610,6 +17036,27 @@ mod tests {
             err.to_string().contains("digest mismatch"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn compute_artifact_content_digest_missing_source_uses_public_ref() {
+        let root = TempDirGuard::new("bucephalus_artifact_digest_missing_ref");
+        let missing = root.path.join("private").join("missing-agent.tar");
+
+        let err = compute_artifact_content_digest(&missing)
+            .expect_err("missing artifact source should fail digest computation");
+        let msg = err.to_string();
+
+        assert!(msg.contains("artifact path must be a file or directory"));
+        assert!(msg.contains("artifact_ref: artifact://source"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "artifact digest error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("missing-agent.tar"),
+            "artifact digest error leaked private artifact name: {msg}"
         );
     }
 
@@ -17021,18 +18468,77 @@ mod tests {
     }
 
     #[test]
-    fn load_event_rows_rejects_missing_event_type() {
+    fn load_event_rows_keeps_ingesting_after_missing_event_type() {
         let root = TempDirGuard::new("event_missing_type");
         let events_path = root.path.join("events.jsonl");
-        fs::write(&events_path, "{}\n").unwrap();
+        fs::write(
+            &events_path,
+            "{\"message\":\"token=sk-secretsecretsecretsecretsecret path=/Users/alice/project\"}\n{\"event_type\":\"step\",\"message\":\"after\"}\n",
+        )
+        .unwrap();
 
-        let err = load_event_rows(&events_path, "run_1", "trial_1", 0, "variant_1", "task_1", 0)
-            .expect_err("event rows must not invent event_type");
+        let rows = load_event_rows(&events_path, "run_1", "trial_1", 0, "variant_1", "task_1", 0)
+            .expect("missing event_type should become a redacted parse-error row");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event_type, "trajectory_parse_error");
         assert!(
-            err.to_string().contains("event row 1 missing event_type"),
-            "unexpected error: {}",
-            err
+            rows[0]
+                .payload
+                .pointer("/error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("event row 1 missing event_type")),
+            "unexpected parse-error payload: {}",
+            rows[0].payload
         );
+        assert_eq!(
+            rows[0].payload.pointer("/raw_line_omitted"),
+            Some(&json!(true))
+        );
+        let payload_text = rows[0].payload.to_string();
+        assert!(!payload_text.contains("sk-secret"));
+        assert!(!payload_text.contains("/Users/alice"));
+        assert_eq!(rows[1].event_type, "step");
+        assert_eq!(rows[1].payload.pointer("/message"), Some(&json!("after")));
+    }
+
+    #[test]
+    fn load_event_rows_omits_raw_malformed_event_lines() {
+        let root = TempDirGuard::new("event_malformed_redacted");
+        let events_path = root.path.join("events.jsonl");
+        fs::write(
+            &events_path,
+            "not-json token=sk-secretsecretsecretsecretsecret path=/Users/alice/project\n",
+        )
+        .unwrap();
+
+        let rows = load_event_rows(&events_path, "run_1", "trial_1", 0, "variant_1", "task_1", 0)
+            .expect("malformed event lines should be represented as redacted parse-error rows");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "trajectory_parse_error");
+        assert_eq!(
+            rows[0].payload.pointer("/event_type"),
+            Some(&json!("trajectory_parse_error"))
+        );
+        assert_eq!(rows[0].payload.pointer("/line"), Some(&json!(1)));
+        assert_eq!(
+            rows[0].payload.pointer("/raw_line_omitted"),
+            Some(&json!(true))
+        );
+        assert!(
+            rows[0]
+                .payload
+                .pointer("/error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("line 1")),
+            "parse-error payload should keep parser location without raw event text: {}",
+            rows[0].payload
+        );
+        let payload_text = rows[0].payload.to_string();
+        assert!(!payload_text.contains("sk-secret"));
+        assert!(!payload_text.contains("/Users/alice"));
+        assert!(!payload_text.contains("not-json"));
+        assert!(rows[0].payload.get("raw_line").is_none());
     }
 
     #[test]
@@ -18346,6 +19852,84 @@ mod tests {
     }
 
     #[test]
+    fn modal_worker_id_loader_corrupt_sidecar_without_state_uses_public_ref() {
+        let (root, paths) = create_trial_paths_fixture("bucephalus_modal_corrupt_workers_no_state");
+        let modal_dir = paths.trial_dir.join("modal");
+        ensure_dir(&modal_dir).expect("modal dir");
+        fs::write(modal_dir.join("runtime_workers.json"), "{not json")
+            .expect("write corrupt runtime workers");
+
+        let err = load_modal_runtime_worker_ids_for_test(&paths.trial_dir)
+            .expect_err("corrupt Modal worker sidecar without state ids should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("parse Modal runtime worker state"));
+        assert!(msg.contains("state_ref: modal://runtime-workers"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "Modal worker sidecar parse error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("runtime_workers.json"),
+            "Modal worker sidecar parse error leaked sidecar filename: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modal_worker_id_loader_ignores_symlinked_sidecar_when_state_ids_exist() -> Result<()> {
+        let (root, paths) = create_trial_paths_fixture("bucephalus_modal_workers_symlink_state");
+        let state =
+            runtime_trial_attempt_state_with_task_container(TrialPhase::AgentRunning, "sb-state");
+        persist_attempt_state(&paths.exp_dir, "run_1", &paths.trial_dir, &state)
+            .expect("persist attempt state");
+        let modal_dir = paths.trial_dir.join("modal");
+        ensure_dir(&modal_dir)?;
+        let outside = root.path.join("outside");
+        ensure_dir(&outside)?;
+        let outside_workers = outside.join("runtime_workers.json");
+        fs::write(
+            &outside_workers,
+            r#"{"sandbox_ids":["sb-outside-should-not-be-read"]}"#,
+        )?;
+        symlink(&outside_workers, modal_dir.join("runtime_workers.json"))?;
+
+        let ids = load_modal_runtime_worker_ids_for_test(&paths.trial_dir)?;
+
+        assert_eq!(ids, vec!["sb-state".to_string()]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modal_worker_id_loader_refuses_symlinked_sidecar_without_state_ids() -> Result<()> {
+        let (root, paths) = create_trial_paths_fixture("bucephalus_modal_workers_symlink_no_state");
+        let modal_dir = paths.trial_dir.join("modal");
+        ensure_dir(&modal_dir)?;
+        let outside = root.path.join("outside");
+        ensure_dir(&outside)?;
+        let outside_workers = outside.join("runtime_workers.json");
+        fs::write(&outside_workers, r#"{"sandbox_ids":["sb-outside"]}"#)?;
+        symlink(&outside_workers, modal_dir.join("runtime_workers.json"))?;
+
+        let err = load_modal_runtime_worker_ids_for_test(&paths.trial_dir)
+            .expect_err("symlinked Modal worker sidecar without state ids should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("symlinked Modal runtime worker state"));
+        assert!(msg.contains("state_ref: modal://runtime-workers"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "Modal worker symlink error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains(&outside.display().to_string()),
+            "Modal worker symlink error leaked target path: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn live_event_ingest_handle_drop_stops_background_thread() -> Result<()> {
         let (_root, run_dir) = create_run_dir("bucephalus_live_ingest_drop", "run_1");
         let events_path = run_dir.join("events.jsonl");
@@ -18754,6 +20338,29 @@ mod tests {
     }
 
     #[test]
+    fn public_run_artifact_refs_omit_local_parent_paths() {
+        let package_ref =
+            public_package_input_ref(Path::new("/Users/alice/private/project/package/manifest.json"));
+
+        assert_eq!(public_run_artifact_ref("run_20260609_000001"), "run://run_20260609_000001");
+        assert_eq!(package_ref, "package://package");
+        assert!(!package_ref.contains("/Users/alice"));
+        assert!(!package_ref.contains("private/project"));
+    }
+
+    #[test]
+    fn run_manifest_json_uses_public_project_ref() {
+        let behavior = RunBehavior::default();
+        let manifest = run_manifest_json("run_001", &behavior);
+
+        assert_eq!(manifest["schema_version"], "manifest_v1");
+        assert_eq!(manifest["run_id"], "run_001");
+        assert_eq!(manifest["project_ref"], "package://project-root");
+        assert!(manifest.get("project_root").is_none());
+        assert!(!manifest.to_string().contains("/Users/"));
+    }
+
+    #[test]
     fn write_run_session_state_roundtrip() {
         let root = TempDirGuard::new("session_roundtrip");
         let run_dir = root.path.join("run");
@@ -19013,6 +20620,29 @@ mod tests {
     }
 
     #[test]
+    fn copy_path_into_package_missing_source_uses_public_refs() {
+        let root = TempDirGuard::new("copy_pkg_missing_source_ref");
+        let src = root.path.join("private").join("missing.txt");
+        let dst = root.path.join("dest").join("missing.txt");
+
+        let err = copy_path_into_package(&src, &dst)
+            .expect_err("missing package source should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("expected a file or directory source"));
+        assert!(msg.contains("source_ref: source://input"));
+        assert!(msg.contains("output_ref: package://output"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "package copy error leaked root path: {msg}"
+        );
+        assert!(
+            !msg.contains("missing.txt"),
+            "package copy error leaked source file name: {msg}"
+        );
+    }
+
+    #[test]
     fn stage_source_into_package_absolute_path() {
         let root = TempDirGuard::new("stage_abs");
         let exp_dir = root.path.join("exp");
@@ -19067,15 +20697,29 @@ mod tests {
         ensure_dir(&pkg_dir).unwrap();
         let mut copies = BTreeMap::new();
         let mut counter = 0usize;
-        assert!(stage_source_into_package(
+        let err = stage_source_into_package(
             "nonexistent.tar",
             &exp_dir,
             &pkg_dir,
             "agent_builds",
             &mut copies,
-            &mut counter
+            &mut counter,
         )
-        .is_err());
+        .expect_err("missing staged source should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("failed to read staged source"));
+        assert!(msg.contains("source_ref: source://nonexistent.tar"));
+        assert!(msg.contains("resolved_ref: source://nonexistent.tar"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "staged source error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("resolved from"),
+            "staged source error should not print raw resolved-from text: {msg}"
+        );
+        assert_eq!(counter, 0);
     }
 
     #[test]
@@ -19096,8 +20740,46 @@ mod tests {
             &mut counter,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("must have a file name"));
+        let msg = err.to_string();
+        assert!(msg.contains("must have a file name"));
+        assert!(msg.contains("source_ref: source://input"));
+        assert!(msg.contains("resolved_ref: source://outside-workspace"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "unnamed staged source error leaked fixture root: {msg}"
+        );
         assert_eq!(counter, 0);
+    }
+
+    #[test]
+    fn stage_public_runtime_path_reference_missing_source_uses_public_refs() {
+        let root = TempDirGuard::new("stage_public_runtime_path_missing");
+        let exp_dir = root.path.join("exp");
+        let pkg_dir = root.path.join("pkg");
+        ensure_dir(&exp_dir).unwrap();
+        ensure_dir(&pkg_dir).unwrap();
+        let mut copies = BTreeMap::new();
+        let mut manifest_entries = Vec::new();
+
+        let err = stage_public_runtime_path_reference(
+            Path::new("support/missing.json"),
+            &exp_dir,
+            &pkg_dir,
+            &mut copies,
+            &mut manifest_entries,
+            "trial_runtime.agent.command[1]",
+        )
+        .expect_err("missing public runtime path should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("failed to read trial_runtime.agent.command[1] public path reference"));
+        assert!(msg.contains("source_ref: source://support/missing.json"));
+        assert!(msg.contains("resolved_ref: source://support/missing.json"));
+        assert!(
+            !msg.contains(&root.path.display().to_string()),
+            "public runtime path error leaked fixture root: {msg}"
+        );
+        assert!(manifest_entries.is_empty());
     }
 
     #[test]
@@ -19444,12 +21126,46 @@ mod tests {
 
     #[test]
     fn load_sealed_package_for_run_missing_file_fails() {
-        let path = Path::new("/nonexistent/experiment.yaml");
-        let err = load_sealed_package_for_run(path).unwrap_err();
+        let guard = TempDirGuard::new("load_exp_missing_public_ref");
+        let missing = guard.path.join("missing-package");
+        let err = load_sealed_package_for_run(&missing).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("resolve run input path"),
-            "unexpected error: {}",
-            err
+            msg.contains("resolve run input path"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("target_ref: package://."),
+            "expected public target ref, got: {msg}"
+        );
+        assert!(
+            !msg.contains(&guard.path.display().to_string()),
+            "missing package input error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("missing-package"),
+            "missing package input error leaked private target name: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_sealed_package_for_run_missing_checksums_uses_package_ref() {
+        let guard = TempDirGuard::new("load_exp_pkg_missing_checksums_public_ref");
+        fs::write(
+            guard.path.join("manifest.json"),
+            r#"{"schema_version":"sealed_run_package_v2","created_at":"2026-03-04T00:00:00Z","resolved_experiment":{},"checksums_ref":"missing-checksums.json","package_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        )
+        .expect("manifest");
+
+        let err = load_sealed_package_for_run(&guard.path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checksums missing or unreadable at package://missing-checksums.json"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&guard.path.display().to_string()),
+            "missing checksums error leaked package root: {msg}"
         );
     }
 
@@ -19471,7 +21187,12 @@ mod tests {
         let manifest = guard.path.join("manifest.json");
         fs::write(&manifest, r#"{}"#).unwrap();
         let err = load_authoring_input_for_build(&manifest, None).unwrap_err();
-        assert!(err.to_string().contains("build_input_invalid_kind"));
+        let msg = err.to_string();
+        assert!(msg.contains("build_input_invalid_kind"));
+        assert!(
+            !msg.contains(&guard.path.display().to_string()),
+            "manifest-as-build-input error leaked fixture root: {msg}"
+        );
     }
 
     #[test]
@@ -19479,10 +21200,34 @@ mod tests {
         let guard = TempDirGuard::new("load_missing_authoring_input");
         let missing = guard.path.join("missing.yaml");
         let err = load_authoring_input_for_build(&missing, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("resolve build input path"));
+        assert!(msg.contains("target_ref: workspace://experiment"));
+        assert!(msg.contains("bucephalus init <workspace-dir>"));
+        assert!(msg.contains("bucephalus build <experiment-yaml> --out <package-dir>"));
         assert!(
-            err.to_string().contains("resolve build input path"),
-            "unexpected error: {}",
-            err
+            !msg.contains(&guard.path.display().to_string()),
+            "missing build input error leaked fixture root: {msg}"
+        );
+        assert!(
+            !msg.contains("missing.yaml"),
+            "missing build input error leaked private target file name: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_authoring_input_for_build_directory_uses_public_ref() {
+        let guard = TempDirGuard::new("load_authoring_input_directory_ref");
+        let err = load_authoring_input_for_build(&guard.path, None).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("build_input_invalid_kind"));
+        assert!(msg.contains("expected v1 experiment YAML file, got directory"));
+        assert!(msg.contains("target_ref: workspace://experiment"));
+        assert!(msg.contains("bucephalus build <experiment-yaml> --out <package-dir>"));
+        assert!(
+            !msg.contains(&guard.path.display().to_string()),
+            "directory build input error leaked fixture root: {msg}"
         );
     }
 
@@ -19571,6 +21316,68 @@ mod tests {
         assert!(
             msg.contains("package check failed to read package lock"),
             "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("package://package.lock"),
+            "expected public package ref, got: {msg}"
+        );
+        assert!(
+            !msg.contains(&build.package_dir.display().to_string()),
+            "package check error must not leak the package root: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_package_missing_checksummed_file_uses_package_ref() {
+        let root = create_dx_authoring_fixture("bucephalus_check_missing_payload_file");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        fs::remove_file(build.package_dir.join("tasks").join("tasks.jsonl"))
+            .expect("remove packaged tasks");
+
+        let err = check_package(&build.package_dir)
+            .expect_err("package checks must reject missing checksummed package files");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checksummed file missing: package://tasks/tasks.jsonl"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&build.package_dir.display().to_string()),
+            "package check error must not leak the package root: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_package_malformed_task_rows_use_package_ref() {
+        let package = TempDirGuard::new("bucephalus_check_malformed_tasks_public_ref");
+        atomic_write_json_pretty(
+            &package.path.join("package.lock"),
+            &json!({
+                "schema_version": "sealed_package_lock_v1",
+                "package_digest": TEST_PACKAGE_DIGEST
+            }),
+        )
+        .expect("package lock");
+        fs::write(package.path.join("resolved_experiment.json"), "{}\n")
+            .expect("resolved experiment");
+        fs::create_dir_all(package.path.join("tasks")).expect("tasks dir");
+        fs::write(package.path.join("tasks").join("tasks.jsonl"), "{not-json}\n")
+            .expect("malformed tasks");
+
+        let err = check_package(&package.path)
+            .expect_err("package checks must report malformed task rows");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("package check failed to parse package://tasks/tasks.jsonl line 1"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&package.path.display().to_string()),
+            "package check error must not leak the package root: {msg}"
         );
     }
 
@@ -19744,6 +21551,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn copy_verified_package_payload_for_run_missing_manifest_uses_package_ref() {
+        let package = TempDirGuard::new("bucephalus_payload_copy_missing_manifest_ref");
+        let run = TempDirGuard::new("bucephalus_payload_copy_missing_manifest_run");
+
+        let err = copy_verified_package_payload_for_run(&package.path, &run.path)
+            .expect_err("copy must reject packages without a manifest");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("manifest missing or unreadable at package://manifest.json"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&package.path.display().to_string()),
+            "copy error leaked package root: {msg}"
+        );
+    }
+
+    #[test]
+    fn copy_verified_package_payload_for_run_existing_destination_uses_run_ref() {
+        let root = create_dx_authoring_fixture("bucephalus_payload_copy_existing_dest");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let run_dir = root.path.join("run_copy");
+        ensure_dir(&run_dir.join("tasks")).expect("run tasks dir");
+        fs::write(run_dir.join("tasks").join("tasks.jsonl"), "{}\n")
+            .expect("existing run destination");
+
+        let err = copy_verified_package_payload_for_run(&build.package_dir, &run_dir)
+            .expect_err("copy must reject existing run destinations");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("destination already exists: run://tasks/tasks.jsonl"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&run_dir.display().to_string()),
+            "copy error must not leak the run root: {msg}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn copy_verified_package_payload_for_run_rejects_symlinked_destination_parent() {
@@ -19765,6 +21616,18 @@ mod tests {
         assert!(
             msg.contains("destination parent resolves outside run directory"),
             "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("run://tasks"),
+            "expected public run ref, got: {msg}"
+        );
+        assert!(
+            !msg.contains(&run_dir.display().to_string()),
+            "copy error must not leak the run root: {msg}"
+        );
+        assert!(
+            !msg.contains(&outside.display().to_string()),
+            "copy error must not leak the symlink target: {msg}"
         );
         assert!(
             !outside.join("tasks.jsonl").exists(),
@@ -19897,6 +21760,49 @@ mod tests {
                 .contains("runtime staging manifest missing entries for variant 'treatment'"),
             "{}",
             err
+        );
+        assert!(
+            err.to_string().contains(&format!("in package://{}", STAGING_MANIFEST_FILE)),
+            "{}",
+            err
+        );
+        assert!(
+            !err.to_string().contains(&guard.path.display().to_string()),
+            "missing variant error leaked package root: {err}"
+        );
+    }
+
+    #[test]
+    fn load_staging_specs_from_package_missing_source_uses_package_ref() {
+        let guard = TempDirGuard::new("load_staging_specs_missing_source_ref");
+        write_runtime_staging_manifest(
+            &guard.path,
+            &json!({
+                "schema_version": STAGING_MANIFEST_SCHEMA_VERSION,
+                "variants": {
+                    "control": [{
+                        "original_relative_path": "support/missing.json",
+                        "packaged_path": "runtime_assets/missing.json",
+                        "runtime_path": "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/missing.json",
+                        "required": true,
+                        "read_only": true
+                    }]
+                }
+            }),
+        );
+
+        let err = load_staging_specs_from_package(&guard.path, "control")
+            .expect_err("missing packaged staging source should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "failed to read packaged runtime staging source package://runtime_assets/missing.json"
+            ),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains(&guard.path.display().to_string()),
+            "missing staging source error leaked package root: {msg}"
         );
     }
 

@@ -16,6 +16,14 @@ digest, manifest digest, and core binary digest.
 USAGE
 }
 
+public_release_input_ref() {
+  printf '%s\n' "release-input://source"
+}
+
+public_provenance_output_ref() {
+  printf '%s\n' "release-provenance://output"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --release)
@@ -31,7 +39,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "unknown argument: $1" >&2
+      echo "unknown argument" >&2
       usage >&2
       exit 2
       ;;
@@ -73,6 +81,18 @@ trap cleanup EXIT
 require_command bun
 require_command tar
 
+if [[ ! -e "${RELEASE_INPUT}" ]]; then
+  echo "release input does not exist" >&2
+  echo "release_ref: $(public_release_input_ref)" >&2
+  exit 2
+fi
+
+if [[ -L "${OUT_PATH}" ]]; then
+  echo "refusing to write provenance through a symlinked output path" >&2
+  echo "provenance_ref: $(public_provenance_output_ref)" >&2
+  exit 1
+fi
+
 "${ROOT_DIR}/scripts/release/verify-core-release.sh" "${RELEASE_INPUT}"
 
 RELEASE_ARCHIVE_SHA=""
@@ -87,7 +107,17 @@ else
   RELEASE_DIR="${WORK_DIR}"
 fi
 
-mkdir -p "$(dirname "${OUT_PATH}")"
+if [[ -e "${OUT_PATH}" && ! -f "${OUT_PATH}" ]]; then
+  echo "refusing to write provenance to a non-file output path" >&2
+  echo "provenance_ref: $(public_provenance_output_ref)" >&2
+  exit 1
+fi
+
+if ! mkdir -p "$(dirname "${OUT_PATH}")" 2>/dev/null; then
+  echo "failed to prepare provenance output directory" >&2
+  echo "provenance_ref: $(public_provenance_output_ref)" >&2
+  exit 1
+fi
 if [[ -z "${WORK_DIR}" ]]; then
   WORK_DIR="$(mktemp -d)"
 fi
@@ -112,7 +142,9 @@ const provenance = {
   },
   artifacts: {
     core_binary: manifest.artifacts.core_binary,
+    cloud_cli_binary: manifest.artifacts.cloud_cli_binary,
     modal_launcher_binary: manifest.artifacts.modal_launcher_binary,
+    installer_script: manifest.artifacts.installer_script,
   },
   builder: {
     kind: isGithubActions ? "github_actions" : "local",
@@ -144,4 +176,4 @@ OUT_PATH="${OUT_PATH}" \
 bun "${WRITE_JS}"
 
 "${ROOT_DIR}/scripts/release/verify-core-release-provenance.sh" "${OUT_PATH}" --release "${RELEASE_INPUT}"
-echo "provenance=${OUT_PATH}"
+echo "provenance=$(public_provenance_output_ref)"

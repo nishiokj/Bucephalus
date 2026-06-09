@@ -42,6 +42,12 @@ bucephalus check-package <package_dir> --json
 `check-package` does not start Docker, access providers, load secrets, or run
 trial commands.
 
+Cloud upload commands validate sealed archives before sending bytes to the Cloud
+API. `bucephalus-cloud deploy` builds the archive from manifest/checksum entries;
+`bucephalus-cloud import sealed-package <package.tgz>` rejects archives without a
+root `manifest.json`, with checksum mismatches, or with extra files not declared
+by the sealed package.
+
 ## Current Checks
 
 The report is written as `package_checks.json` with `schema_version:

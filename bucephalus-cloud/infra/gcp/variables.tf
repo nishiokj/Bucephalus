@@ -294,6 +294,28 @@ variable "runner_gce_machine_type" {
   }
 }
 
+variable "runner_gce_cpu_count" {
+  description = "CPU capacity advertised by the default per-run GCE Docker runner pool."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.runner_gce_cpu_count >= 1
+    error_message = "runner_gce_cpu_count must be at least 1."
+  }
+}
+
+variable "runner_gce_memory_mb" {
+  description = "Memory capacity in MB advertised by the default per-run GCE Docker runner pool."
+  type        = number
+  default     = 8192
+
+  validation {
+    condition     = var.runner_gce_memory_mb >= 1024
+    error_message = "runner_gce_memory_mb must be at least 1024."
+  }
+}
+
 variable "runner_gce_boot_disk_size_gb" {
   description = "Boot disk size for per-run GCE Docker runner VMs."
   type        = number

@@ -1,12 +1,15 @@
 import { authOwnerKey, type AuthContext } from "../auth";
-import { HttpError, isRecord, jsonResponse, optionalString, readJsonObject, requireRecord, requireString } from "../http";
+import { decodePathParam, HttpError, isRecord, jsonResponse, optionalString, queryIntegerParam, readJsonObject, requireRecord, requireString } from "../http";
 import type { LatchSubmissionRecord, LatchSubmissionRepository } from "../latch/repository";
 import type { JsonObject } from "../primitives";
+import { publicBoundaryJsonObject, publicBoundaryText } from "../publicBoundary";
 import { RegistryRepository } from "../registry/repository";
 
 const LATCH_MANIFEST_SCHEMA = "latch_manifest_v1";
 const LATCH_RESOLUTION_SCHEMA = "latch_resolution_v1";
 const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const LATCH_CASE_LIMIT_MAX = 200;
 
 export async function handleLatchRoute(
   request: Request,
@@ -35,7 +38,10 @@ export async function handleLatchRoute(
     if (!submissions) {
       throw new HttpError(500, "latch_submissions_unavailable", "Latch submissions repository is not configured");
     }
-    const submissionId = decodeURIComponent(url.pathname.slice("/v1/latch/submissions/".length));
+    const submissionId = requireUuidString(
+      decodePathParam(url.pathname.slice("/v1/latch/submissions/".length), "/submission_id"),
+      "/submission_id",
+    );
     const record = await submissions.getSubmission(submissionId, authOwnerKey(auth));
     if (!record) {
       throw new HttpError(404, "latch_submission_not_found", "Latch submission not found");
@@ -47,6 +53,9 @@ export async function handleLatchRoute(
 
 async function resolveLatchBenchmark(request: Request, registry: RegistryRepository): Promise<Response> {
   const body = await readJsonObject(request);
+  const caseLimit = positiveInteger(body.case_limit, "/case_limit", { max: LATCH_CASE_LIMIT_MAX })
+    ?? positiveInteger(body.cases, "/cases", { max: LATCH_CASE_LIMIT_MAX })
+    ?? undefined;
   const benchmarkRef = benchmarkRefFromBody(body);
   const contentDigest = benchmarkRef.digest
     ?? await registry.resolveAlias("benchmark", benchmarkRef.alias, scopeInput(benchmarkRef));
@@ -69,9 +78,6 @@ async function resolveLatchBenchmark(request: Request, registry: RegistryReposit
   }
 
   const manifest = latchManifestFromBenchmark(canonical);
-  const caseLimit = positiveInteger(body.case_limit, "/case_limit")
-    ?? positiveInteger(body.cases, "/cases")
-    ?? undefined;
   const limitedManifest = limitManifestCases(manifest, caseLimit);
   const materials = Array.isArray(canonical.materials) ? canonical.materials : [];
 
@@ -100,10 +106,18 @@ function benchmarkRefFromBody(body: Record<string, unknown>): {
 } {
   const rawRef = isRecord(body.benchmark_ref) ? body.benchmark_ref : null;
   const rawBenchmark = optionalString(body.benchmark, "/benchmark");
-  const digest = optionalString(rawRef?.digest, "/benchmark_ref/digest");
-  const alias = optionalString(rawRef?.alias, "/benchmark_ref/alias")
-    ?? (rawBenchmark && !SHA256_DIGEST_PATTERN.test(rawBenchmark) ? rawBenchmark : null);
-  const benchmarkDigest = digest ?? (rawBenchmark && SHA256_DIGEST_PATTERN.test(rawBenchmark) ? rawBenchmark : null);
+  const digest = optionalSha256(rawRef?.digest, "/benchmark_ref/digest");
+  let alias = optionalString(rawRef?.alias, "/benchmark_ref/alias");
+  let benchmarkDigest = digest;
+  if (rawBenchmark) {
+    if (SHA256_DIGEST_PATTERN.test(rawBenchmark)) {
+      benchmarkDigest ??= rawBenchmark;
+    } else if (rawBenchmark.toLowerCase().startsWith("sha256:")) {
+      throw new HttpError(400, "invalid_digest", "/benchmark must be sha256:<64 lowercase hex chars>");
+    } else {
+      alias ??= rawBenchmark;
+    }
+  }
   if (!alias && !benchmarkDigest) {
     throw new HttpError(400, "benchmark_required", "Provide benchmark or benchmark_ref.alias/digest");
   }
@@ -175,12 +189,18 @@ function limitManifestCases(manifest: Record<string, unknown>, caseLimit: number
   };
 }
 
-function positiveInteger(value: unknown, pointer: string): number | null {
+function positiveInteger(value: unknown, pointer: string, bounds: { max?: number } = {}): number | null {
   if (value === undefined || value === null) {
     return null;
   }
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
-    throw new HttpError(400, "invalid_request", `${pointer} must be a positive integer`);
+  const max = bounds.max ?? Number.MAX_SAFE_INTEGER;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > max) {
+    const rangeDescription = bounds.max === undefined ? "a positive integer" : `an integer from 1 to ${max}`;
+    throw new HttpError(400, "invalid_request", `${pointer} must be ${rangeDescription}`, {
+      pointer,
+      min: 1,
+      max,
+    });
   }
   return value;
 }
@@ -212,7 +232,7 @@ async function createLatchSubmission(
   const archiveDigest = requireSha256(body.archive_digest, "/archive_digest");
   const record = await submissions.createSubmission({
     dispatchId: requireString(body.dispatch_id, "/dispatch_id"),
-    uploadId: requireString(body.upload_id, "/upload_id"),
+    uploadId: requireUuidString(body.upload_id, "/upload_id"),
     benchmarkRef: requireString(benchmark.id, "/benchmark/id"),
     benchmarkDigest: optionalSha256(benchmark.content_digest, "/benchmark/content_digest"),
     resolutionId: optionalString(resolution.resolution_id, "/resolution/resolution_id"),
@@ -230,18 +250,18 @@ async function createLatchSubmission(
 function submissionToWire(record: LatchSubmissionRecord) {
   return {
     submission_id: record.submission_id,
-    dispatch_id: record.dispatch_id,
+    dispatch_id: publicBoundaryText(record.dispatch_id),
     upload_id: record.upload_id,
     benchmark: {
-      id: record.benchmark_ref,
+      id: publicBoundaryText(record.benchmark_ref),
       content_digest: record.benchmark_digest,
     },
-    resolution_id: record.resolution_id,
+    resolution_id: record.resolution_id === null ? null : publicBoundaryText(record.resolution_id),
     archive_digest: record.archive_digest,
-    grading_status: record.grading_status,
-    summary: record.summary_json,
-    lifecycle: record.lifecycle_json,
-    result: record.result_json,
+    grading_status: record.grading_status === null ? null : publicBoundaryText(record.grading_status),
+    summary: publicBoundaryJsonObject(record.summary_json),
+    lifecycle: publicBoundaryJsonObject(record.lifecycle_json),
+    result: publicBoundaryJsonObject(record.result_json),
     created_at: record.created_at,
     updated_at: record.updated_at,
   };
@@ -273,11 +293,17 @@ function optionalSha256(value: unknown, pointer: string): string | null {
   return digest;
 }
 
-function limitFromUrl(url: URL): number {
-  const raw = url.searchParams.get("limit");
-  if (!raw) {
-    return 50;
+function requireUuidString(value: unknown, pointer: string): string {
+  if (typeof value !== "string") {
+    throw new HttpError(400, "invalid_request", `${pointer} must be a UUID`);
   }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : 50;
+  const normalized = value.trim().toLowerCase();
+  if (!UUID_PATTERN.test(normalized)) {
+    throw new HttpError(400, "invalid_request", `${pointer} must be a UUID`);
+  }
+  return normalized;
+}
+
+function limitFromUrl(url: URL): number {
+  return queryIntegerParam(url, "limit", { defaultValue: 50, min: 1, max: 200 });
 }

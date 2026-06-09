@@ -88,6 +88,10 @@ explicit rollback to a previously recorded promotion digest. The GitHub deploy
 workflow downloads the `cloud-image-promotion-evidence-<target>` artifact from a
 release workflow run, verifies `cloud-image-promotion-evidence.json`, and passes
 the generated `gcp-image-digests.tfvars` as a separate Terraform var-file.
+The generated deploy tfvars file is non-secret configuration only; the workflow
+renders it through `scripts/deploy/write-gcp-deploy-tfvars.sh`, which refuses
+symlinked output paths and logs the stable `tfvars://gcp-deploy` ref rather than
+the runner-local temp path.
 
 The deployment sequence is intentionally staged:
 

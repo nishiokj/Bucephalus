@@ -11,6 +11,19 @@ bucephalus runs
 bucephalus runs --json
 ```
 
+`runs` includes a `next_action` column. Active runs point at `views-live`;
+interrupted runs point at `recover`.
+
+For an interrupted run:
+
+```bash
+bucephalus recover <run_id>
+bucephalus continue <run_id>
+```
+
+`--run-dir <path>` remains available when you need to operate on a run directory
+that is not registered in the configured run store.
+
 ## Standard Views
 
 ```bash
@@ -103,8 +116,11 @@ Useful raw views include:
 
 Runtime events are written from declared `stages.agent.events` JSONL
 captures. `bucephalus views <run_id> events` prints the captured payloads.
-For SQL, `raw_events.event_json` is the raw payload text, and `raw_events.buc_event_row_json`
-is Buc's row wrapper:
+For SQL, `raw_events.event_json` is the payload Buc ingested, and
+`raw_events.buc_event_row_json` is Buc's row wrapper. Malformed JSONL rows are
+represented as `trajectory_parse_error` payloads with line numbers, but the raw
+malformed line is omitted so inspection views do not become a secret or local
+path sink:
 
 ```bash
 bucephalus query <run_id> "
@@ -132,6 +148,45 @@ bucephalus query <run_id> "
 The `raw_events` view includes live rows whose trial has not committed yet, so it
 is the right place to inspect whether an executing agent is still producing
 observable work.
+
+## Cleaning Local Runs
+
+Preview local run cleanup before deleting anything:
+
+```bash
+bucephalus clean --runs --dry-run
+bucephalus clean --runs --dry-run --json
+```
+
+Dry-run reports active, interrupted, and untracked local run-root entries without
+requiring override flags.
+Actual deletion requires `--force`. Active runs also require
+`--include-active`, and interrupted runs require `--include-interrupted`; recover
+or continue interrupted runs first when you still need their schedule state.
+Untracked entries under the local run root, such as partial or corrupt run
+directories, require `--include-untracked` so cleanup never silently removes
+files that were not visible in the run inventory preview.
+
+## Support Bundles
+
+Use `publish` when you need a shareable support bundle for a run:
+
+```bash
+bucephalus publish --run-dir <run_dir>
+bucephalus publish --run-dir <run_dir> --out support.zip --json
+```
+
+By default, the bundle is written under `<run_dir>/debug_bundles/` with a
+timestamped filename. If you pass `--out`, Bucephalus refuses to overwrite an
+existing file.
+
+Support bundles are redacted and curated. They include top-level run metadata
+and selected trial JSON/JSONL diagnostics, but skip raw logs, runtime state,
+workspace/state/temp/auth directories, unsupported artifact types, and
+secret-looking filenames. JSON and JSONL entries redact secret-like keys,
+environment fields, local paths, command/argument/URL fields, and
+prompt/content/input/output/message-like fields. Inspect the bundle before
+sharing it.
 
 ## Compare Runs
 

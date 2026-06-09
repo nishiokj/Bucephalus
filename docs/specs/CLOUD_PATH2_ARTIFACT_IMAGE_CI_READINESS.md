@@ -140,18 +140,19 @@ user-secret policy.
   provenance can be accepted.
 - `scripts/release/write-gcp-image-tfvars.sh` converts a verified pushed image
   build manifest into digest-addressed GCP Terraform image inputs for API,
-  pool-controller, and migrations from one Artifact Registry repository family,
-  then verifies the generated file.
+  pool-controller, migrations, and worker from one Artifact Registry repository
+  family, then verifies the generated file.
 - `scripts/release/verify-gcp-image-tfvars.sh` verifies that a GCP image tfvars
   handoff contains exactly the expected digest refs from a pushed image manifest
-  and no extra Terraform variables. Worker images remain build evidence and are
-  explicitly rejected as deploy tfvars inputs.
+  and no extra Terraform variables. The worker image digest is included so the
+  deploy and cleanup workflows consume one complete, verified image handoff.
 - `scripts/release/verify-gcp-image-promotion-evidence.sh` verifies that the
   pushed image manifest, image-build provenance, and GCP tfvars all describe the
   same digest-addressed promotion input set before handoff. It independently
   checks the Terraform handoff against both manifest and provenance immutable
-  refs, requires one Artifact Registry repository family, and keeps worker
-  images out of promotion tfvars.
+  refs, requires one Artifact Registry repository family, requires the worker
+  image digest alongside the control-plane image digests, and rejects symlinked
+  handoff paths without echoing malformed tfvars content.
 - `scripts/release/write-cloud-image-promotion-evidence-index.sh` writes
   `cloud-image-promotion-evidence.json` for pushed image handoff evidence after
   verifying the complete manifest/provenance/tfvars bundle.
@@ -160,8 +161,8 @@ user-secret policy.
   file digests when present, re-runs the complete promotion verifier, and keeps
   the index explicitly unsigned until signing is configured. The index must
   contain exactly the pushed image manifest, image-build provenance, and tfvars
-  evidence entries, and it records the single Artifact Registry repository
-  family used by deployable image refs.
+  evidence entries, rejects symlinked references, and records the single
+  Artifact Registry repository family used by deployable image refs.
 - `scripts/ci/verify-cloud-release-boundary.sh` is part of
   `scripts/ci/cloud-gates.sh` and checks that release workflow/image definitions
   do not regress to retired deploy payloads, mutable `latest` inputs, direct
@@ -184,9 +185,10 @@ user-secret policy.
   Hub, localhost, examples, tags, digests, URLs, or the local smoke default. The
   Bun base image input must be digest-addressed and must not use a `latest` tag
   even when a digest is present.
-- The release workflow defaults pushed images to
-  `us-central1-docker.pkg.dev/gen-lang-client-0255842044/buc-bucephalus-cloud/bucephalus-cloud`,
-  matching the first GCP substrate's Terraform repository name.
+- The release workflow requires pushed images to use the configured
+  `BUCEPHALUS_IMAGE_REPOSITORY` repository variable, for example
+  `us-central1-docker.pkg.dev/<project-id>/buc-bucephalus-cloud/bucephalus-cloud`,
+  matching the target GCP substrate's Terraform repository name.
 - `.github/workflows/bucephalus-release.yml` authenticates pushed image
   publication through Google Workload Identity using
   `google-github-actions/auth@v3`, installs gcloud with

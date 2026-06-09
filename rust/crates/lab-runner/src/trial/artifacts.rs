@@ -15,6 +15,14 @@ pub(crate) struct AgentResponseRead {
     pub(crate) parse_error: Option<String>,
 }
 
+fn public_trial_contract_ref(path: &Path) -> &'static str {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("trial_input.json") => "contract://in/trial_input.json",
+        Some("result.json") => "contract://out/result.json",
+        _ => "[REDACTED:local-path]",
+    }
+}
+
 pub(crate) fn load_agent_response_resilient(path: &Path) -> Result<AgentResponseRead> {
     if !path.exists() {
         return Ok(AgentResponseRead {
@@ -34,7 +42,7 @@ pub(crate) fn load_agent_response_resilient(path: &Path) -> Result<AgentResponse
         Err(err) => {
             let detail = format!(
                 "failed to parse agent response JSON at {}: {}",
-                path.display(),
+                public_trial_contract_ref(path),
                 err
             );
             Ok(AgentResponseRead {
@@ -78,12 +86,13 @@ pub(crate) fn artifact_type_from_trial_input(trial_input: &Value) -> Result<Arti
 }
 
 pub(crate) fn artifact_type_from_trial_input_path(path: &Path) -> Result<ArtifactType> {
+    let input_ref = public_trial_contract_ref(path);
     let bytes =
-        fs::read(path).with_context(|| format!("failed to read trial input {}", path.display()))?;
+        fs::read(path).with_context(|| format!("failed to read trial input {input_ref}"))?;
     let trial_input: Value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse trial input JSON {}", path.display()))?;
+        .with_context(|| format!("failed to parse trial input JSON {input_ref}"))?;
     artifact_type_from_trial_input(&trial_input)
-        .with_context(|| format!("failed to resolve artifact_type from {}", path.display()))
+        .with_context(|| format!("failed to resolve artifact_type from {input_ref}"))
 }
 
 pub(crate) fn extract_candidate_artifact_record(

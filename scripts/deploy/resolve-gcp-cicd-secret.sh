@@ -54,12 +54,37 @@ if ! command -v bun >/dev/null 2>&1; then
 fi
 
 MODE="${MODE}" bun -e '
+import { lstatSync } from "node:fs";
+
 const mode = process.env.MODE;
 const raw = process.env.BUC_CI_CD?.trim();
 
 function fail(message) {
   console.error(message);
   process.exit(1);
+}
+
+function requireAppendTarget(path, label) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    fail(`${label} does not exist or cannot be inspected`);
+  }
+  if (stat.isSymbolicLink()) {
+    fail(`${label} must not be a symlink`);
+  }
+  if (!stat.isFile()) {
+    fail(`${label} must be a regular file`);
+  }
+}
+
+async function appendGitHubFile(path, label, text) {
+  if (!path) {
+    return;
+  }
+  requireAppendTarget(path, label);
+  await Bun.write(path, text, { append: true });
 }
 
 function pickFromSecret(secret) {
@@ -116,12 +141,8 @@ if (!/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.iam\.gserviceaccount\.com$/.test(accoun
 }
 
 const output = process.env.GITHUB_OUTPUT;
-if (output) {
-  await Bun.write(output, `workload_identity_provider=${provider}\nservice_account=${account}\n`, { append: true });
-}
+await appendGitHubFile(output, "GitHub output file", `workload_identity_provider=${provider}\nservice_account=${account}\n`);
 const env = process.env.GITHUB_ENV;
-if (env) {
-  await Bun.write(env, `BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER=${provider}\nBUCEPHALUS_GCP_SERVICE_ACCOUNT=${account}\n`, { append: true });
-}
-console.log(`resolved ${mode} GCP CI/CD identity for ${account}`);
+await appendGitHubFile(env, "GitHub env file", `BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER=${provider}\nBUCEPHALUS_GCP_SERVICE_ACCOUNT=${account}\n`);
+console.log(`resolved ${mode} GCP CI/CD identity`);
 '

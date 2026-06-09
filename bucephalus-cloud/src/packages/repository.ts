@@ -302,36 +302,68 @@ export class RunRepository {
         select *
         from cloud.runs
         where status in ('created', 'waiting_for_runner')
+          and jsonb_typeof(run_requirements->'executor') = 'string'
           and run_requirements->>'executor' = any(${capabilities.executors})
           and (
             run_requirements->>'arch' is null
-            or ${capabilities.arch ?? null}::text is null
-            or run_requirements->>'arch' = ${capabilities.arch ?? null}
+            or (
+              jsonb_typeof(run_requirements->'arch') = 'string'
+              and ${capabilities.arch ?? null}::text is not null
+              and run_requirements->>'arch' = ${capabilities.arch ?? null}
+            )
           )
           and (
             (run_requirements->>'cpu_count') is null
-            or ${capabilities.cpu_count ?? null}::int is null
-            or (run_requirements->>'cpu_count')::int <= ${capabilities.cpu_count ?? null}::int
+            or case
+              when jsonb_typeof(run_requirements->'cpu_count') = 'number'
+                and run_requirements->>'cpu_count' ~ '^[1-9][0-9]*$'
+              then ${capabilities.cpu_count ?? null}::int is not null
+                and (run_requirements->>'cpu_count')::int <= ${capabilities.cpu_count ?? null}::int
+              else false
+            end
           )
           and (
             (run_requirements->>'memory_mb') is null
-            or ${capabilities.memory_mb ?? null}::int is null
-            or (run_requirements->>'memory_mb')::int <= ${capabilities.memory_mb ?? null}::int
+            or case
+              when jsonb_typeof(run_requirements->'memory_mb') = 'number'
+                and run_requirements->>'memory_mb' ~ '^[1-9][0-9]*$'
+              then ${capabilities.memory_mb ?? null}::int is not null
+                and (run_requirements->>'memory_mb')::int <= ${capabilities.memory_mb ?? null}::int
+              else false
+            end
           )
           and (
             (run_requirements->>'disk_mb') is null
-            or ${capabilities.disk_mb ?? null}::int is null
-            or (run_requirements->>'disk_mb')::int <= ${capabilities.disk_mb ?? null}::int
+            or case
+              when jsonb_typeof(run_requirements->'disk_mb') = 'number'
+                and run_requirements->>'disk_mb' ~ '^[1-9][0-9]*$'
+              then ${capabilities.disk_mb ?? null}::int is not null
+                and (run_requirements->>'disk_mb')::int <= ${capabilities.disk_mb ?? null}::int
+              else false
+            end
           )
           and (
             run_requirements->>'isolation' is null
-            or ${capabilityIsolation}::text[] = '{}'
-            or run_requirements->>'isolation' = any(${capabilityIsolation})
+            or (
+              jsonb_typeof(run_requirements->'isolation') = 'string'
+              and (
+                ${capabilityIsolation}::text[] = '{}'
+                or run_requirements->>'isolation' = any(${capabilityIsolation})
+              )
+            )
           )
+          and jsonb_typeof(run_requirements->'requires') = 'array'
           and not exists (
             select 1
-            from jsonb_array_elements_text(coalesce(run_requirements->'requires', '[]'::jsonb)) required(resource)
+            from jsonb_array_elements_text(run_requirements->'requires') required(resource)
             where not (required.resource = any(${capabilities.resources}))
+          )
+          and (
+            jsonb_typeof(secret_refs) = 'object'
+            and (
+              secret_refs = '{}'::jsonb
+              or 'secret_resolver' = any(${capabilities.resources})
+            )
           )
         order by created_at asc
         for update skip locked
@@ -584,8 +616,11 @@ export class RunRepository {
 }
 
 export function requireStringMap(value: unknown, pointer: string): Record<string, string> {
-  if (!isRecord(value)) {
+  if (value === undefined) {
     return {};
+  }
+  if (!isRecord(value)) {
+    throw new HttpError(400, "invalid_string_map", `${pointer} must be an object`);
   }
   const out: Record<string, string> = {};
   for (const [key, item] of Object.entries(value)) {

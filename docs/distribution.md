@@ -16,6 +16,16 @@ archive, verifies the archive checksum, and installs `bucephalus` into
 `$HOME/.local/bin` unless `BUCEPHALUS_INSTALL_DIR` is set.
 The sibling checksum file must contain exactly one record in the release format:
 `<lowercase-sha256>  <archive-name>`.
+Before extraction, the installer also verifies that the archive contains only
+the expected flat public files: `bucephalus`, `bucephalus-cloud`,
+`bucephalus-modal-launcher`, `install.sh`, `README.md`, `LICENSE`,
+`release-manifest.json`, and `SHA256SUMS`. Absolute paths, traversal, duplicate
+members, symlinks, directories, and unexpected files are rejected. The installer
+reports rejected member names as `archive-member://...` refs and redacts
+secret-like names. It places the archive-bundled script at
+`<install-dir>/bucephalus-install.sh` as a local reference copy. Artifacts are
+copied through an install-dir-local random staging directory with private
+permissions, and the staging directory is removed after success or failure.
 
 Install a specific release with:
 
@@ -29,11 +39,12 @@ Update an already-installed release with:
 bucephalus update
 ```
 
-The update command downloads and runs the same installer, pins
-`BUCEPHALUS_INSTALL_DIR` to the directory containing the running binary, skips
-shell profile edits by default, and refreshes `bucephalus setup` unless
-`--setup=false` is passed. Use `--version 0.3.1` to update or roll back to a
-specific release.
+The update command resolves the installer from GitHub Release assets, downloads
+`install.sh` plus `install.sh.sha256`, verifies the installer checksum before
+execution, pins `BUCEPHALUS_INSTALL_DIR` to the directory containing the running
+binary, skips shell profile edits by default, and refreshes `bucephalus setup`
+unless `--setup=false` is passed. Use `--version 0.3.1` to update or roll back
+to a specific release.
 
 From a checkout, the source install remains:
 
@@ -93,11 +104,14 @@ bucephalus-x86_64-apple-darwin.tar.gz
 bucephalus-x86_64-unknown-linux-gnu.tar.gz
 bucephalus-aarch64-unknown-linux-gnu.tar.gz
 <archive>.sha256
+install.sh
+install.sh.sha256
 ```
 
-Each archive contains `bucephalus`, the packaged `bucephalus-modal-launcher`
-helper used by the Modal backend, `README.md`, `LICENSE`,
-`release-manifest.json`, and `SHA256SUMS`. Build one locally with:
+Each archive contains `bucephalus`, `bucephalus-cloud`, the packaged
+`bucephalus-modal-launcher` helper used by the Modal backend, `install.sh`,
+`README.md`, `LICENSE`, `release-manifest.json`, and `SHA256SUMS`. Build one
+locally with:
 
 ```bash
 scripts/release/build-core-release.sh --version 0.3.1 --target aarch64-apple-darwin
@@ -114,6 +128,10 @@ scripts/release/verify-core-release-provenance.sh \
   dist/releases/bucephalus-<target>.provenance.json \
   --release dist/releases/bucephalus-<target>.tar.gz
 ```
+
+`verify-core-release.sh` screens tar member names and file types before
+extracting an archive, so a verifier run on a bad archive cannot write outside
+its temporary inspection directory.
 
 The Homebrew formula can consume the same archive for its target, verify SHA256,
 and install `bucephalus` plus `bucephalus-modal-launcher` into the same bin
@@ -164,6 +182,15 @@ Docker on every VM boot. Ubuntu or other images can still be supplied with
 only when Docker is missing. The worker container does not install Docker
 packages; both the Cloud worker cleanup path and the Core local-Docker executor
 talk to the mounted host Docker socket through the Docker Engine API.
+Worker lifecycle events sent back to Cloud use stable labels, Core run IDs, and
+cleanup counts rather than VM-local workspace paths, so durable telemetry is not
+a host filesystem inventory. Runner instance metadata follows the same boundary:
+it reports capacity and cleanup policy with a stable worker data label, and
+attempt failure messages are redacted before they become user-visible run state.
+Malformed runtime event lines are recorded as parse errors without echoing the
+raw line into Cloud snapshots. Cloud runtime snapshots also redact path-like
+fields such as project roots, workspaces, mounts, and generic path fields before
+they are stored as durable API-visible state.
 
 In CI, Cloud install/typecheck/tests/OpenAPI/migration integration gates run
 once in the `release-gates` job. Each Linux core matrix job then verifies its
@@ -204,8 +231,9 @@ scripts/release/verify-buc-release.sh dist/releases/bucephalus-<version>-<target
 ```
 
 The verifier rejects checksum drift, malformed bundled checksum records,
-incomplete bundled checksum coverage, malformed release metadata, non-Markdown
-retired deploy payloads under `bucephalus-cloud/deploy/`, and
+incomplete bundled checksum coverage, malformed release metadata, text payloads
+that embed macOS, Linux, Windows, WSL, home-relative, or mounted-volume local
+path shapes, non-Markdown retired deploy payloads under `bucephalus-cloud/deploy/`, and
 `.env`/`.env.example` files in the release artifact. This keeps the release
 bundle as code and metadata, not a secret or local deployment store.
 
@@ -287,11 +315,13 @@ as `cloud-ui-assets-<version>`.
 `push_images` requires `build_images`, and image builds require a
 digest-addressed `bun_base_image`. The workflow defaults `bun_base_image` to the
 approved `oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4`
-base and defaults `image_repository` to
-`us-central1-docker.pkg.dev/gen-lang-client-0255842044/buc-bucephalus-cloud/bucephalus-cloud`
-for the first GCP environment. Registry authentication must already be
-available to the workflow through GitHub OIDC and Google Workload Identity; the
-workflow does not invent static registry credentials. Pushed publication also
+base. Image builds require the repository variable
+`BUCEPHALUS_IMAGE_REPOSITORY` to be configured to the target Artifact Registry
+prefix, for example
+`us-central1-docker.pkg.dev/<project-id>/buc-bucephalus-cloud/bucephalus-cloud`.
+Registry authentication must already be available to the workflow through
+GitHub OIDC and Google Workload Identity; the workflow does not invent static
+registry credentials. Pushed publication also
 requires `image_repository` to use the first-cloud GCP Artifact Registry prefix
 shape:
 
@@ -338,7 +368,11 @@ That script rejects static credential surfaces. A temporary
 manual service-account key paths are rejected. The script configures Docker with
 the gcloud Artifact Registry credential helper for the repository hostname and
 declares `BUCEPHALUS_GCP_REGISTRY_AUTH_READY=true`. The image build script
-requires that ready marker before any pushed buildx invocation.
+requires that ready marker before any pushed buildx invocation. The CI/CD auth
+resolver accepts either the consolidated `BUC_CI_CD` JSON secret or the legacy
+split GCP secrets, appends resolved identities only to regular GitHub
+output/env files, and logs a stable resolution message rather than the
+service-account email.
 
 Validate an image build manifest with:
 
@@ -424,11 +458,12 @@ scripts/release/write-gcp-image-tfvars.sh \
 ```
 
 The generated file contains only real digest-addressed `api_image_digest`,
-`pool_controller_image_digest`, and `migration_image_digest` values. It is a
-promotion input, not an apply step, and it refuses local `pushed: false` image
-manifests or all-zero placeholder digests. Those three refs must come from the
-same GCP Artifact Registry repository family, and worker image refs are
-intentionally excluded from the Terraform handoff.
+`pool_controller_image_digest`, `migration_image_digest`, and
+`worker_image_digest` values. It is a promotion input, not an apply step, and it
+refuses local `pushed: false` image manifests, all-zero placeholder digests, and
+symlinked handoff paths. Those four refs must come from the same GCP Artifact
+Registry repository family. Diagnostics identify the handoff as
+`tfvars://gcp-image-digests` rather than echoing local output paths.
 
 Verify an existing tfvars handoff against its pushed image manifest with:
 
@@ -454,9 +489,9 @@ scripts/release/verify-gcp-image-promotion-evidence.sh \
 
 This ties the pushed image manifest, unsigned image-build provenance, and GCP
 tfvars handoff together. It rejects local manifests, mismatched image digests,
-stale tfvars, cross-family Terraform image refs, worker image promotion inputs,
-missing boundary-inspection evidence, and provenance that claims signing before
-the signing boundary exists.
+stale tfvars, cross-family Terraform image refs, missing worker image promotion
+inputs, missing boundary-inspection evidence, and provenance that claims signing
+before the signing boundary exists.
 
 Write and verify the pushed-image promotion evidence index with:
 
@@ -473,9 +508,12 @@ scripts/release/verify-cloud-image-promotion-evidence-index.sh \
 `cloud-image-promotion-evidence.json` records the SHA256 digests of the pushed
 image manifest, unsigned image-build provenance, and generated tfvars handoff.
 It records exactly those three evidence entries plus the single GCP Artifact
-Registry repository family used by API, pool-controller, and migration image
-refs. When those files are present, the verifier rechecks their digests and
-reruns the complete promotion evidence verifier. The index is also unsigned
+Registry repository family used by API, pool-controller, migration, and worker
+image refs. The writer and verifier reject symlinked handoff paths, publish the
+index through a same-directory temporary file, and use
+`promotion-evidence://cloud-image-promotion-evidence` diagnostics instead of
+local paths. When those files are present, the verifier rechecks their digests
+and reruns the complete promotion evidence verifier. The index is also unsigned
 until the same signing boundary that covers release and image provenance exists.
 
 The release workflow uploads pushed-image handoff files as one versioned
@@ -520,10 +558,13 @@ terraform plan \
 ```
 
 The workflow does not accept `api_image_digest`,
-`pool_controller_image_digest`, or `migration_image_digest` as manual inputs.
-Those values must come from the verified `gcp-image-digests.tfvars` artifact.
-Every run creates a Terraform plan. When `apply=true`, the workflow applies that
-same generated plan file. API applies execute the Cloud Run migration job after
+`pool_controller_image_digest`, `migration_image_digest`, or
+`worker_image_digest` as manual inputs. Those values must come from the verified
+`gcp-image-digests.tfvars` artifact. Non-secret deploy tfvars are written
+through a same-directory temporary file, refuse symlinked output paths, and use
+`tfvars://gcp-deploy` diagnostics instead of echoing local temp paths. Every run
+creates a Terraform plan. When `apply=true`, the workflow applies that same
+generated plan file. API applies execute the Cloud Run migration job after
 Terraform applies the selected API-stage changes. Apply promotions smoke
 `/readyz`, a user-authenticated API request, and a worker-authenticated API
 request. Missing Workload Identity, Terraform backend access, smoke identity
@@ -576,8 +617,9 @@ provenance verifiers before emitting the index. In the tagged release workflow,
 the writer also receives the required Core and Cloud target matrix and rejects a
 partial or extra target set before `release-assets.json` is attached to the
 GitHub Release alongside the archive assets. Indexed archive, checksum,
-provenance, and asset-root paths must be artifact-local paths. Expanded release
-directories are not publishable assets.
+provenance, and asset-root paths must be artifact-local paths, and asset roots,
+entries, and locally rechecked index references must not be symlinks. Expanded
+release directories are not publishable assets.
 
 GitHub Actions upload artifacts in the release workflow are intermediate handoff
 evidence and use explicit 30-day retention. Durable rollback and promotion

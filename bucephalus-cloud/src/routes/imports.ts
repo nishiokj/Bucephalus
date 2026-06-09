@@ -1,15 +1,20 @@
+import { lstat, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { authOwnerKey, type AuthContext } from "../auth";
 import { loadConfig } from "../config";
-import { HttpError, jsonResponse, optionalString, readJsonObject, requireString } from "../http";
+import { decodePathParam, HttpError, jsonResponse, optionalString, queryIntegerParam, readJsonObject, requireString } from "../http";
 import { ImportJobRecord, ImportRepository, UploadRecord } from "../imports/repository";
-import { inspectSealedPackageArchive, SealedPackageInspectionError } from "../imports/sealedPackage";
+import { inspectSealedPackageArchive, SealedPackageInspectionError, type ImportDiagnostic } from "../imports/sealedPackage";
 import { materializeStoredObject, putUploadObject } from "../objectStorage";
 import { PackageRepository } from "../packages/repository";
 import { sha256Digest } from "../primitives";
+import { publicBoundaryImportDiagnostic, publicBoundaryText } from "../publicBoundary";
 
 const DEFAULT_MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
 const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DEFAULT_UPLOAD_MEDIA_TYPE = "application/octet-stream";
+const UPLOAD_MEDIA_TYPE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/;
 
 export async function handleImportRoute(
   request: Request,
@@ -41,7 +46,10 @@ export async function handleImportRoute(
   }
 
   if (request.method === "GET" && importPath(url.pathname)) {
-    const importId = decodeURIComponent(url.pathname.slice("/v1/imports/".length));
+    const importId = requireUuidString(
+      decodePathParam(url.pathname.slice("/v1/imports/".length), "/import_id"),
+      "/import_id",
+    );
     const job = await imports.getImportJob(importId, ownerKey);
     if (!job) {
       throw new HttpError(404, "import_not_found", "Import not found");
@@ -53,12 +61,7 @@ export async function handleImportRoute(
 }
 
 function limitFromUrl(url: URL): number {
-  const raw = url.searchParams.get("limit");
-  if (!raw) {
-    return 50;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : 50;
+  return queryIntegerParam(url, "limit", { defaultValue: 50, min: 1, max: 200 });
 }
 
 async function createUpload(request: Request, imports: ImportRepository, ownerKey?: string): Promise<Response> {
@@ -76,7 +79,7 @@ async function createUpload(request: Request, imports: ImportRepository, ownerKe
   }
   const upload = await imports.createUpload({
     filename: requireString(body.filename, "/filename"),
-    mediaType: optionalString(body.media_type, "/media_type") ?? "application/octet-stream",
+    mediaType: uploadMediaType(body.media_type),
     expectedDigest,
     byteSize,
     ownerKey,
@@ -95,8 +98,9 @@ async function putUploadContent(
   if (!upload) {
     throw new HttpError(404, "upload_not_found", "Upload not found");
   }
+  const mediaType = persistedUploadMediaType(upload.media_type);
   const bytes = await readBoundedUploadBody(request, persistedUploadByteSize(upload.byte_size));
-  const storagePath = await putUploadObject(uploadId, bytes, upload.media_type);
+  const storagePath = await putUploadObject(uploadId, bytes, mediaType);
   const updated = await imports.markUploaded({
     uploadId,
     contentDigest: sha256Digest(bytes),
@@ -197,6 +201,26 @@ function uploadByteSize(value: unknown): number | null {
   return value;
 }
 
+function uploadMediaType(value: unknown): string {
+  const raw = optionalString(value, "/media_type") ?? DEFAULT_UPLOAD_MEDIA_TYPE;
+  const normalized = raw.trim().toLowerCase();
+  if (!UPLOAD_MEDIA_TYPE_PATTERN.test(normalized)) {
+    throw new HttpError(400, "invalid_upload_media_type", "media_type must be a MIME type like application/gzip");
+  }
+  return normalized;
+}
+
+function persistedUploadMediaType(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new HttpError(500, "invalid_persisted_upload_media_type", "Persisted upload media_type is invalid");
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!UPLOAD_MEDIA_TYPE_PATTERN.test(normalized)) {
+    throw new HttpError(500, "invalid_persisted_upload_media_type", "Persisted upload media_type is invalid");
+  }
+  return normalized;
+}
+
 function persistedUploadByteSize(value: unknown): number | null {
   if (value === undefined || value === null) {
     return null;
@@ -222,6 +246,17 @@ function maxUploadBytes(): number {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_UPLOAD_BYTES;
 }
 
+function requireUuidString(value: unknown, pointer: string): string {
+  if (typeof value !== "string") {
+    throw new HttpError(400, "invalid_request", `${pointer} must be a UUID`);
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!UUID_PATTERN.test(normalized)) {
+    throw new HttpError(400, "invalid_request", `${pointer} must be a UUID`);
+  }
+  return normalized;
+}
+
 async function completeUpload(url: URL, imports: ImportRepository, ownerKey?: string): Promise<Response> {
   const uploadId = uploadIdFromCompletePath(url.pathname);
   const upload = await imports.completeUpload(uploadId, ownerKey);
@@ -235,7 +270,7 @@ async function importSealedPackage(
   ownerKey?: string,
 ): Promise<Response> {
   const body = await readJsonObject(request);
-  const uploadId = requireString(body.upload_id, "/upload_id");
+  const uploadId = requireUuidString(body.upload_id, "/upload_id");
   const upload = await imports.getUpload(uploadId, ownerKey);
   if (!upload) {
     throw new HttpError(404, "upload_not_found", "Upload not found");
@@ -249,21 +284,22 @@ async function importSealedPackage(
     label: optionalString(body.label, "/label"),
     ownerKey,
   });
+  const importWorkDir = join(loadConfig().dataDir, "imports", importId);
   try {
-    const importWorkDir = join(loadConfig().dataDir, "imports", importId);
     const inspectionWorkDir = join(importWorkDir, "extracted");
     const archivePath = await materializeStoredObject(upload.storage_path, join(importWorkDir, "archive"), "package.blob");
     const inspection = await inspectSealedPackageArchive({
       archivePath,
       workDir: inspectionWorkDir,
     });
+    const diagnostics = publicImportDiagnostics(inspection.diagnostics);
     await imports.updateImportInspection({
       importId,
       status: "accepted",
       packageDigest: inspection.packageDigest,
       manifestJson: inspection.manifestJson,
       resolvedExperimentJson: inspection.resolvedExperimentJson,
-      diagnostics: inspection.diagnostics,
+      diagnostics,
     });
     if (inspection.packageDigest) {
       await packages.upsertArtifact({
@@ -275,17 +311,20 @@ async function importSealedPackage(
         manifestJson: inspection.manifestJson,
         resolvedExperimentJson: inspection.resolvedExperimentJson,
         imageRefs: inspection.imageRefs,
-        diagnostics: inspection.diagnostics,
+        diagnostics,
         ownerKey,
       });
     }
   } catch (error) {
+    const inspectionFailure = publicImportInspectionFailure(error);
     await imports.updateImportInspection({
       importId,
       status: "failed",
-      errorMessage: error instanceof Error ? error.message : String(error),
-      diagnostics: error instanceof SealedPackageInspectionError ? error.diagnostics : [],
+      errorMessage: inspectionFailure.errorMessage,
+      diagnostics: inspectionFailure.diagnostics,
     });
+  } finally {
+    await cleanupImportWorkDir(importWorkDir);
   }
 
   const job = await imports.getImportJob(importId, ownerKey);
@@ -295,11 +334,46 @@ async function importSealedPackage(
   return jsonResponse(importJobToWire(job), { status: 201 });
 }
 
+async function cleanupImportWorkDir(importWorkDir: string): Promise<void> {
+  try {
+    const metadata = await lstat(importWorkDir).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        return null;
+      }
+      throw error;
+    });
+    if (!metadata) {
+      return;
+    }
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      await rm(importWorkDir, { force: true });
+      return;
+    }
+    await rm(importWorkDir, { recursive: true, force: true });
+  } catch {
+    // Import work dirs are scratch space; cleanup failures should not hide the recorded import result.
+  }
+}
+
+export function publicImportInspectionFailure(error: unknown): {
+  errorMessage: string;
+  diagnostics: ImportDiagnostic[];
+} {
+  return {
+    errorMessage: publicBoundaryText(error instanceof Error ? error.message : String(error)),
+    diagnostics: error instanceof SealedPackageInspectionError ? publicImportDiagnostics(error.diagnostics) : [],
+  };
+}
+
+export function publicImportDiagnostics(diagnostics: ImportDiagnostic[]): ImportDiagnostic[] {
+  return diagnostics.map(publicBoundaryImportDiagnostic);
+}
+
 function uploadToWire(upload: UploadRecord) {
   return {
     upload_id: upload.upload_id,
-    filename: upload.filename,
-    media_type: upload.media_type,
+    filename: publicBoundaryText(upload.filename),
+    media_type: publicBoundaryText(upload.media_type),
     expected_digest: upload.expected_digest,
     content_digest: upload.content_digest,
     byte_size: persistedUploadByteSize(upload.byte_size),
@@ -307,7 +381,7 @@ function uploadToWire(upload: UploadRecord) {
     created_at: upload.created_at,
     uploaded_at: upload.uploaded_at,
     completed_at: upload.completed_at,
-    error_message: upload.error_message,
+    error_message: upload.error_message === null ? null : publicBoundaryText(upload.error_message),
   };
 }
 
@@ -317,10 +391,10 @@ function importJobToWire(job: ImportJobRecord) {
     upload_id: job.upload_id,
     import_type: job.import_type,
     status: job.status,
-    label: job.label,
+    label: job.label === null ? null : publicBoundaryText(job.label),
     package_digest: job.package_digest,
-    error_message: job.error_message,
-    diagnostics: job.diagnostics ?? [],
+    error_message: job.error_message === null ? null : publicBoundaryText(job.error_message),
+    diagnostics: (job.diagnostics ?? []).map(publicBoundaryImportDiagnostic),
     created_at: job.created_at,
     updated_at: job.updated_at,
   };
@@ -339,9 +413,15 @@ function importPath(pathname: string): boolean {
 }
 
 function uploadIdFromContentPath(pathname: string): string {
-  return decodeURIComponent(pathname.slice("/v1/uploads/".length, -"/content".length));
+  return requireUuidString(
+    decodePathParam(pathname.slice("/v1/uploads/".length, -"/content".length), "/upload_id"),
+    "/upload_id",
+  );
 }
 
 function uploadIdFromCompletePath(pathname: string): string {
-  return decodeURIComponent(pathname.slice("/v1/uploads/".length, -"/complete".length));
+  return requireUuidString(
+    decodePathParam(pathname.slice("/v1/uploads/".length, -"/complete".length), "/upload_id"),
+    "/upload_id",
+  );
 }

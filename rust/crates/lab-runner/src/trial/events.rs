@@ -42,24 +42,19 @@ pub(crate) fn load_event_rows(
                     .or_else(|| payload.get("type").and_then(Value::as_str))
                     .map(str::trim)
                     .filter(|event_type| !event_type.is_empty())
-                    .ok_or_else(|| anyhow!("event row {} missing event_type", seq + 1))?
-                    .to_string();
-                let ts = payload
-                    .get("ts")
-                    .and_then(Value::as_str)
-                    .or_else(|| payload.get("timestamp").and_then(Value::as_str))
                     .map(str::to_string);
-                (event_type, ts, payload)
+                if let Some(event_type) = event_type {
+                    let ts = payload
+                        .get("ts")
+                        .and_then(Value::as_str)
+                        .or_else(|| payload.get("timestamp").and_then(Value::as_str))
+                        .map(str::to_string);
+                    (event_type, ts, payload)
+                } else {
+                    event_parse_error_row(seq, format!("event row {} missing event_type", seq + 1))
+                }
             }
-            Err(err) => (
-                "trajectory_parse_error".to_string(),
-                None,
-                json!({
-                    "event_type": "trajectory_parse_error",
-                    "error": err.to_string(),
-                    "raw_line": trimmed,
-                }),
-            ),
+            Err(err) => event_parse_error_row(seq, err.to_string()),
         };
         rows.push(EventRow {
             run_id: run_id.to_string(),
@@ -78,6 +73,19 @@ pub(crate) fn load_event_rows(
         });
     }
     Ok(rows)
+}
+
+fn event_parse_error_row(seq: usize, error: impl Into<String>) -> (String, Option<String>, Value) {
+    (
+        "trajectory_parse_error".to_string(),
+        None,
+        json!({
+            "event_type": "trajectory_parse_error",
+            "error": error.into(),
+            "line": seq + 1,
+            "raw_line_omitted": true,
+        }),
+    )
 }
 
 #[derive(Debug, Clone)]

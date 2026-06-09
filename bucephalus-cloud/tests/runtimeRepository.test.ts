@@ -60,6 +60,104 @@ describe("runtime repository worker snapshots", () => {
     })).toBeNull();
   });
 
+  test("redacts raw worker snapshot values before deriving runtime rows", () => {
+    const snapshot = runtimeSnapshotFromWorkerEventPayload({
+      core_run_id: "run_20260529_000001_000001_000001",
+      run_dir_name: "/Users/alice/private/run_20260529_000001_000001_000001",
+      runtime_values: {
+        run_control_v2: {
+          project_root: "/Users/alice/private/project",
+          access_token: "raw-runtime-token",
+          dashboard_url: "https://runtime.example/runs/1?token=raw-dashboard-token",
+        },
+      },
+      trial_summaries: [
+        {
+          trial_id: "trial-1",
+          summary: {
+            ids: {
+              trial_id: "trial-1",
+              variant_id: "variant-a",
+              task_id: "task-a",
+            },
+            outcome: "success",
+            primary_metric: {
+              name: "score",
+              value: 1,
+            },
+            metrics: {
+              score: 1,
+            },
+            bindings: {
+              workspace: "/private/tmp/bucephalus/workspace",
+              api_key: "sk-abcdefghijklmnopqrstuvwxyz",
+            },
+          },
+          contract_trace: {
+            ids: {
+              trial_id: "trial-1",
+              variant_id: "variant-a",
+              task_id: "task-a",
+            },
+            stages: {
+              agent_execution: {
+                status: "ok",
+                message: "used /home/alice/private token=raw-stage-token",
+                password: "raw-stage-password",
+              },
+            },
+          },
+          trial_events: [
+            {
+              event_type: "log",
+              message: "wrote /Users/alice/private/event.log",
+              authorization: "Bearer raw-authorization",
+            },
+          ],
+        },
+      ],
+      evidence_records: [
+        {
+          ids: {
+            trial_id: "trial-1",
+          },
+          schedule_idx: 0,
+          attempt: 0,
+          recorded_at_ms: 123,
+          secret_note: "raw-evidence-secret",
+          evidence: {
+            stdout_ref: "file:///private/tmp/bucephalus/stdout.log",
+          },
+        },
+      ],
+      omitted: ["/Users/alice/private/runtime/run_session_state.json"],
+    });
+    if (!snapshot) {
+      throw new Error("snapshot did not normalize");
+    }
+
+    const encoded = JSON.stringify({
+      snapshot,
+      trial_results: runtimeTrialResultsFromSnapshots([snapshot]),
+      contract_stages: runtimeContractStagesFromSnapshots([snapshot]),
+      events: runtimeEventRowsFromSnapshots([snapshot]),
+      attempt_objects: runtimeAttemptObjectsFromSnapshots([snapshot]),
+    });
+
+    expect(encoded).toContain("[redacted");
+    expect(encoded).not.toContain("/Users/alice");
+    expect(encoded).not.toContain("/private/tmp");
+    expect(encoded).not.toContain("/home/alice");
+    expect(encoded).not.toContain("raw-runtime-token");
+    expect(encoded).not.toContain("raw-dashboard-token");
+    expect(encoded).not.toContain("raw-stage-token");
+    expect(encoded).not.toContain("raw-stage-password");
+    expect(encoded).not.toContain("raw-authorization");
+    expect(encoded).not.toContain("raw-evidence-secret");
+    expect(encoded).not.toContain("sk-abcdefghijklmnopqrstuvwxyz");
+    expect(runtimeAttemptObjectsFromSnapshots([snapshot])[0]?.object_ref).toBe("file://[redacted-local-path]");
+  });
+
   test("derives results rows from Core trial summaries in worker snapshots", () => {
     const snapshot = runtimeSnapshotFromWorkerEventPayload({
       core_run_id: "run_20260529_000001_000001_000001",

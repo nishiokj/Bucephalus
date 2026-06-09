@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROVENANCE=""
 RELEASE_INPUT=""
 WORK_DIR=""
@@ -15,6 +16,14 @@ Validates unsigned Bucephalus Core release provenance. When --release is
 provided, also verifies that the provenance describes that exact release
 artifact or directory.
 USAGE
+}
+
+public_provenance_input_ref() {
+  printf '%s\n' "release-provenance://input"
+}
+
+public_release_input_ref() {
+  printf '%s\n' "release-input://source"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -32,7 +41,7 @@ while [[ $# -gt 0 ]]; do
         PROVENANCE="$1"
         shift
       else
-        echo "unknown argument: $1" >&2
+        echo "unknown argument" >&2
         usage >&2
         exit 2
       fi
@@ -46,7 +55,8 @@ if [[ -z "${PROVENANCE}" ]]; then
 fi
 
 if [[ ! -f "${PROVENANCE}" ]]; then
-  echo "provenance does not exist: ${PROVENANCE}" >&2
+  echo "provenance does not exist" >&2
+  echo "provenance_ref: $(public_provenance_input_ref)" >&2
   exit 2
 fi
 
@@ -82,16 +92,19 @@ if [[ -n "${RELEASE_INPUT}" ]]; then
       echo "required command not found: tar" >&2
       exit 2
     fi
+    "${ROOT_DIR}/scripts/release/verify-core-release.sh" "${RELEASE_INPUT}"
     RELEASE_ARCHIVE_SHA="$(sha256_file "${RELEASE_INPUT}")"
     WORK_DIR="$(mktemp -d)"
     tar -xzf "${RELEASE_INPUT}" -C "${WORK_DIR}"
     RELEASE_DIR="${WORK_DIR}"
   else
-    echo "release input does not exist: ${RELEASE_INPUT}" >&2
+    echo "release input does not exist" >&2
+    echo "release_ref: $(public_release_input_ref)" >&2
     exit 2
   fi
   if [[ ! -f "${RELEASE_DIR}/release-manifest.json" ]]; then
-    echo "release input is missing release-manifest.json: ${RELEASE_INPUT}" >&2
+    echo "release input is missing release-manifest.json" >&2
+    echo "release_ref: $(public_release_input_ref)" >&2
     exit 1
   fi
 fi
@@ -206,10 +219,18 @@ if (provenance.artifacts?.core_binary?.path !== "bucephalus") {
   fail("artifacts.core_binary.path must be bucephalus");
 }
 checkSha(provenance.artifacts.core_binary.sha256, "artifacts.core_binary.sha256");
+if (provenance.artifacts?.cloud_cli_binary?.path !== "bucephalus-cloud") {
+  fail("artifacts.cloud_cli_binary.path must be bucephalus-cloud");
+}
+checkSha(provenance.artifacts.cloud_cli_binary.sha256, "artifacts.cloud_cli_binary.sha256");
 if (provenance.artifacts?.modal_launcher_binary?.path !== "bucephalus-modal-launcher") {
   fail("artifacts.modal_launcher_binary.path must be bucephalus-modal-launcher");
 }
 checkSha(provenance.artifacts.modal_launcher_binary.sha256, "artifacts.modal_launcher_binary.sha256");
+if (provenance.artifacts?.installer_script?.path !== "install.sh") {
+  fail("artifacts.installer_script.path must be install.sh");
+}
+checkSha(provenance.artifacts.installer_script.sha256, "artifacts.installer_script.sha256");
 checkBuilder(provenance.builder, provenance.release);
 if (releaseDir) {
   const manifestPath = join(releaseDir, "release-manifest.json");
@@ -228,8 +249,14 @@ if (releaseDir) {
   if (JSON.stringify(provenance.artifacts.core_binary) !== JSON.stringify(manifest.artifacts?.core_binary)) {
     fail("artifacts.core_binary does not match release manifest");
   }
+  if (JSON.stringify(provenance.artifacts.cloud_cli_binary) !== JSON.stringify(manifest.artifacts?.cloud_cli_binary)) {
+    fail("artifacts.cloud_cli_binary does not match release manifest");
+  }
   if (JSON.stringify(provenance.artifacts.modal_launcher_binary) !== JSON.stringify(manifest.artifacts?.modal_launcher_binary)) {
     fail("artifacts.modal_launcher_binary does not match release manifest");
+  }
+  if (JSON.stringify(provenance.artifacts.installer_script) !== JSON.stringify(manifest.artifacts?.installer_script)) {
+    fail("artifacts.installer_script does not match release manifest");
   }
 }
 if (provenance.signature?.status !== "unsigned") {
@@ -239,5 +266,5 @@ checkSha(provenance.provenance_sha256, "provenance_sha256");
 if (provenance.provenance_sha256 !== recompute(provenance)) {
   fail("provenance_sha256 does not match provenance content");
 }
-console.log(`verified core release provenance ${path}`);
+console.log("verified core release provenance release-provenance://input");
 ' "${PROVENANCE}"

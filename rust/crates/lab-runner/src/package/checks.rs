@@ -5,8 +5,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::config::{
-    atomic_write_json_pretty, load_json_file, parse_metric_definitions, parse_policies,
-    parse_string_array_field,
+    atomic_write_json_pretty, parse_metric_definitions, parse_policies, parse_string_array_field,
 };
 use crate::model::{GradingStrategy, SchedulingPolicy};
 use crate::package::sealed::verify_sealed_package_integrity;
@@ -33,12 +32,13 @@ impl CheckStatus {
     }
 }
 
-fn check(id: &str, status: CheckStatus, reason: impl Into<String>, evidence: Value) -> Value {
+fn check(id: &str, status: CheckStatus, reason: impl Into<String>, mut evidence: Value) -> Value {
+    redact_package_check_public_json(&mut evidence);
     json!({
         "id": id,
         "scope": "package",
         "status": status.as_str(),
-        "reason": reason.into(),
+        "reason": public_package_check_string(&reason.into()),
         "evidence": evidence,
     })
 }
@@ -58,7 +58,7 @@ pub fn check_package(package_dir: &Path) -> Result<Value> {
     let package_digest = read_package_digest(package_dir)?;
     let manifest_path = package_dir.join("manifest.json");
     if manifest_path.exists() {
-        let manifest = load_json_file(&manifest_path)?;
+        let manifest = load_package_json(package_dir, &manifest_path, "manifest")?;
         if manifest.pointer("/schema_version").and_then(Value::as_str)
             == Some("sealed_run_package_v2")
         {
@@ -66,19 +66,35 @@ pub fn check_package(package_dir: &Path) -> Result<Value> {
         }
     }
     let resolved_path = package_dir.join("resolved_experiment.json");
-    let resolved: Value =
-        serde_json::from_slice(&std::fs::read(&resolved_path).map_err(|err| {
-            anyhow!(
-                "package check failed to read {}: {}",
-                resolved_path.display(),
-                err
-            )
-        })?)?;
+    let resolved = load_package_json(package_dir, &resolved_path, "resolved experiment")?;
     let tasks_path = package_dir.join("tasks").join("tasks.jsonl");
-    let tasks = load_packaged_tasks(&tasks_path)?;
+    let tasks = load_packaged_tasks(
+        &tasks_path,
+        &public_package_path_ref(package_dir, &tasks_path),
+    )?;
     let report = collect_package_checks(&resolved, &tasks, &package_digest)?;
     atomic_write_json_pretty(&package_dir.join(PACKAGE_CHECKS_FILE), &report)?;
     Ok(report)
+}
+
+fn load_package_json(package_dir: &Path, path: &Path, description: &str) -> Result<Value> {
+    let path_ref = public_package_path_ref(package_dir, path);
+    let bytes = std::fs::read(path).map_err(|err| {
+        anyhow!(
+            "package check failed to read {} {}: {}",
+            description,
+            path_ref,
+            err
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|err| {
+        anyhow!(
+            "package check failed to parse {} {}: {}",
+            description,
+            path_ref,
+            err
+        )
+    })
 }
 
 fn collect_package_checks(
@@ -492,20 +508,27 @@ fn path_prefix_overlaps(a: &str, b: &str) -> bool {
     a == b || a.starts_with(&format!("{}/", b)) || b.starts_with(&format!("{}/", a))
 }
 
-fn load_packaged_tasks(path: &Path) -> Result<Vec<Value>> {
+fn load_packaged_tasks(path: &Path, path_ref: &str) -> Result<Vec<Value>> {
     let file = std::fs::File::open(path)
-        .map_err(|err| anyhow!("package check failed to read {}: {}", path.display(), err))?;
+        .map_err(|err| anyhow!("package check failed to read {}: {}", path_ref, err))?;
     let reader = std::io::BufReader::new(file);
     let mut tasks = Vec::new();
     for (idx, line) in std::io::BufRead::lines(reader).enumerate() {
-        let line = line?;
+        let line = line.map_err(|err| {
+            anyhow!(
+                "package check failed to read {} line {}: {}",
+                path_ref,
+                idx + 1,
+                err
+            )
+        })?;
         if line.trim().is_empty() {
             continue;
         }
         tasks.push(serde_json::from_str::<Value>(&line).map_err(|err| {
             anyhow!(
                 "package check failed to parse {} line {}: {}",
-                path.display(),
+                path_ref,
                 idx + 1,
                 err
             )
@@ -516,13 +539,8 @@ fn load_packaged_tasks(path: &Path) -> Result<Vec<Value>> {
 
 fn read_package_digest(package_dir: &Path) -> Result<String> {
     let lock_path = package_dir.join("package.lock");
-    let value = load_json_file(&lock_path).map_err(|err| {
-        anyhow!(
-            "package check failed to read package lock {}: {}",
-            lock_path.display(),
-            err
-        )
-    })?;
+    let lock_ref = public_package_path_ref(package_dir, &lock_path);
+    let value = load_package_json(package_dir, &lock_path, "package lock")?;
     crate::package::validate::validate_schema_contract_value(&value, "package lock")?;
     value
         .get("package_digest")
@@ -531,7 +549,309 @@ fn read_package_digest(package_dir: &Path) -> Result<String> {
         .ok_or_else(|| {
             anyhow!(
                 "package check failed to read package_digest from {}",
-                lock_path.display()
+                lock_ref
             )
         })
+}
+
+fn public_package_path_ref(package_dir: &Path, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(package_dir) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return "package://.".to_string();
+    }
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("package://{rel}")
+}
+
+fn redact_package_check_public_json(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            *text = public_package_check_string(text);
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_package_check_public_json(item);
+            }
+        }
+        Value::Object(object) => {
+            for (key, child) in object {
+                if let Some(marker) = package_check_redaction_marker_for_key(key) {
+                    *child = Value::String(marker.to_string());
+                } else {
+                    redact_package_check_public_json(child);
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn package_check_redaction_marker_for_key(key: &str) -> Option<&'static str> {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    if normalized.ends_with("present") || normalized.ends_with("ref") {
+        return None;
+    }
+    if normalized == "env"
+        || normalized == "environment"
+        || normalized.ends_with("env")
+        || normalized.ends_with("environment")
+    {
+        return Some("[REDACTED:environment]");
+    }
+    if normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("password")
+        || normalized.contains("apikey")
+        || normalized.contains("credential")
+        || normalized.contains("authorization")
+        || normalized.contains("bearer")
+        || normalized.contains("cookie")
+        || normalized.contains("privatekey")
+    {
+        return Some("[REDACTED:secret-like]");
+    }
+    None
+}
+
+fn public_package_check_string(message: &str) -> String {
+    let mut redacted = message
+        .lines()
+        .map(redact_package_check_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if message.ends_with('\n') {
+        redacted.push('\n');
+    }
+    redacted
+}
+
+fn redact_package_check_line(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("authorization:") || lower.contains("bearer ") {
+        return "[REDACTED:secret-like]".to_string();
+    }
+    let token_redacted = line
+        .split_inclusive(char::is_whitespace)
+        .map(|chunk| {
+            if let Some(last) = chunk.chars().last().filter(|ch| ch.is_whitespace()) {
+                let token = &chunk[..chunk.len() - last.len_utf8()];
+                format!("{}{}", redact_package_check_token(token), last)
+            } else {
+                redact_package_check_token(chunk)
+            }
+        })
+        .collect::<String>();
+    redact_local_paths_in_package_check_text(&token_redacted)
+}
+
+fn redact_package_check_token(token: &str) -> String {
+    let trimmed_start = token.trim_start_matches(package_check_token_prefix);
+    let prefix_len = token.len() - trimmed_start.len();
+    let trimmed_core = trimmed_start.trim_end_matches(package_check_token_suffix);
+    let suffix_len = trimmed_start.len() - trimmed_core.len();
+    let prefix = &token[..prefix_len];
+    let suffix = &token[token.len() - suffix_len..];
+    let lower = trimmed_core.to_ascii_lowercase();
+
+    if trimmed_core.contains("[REDACTED:") {
+        return token.to_string();
+    }
+
+    let redacted_core = if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("file://")
+    {
+        Some(redact_package_check_url(trimmed_core))
+    } else if looks_like_package_check_local_path(trimmed_core) {
+        Some("[REDACTED:local-path]".to_string())
+    } else if let Some((key, value)) = trimmed_core.split_once('=') {
+        let key_lower = key.to_ascii_lowercase();
+        if key_lower.contains("token")
+            || key_lower.contains("secret")
+            || key_lower.contains("password")
+            || key_lower.contains("apikey")
+            || key_lower.contains("api_key")
+            || key_lower.contains("credential")
+        {
+            Some(format!("{key}=[REDACTED:secret-like]"))
+        } else if looks_like_package_check_local_path(value) {
+            Some(format!("{key}=[REDACTED:local-path]"))
+        } else if looks_like_package_check_url(value) {
+            Some(format!("{key}={}", redact_package_check_url(value)))
+        } else {
+            None
+        }
+    } else if lower.starts_with("sk-") {
+        Some("[REDACTED:secret-like]".to_string())
+    } else {
+        None
+    };
+
+    match redacted_core {
+        Some(core) => format!("{prefix}{core}{suffix}"),
+        None => token.to_string(),
+    }
+}
+
+fn package_check_token_prefix(ch: char) -> bool {
+    matches!(ch, '(' | '[' | '{' | '<' | '"' | '\'' | '`')
+}
+
+fn package_check_token_suffix(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ',' | ';' | ')' | ']' | '}' | '>' | '"' | '\'' | '`'
+    )
+}
+
+fn looks_like_package_check_local_path(value: &str) -> bool {
+    value.starts_with("/Users/")
+        || value.starts_with("/home/")
+        || value.starts_with("/private/")
+        || value.starts_with("/tmp/")
+}
+
+fn looks_like_package_check_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("file://")
+}
+
+fn redact_package_check_url(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("file://") {
+        return "file://[REDACTED:local-path]".to_string();
+    }
+    let Some(scheme_end) = value.find("://") else {
+        return "[REDACTED:url]".to_string();
+    };
+    let scheme = &value[..scheme_end + 3];
+    let mut remainder = &value[scheme_end + 3..];
+    let authority_end = remainder
+        .find(|ch: char| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(remainder.len());
+    let mut redacted = false;
+    if let Some(at) = remainder[..authority_end].rfind('@') {
+        remainder = &remainder[at + 1..];
+        redacted = true;
+    }
+    if let Some(end) = remainder.find(|ch: char| matches!(ch, '?' | '#')) {
+        remainder = &remainder[..end];
+        redacted = true;
+    }
+
+    let mut public = format!("{scheme}{remainder}");
+    if redacted {
+        public.push_str(" [redacted URL credentials/query]");
+    }
+    public
+}
+
+fn redact_local_paths_in_package_check_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = earliest_package_check_local_path_start(rest) {
+        out.push_str(&rest[..start]);
+        out.push_str("[REDACTED:local-path]");
+        let after_start = &rest[start..];
+        let end = after_start
+            .find(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(ch, ':' | '"' | '\'' | '`' | '<' | '>' | '|' | ',' | ';')
+            })
+            .unwrap_or(after_start.len());
+        rest = &after_start[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn earliest_package_check_local_path_start(text: &str) -> Option<usize> {
+    ["/Users/", "/home/", "/private/", "/tmp/"]
+        .iter()
+        .filter_map(|prefix| text.find(prefix))
+        .min()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_check_values_are_public_boundary_safe() {
+        let item = check(
+            "boundary.public",
+            CheckStatus::Fail,
+            "failed to read /Users/alice/work/run.json: Permission denied\nmirror https://mirror-user:mirror-secret@mirror.example/releases?token=raw-query#frag\nworker token=raw-worker-token\nlocal file:///private/tmp/bucephalus/install.sh",
+            json!({
+                "api_token": "raw-evidence-token",
+                "container_path": "/bucephalus/out/result.json",
+                "env": {
+                    "OPENAI_API_KEY": "live-env-secret"
+                },
+                "mutable_images": ["python:3.11-slim"],
+                "notes": [
+                    "Authorization: Bearer raw-header-token",
+                    "workspace=/Users/alice/work"
+                ],
+                "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "result_path": "/Users/alice/work/result.json"
+            }),
+        );
+        let encoded = serde_json::to_string(&item).expect("json");
+
+        assert!(encoded.contains("failed to read"));
+        assert!(encoded.contains("Permission denied"));
+        assert!(encoded.contains("https://mirror.example/releases"));
+        assert!(encoded.contains("[redacted URL credentials/query]"));
+        assert!(encoded.contains("token=[REDACTED:secret-like]"));
+        assert!(encoded.contains("file://[REDACTED:local-path]"));
+        assert_eq!(
+            item.pointer("/evidence/api_token").and_then(Value::as_str),
+            Some("[REDACTED:secret-like]")
+        );
+        assert_eq!(
+            item.pointer("/evidence/container_path")
+                .and_then(Value::as_str),
+            Some("/bucephalus/out/result.json")
+        );
+        assert_eq!(
+            item.pointer("/evidence/env").and_then(Value::as_str),
+            Some("[REDACTED:environment]")
+        );
+        assert_eq!(
+            item.pointer("/evidence/mutable_images/0")
+                .and_then(Value::as_str),
+            Some("python:3.11-slim")
+        );
+        assert_eq!(
+            item.pointer("/evidence/result_path")
+                .and_then(Value::as_str),
+            Some("[REDACTED:local-path]")
+        );
+
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "live-env-secret",
+            "mirror-secret",
+            "mirror-user",
+            "raw-evidence-token",
+            "raw-header-token",
+            "raw-query",
+            "raw-worker-token",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "package check leaked forbidden text {forbidden}: {encoded}"
+            );
+        }
+    }
 }

@@ -1,7 +1,9 @@
 use crate::backend::docker::{ContainerHandle, DockerRuntime};
 use crate::config::load_json_file;
 use crate::experiment::lease::{acquire_run_operation_lease, RunOperationType};
-use crate::experiment::runner::{fork_trial_inner, resolve_resume_selector};
+use crate::experiment::runner::{
+    fork_trial_inner, public_run_artifact_ref, public_run_dir_ref, resolve_resume_selector,
+};
 use crate::experiment::state::{load_run_session_state, resolved_executor_kind};
 #[cfg(test)]
 use crate::model::ActiveRuntimeControl;
@@ -481,14 +483,18 @@ pub fn pause_run(
     let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Pause)?;
     let run_dir = run_dir
         .canonicalize()
-        .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
+        .map_err(|_| anyhow!("run not found: {}", public_run_dir_ref(run_dir)))?;
     let run_control = load_run_control(&run_dir)?;
+    let run_id = require_run_control_run_id(&run_control)?;
     let status = run_control_status(&run_control)?;
     if status != "running" {
-        return Err(anyhow!("pause_non_running: run status is {}", status));
+        return Err(anyhow!(
+            "pause_non_running: {} status is {}",
+            public_run_artifact_ref(&run_id),
+            status
+        ));
     }
 
-    let run_id = require_run_control_run_id(&run_control)?;
     let active_trial_ids = run_control_active_trial_ids(&run_control);
     let target_trials: Vec<String> = if let Some(id) = trial_id {
         if !active_trial_ids.iter().any(|active| active == id) {
@@ -621,18 +627,18 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
     let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Kill)?;
     let run_dir = run_dir
         .canonicalize()
-        .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
+        .map_err(|_| anyhow!("run not found: {}", public_run_dir_ref(run_dir)))?;
     let run_control = load_run_control(&run_dir)?;
+    let run_id = require_run_control_run_id(&run_control)?;
     let status = run_control_status(&run_control)?.to_string();
 
     if status == "completed" {
         return Err(anyhow!(
-            "kill_terminal_status: run is already '{}', nothing to kill",
+            "kill_terminal_status: {} is already '{}', nothing to kill",
+            public_run_artifact_ref(&run_id),
             status
         ));
     }
-
-    let run_id = require_run_control_run_id(&run_control)?;
 
     let active_trial_ids = run_control_active_trial_ids(&run_control);
     let active_by_id: HashMap<String, RunControlActiveTrial> =
@@ -734,14 +740,18 @@ pub fn resume_trial(
     let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Resume)?;
     let run_dir = run_dir
         .canonicalize()
-        .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
+        .map_err(|_| anyhow!("run not found: {}", public_run_dir_ref(run_dir)))?;
     let run_control = load_run_control(&run_dir)?;
+    let run_id = require_run_control_run_id(&run_control)?;
     let status = run_control_status(&run_control)?;
     if status != "paused" {
-        return Err(anyhow!("resume_non_paused: run status is {}", status));
+        return Err(anyhow!(
+            "resume_non_paused: {} status is {}",
+            public_run_artifact_ref(&run_id),
+            status
+        ));
     }
 
-    let run_id = require_run_control_run_id(&run_control)?;
     let active_trial_ids = run_control_active_trial_ids(&run_control);
     let target_trial = if let Some(id) = trial_id {
         if !active_trial_ids.is_empty() && !active_trial_ids.iter().any(|active| active == id) {

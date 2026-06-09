@@ -111,6 +111,99 @@ fn modal_remote_path_contains(parent: &str, child: &str) -> bool {
     child.starts_with(&format!("{}/", parent.trim_end_matches('/')))
 }
 
+fn public_modal_remote_path_ref(remote_path: &str) -> String {
+    let normalized = normalized_modal_remote_path(remote_path)
+        .unwrap_or_else(|_| remote_path.trim().to_string());
+    for (prefix, scheme) in [
+        (BUCEPHALUS_CONTRACT_IN_DIR, "contract://in"),
+        (BUCEPHALUS_CONTRACT_OUT_DIR, "contract://out"),
+        ("/bucephalus/state", "contract://state"),
+        (BUCEPHALUS_CONTRACT_WORKSPACE_DIR, "contract://workspace"),
+        (BUCEPHALUS_CONTRACT_EVENTS_DIR, "contract://events"),
+        ("/bucephalus/tmp", "contract://tmp"),
+    ] {
+        if normalized == prefix {
+            return scheme.to_string();
+        }
+        if let Some(rel) = normalized.strip_prefix(&format!("{prefix}/")) {
+            return format!("{scheme}/{rel}");
+        }
+    }
+    "[REDACTED:modal-remote-path]".to_string()
+}
+
+fn modal_local_ref_for_object(object: &serde_json::Map<String, Value>) -> String {
+    for key in ["remote_path", "scratch_path", "durable_path", "path"] {
+        if let Some(raw) = object.get(key).and_then(Value::as_str) {
+            return public_modal_remote_path_ref(raw);
+        }
+    }
+    "[REDACTED:local-path]".to_string()
+}
+
+fn redact_modal_launch_spec_for_persistence(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, child) in object {
+                if key == "local_path" {
+                    continue;
+                }
+                if key == "runtime_transfer_archive" {
+                    redacted.insert(
+                        "runtime_transfer_archive_ref".to_string(),
+                        json!("modal://runtime-transfer-archive"),
+                    );
+                    continue;
+                }
+                redacted.insert(key.clone(), redact_modal_launch_spec_for_persistence(child));
+            }
+            if object.contains_key("local_path") {
+                redacted.insert(
+                    "local_ref".to_string(),
+                    json!(modal_local_ref_for_object(object)),
+                );
+            }
+            Value::Object(redacted)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(redact_modal_launch_spec_for_persistence)
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn create_modal_artifact_file(path: &Path, artifact_ref: &str) -> Result<File> {
+    ensure_runtime_artifact_path(path, artifact_ref)?;
+    File::create(path).with_context(|| {
+        format!("failed to create Modal runtime artifact\n\nartifact_ref: {artifact_ref}")
+    })
+}
+
+struct PrivateModalLaunchSpecGuard {
+    path: PathBuf,
+}
+
+impl PrivateModalLaunchSpecGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for PrivateModalLaunchSpecGuard {
+    fn drop(&mut self) {
+        if let Err(err) = remove_path_if_exists(&self.path) {
+            eprintln!(
+                "warning: failed to remove private Modal launch spec [REDACTED:local-path]: {}",
+                err
+            );
+        }
+    }
+}
+
 fn validate_modal_copy_targets(copies: &[Value]) -> Result<()> {
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for copy in copies {
@@ -123,23 +216,22 @@ fn validate_modal_copy_targets(copies: &[Value]) -> Result<()> {
             .get("local_path")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("modal copy entry missing local_path"))?;
-        for (previous_target, previous_local) in &seen {
+        for previous_target in seen.keys() {
             if modal_remote_path_contains(&target, previous_target) {
                 return Err(anyhow!(
-                    "modal copy remote_path '{}' overlaps with '{}' ({} and {})",
+                    "modal copy remote_path '{}' overlaps with '{}'",
                     target,
-                    previous_target,
-                    local_path,
-                    previous_local
+                    previous_target
                 ));
             }
         }
-        if let Some(previous_local) = seen.insert(target.clone(), local_path.to_string()) {
+        if seen
+            .insert(target.clone(), local_path.to_string())
+            .is_some()
+        {
             return Err(anyhow!(
-                "modal copy remote_path '{}' is declared more than once ({} and {})",
-                target,
-                previous_local,
-                local_path
+                "modal copy remote_path '{}' is declared more than once",
+                target
             ));
         }
     }
@@ -360,41 +452,69 @@ fn modal_runtime_workers_path(trial_dir: &Path) -> PathBuf {
     trial_dir.join("modal").join("runtime_workers.json")
 }
 
+fn dedupe_modal_worker_ids(ids: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    ids.retain(|id| !id.trim().is_empty() && seen.insert(id.clone()));
+}
+
 fn load_modal_runtime_worker_ids(trial_dir: &Path) -> Result<Vec<String>> {
     let mut ids = load_trial_attempt_container_ids(trial_dir)?;
     let path = modal_runtime_workers_path(trial_dir);
-    if path.exists() {
-        let value: Value = match fs::read(&path)
-            .with_context(|| format!("read modal runtime workers {}", path.display()))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .with_context(|| format!("parse modal runtime workers {}", path.display()))
-            }) {
-            Ok(value) => value,
-            Err(err) if !ids.is_empty() => {
-                let mut seen = BTreeSet::new();
-                ids.retain(|id| !id.trim().is_empty() && seen.insert(id.clone()));
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            dedupe_modal_worker_ids(&mut ids);
+            if !ids.is_empty() {
                 return Ok(ids);
             }
-            Err(err) => return Err(err),
-        };
-        if let Some(workers) = value.get("workers").and_then(Value::as_array) {
-            for worker in workers {
-                if let Some(id) = worker.get("sandbox_id").and_then(Value::as_str) {
-                    ids.push(id.to_string());
+            return Err(anyhow!(
+                "refusing to read symlinked Modal runtime worker state\n\nstate_ref: modal://runtime-workers"
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(anyhow!(
+                "refusing to read Modal runtime worker state because it is not a file\n\nstate_ref: modal://runtime-workers"
+            ));
+        }
+        Ok(_) => {
+            let value: Value = match fs::read(&path)
+                .with_context(|| {
+                    "read Modal runtime worker state\n\nstate_ref: modal://runtime-workers"
+                })
+                .and_then(|bytes| {
+                    serde_json::from_slice(&bytes).with_context(|| {
+                        "parse Modal runtime worker state\n\nstate_ref: modal://runtime-workers"
+                    })
+                }) {
+                Ok(value) => value,
+                Err(err) if !ids.is_empty() => {
+                    dedupe_modal_worker_ids(&mut ids);
+                    return Ok(ids);
+                }
+                Err(err) => return Err(err),
+            };
+            if let Some(workers) = value.get("workers").and_then(Value::as_array) {
+                for worker in workers {
+                    if let Some(id) = worker.get("sandbox_id").and_then(Value::as_str) {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+            if let Some(sandbox_ids) = value.get("sandbox_ids").and_then(Value::as_array) {
+                for id in sandbox_ids {
+                    if let Some(id) = id.as_str() {
+                        ids.push(id.to_string());
+                    }
                 }
             }
         }
-        if let Some(sandbox_ids) = value.get("sandbox_ids").and_then(Value::as_array) {
-            for id in sandbox_ids {
-                if let Some(id) = id.as_str() {
-                    ids.push(id.to_string());
-                }
-            }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(anyhow!(
+                "inspect Modal runtime worker state\n\nstate_ref: modal://runtime-workers\n\nerror: {err}"
+            ));
         }
     }
-    let mut seen = BTreeSet::new();
-    ids.retain(|id| !id.trim().is_empty() && seen.insert(id.clone()));
+    dedupe_modal_worker_ids(&mut ids);
     Ok(ids)
 }
 
@@ -411,9 +531,10 @@ fn run_modal_cleanup(
     let modal_dir = trial_dir.join("modal");
     ensure_dir(&modal_dir)?;
     let spec_path = modal_dir.join("cleanup.json");
-    fs::write(
+    write_runtime_artifact_file(
         &spec_path,
-        serde_json::to_vec_pretty(&json!({ "sandbox_ids": worker_ids }))?,
+        &serde_json::to_vec_pretty(&json!({ "sandbox_ids": worker_ids }))?,
+        "modal://cleanup-spec",
     )?;
     let command = modal_launcher_command(launcher, &modal_dir, "cleanup", &spec_path);
     let output = run_modal_launcher_command(command, &modal_dir, "cleanup")?;
@@ -432,14 +553,22 @@ fn run_modal_cleanup(
         .find_map(|line| line.strip_prefix("BUCEPHALUS_MODAL_CLEANUP="))
         .ok_or_else(|| {
             anyhow!(
-                "modal cleanup launcher did not emit BUCEPHALUS_MODAL_CLEANUP in {}",
-                output.stdout_path.display()
+                "modal cleanup launcher did not emit BUCEPHALUS_MODAL_CLEANUP\n\nlog_ref: modal-log://cleanup/stdout"
             )
         })?;
     let cleaned = serde_json::from_str::<ModalCleanupMarker>(marker)?.cleaned;
     Ok(RuntimeCleanupOutcome {
         cleaned_workers: cleaned,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn run_modal_cleanup_for_test(
+    launcher: &Path,
+    trial_dir: &Path,
+    worker_ids: &[String],
+) -> Result<RuntimeCleanupOutcome> {
+    run_modal_cleanup(launcher, trial_dir, worker_ids)
 }
 
 #[derive(serde::Deserialize)]
@@ -451,6 +580,7 @@ struct ModalLauncherOutput {
     status: ExitStatus,
     stdout_tail: String,
     stderr_tail: String,
+    #[cfg(test)]
     stdout_path: PathBuf,
 }
 
@@ -462,10 +592,10 @@ fn run_modal_launcher_command(
     ensure_dir(modal_dir)?;
     let stdout_path = modal_dir.join(format!("{log_stem}_stdout.log"));
     let stderr_path = modal_dir.join(format!("{log_stem}_stderr.log"));
-    let stdout = File::create(&stdout_path)
-        .with_context(|| format!("create modal launcher stdout log {}", stdout_path.display()))?;
-    let stderr = File::create(&stderr_path)
-        .with_context(|| format!("create modal launcher stderr log {}", stderr_path.display()))?;
+    let stdout_ref = format!("modal-log://{log_stem}/stdout");
+    let stderr_ref = format!("modal-log://{log_stem}/stderr");
+    let stdout = create_modal_artifact_file(&stdout_path, &stdout_ref)?;
+    let stderr = create_modal_artifact_file(&stderr_path, &stderr_ref)?;
     let status = command
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -475,6 +605,7 @@ fn run_modal_launcher_command(
         status,
         stdout_tail: read_file_tail_lossy(&stdout_path, MODAL_LAUNCHER_LOG_TAIL_BYTES)?,
         stderr_tail: read_file_tail_lossy(&stderr_path, MODAL_LAUNCHER_LOG_TAIL_BYTES)?,
+        #[cfg(test)]
         stdout_path,
     })
 }
@@ -954,9 +1085,10 @@ fn execute_modal_trial_runtime(
             &grader_run,
         )?;
         let mapped_output_path = request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
-        fs::write(
+        write_runtime_artifact_file(
             &mapped_output_path,
-            serde_json::to_vec_pretty(&synthesized)?,
+            &serde_json::to_vec_pretty(&synthesized)?,
+            "runtime-output://mapped-grader",
         )?;
         match validate_json_schema("trial_conclusion_v1.jsonschema", &mapped_output_path) {
             Ok(row) => {
@@ -1779,12 +1911,7 @@ fn build_modal_runtime_transfer_archive(
     launch: &ModalLaunchSpec,
 ) -> Result<PathBuf> {
     let archive_path = modal_runtime_transfer_archive_path(modal_dir);
-    let file = File::create(&archive_path).with_context(|| {
-        format!(
-            "create modal runtime transfer archive {}",
-            archive_path.display()
-        )
-    })?;
+    let file = create_modal_artifact_file(&archive_path, "modal://runtime-transfer-archive")?;
     let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut archive = tar::Builder::new(encoder);
     for directory in [
@@ -1820,6 +1947,56 @@ fn build_modal_runtime_transfer_archive(
     Ok(archive_path)
 }
 
+fn modal_public_launch_spec_path(modal_dir: &Path) -> PathBuf {
+    modal_dir.join("launch.json")
+}
+
+fn modal_private_launch_spec_path(modal_dir: &Path) -> PathBuf {
+    modal_dir.join("launch.private.json")
+}
+
+fn write_modal_launch_specs(
+    modal_dir: &Path,
+    private_launch_value: &Value,
+) -> Result<(PathBuf, PrivateModalLaunchSpecGuard)> {
+    let public_spec_path = modal_public_launch_spec_path(modal_dir);
+    let public_launch_value = redact_modal_launch_spec_for_persistence(private_launch_value);
+    write_runtime_artifact_file(
+        &public_spec_path,
+        &serde_json::to_vec_pretty(&public_launch_value)?,
+        "modal://launch-spec/public",
+    )?;
+
+    let private_spec_path = modal_private_launch_spec_path(modal_dir);
+    write_runtime_artifact_file(
+        &private_spec_path,
+        &serde_json::to_vec_pretty(private_launch_value)?,
+        "modal://launch-spec/private",
+    )?;
+    Ok((
+        private_spec_path.clone(),
+        PrivateModalLaunchSpecGuard::new(private_spec_path),
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn write_modal_launch_specs_for_test(
+    modal_dir: &Path,
+    private_launch_value: &Value,
+) -> Result<(Value, bool)> {
+    ensure_dir(modal_dir)?;
+    let (private_spec_path, private_spec_guard) =
+        write_modal_launch_specs(modal_dir, private_launch_value)?;
+    let private_spec_was_written = private_spec_path.exists();
+    drop(private_spec_guard);
+    let private_spec_was_removed = !private_spec_path.exists();
+    let public_value = crate::config::load_json_file(&modal_public_launch_spec_path(modal_dir))?;
+    Ok((
+        public_value,
+        private_spec_was_written && private_spec_was_removed,
+    ))
+}
+
 fn modal_launcher_command(
     launcher: &Path,
     modal_dir: &Path,
@@ -1850,7 +2027,6 @@ fn run_modal_launch(
     let modal_dir = trial_dir.join("modal");
     ensure_dir(&modal_dir)?;
     let runtime_transfer_archive = build_modal_runtime_transfer_archive(&modal_dir, launch)?;
-    let spec_path = modal_dir.join("launch.json");
     let mut launch_value = launch.value.clone();
     let launch_object = launch_value
         .as_object_mut()
@@ -1859,13 +2035,11 @@ fn run_modal_launch(
         "runtime_transfer_archive".to_string(),
         json!(runtime_transfer_archive),
     );
-    fs::write(&spec_path, serde_json::to_vec_pretty(&launch_value)?)?;
+    let (spec_path, _private_spec_guard) = write_modal_launch_specs(&modal_dir, &launch_value)?;
     let stdout_path = modal_dir.join("sandbox_stdout.log");
     let stderr_path = modal_dir.join("sandbox_stderr.log");
-    let stdout_log = File::create(&stdout_path)
-        .with_context(|| format!("create modal launcher stdout log {}", stdout_path.display()))?;
-    let stderr = File::create(&stderr_path)
-        .with_context(|| format!("create modal launcher stderr log {}", stderr_path.display()))?;
+    let stdout_log = create_modal_artifact_file(&stdout_path, "modal-log://sandbox/stdout")?;
+    let stderr = create_modal_artifact_file(&stderr_path, "modal-log://sandbox/stderr")?;
     let mut command = modal_launcher_command(launcher, &modal_dir, "launch", &spec_path);
     let mut child = command
         .stdout(Stdio::piped())
@@ -2184,7 +2358,16 @@ pub(crate) fn read_modal_launcher_log_tail_for_test(path: &Path) -> Result<Strin
 
 #[cfg(test)]
 pub(crate) fn read_captured_file_value_for_test(path: &Path, format: &str) -> Result<Value> {
-    read_captured_file_value(path, format)
+    read_captured_file_value(path, format, None)
+}
+
+#[cfg(test)]
+pub(crate) fn read_captured_file_value_with_container_for_test(
+    path: &Path,
+    format: &str,
+    container_path: &str,
+) -> Result<Value> {
+    read_captured_file_value(path, format, Some(container_path))
 }
 
 #[cfg(test)]

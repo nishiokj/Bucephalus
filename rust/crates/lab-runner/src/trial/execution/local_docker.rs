@@ -1105,7 +1105,7 @@ fn capture_runtime_output(
                 });
             };
             Ok(CapturedTransportOutput {
-                value: read_captured_file_value(&host_path, format)?,
+                value: read_captured_file_value(&host_path, format, Some(container_path))?,
                 host_path: Some(host_path),
                 container_path: Some(container_path.to_string()),
                 format: Some(format.to_string()),
@@ -1123,7 +1123,7 @@ fn capture_runtime_output(
                         container_path
                     )
                 })?;
-            let result_json = read_captured_file_value(&host_path, "json")?;
+            let result_json = read_captured_file_value(&host_path, "json", Some(container_path))?;
             let value = if let Some(field) = capture.field.as_deref() {
                 let selected = select_transport_field(&result_json, field).ok_or_else(|| {
                     anyhow!("{}.capture.field '{}' resolved to null", label, field)
@@ -2039,9 +2039,10 @@ where
                 &grader_run,
             )?;
             let mapped_output_path = request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
-            fs::write(
+            write_runtime_artifact_file(
                 &mapped_output_path,
-                serde_json::to_vec_pretty(&synthesized)?,
+                &serde_json::to_vec_pretty(&synthesized)?,
+                "runtime-output://mapped-grader",
             )?;
 
             match validate_json_schema("trial_conclusion_v1.jsonschema", &mapped_output_path) {

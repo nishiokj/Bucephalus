@@ -21,6 +21,11 @@ export type StorageConfig =
       backend: "filesystem";
     }
   | {
+      backend: "gcs";
+      bucket: string;
+      prefix: string;
+    }
+  | {
       backend: "r2";
       accountId: string | null;
       endpoint: string;
@@ -77,6 +82,14 @@ function loadStorageConfig(env: NodeJS.ProcessEnv): StorageConfig {
   const backend = (env.BUCEPHALUS_CLOUD_STORAGE_BACKEND?.trim() || "filesystem").toLowerCase();
   if (backend === "filesystem") {
     return { backend: "filesystem" };
+  }
+  if (backend === "gcs") {
+    const bucket = env.BUCEPHALUS_CLOUD_GCS_BUCKET?.trim() || null;
+    const prefix = env.BUCEPHALUS_CLOUD_GCS_PREFIX?.trim() || "";
+    if (!bucket) {
+      throw new Error("BUCEPHALUS_CLOUD_GCS_BUCKET is required for GCS storage");
+    }
+    return { backend: "gcs", bucket, prefix };
   }
   if (backend !== "r2") {
     throw new Error(`Unsupported BUCEPHALUS_CLOUD_STORAGE_BACKEND: ${backend}`);

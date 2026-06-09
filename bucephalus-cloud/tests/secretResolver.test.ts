@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
 import {
+  fetchSecretValue,
   resolveSecrets,
   secretFetchPlan,
 } from "../src/secretResolver";
@@ -170,27 +171,74 @@ describe("attempt secret resolver", () => {
       const outsideTarget = join(outside, "leaked-secret");
       await symlink(outsideTarget, join(root, "OPENAI_API_KEY.secret"));
 
-      await expect(resolveSecrets({
-        attempt_id: "attempt-1",
-        run_id: "run-1",
-        output_dir: root,
-        secrets: [
-          { id: "OPENAI_API_KEY", ref: "env:OPENAI_API_KEY" },
-        ],
-      }, {
-        env: {
-          BUCEPHALUS_SECRET_RESOLVER_ALLOW_ENV: "true",
-          OPENAI_API_KEY: "secret-value",
-        },
-        runCommand: async () => {
-          throw new Error("provider command should not run for env refs");
-        },
-      })).rejects.toThrow("already exists");
+      let message = "";
+      try {
+        await resolveSecrets({
+          attempt_id: "attempt-1",
+          run_id: "run-1",
+          output_dir: root,
+          secrets: [
+            { id: "OPENAI_API_KEY", ref: "env:OPENAI_API_KEY" },
+          ],
+        }, {
+          env: {
+            BUCEPHALUS_SECRET_RESOLVER_ALLOW_ENV: "true",
+            OPENAI_API_KEY: "secret-value",
+          },
+          runCommand: async () => {
+            throw new Error("provider command should not run for env refs");
+          },
+        });
+        throw new Error("resolver unexpectedly followed preexisting secret-file symlink");
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+
+      expect(message).toContain("Secret output file already exists");
+      expect(message).toContain("output_ref: secret-output://OPENAI_API_KEY.secret");
+      expect(message).not.toContain(root);
+      expect(message).not.toContain(outside);
+      expect(message).not.toContain(outsideTarget);
 
       await expect(readFile(outsideTarget, "utf8")).rejects.toThrow();
     } finally {
       await rm(root, { recursive: true, force: true });
       await rm(outside, { recursive: true, force: true });
     }
+  });
+
+  test("redacts provider command path and stderr on secret fetch failures", async () => {
+    let message = "";
+    try {
+      await fetchSecretValue(
+        "gcp-secret-manager://projects/acme-prod/secrets/openai_api_key/versions/7",
+        {
+          env: {
+            BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD: "/Users/alice/private/bin/gcloud",
+          },
+          runCommand: async () => {
+            throw new Error(
+              "failed near /Users/alice/private/project token=raw-provider-token "
+                + "gcp-secret-manager://projects/acme-prod/secrets/openai_api_key/versions/7 "
+                + "https://alice:secret@example.com/result?token=raw-query",
+            );
+          },
+        },
+      );
+      throw new Error("provider command unexpectedly succeeded");
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain("Secret provider command failed");
+    expect(message).toContain("[redacted-local-path]");
+    expect(message).toContain("token=[redacted-secret]");
+    expect(message).toContain("[redacted-secret]");
+    expect(message).toContain("https://example.com/result [redacted URL credentials/query]");
+    expect(message).not.toContain("/Users/alice");
+    expect(message).not.toContain("private/bin/gcloud");
+    expect(message).not.toContain("raw-provider-token");
+    expect(message).not.toContain("raw-query");
+    expect(message).not.toContain("gcp-secret-manager://");
   });
 });

@@ -18,8 +18,13 @@ if [[ -z "${INDEX}" || "${INDEX}" == "-h" || "${INDEX}" == "--help" ]]; then
   exit 2
 fi
 
+if [[ -L "${INDEX}" ]]; then
+  echo "cloud image promotion evidence index must not be a symlink" >&2
+  exit 2
+fi
+
 if [[ ! -f "${INDEX}" ]]; then
-  echo "cloud image promotion evidence index does not exist: ${INDEX}" >&2
+  echo "cloud image promotion evidence index does not exist" >&2
   exit 2
 fi
 
@@ -30,12 +35,11 @@ fi
 
 INDEX="${INDEX}" bun -e '
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { lstatSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const indexPath = process.env.INDEX;
 const indexDir = dirname(indexPath);
-const index = JSON.parse(await Bun.file(indexPath).text());
 const sha256 = /^[a-f0-9]{64}$/;
 const gitSha = /^[a-f0-9]{40}$/;
 const digest = /^sha256:[a-f0-9]{64}$/;
@@ -55,17 +59,67 @@ function checkSha(value, label) {
   }
 }
 
-async function hashFile(path) {
+function existingRegularFile(path, label) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    fail(`${label} does not exist or cannot be inspected`);
+  }
+  if (stat.isSymbolicLink()) {
+    fail(`${label} must not be a symlink`);
+  }
+  if (!stat.isFile()) {
+    fail(`${label} must be a regular file`);
+  }
+  return true;
+}
+
+function requireRegularFile(path, label) {
+  if (!existingRegularFile(path, label)) {
+    fail(`${label} does not exist`);
+  }
+}
+
+async function readTextFile(path, label) {
+  requireRegularFile(path, label);
+  return Bun.file(path).text();
+}
+
+async function hashFile(path, label) {
+  requireRegularFile(path, label);
   return createHash("sha256").update(Buffer.from(await Bun.file(path).arrayBuffer())).digest("hex");
 }
 
-function resolveEvidencePath(entry) {
-  if (existsSync(entry.path)) {
+function resolveEvidencePath(entry, label) {
+  if (existingRegularFile(entry.path, `${label}.path file`)) {
     return entry.path;
   }
   const sibling = join(indexDir, entry.name);
-  return existsSync(sibling) ? sibling : null;
+  return existingRegularFile(sibling, `${label}.sibling file`) ? sibling : null;
 }
+
+function looksLikeHostPath(path) {
+  const normalized = path.replace(/^\.\//, "");
+  return /^(Users|home|private|tmp|var\/folders|Volumes|Desktop|Documents|Downloads|runner\/work|github\/workspace)\//.test(normalized);
+}
+
+function checkArtifactPath(path, label) {
+  if (typeof path !== "string" || path.trim() === "" || path.includes("..") || path.startsWith("/") || path.includes("\\")) {
+    fail(`${label} must be a stable artifact-local path`);
+  }
+  if (looksLikeHostPath(path)) {
+    fail(`${label} must not look like a host filesystem path`);
+  }
+  if (/(^|\/)\.env(\.example)?$/.test(path) || /(^|[-_.])latest([-_.]|$)/.test(path)) {
+    fail(`${label} contains a forbidden promotion evidence name`);
+  }
+}
+
+const index = JSON.parse(await readTextFile(indexPath, "cloud image promotion evidence index"));
 
 if (index.schema_version !== "bucephalus_cloud_image_promotion_evidence_index_v1") {
   fail("schema_version must be bucephalus_cloud_image_promotion_evidence_index_v1");
@@ -121,16 +175,14 @@ if (evidence.tfvars?.name !== "gcp-image-digests.tfvars") {
 }
 
 for (const [name, entry] of Object.entries(evidence)) {
-  if (typeof entry.path !== "string" || entry.path.trim() === "" || entry.path.includes("..") || entry.path.startsWith("/") || entry.path.includes("\\")) {
-    fail(`evidence.${name}.path must be a stable artifact-local path`);
-  }
-  if (/(^|\/)\.env(\.example)?$/.test(entry.path) || /(^|[-_.])latest([-_.]|$)/.test(entry.path)) {
-    fail(`evidence.${name}.path contains a forbidden promotion evidence name`);
+  checkArtifactPath(entry.path, `evidence.${name}.path`);
+  if (entry.path.split("/").pop() !== entry.name) {
+    fail(`evidence.${name}.name must match path basename`);
   }
   checkSha(entry.sha256, `evidence.${name}.sha256`);
-  const resolvedPath = resolveEvidencePath(entry);
-  if (resolvedPath !== null && await hashFile(resolvedPath) !== entry.sha256) {
-    fail(`${resolvedPath} digest does not match index`);
+  const resolvedPath = resolveEvidencePath(entry, `evidence.${name}`);
+  if (resolvedPath !== null && await hashFile(resolvedPath, `evidence.${name} file`) !== entry.sha256) {
+    fail(`evidence.${name}.sha256 does not match referenced file`);
   }
 }
 
@@ -167,12 +219,12 @@ for (const component of deployComponents) {
   }
 }
 
-const resolvedImageManifest = resolveEvidencePath(evidence.image_manifest);
-const resolvedImageProvenance = resolveEvidencePath(evidence.image_provenance);
-const resolvedTfvars = resolveEvidencePath(evidence.tfvars);
+const resolvedImageManifest = resolveEvidencePath(evidence.image_manifest, "evidence.image_manifest");
+const resolvedImageProvenance = resolveEvidencePath(evidence.image_provenance, "evidence.image_provenance");
+const resolvedTfvars = resolveEvidencePath(evidence.tfvars, "evidence.tfvars");
 if (resolvedImageManifest && resolvedImageProvenance && resolvedTfvars) {
-  const manifest = JSON.parse(await Bun.file(resolvedImageManifest).text());
-  const provenance = JSON.parse(await Bun.file(resolvedImageProvenance).text());
+  const manifest = JSON.parse(await readTextFile(resolvedImageManifest, "evidence.image_manifest file"));
+  const provenance = JSON.parse(await readTextFile(resolvedImageProvenance, "evidence.image_provenance file"));
   if (manifest.release?.version !== index.release.version || provenance.release?.version !== index.release.version) {
     fail("promotion evidence release.version does not match index");
   }
@@ -194,36 +246,73 @@ if (resolvedImageManifest && resolvedImageProvenance && resolvedTfvars) {
   }
 }
 
-console.log(`verified cloud image promotion evidence index ${indexPath}`);
+console.log("verified cloud image promotion evidence index promotion-evidence://cloud-image-promotion-evidence");
 '
 
-set +e
-INDEX="${INDEX}" bun -e '
-import { existsSync } from "node:fs";
+resolve_evidence_path() {
+  local key="$1"
+  INDEX="${INDEX}" KEY="${key}" bun -e '
+import { lstatSync } from "node:fs";
 import { dirname, join } from "node:path";
-const index = JSON.parse(await Bun.file(process.env.INDEX).text());
-const indexDir = dirname(process.env.INDEX);
-const evidence = index.evidence ?? {};
-function existsEvidence(entry) {
-  return Boolean(entry) && (existsSync(entry.path) || existsSync(join(indexDir, entry.name)));
+
+function fail(message) {
+  console.error(message);
+  process.exit(1);
 }
-if (existsEvidence(evidence.image_manifest) && existsEvidence(evidence.image_provenance) && existsEvidence(evidence.tfvars)) {
+
+function existingRegularFile(path, label) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    fail(`${label} does not exist or cannot be inspected`);
+  }
+  if (stat.isSymbolicLink()) {
+    fail(`${label} must not be a symlink`);
+  }
+  if (!stat.isFile()) {
+    fail(`${label} must be a regular file`);
+  }
+  return true;
+}
+
+function requireRegularFile(path, label) {
+  if (!existingRegularFile(path, label)) {
+    fail(`${label} does not exist`);
+  }
+}
+
+async function readTextFile(path, label) {
+  requireRegularFile(path, label);
+  return Bun.file(path).text();
+}
+
+const index = JSON.parse(await readTextFile(process.env.INDEX, "cloud image promotion evidence index"));
+const key = process.env.KEY;
+const entry = index.evidence?.[key];
+if (!entry) {
   process.exit(0);
 }
-process.exit(3);
+if (existingRegularFile(entry.path, `evidence.${key}.path file`)) {
+  console.log(entry.path);
+  process.exit(0);
+}
+const sibling = join(dirname(process.env.INDEX), entry.name);
+if (existingRegularFile(sibling, `evidence.${key}.sibling file`)) {
+  console.log(sibling);
+}
 '
-evidence_status="$?"
-set -e
-case "${evidence_status}" in
-  0)
-    "${BASH_SOURCE[0]%/*}/verify-gcp-image-promotion-evidence.sh" \
-      --image-manifest "$(INDEX="${INDEX}" bun -e 'import { existsSync } from "node:fs"; import { dirname, join } from "node:path"; const i = JSON.parse(await Bun.file(process.env.INDEX).text()); const p = i.evidence.image_manifest.path; console.log(existsSync(p) ? p : join(dirname(process.env.INDEX), i.evidence.image_manifest.name));')" \
-      --image-provenance "$(INDEX="${INDEX}" bun -e 'import { existsSync } from "node:fs"; import { dirname, join } from "node:path"; const i = JSON.parse(await Bun.file(process.env.INDEX).text()); const p = i.evidence.image_provenance.path; console.log(existsSync(p) ? p : join(dirname(process.env.INDEX), i.evidence.image_provenance.name));')" \
-      --tfvars "$(INDEX="${INDEX}" bun -e 'import { existsSync } from "node:fs"; import { dirname, join } from "node:path"; const i = JSON.parse(await Bun.file(process.env.INDEX).text()); const p = i.evidence.tfvars.path; console.log(existsSync(p) ? p : join(dirname(process.env.INDEX), i.evidence.tfvars.name));')"
-    ;;
-  3)
-    ;;
-  *)
-    exit "${evidence_status}"
-    ;;
-esac
+}
+
+resolved_image_manifest="$(resolve_evidence_path image_manifest)"
+resolved_image_provenance="$(resolve_evidence_path image_provenance)"
+resolved_tfvars="$(resolve_evidence_path tfvars)"
+if [[ -n "${resolved_image_manifest}" && -n "${resolved_image_provenance}" && -n "${resolved_tfvars}" ]]; then
+  "${BASH_SOURCE[0]%/*}/verify-gcp-image-promotion-evidence.sh" \
+    --image-manifest "${resolved_image_manifest}" \
+    --image-provenance "${resolved_image_provenance}" \
+    --tfvars "${resolved_tfvars}"
+fi

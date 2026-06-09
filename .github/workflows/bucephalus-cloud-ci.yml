@@ -18,6 +18,7 @@ on:
       - "bucephalus-cloud/**"
       - "bucephalus-cloud/infra/gcp/**"
       - "scripts/ci/cloud-gates.sh"
+      - "scripts/ci/verify-installer-archive-boundary.sh"
       - "scripts/ci/verify-cloud-release-boundary.sh"
       - "scripts/deploy/**"
       - "scripts/release/build-buc-release.sh"
@@ -62,6 +63,7 @@ on:
       - "bucephalus-cloud/**"
       - "bucephalus-cloud/infra/gcp/**"
       - "scripts/ci/cloud-gates.sh"
+      - "scripts/ci/verify-installer-archive-boundary.sh"
       - "scripts/ci/verify-cloud-release-boundary.sh"
       - "scripts/deploy/**"
       - "scripts/release/build-buc-release.sh"
@@ -107,6 +109,9 @@ jobs:
 
       - name: Verify release boundary policy
         run: scripts/ci/verify-cloud-release-boundary.sh
+
+      - name: Verify installer archive boundary
+        run: bash scripts/ci/verify-installer-archive-boundary.sh
 
       - name: Verify signing policy
         run: scripts/release/verify-cloud-signing-policy.sh

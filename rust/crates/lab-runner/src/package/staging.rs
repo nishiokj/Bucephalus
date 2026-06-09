@@ -161,11 +161,14 @@ pub(crate) fn stage_source_into_package(
     if let Some(existing) = copies.get(&key) {
         return Ok(existing.clone());
     }
+    let source_ref = public_declared_path_ref("source", raw_source);
+    let resolved_ref = resolved
+        .strip_prefix(exp_dir)
+        .map(|rel| public_relative_path_ref("source", rel))
+        .unwrap_or_else(|_| "source://outside-workspace".to_string());
     fs::metadata(&resolved).with_context(|| {
         format!(
-            "package build failed to read staged source '{}' resolved from '{}'",
-            resolved.display(),
-            raw_source
+            "package build failed to read staged source\n\nsource_ref: {source_ref}\nresolved_ref: {resolved_ref}"
         )
     })?;
     let name = resolved
@@ -173,9 +176,9 @@ pub(crate) fn stage_source_into_package(
         .and_then(|n| n.to_str())
         .ok_or_else(|| {
             anyhow!(
-                "package build staged source '{}' resolved from '{}' must have a file name",
-                resolved.display(),
-                raw_source
+                "package build staged source must have a file name\n\nsource_ref: {}\nresolved_ref: {}",
+                source_ref,
+                resolved_ref
             )
         })?;
     let rel_path = PathBuf::from(subdir).join(format!("{:03}_{}", *counter, name));
@@ -203,12 +206,13 @@ pub(crate) fn stage_public_runtime_path_reference(
 ) -> Result<String> {
     let rel_portable = as_portable_rel(rel);
     let resolved = normalize_path(&exp_dir.join(rel));
+    let source_ref = public_relative_path_ref("source", rel);
     fs::metadata(&resolved).with_context(|| {
         format!(
-            "package build failed to read {} public path reference '{}' resolved to '{}'",
+            "package build failed to read {} public path reference\n\nsource_ref: {}\nresolved_ref: {}",
             field_name,
-            rel_portable,
-            resolved.display()
+            source_ref,
+            source_ref
         )
     })?;
     if copies.contains_key(&rel_portable) {
@@ -261,8 +265,10 @@ pub(crate) fn rewrite_packaged_runtime_asset_entries(
         )
         .with_context(|| {
             format!(
-                "failed to stage {}[{}].build_source_path '{}' into sealed package",
-                field_name, idx, raw
+                "failed to stage {}[{}].build_source_path into sealed package\n\nsource_ref: {}",
+                field_name,
+                idx,
+                public_declared_path_ref("source", raw)
             )
         })?;
         if let Some(obj) = item.as_object_mut() {
@@ -296,8 +302,9 @@ pub(crate) fn rewrite_optional_package_source_path(
         stage_source_into_package(raw, exp_dir, package_dir, subdir, file_copies, file_counter)
             .with_context(|| {
                 format!(
-                    "failed to stage {} '{}' into sealed package",
-                    field_name, raw
+                    "failed to stage {} into sealed package\n\nsource_ref: {}",
+                    field_name,
+                    public_declared_path_ref("source", raw)
                 )
             })?;
     *item = Value::String(rel);
@@ -336,8 +343,7 @@ pub(crate) fn stage_command_path_refs_for_package(
             token,
             exp_dir,
             &format!("{}[{}]", field_name, idx),
-        )
-        .with_context(|| format!("while staging command path refs for {}", field_name))?
+        )?
         else {
             continue;
         };
@@ -424,28 +430,22 @@ pub(crate) fn validate_host_grader_command_package_boundary(
         }
         if Path::new(trimmed).is_absolute() {
             return Err(anyhow!(
-                "{}[{}] references an absolute host path '{}'; host grader code must be declared through trial_runtime.grader.host.capability",
+                "{}[{}] references an absolute host path {}; host grader code must be declared through trial_runtime.grader.host.capability",
                 field_name,
                 idx,
-                trimmed
+                public_declared_path_ref("source", trimmed)
             ));
         }
         if let Some(rel) = resolve_existing_public_path_reference(
             trimmed,
             exp_dir,
             &format!("{}[{}]", field_name, idx),
-        )
-        .with_context(|| {
-            format!(
-                "while validating host grader command boundary for {}",
-                field_name
-            )
-        })? {
+        )? {
             return Err(anyhow!(
-                "{}[{}] references package-local file '{}'; host grader files cannot be staged into the task workspace. Use trial_runtime.grader.host.capability for package-scoped graders",
+                "{}[{}] references package-local file {}; host grader files cannot be staged into the task workspace. Use trial_runtime.grader.host.capability for package-scoped graders",
                 field_name,
                 idx,
-                rel.display()
+                public_relative_path_ref("source", &rel)
             ));
         }
     }
@@ -536,18 +536,12 @@ pub(crate) fn validate_grader_command_has_no_package_local_refs(
             trimmed,
             exp_dir,
             &format!("{}[{}]", field_name, idx),
-        )
-        .with_context(|| {
-            format!(
-                "while validating strategy='{}' grader command boundary for {}",
-                strategy, field_name
-            )
-        })? {
+        )? {
             return Err(anyhow!(
-                "{}[{}] references package-local file '{}'; strategy='{}' owns grader files through its explicit grader runtime fields, not generic command path staging",
+                "{}[{}] references package-local file {}; strategy='{}' owns grader files through its explicit grader runtime fields, not generic command path staging",
                 field_name,
                 idx,
-                rel.display(),
+                public_relative_path_ref("source", &rel),
                 strategy
             ));
         }
@@ -954,8 +948,8 @@ pub(crate) fn write_runtime_staging_manifest(
             )?;
             fs::metadata(&packaged_source).with_context(|| {
                 format!(
-                    "failed to read packaged runtime staging source '{}' for variant '{}'",
-                    packaged_source.display(),
+                    "failed to read packaged runtime staging source {} for variant '{}'",
+                    public_package_output_path_ref(package_dir, &packaged_source),
                     variant.id
                 )
             })?;

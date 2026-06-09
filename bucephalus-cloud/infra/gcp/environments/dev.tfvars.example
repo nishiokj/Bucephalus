@@ -1,4 +1,4 @@
-project_id  = "gen-lang-client-0255842044"
+project_id  = "your-gcp-project-id"
 region      = "us-central1"
 environment = "bucephalus"
 
@@ -23,7 +23,7 @@ cloud_sql_point_in_time_recovery_enabled = false
 # migration_image_digest, and worker_image_digest.
 
 oauth_issuer         = "https://accounts.google.com"
-oauth_user_client_id = "380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
+oauth_user_client_id = "000000000000-example.apps.googleusercontent.com"
 oauth_jwks_url       = "https://www.googleapis.com/oauth2/v3/certs"
 
 # The values below are required only when deploy_api_services=true or

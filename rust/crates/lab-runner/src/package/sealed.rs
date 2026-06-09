@@ -17,6 +17,54 @@ struct VerifiedPackageIntegrity {
     checksums: Value,
 }
 
+fn public_package_path_ref(package_dir: &Path, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(package_dir) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return "package://.".to_string();
+    }
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("package://{rel}")
+}
+
+fn public_package_error_message(package_dir: &Path, err: impl std::fmt::Display) -> String {
+    let mut message = err.to_string();
+    let root = package_dir.display().to_string();
+    if !root.is_empty() {
+        let root_prefix = format!("{root}{}", std::path::MAIN_SEPARATOR);
+        message = message.replace(&root_prefix, "package://");
+        message = message.replace(&root, "package://.");
+    }
+    message
+}
+
+fn public_run_path_ref(run_dir: &Path, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(run_dir) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return "run://.".to_string();
+    }
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("run://{rel}")
+}
+
+fn public_run_input_ref(_path: &Path) -> &'static str {
+    "package://."
+}
+
+fn run_input_resolution_context(path: &Path) -> String {
+    format!(
+        "resolve run input path\n\ntarget_ref: {}\n\nNext steps:\n  bucephalus build experiment.yaml --out <package-dir>\n  bucephalus run <package-dir>\n  bucephalus doctor <package-dir>",
+        public_run_input_ref(path)
+    )
+}
+
 pub(crate) fn resolve_package_path_under_root(
     package_dir: &Path,
     rel_path: &str,
@@ -30,16 +78,32 @@ pub(crate) fn resolve_package_path_under_root(
         return Err(anyhow!("{} must be relative to package root", field_name));
     }
     let resolved = normalize_path(&package_dir.join(trimmed));
+    let lexical_root = normalize_path(package_dir);
+    if !resolved.starts_with(&lexical_root) {
+        return Err(anyhow!(
+            "{} escapes package root: '{}' (root: package://.)",
+            field_name,
+            rel_path
+        ));
+    }
     let root = fs::canonicalize(package_dir)
-        .with_context(|| format!("failed to resolve package root {}", package_dir.display()))?;
-    let resolved_cmp = fs::canonicalize(&resolved)
-        .with_context(|| format!("failed to resolve package path {}", resolved.display()))?;
+        .with_context(|| "failed to resolve package root package://.")?;
+    let resolved_cmp = match fs::canonicalize(&resolved) {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(resolved),
+        Err(err) => {
+            return Err(anyhow!(
+                "failed to resolve package path {}: {}",
+                public_package_path_ref(package_dir, &resolved),
+                err
+            ));
+        }
+    };
     if !resolved_cmp.starts_with(&root) {
         return Err(anyhow!(
-            "{} escapes package root: '{}' (root: {})",
+            "{} escapes package root: '{}' (root: package://.)",
             field_name,
-            rel_path,
-            root.display()
+            rel_path
         ));
     }
     Ok(resolved)
@@ -107,7 +171,13 @@ fn verify_sealed_package_integrity_snapshot(
     validate_metadata_ref_outside_runtime_payload(checksums_ref, "checksums_ref")?;
     let checksums_path =
         resolve_package_path_under_root(package_dir, checksums_ref, "checksums_ref")?;
-    let checksums = load_json_file(&checksums_path)?;
+    let checksums = load_json_file(&checksums_path).map_err(|err| {
+        anyhow!(
+            "preflight_failed: checksums missing or unreadable at {}: {}",
+            public_package_path_ref(package_dir, &checksums_path),
+            public_package_error_message(package_dir, err)
+        )
+    })?;
     if checksums.pointer("/schema_version").and_then(Value::as_str)
         != Some("sealed_package_checksums_v2")
     {
@@ -130,7 +200,7 @@ fn verify_sealed_package_integrity_snapshot(
         if !file_path.is_file() {
             return Err(anyhow!(
                 "preflight_failed: checksummed file missing: {}",
-                file_path.display()
+                public_package_path_ref(package_dir, &file_path)
             ));
         }
         let actual = sha256_file(&file_path)?;
@@ -176,8 +246,8 @@ fn verify_sealed_package_integrity_snapshot(
     let lock = load_json_file(&lock_path).map_err(|err| {
         anyhow!(
             "preflight_failed: package.lock missing or unreadable at {}: {}",
-            lock_path.display(),
-            err
+            public_package_path_ref(package_dir, &lock_path),
+            public_package_error_message(package_dir, err)
         )
     })?;
     if lock.pointer("/package_digest").and_then(Value::as_str) != Some(manifest_digest) {
@@ -195,8 +265,8 @@ fn verify_sealed_package_integrity_snapshot(
         let package_checks = load_json_file(&package_checks_path).map_err(|err| {
             anyhow!(
                 "preflight_failed: package checks missing or unreadable at {}: {}",
-                package_checks_path.display(),
-                err
+                public_package_path_ref(package_dir, &package_checks_path),
+                public_package_error_message(package_dir, err)
             )
         })?;
         if package_checks
@@ -218,8 +288,8 @@ fn verify_sealed_package_integrity_snapshot(
     let resolved_experiment = load_json_file(&resolved_path).map_err(|err| {
         anyhow!(
             "preflight_failed: resolved_experiment.json missing or unreadable at {}: {}",
-            resolved_path.display(),
-            err
+            public_package_path_ref(package_dir, &resolved_path),
+            public_package_error_message(package_dir, err)
         )
     })?;
     let staging_manifest_path =
@@ -228,8 +298,8 @@ fn verify_sealed_package_integrity_snapshot(
         anyhow!(
             "preflight_failed: {} missing or unreadable at {}: {}",
             STAGING_MANIFEST_FILE,
-            staging_manifest_path.display(),
-            err
+            public_package_path_ref(package_dir, &staging_manifest_path),
+            public_package_error_message(package_dir, err)
         )
     })?;
     Ok(VerifiedPackageIntegrity {
@@ -268,7 +338,13 @@ pub(crate) fn copy_verified_package_payload_for_run(
     run_dir: &Path,
 ) -> Result<()> {
     let manifest_path = package_dir.join("manifest.json");
-    let manifest = load_json_file(&manifest_path)?;
+    let manifest = load_json_file(&manifest_path).map_err(|err| {
+        anyhow!(
+            "preflight_failed: manifest missing or unreadable at {}: {}",
+            public_package_path_ref(package_dir, &manifest_path),
+            public_package_error_message(package_dir, err)
+        )
+    })?;
     let verified = verify_sealed_package_integrity_snapshot(package_dir, &manifest)?;
     let files = verified
         .checksums
@@ -299,7 +375,7 @@ pub(crate) fn copy_verified_package_payload_for_run(
             return Err(anyhow!(
                 "preflight_failed: package payload '{}' resolves outside run directory: {}",
                 rel,
-                destination.display()
+                public_run_path_ref(run_dir, &destination)
             ));
         }
         if let Some(parent) = destination.parent() {
@@ -310,7 +386,7 @@ pub(crate) fn copy_verified_package_payload_for_run(
                 return Err(anyhow!(
                     "preflight_failed: package payload '{}' destination parent resolves outside run directory: {}",
                     rel,
-                    parent.display()
+                    public_run_path_ref(run_dir, parent)
                 ));
             }
         }
@@ -319,14 +395,14 @@ pub(crate) fn copy_verified_package_payload_for_run(
                 return Err(anyhow!(
                     "preflight_failed: package payload '{}' destination already exists with unsupported file type: {}",
                     rel,
-                    destination.display()
+                    public_run_path_ref(run_dir, &destination)
                 ));
             }
             Ok(_) => {
                 return Err(anyhow!(
                     "preflight_failed: package payload '{}' destination already exists: {}",
                     rel,
-                    destination.display()
+                    public_run_path_ref(run_dir, &destination)
                 ));
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -351,9 +427,8 @@ fn package_relative_path(package_dir: &Path, path: &Path) -> Result<String> {
         .map(as_portable_rel)
         .with_context(|| {
             format!(
-                "package path {} escaped package root {}",
-                path.display(),
-                package_dir.display()
+                "package path {} escaped package root package://.",
+                public_package_path_ref(package_dir, path)
             )
         })
 }
@@ -421,7 +496,12 @@ fn verify_no_unsealed_package_payload_entries(
 ) -> Result<()> {
     let metadata_paths = package_metadata_paths(manifest);
     for entry in walkdir::WalkDir::new(package_dir) {
-        let entry = entry?;
+        let entry = entry.map_err(|err| {
+            anyhow!(
+                "preflight_failed: failed to inspect sealed package entry: {}",
+                public_package_error_message(package_dir, err)
+            )
+        })?;
         let rel = package_relative_path(package_dir, entry.path())?;
         if rel.is_empty() {
             continue;
@@ -479,7 +559,7 @@ pub(crate) fn verify_package_cas_pointers(
             anyhow!(
                 "preflight_failed: package CAS pointer '{}' references missing package blob {}: {}",
                 pointer_rel,
-                blob_path.display(),
+                public_package_path_ref(package_dir, &blob_path),
                 err
             )
         })?;
@@ -487,14 +567,14 @@ pub(crate) fn verify_package_cas_pointers(
             return Err(anyhow!(
                 "preflight_failed: package CAS pointer '{}' references non-file package blob {}",
                 pointer_rel,
-                blob_path.display()
+                public_package_path_ref(package_dir, &blob_path)
             ));
         }
         if blob_meta.len() != pointer.size_bytes {
             return Err(anyhow!(
                 "preflight_failed: package CAS pointer '{}' blob size mismatch for {} (expected {}, got {})",
                 pointer_rel,
-                blob_path.display(),
+                public_package_path_ref(package_dir, &blob_path),
                 pointer.size_bytes,
                 blob_meta.len()
             ));
@@ -536,7 +616,7 @@ pub(crate) fn verify_package_cas_pointers(
 pub(crate) fn load_sealed_package_for_run(path: &Path) -> Result<LoadedExperimentInput> {
     let canonical = path
         .canonicalize()
-        .with_context(|| format!("resolve run input path '{}'", path.display()))?;
+        .with_context(|| run_input_resolution_context(path))?;
     let (manifest_path, exp_dir) = if canonical.is_dir() {
         let manifest = canonical.join("manifest.json");
         if !manifest.is_file() {
@@ -560,12 +640,18 @@ pub(crate) fn load_sealed_package_for_run(path: &Path) -> Result<LoadedExperimen
             "run_input_invalid_kind: expected sealed package dir or manifest"
         ));
     };
-    let manifest = load_json_file(&manifest_path)?;
+    let manifest = load_json_file(&manifest_path).map_err(|err| {
+        anyhow!(
+            "preflight_failed: manifest missing or unreadable at {}: {}",
+            public_package_path_ref(&exp_dir, &manifest_path),
+            public_package_error_message(&exp_dir, err)
+        )
+    })?;
     let json_value = verify_sealed_package_integrity(&exp_dir, &manifest)?;
     let project_root = find_project_root(&exp_dir);
     let project_root = project_root
         .canonicalize()
-        .with_context(|| format!("resolve project root '{}'", project_root.display()))?;
+        .with_context(|| "resolve project root for package://.")?;
     Ok(LoadedExperimentInput {
         json_value,
         exp_dir,

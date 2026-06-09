@@ -67,6 +67,7 @@ struct RunAnalysisContext {
     account_id: String,
     run_id: String,
     db_path: PathBuf,
+    account_db_ref: String,
     comparison_policy: String,
     scheduling_policy: String,
     view_set: ViewSet,
@@ -99,11 +100,88 @@ fn active_account_id() -> String {
     format!("local-{}", &hex[..16])
 }
 
+fn public_ref_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn public_run_ref(run_dir: &Path) -> String {
+    let run_id = run_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(public_ref_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "current".to_string());
+    format!("run://{run_id}")
+}
+
+fn public_run_path_ref(run_dir: &Path, path: &Path) -> String {
+    public_run_path_ref_if_under(run_dir, path)
+        .unwrap_or_else(|| "[REDACTED:local-path]".to_string())
+}
+
+fn public_run_path_ref_if_under(run_dir: &Path, path: &Path) -> Option<String> {
+    let Ok(rel) = path.strip_prefix(run_dir) else {
+        return None;
+    };
+    if rel.as_os_str().is_empty() {
+        return Some(public_run_ref(run_dir));
+    }
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    Some(format!("run://{rel}"))
+}
+
+fn public_account_db_ref_for_run(run_dir: &Path, db_path: &Path) -> String {
+    if let Some(public_ref) = public_run_path_ref_if_under(run_dir, db_path) {
+        return public_ref;
+    }
+
+    let Some(mut suffix) = db_path.file_name().map(PathBuf::from) else {
+        return "state://account-db".to_string();
+    };
+    let mut ancestor = db_path.parent();
+    while let Some(parent) = ancestor {
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            let candidate = canonical_parent.join(&suffix);
+            if let Some(public_ref) = public_run_path_ref_if_under(run_dir, &candidate) {
+                return public_ref;
+            }
+        }
+        let Some(name) = parent.file_name() else {
+            break;
+        };
+        suffix = PathBuf::from(name).join(suffix);
+        ancestor = parent.parent();
+    }
+
+    "state://account-db".to_string()
+}
+
+fn public_project_ref(_project_root: &Path) -> &'static str {
+    "workspace://current"
+}
+
+fn public_account_db_ref_for_project(_project_root: &Path, _db_path: &Path) -> &'static str {
+    "state://account-db"
+}
+
 fn account_sqlite_path_for_run(_run_dir: &Path) -> Result<PathBuf> {
     if let Some(raw) = std::env::var_os(BUCEPHALUS_DB_ENV) {
         let path = PathBuf::from(raw);
         if !path.is_absolute() {
-            return Err(anyhow!("{} must be an absolute path", BUCEPHALUS_DB_ENV));
+            return Err(anyhow!(
+                "{} must be an absolute path\naccount_db_ref: state://account-db",
+                BUCEPHALUS_DB_ENV
+            ));
         }
         return Ok(path);
     }
@@ -111,7 +189,10 @@ fn account_sqlite_path_for_run(_run_dir: &Path) -> Result<PathBuf> {
     if let Some(raw) = std::env::var_os(BUCEPHALUS_HOME_ENV) {
         let path = PathBuf::from(raw);
         if !path.is_absolute() {
-            return Err(anyhow!("{} must be an absolute path", BUCEPHALUS_HOME_ENV));
+            return Err(anyhow!(
+                "{} must be an absolute path\naccount_db_ref: state://account-db",
+                BUCEPHALUS_HOME_ENV
+            ));
         }
         return Ok(path.join("bucephalus.sqlite"));
     }
@@ -174,7 +255,7 @@ fn account_sqlite_path_for_run(_run_dir: &Path) -> Result<PathBuf> {
 
 pub fn list_views(run_dir: &Path) -> Result<Vec<String>> {
     let context = load_run_context(run_dir)?;
-    let conn = open_account_db(&context.db_path)?;
+    let conn = open_account_db(&context.db_path, &context.account_db_ref)?;
     register_views(&conn, &context)?;
     let list_sql = "SELECT name
                     FROM sqlite_temp_master
@@ -210,7 +291,7 @@ pub fn query_view(run_dir: &Path, view_name: &str, limit: usize) -> Result<Query
 pub fn query_run(run_dir: &Path, sql: &str) -> Result<QueryTable> {
     let normalized = validate_read_only_sql(sql)?;
     let context = load_run_context(run_dir)?;
-    let conn = open_account_db(&context.db_path)?;
+    let conn = open_account_db(&context.db_path, &context.account_db_ref)?;
     register_views(&conn, &context)?;
     execute_select_query(&conn, &normalized)
 }
@@ -227,14 +308,16 @@ pub fn query_trend(
     }
 
     let db_path = account_sqlite_path_for_run(project_root)?;
+    let account_db_ref = public_account_db_ref_for_project(project_root, &db_path);
     if !db_path.exists() {
         return Err(anyhow!(
-            "account sqlite database not found: {}",
-            db_path.display()
+            "account sqlite database not found for {}\naccount_db_ref: {}",
+            public_project_ref(project_root),
+            account_db_ref
         ));
     }
     let account_id = active_account_id();
-    let conn = open_account_db(&db_path)?;
+    let conn = open_account_db(&db_path, account_db_ref)?;
     register_trend_views(&conn, &account_id)?;
 
     let mut conditions = vec![format!("r.experiment_id = {}", sql_literal(experiment_id))];
@@ -270,11 +353,12 @@ fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
         .canonicalize()
         .unwrap_or_else(|_| run_dir.to_path_buf());
     let db_path = account_sqlite_path_for_run(&canonical)?;
+    let account_db_ref = public_account_db_ref_for_run(&canonical, &db_path);
     if !db_path.exists() {
         return Err(anyhow!(
-            "account sqlite database not found for run {}: {}",
-            canonical.display(),
-            db_path.display()
+            "account sqlite database not found for {}\naccount_db_ref: {}",
+            public_run_ref(&canonical),
+            account_db_ref
         ));
     }
     let resolved = read_resolved_experiment(&canonical)?;
@@ -291,6 +375,7 @@ fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
             .unwrap_or("run")
             .to_string(),
         db_path,
+        account_db_ref,
         comparison_policy: design.comparison,
         scheduling_policy: design.scheduling,
         view_set,
@@ -299,13 +384,29 @@ fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
 
 fn read_resolved_experiment(run_dir: &Path) -> Result<Option<Value>> {
     let path = run_dir.join("resolved_experiment.json");
-    if !path.exists() {
-        return Ok(None);
+    let public_path = public_run_path_ref(run_dir, &path);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(anyhow!(
+                "refusing to read symlinked resolved experiment metadata {public_path}"
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(anyhow!(
+                "refusing to read resolved experiment metadata because it is not a file {public_path}"
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(anyhow!(
+                "failed to inspect resolved experiment metadata {public_path}: {err}"
+            ));
+        }
     }
-    let raw =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let raw = fs::read_to_string(&path).with_context(|| format!("failed to read {public_path}"))?;
     let value = serde_json::from_str::<Value>(&raw)
-        .with_context(|| format!("invalid JSON in {}", path.display()))?;
+        .with_context(|| format!("invalid JSON in {public_path}"))?;
     Ok(Some(value))
 }
 
@@ -405,12 +506,12 @@ fn load_view_bundle_sql(view_set: ViewSet) -> Result<Option<String>> {
     Ok(Some(content.to_string()))
 }
 
-fn open_account_db(db_path: &Path) -> Result<Connection> {
+fn open_account_db(db_path: &Path, account_db_ref: &str) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
-    .with_context(|| format!("failed to open account database {}", db_path.display()))?;
+    .with_context(|| format!("failed to open account database {account_db_ref}"))?;
     register_math_functions(&conn)?;
     Ok(conn)
 }
@@ -1281,18 +1382,24 @@ fn value_ref_to_json(value: ValueRef<'_>) -> Value {
 
 fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
     let normalized = normalize_sql(sql)?;
-    let mut stmt = conn
-        .prepare(&normalized)
-        .with_context(|| format!("failed to prepare query: {}", normalized))?;
+    let mut stmt = conn.prepare(&normalized).with_context(|| {
+        format!(
+            "failed to prepare query\nquery_ref: {}",
+            public_query_ref(&normalized)
+        )
+    })?;
     let columns: Vec<String> = stmt
         .column_names()
         .into_iter()
         .map(str::to_string)
         .collect();
     let column_count = columns.len();
-    let mut rows = stmt
-        .query([])
-        .with_context(|| format!("failed to execute query: {}", normalized))?;
+    let mut rows = stmt.query([]).with_context(|| {
+        format!(
+            "failed to execute query\nquery_ref: {}",
+            public_query_ref(&normalized)
+        )
+    })?;
 
     let mut out_rows: Vec<Vec<Value>> = Vec::new();
     while let Some(row) = rows.next()? {
@@ -1307,6 +1414,10 @@ fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
         columns,
         rows: out_rows,
     })
+}
+
+fn public_query_ref(_sql: &str) -> &'static str {
+    "query://input"
 }
 
 fn validate_read_only_sql(sql: &str) -> Result<String> {
@@ -1376,7 +1487,67 @@ fn sql_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection as SqliteConnection;
     use serde_json::json;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ACCOUNT_DB_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_account_db_env() -> MutexGuard<'static, ()> {
+        ACCOUNT_DB_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EnvVarGuard {
+        name: &'static str,
+        saved: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(name: &'static str, value: &Path) -> Self {
+            let saved = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, saved }
+        }
+
+        fn set_str(name: &'static str, value: &str) -> Self {
+            let saved = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, saved }
+        }
+
+        fn unset(name: &'static str) -> Self {
+            let saved = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.saved {
+                std::env::set_var(self.name, value);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "bucephalus_analysis_{}_{}_{}",
+            label,
+            std::process::id(),
+            nanos
+        ))
+    }
 
     #[test]
     fn picks_ab_test_for_two_variant_paired_interleaved() {
@@ -1448,5 +1619,235 @@ mod tests {
 
         let err = validate_read_only_sql("DELETE FROM trials").expect_err("should reject delete");
         assert!(err.to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn query_prepare_errors_do_not_echo_sql_literals() {
+        let conn = SqliteConnection::open_in_memory().expect("sqlite");
+        let sql = "SELECT * FROM missing_table WHERE path = '/Users/alice/private/query.json' AND token = 'raw-sql-secret'";
+
+        let err = execute_select_query(&conn, sql).expect_err("missing table should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("failed to prepare query"));
+        assert!(message.contains("query_ref: query://input"));
+        for forbidden in [
+            "/Users/alice",
+            "private/query",
+            "raw-sql-secret",
+            "missing_table WHERE",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "query prepare error leaked forbidden SQL text: {forbidden}\n{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_trend_missing_account_db_uses_public_refs() {
+        let _env_guard = lock_account_db_env();
+        let project_root = temp_dir("trend_missing_db");
+        std::fs::create_dir_all(&project_root).expect("project root");
+        let db_path = project_root.join("private-state").join("bucephalus.sqlite");
+        let _db_env = EnvVarGuard::set_path(BUCEPHALUS_DB_ENV, &db_path);
+
+        let err = query_trend(&project_root, "experiment_1", None, None)
+            .expect_err("missing account db should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("workspace://current"));
+        assert!(message.contains("account_db_ref: state://account-db"));
+        assert!(
+            !message.contains(&project_root.display().to_string()),
+            "trend error leaked project root: {message}"
+        );
+        assert!(
+            !message.contains(&db_path.display().to_string()),
+            "trend error leaked account db path: {message}"
+        );
+
+        std::fs::remove_dir_all(&project_root).expect("cleanup");
+    }
+
+    #[test]
+    fn query_run_relative_account_db_env_uses_public_ref() {
+        let _env_guard = lock_account_db_env();
+        let root = temp_dir("relative_db_env");
+        let run_dir = root.join("run_relative_db_env");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let _db_env = EnvVarGuard::set_str(BUCEPHALUS_DB_ENV, "relative/private.sqlite");
+
+        let err = query_run(&run_dir, "SELECT 1").expect_err("relative DB env should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("BUCEPHALUS_DB must be an absolute path"));
+        assert!(message.contains("account_db_ref: state://account-db"));
+        assert!(
+            !message.contains("relative/private.sqlite"),
+            "relative DB env error leaked raw env value: {message}"
+        );
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "relative DB env error leaked fixture root: {message}"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn query_trend_relative_home_env_uses_public_ref() {
+        let _env_guard = lock_account_db_env();
+        let project_root = temp_dir("relative_home_env");
+        std::fs::create_dir_all(&project_root).expect("project root");
+        let _db_env = EnvVarGuard::unset(BUCEPHALUS_DB_ENV);
+        let _home_env = EnvVarGuard::set_str(BUCEPHALUS_HOME_ENV, "relative/home");
+
+        let err = query_trend(&project_root, "experiment_1", None, None)
+            .expect_err("relative home env should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("BUCEPHALUS_HOME must be an absolute path"));
+        assert!(message.contains("account_db_ref: state://account-db"));
+        assert!(
+            !message.contains("relative/home"),
+            "relative home env error leaked raw env value: {message}"
+        );
+        assert!(
+            !message.contains(&project_root.display().to_string()),
+            "relative home env error leaked project root: {message}"
+        );
+
+        std::fs::remove_dir_all(&project_root).expect("cleanup");
+    }
+
+    #[test]
+    fn query_run_missing_account_db_uses_public_refs() {
+        let _env_guard = lock_account_db_env();
+        let root = temp_dir("run_missing_db");
+        let run_dir = root.join("run_missing_db");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let db_path = run_dir.join(".bucephalus").join("bucephalus.sqlite");
+        let _db_env = EnvVarGuard::set_path(BUCEPHALUS_DB_ENV, &db_path);
+
+        let err = query_run(&run_dir, "SELECT 1").expect_err("missing account db should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("run://run_missing_db"));
+        assert!(message.contains("account_db_ref: run://.bucephalus/bucephalus.sqlite"));
+        assert!(
+            !message.contains(&run_dir.display().to_string()),
+            "run error leaked run dir: {message}"
+        );
+        assert!(
+            !message.contains(&db_path.display().to_string()),
+            "run error leaked account db path: {message}"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_resolved_experiment_is_refused_with_public_run_ref() {
+        use std::os::unix::fs::symlink;
+
+        let _env_guard = lock_account_db_env();
+        let root = temp_dir("symlinked_resolved_experiment");
+        let run_dir = root.join("run_symlinked_resolved");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let outside_resolved = outside.join("resolved_experiment.json");
+        std::fs::write(
+            &outside_resolved,
+            r#"{"design":{"policies":{"comparison":"paired","scheduling":"paired_interleaved"}},"baseline":{"variant_id":"base"},"variant_plan":[{"variant_id":"v1"}]}"#,
+        )
+        .expect("outside resolved experiment");
+        symlink(&outside_resolved, run_dir.join("resolved_experiment.json"))
+            .expect("resolved experiment symlink");
+        let db_path = run_dir.join(".bucephalus").join("bucephalus.sqlite");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("db parent");
+        SqliteConnection::open(&db_path).expect("create sqlite");
+        let _db_env = EnvVarGuard::set_path(BUCEPHALUS_DB_ENV, &db_path);
+
+        let err =
+            run_view_set(&run_dir).expect_err("symlinked resolved experiment should be refused");
+        let message = err.to_string();
+
+        assert!(message.contains("symlinked resolved experiment metadata"));
+        assert!(message.contains("run://resolved_experiment.json"));
+        assert!(
+            !message.contains(&run_dir.display().to_string()),
+            "symlinked resolved experiment error leaked run dir: {message}"
+        );
+        assert!(
+            !message.contains(&outside.display().to_string()),
+            "symlinked resolved experiment error leaked symlink target: {message}"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn invalid_resolved_experiment_uses_public_run_path() {
+        let _env_guard = lock_account_db_env();
+        let root = temp_dir("invalid_resolved_experiment");
+        let run_dir = root.join("run_invalid_resolved");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        std::fs::write(run_dir.join("resolved_experiment.json"), "{not-json")
+            .expect("write invalid resolved experiment");
+        let db_path = run_dir.join(".bucephalus").join("bucephalus.sqlite");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("db parent");
+        SqliteConnection::open(&db_path).expect("create sqlite");
+        let _db_env = EnvVarGuard::set_path(BUCEPHALUS_DB_ENV, &db_path);
+
+        let err = run_view_set(&run_dir).expect_err("invalid resolved experiment should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("invalid JSON in run://resolved_experiment.json"));
+        assert!(
+            !message.contains(&run_dir.display().to_string()),
+            "resolved experiment error leaked run dir: {message}"
+        );
+        assert!(
+            !message.contains(
+                &run_dir
+                    .join("resolved_experiment.json")
+                    .display()
+                    .to_string()
+            ),
+            "resolved experiment error leaked file path: {message}"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn account_db_open_error_uses_public_ref() {
+        let _env_guard = lock_account_db_env();
+        let root = temp_dir("account_db_open_error");
+        let run_dir = root.join("run_open_error");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let db_path = run_dir.join(".bucephalus").join("bucephalus.sqlite");
+        std::fs::create_dir_all(&db_path).expect("db path as directory");
+        let _db_env = EnvVarGuard::set_path(BUCEPHALUS_DB_ENV, &db_path);
+
+        let err = query_run(&run_dir, "SELECT 1").expect_err("directory db should fail to open");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("failed to open account database run://.bucephalus/bucephalus.sqlite")
+        );
+        assert!(
+            !message.contains(&run_dir.display().to_string()),
+            "open error leaked run dir: {message}"
+        );
+        assert!(
+            !message.contains(&db_path.display().to_string()),
+            "open error leaked account db path: {message}"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

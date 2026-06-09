@@ -12,6 +12,8 @@ const PACKAGE_CHECKS_SCHEMA_VERSION = "package_checks_v1";
 const STAGING_MANIFEST_FILE = "staging_manifest.json";
 const PACKAGE_BLOBS_DIR = "blobs";
 const CAS_POINTER_SCHEMA = "bucephalus_cas_pointer_v1";
+const PUBLIC_ARCHIVE_ENTRY_POINTER = "/archive_entry";
+const PUBLIC_PACKAGE_ENTRY_POINTER = "/package_entry";
 const RUNTIME_PAYLOAD_ROOTS = new Set([
   "tasks",
   "files",
@@ -125,21 +127,21 @@ async function preflightSealedPackageArchive(archivePath: string): Promise<void>
       }
       const entryType = String(entry.type);
       if (!["File", "OldFile", "ContiguousFile", "Directory"].includes(entryType)) {
-        violation = inspectionError(`sealed package archive contains unsupported entry type '${entryType}'`, {
+        violation = inspectionError("sealed package archive contains unsupported entry type", {
           severity: "error",
           code: "unsupported_archive_entry_type",
-          pointer: `/${escapeJsonPointer(entryPath)}`,
-          message: `Archive entry '${entryPath}' must be a regular file or directory.`,
+          pointer: PUBLIC_ARCHIVE_ENTRY_POINTER,
+          message: "Archive entries must be regular files or directories.",
         });
         return;
       }
       if (entryType !== "Directory") {
         if (seenFilePaths.has(entryPath)) {
-          violation = inspectionError(`sealed package archive contains duplicate file '${entryPath}'`, {
+          violation = inspectionError("sealed package archive contains duplicate file", {
             severity: "error",
             code: "duplicate_archive_entry",
-            pointer: `/${escapeJsonPointer(entryPath)}`,
-            message: `Archive contains duplicate file '${entryPath}'.`,
+            pointer: PUBLIC_ARCHIVE_ENTRY_POINTER,
+            message: "Archive contains a duplicate file entry.",
           });
           return;
         }
@@ -170,10 +172,10 @@ function safeArchivePath(rawPath: string): string {
     || path.startsWith("/")
     || path.split("/").some((part) => part === "..")
   ) {
-    throw inspectionError(`sealed package archive contains unsafe entry path '${rawPath}'`, {
+    throw inspectionError("sealed package archive contains unsafe entry path", {
       severity: "error",
       code: "unsafe_archive_path",
-      pointer: "/",
+      pointer: PUBLIC_ARCHIVE_ENTRY_POINTER,
       message: "Archive entries must be non-empty relative paths without parent components.",
     });
   }
@@ -193,29 +195,146 @@ async function collectPackageImageRefs(root: string, resolvedExperimentJson: Jso
   for (const ref of await collectPackagedTaskImageRefs(root)) {
     refs.add(ref);
   }
-  for (const pointer of [
-    "/trial_runtime/agent/image",
-    "/trial_runtime/grader/separate/image",
-    "/trial_runtime/task/workspace/image",
-  ]) {
-    const value = valueAt(resolvedExperimentJson, pointer);
-    if (typeof value === "string" && value.trim().length > 0) {
-      refs.add(value.trim());
-    }
-  }
-  const sidecars = valueAt(resolvedExperimentJson, "/sidecars");
-  if (isJsonObject(sidecars)) {
-    for (const sidecar of Object.values(sidecars)) {
-      if (!isJsonObject(sidecar)) {
-        continue;
-      }
-      const image = sidecar.image;
-      if (typeof image === "string" && image.trim().length > 0) {
-        refs.add(image.trim());
-      }
-    }
-  }
+  collectTrialRuntimeImageRefs(resolvedExperimentJson, "/trial_runtime", "/resolved_experiment/trial_runtime", refs);
+  collectTopLevelTrialRuntimeAliasImageRefs(resolvedExperimentJson, refs);
+  collectStageImageRefs(resolvedExperimentJson, refs);
+  collectSidecarImageRefs(resolvedExperimentJson, "/sidecars", "/resolved_experiment/sidecars", refs);
+  collectSidecarImageRefs(resolvedExperimentJson, "/ephemerals", "/resolved_experiment/ephemerals", refs);
   return [...refs].sort();
+}
+
+function collectTrialRuntimeImageRefs(
+  root: JsonObject,
+  pointer: string,
+  publicPointer: string,
+  refs: Set<string>,
+): void {
+  const trialRuntime = optionalObjectAt(root, pointer, publicPointer);
+  if (!trialRuntime) {
+    return;
+  }
+  collectAgentImageRef(trialRuntime, publicPointer, refs);
+  collectGraderImageRef(trialRuntime, publicPointer, refs);
+  collectTaskImageRef(trialRuntime, publicPointer, refs);
+}
+
+function collectTopLevelTrialRuntimeAliasImageRefs(resolvedExperimentJson: JsonObject, refs: Set<string>): void {
+  for (const stage of ["task", "agent", "grader"]) {
+    if (resolvedExperimentJson[stage] === undefined) {
+      continue;
+    }
+    const pointer = `/resolved_experiment/${stage}`;
+    const stageObject = optionalObjectAt(
+      { stage: resolvedExperimentJson[stage] },
+      "/stage",
+      pointer,
+    );
+    if (!stageObject) {
+      continue;
+    }
+    switch (stage) {
+      case "task":
+        collectTaskObjectImageRef(stageObject, pointer, refs);
+        break;
+      case "agent":
+        collectAgentImageRef({ agent: stageObject }, "/resolved_experiment", refs);
+        break;
+      case "grader":
+        collectGraderImageRef({ grader: stageObject }, "/resolved_experiment", refs);
+        break;
+    }
+  }
+}
+
+function collectStageImageRefs(resolvedExperimentJson: JsonObject, refs: Set<string>): void {
+  const stages = optionalObjectAt(resolvedExperimentJson, "/stages", "/resolved_experiment/stages");
+  if (!stages) {
+    return;
+  }
+  for (const [stage, value] of Object.entries(stages)) {
+    const stagePointer = `/resolved_experiment/stages/${escapeJsonPointer(stage)}`;
+    const stageObject = optionalObjectAt(
+      { stage: value },
+      "/stage",
+      stagePointer,
+    );
+    if (!stageObject) {
+      continue;
+    }
+    switch (stage) {
+      case "agent":
+        collectAgentImageRef({ agent: stageObject }, "/resolved_experiment/stages", refs);
+        break;
+      case "grader":
+        collectGraderImageRef({ grader: stageObject }, "/resolved_experiment/stages", refs);
+        break;
+      case "case":
+        collectTaskObjectImageRef(stageObject, stagePointer, refs);
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+function collectAgentImageRef(trialRuntime: JsonObject, publicPointer: string, refs: Set<string>): void {
+  const agent = optionalObjectAt(trialRuntime, "/agent", `${publicPointer}/agent`);
+  const agentImage = optionalImageRefAt(agent, "image", `${publicPointer}/agent/image`);
+  if (agentImage) {
+    refs.add(agentImage);
+  }
+}
+
+function collectGraderImageRef(trialRuntime: JsonObject, publicPointer: string, refs: Set<string>): void {
+  const grader = optionalObjectAt(trialRuntime, "/grader", `${publicPointer}/grader`);
+  const separate = optionalObjectAt(grader, "/separate", `${publicPointer}/grader/separate`);
+  const graderImage = optionalImageRefAt(separate, "image", `${publicPointer}/grader/separate/image`);
+  if (graderImage) {
+    refs.add(graderImage);
+  }
+}
+
+function collectTaskImageRef(trialRuntime: JsonObject, publicPointer: string, refs: Set<string>): void {
+  const task = optionalObjectAt(trialRuntime, "/task", `${publicPointer}/task`);
+  collectTaskObjectImageRef(task, `${publicPointer}/task`, refs);
+}
+
+function collectTaskObjectImageRef(task: JsonObject | null, publicPointer: string, refs: Set<string>): void {
+  const workspace = optionalObjectAt(task, "/workspace", `${publicPointer}/workspace`);
+  const workspaceImage = optionalImageRefAt(workspace, "image", `${publicPointer}/workspace/image`, {
+    allowRuntimeFieldSource: true,
+  });
+  if (workspaceImage) {
+    refs.add(workspaceImage);
+  }
+}
+
+function collectSidecarImageRefs(
+  resolvedExperimentJson: JsonObject,
+  pointer: string,
+  publicPointer: string,
+  refs: Set<string>,
+): void {
+  const sidecars = optionalObjectAt(resolvedExperimentJson, pointer, publicPointer);
+  if (!sidecars) {
+    return;
+  }
+  for (const [id, value] of Object.entries(sidecars)) {
+    const itemPointer = `${publicPointer}/${escapeJsonPointer(id)}`;
+    const sidecar = optionalObjectAt(
+      { sidecar: value },
+      "/sidecar",
+      itemPointer,
+    );
+    const image = optionalImageRefAt(
+      sidecar,
+      "image",
+      `${itemPointer}/image`,
+    );
+    if (image) {
+      refs.add(image);
+    }
+  }
 }
 
 async function collectPackagedTaskImageRefs(root: string): Promise<string[]> {
@@ -244,17 +363,81 @@ async function collectPackagedTaskImageRefs(root: string): Promise<string[]> {
     if (!isJsonObject(parsed)) {
       continue;
     }
-    for (const pointer of [
-      "/runtime/container_image/image",
-      "/resources/workspace/image",
-    ]) {
-      const value = valueAt(parsed, pointer);
-      if (typeof value === "string" && value.trim().length > 0) {
-        refs.add(value.trim());
-      }
+    const taskPointer = `/tasks/${idx}`;
+    const runtime = optionalObjectAt(parsed, "/runtime", `${taskPointer}/runtime`);
+    const containerImage = optionalObjectAt(runtime, "/container_image", `${taskPointer}/runtime/container_image`);
+    if (containerImage) {
+      refs.add(requiredImageRefAt(containerImage, "image", `${taskPointer}/runtime/container_image/image`));
+    }
+    const resources = optionalObjectAt(parsed, "/resources", `${taskPointer}/resources`);
+    const workspace = optionalObjectAt(resources, "/workspace", `${taskPointer}/resources/workspace`);
+    const workspaceImage = optionalImageRefAt(workspace, "image", `${taskPointer}/resources/workspace/image`);
+    if (workspaceImage) {
+      refs.add(workspaceImage);
     }
   }
   return [...refs].sort();
+}
+
+function optionalObjectAt(root: JsonObject | null | undefined, pointer: string, diagnosticPointer: string): JsonObject | null {
+  if (!root) {
+    return null;
+  }
+  const value = valueAt(root, pointer);
+  if (value === undefined) {
+    return null;
+  }
+  if (!isJsonObject(value)) {
+    throw inspectionError(`${diagnosticPointer} must be an object`, {
+      severity: "error",
+      code: "invalid_image_requirement_shape",
+      pointer: diagnosticPointer,
+      message: `${diagnosticPointer} must be an object when provided.`,
+    });
+  }
+  return value;
+}
+
+function optionalImageRefAt(
+  root: JsonObject | null | undefined,
+  key: string,
+  diagnosticPointer: string,
+  options: { allowRuntimeFieldSource?: boolean } = {},
+): string | null {
+  if (!root) {
+    return null;
+  }
+  if (!Object.prototype.hasOwnProperty.call(root, key)) {
+    return null;
+  }
+  return requiredImageRefAt(root, key, diagnosticPointer, options);
+}
+
+function requiredImageRefAt(
+  root: JsonObject,
+  key: string,
+  diagnosticPointer: string,
+  options: { allowRuntimeFieldSource?: boolean } = {},
+): string {
+  const value = root[key];
+  if (options.allowRuntimeFieldSource && isRuntimeFieldSource(value)) {
+    return "";
+  }
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw inspectionError(`${diagnosticPointer} must be a non-empty image ref string`, {
+      severity: "error",
+      code: "invalid_image_requirement_shape",
+      pointer: diagnosticPointer,
+      message: `${diagnosticPointer} must be a non-empty image ref string.`,
+    });
+  }
+  return value.trim();
+}
+
+function isRuntimeFieldSource(value: unknown): boolean {
+  return isJsonObject(value)
+    && Object.keys(value).length === 1
+    && value.from === "case_row";
 }
 
 async function verifySealedPackageIntegrity(
@@ -285,29 +468,29 @@ async function verifySealedPackageIntegrity(
 
   for (const [rel, expectedDigest] of Object.entries(files)) {
     if (typeof expectedDigest !== "string" || !SHA256_DIGEST_PATTERN.test(expectedDigest)) {
-      throw inspectionError(`checksums entry '${rel}' must be a sha256 digest`, {
+      throw inspectionError("checksums entry must be a sha256 digest", {
         severity: "error",
         code: "invalid_checksum_digest",
-        pointer: `/checksums/files/${escapeJsonPointer(rel)}`,
-        message: `checksums.files['${rel}'] must be a sha256 digest.`,
+        pointer: "/checksums/files",
+        message: "Each checksums.files value must be sha256:<64 lowercase hex chars>.",
       });
     }
     const filePath = resolvePackagePathUnderRoot(packageDir, rel, "checksums.files");
     if (!(await isRegularFile(filePath))) {
-      throw inspectionError(`checksummed file missing or not regular: ${rel}`, {
+      throw inspectionError("checksummed file missing or not regular", {
         severity: "error",
         code: "checksummed_file_missing",
-        pointer: `/checksums/files/${escapeJsonPointer(rel)}`,
-        message: `Checksummed file '${rel}' must exist as a regular file.`,
+        pointer: "/checksums/files",
+        message: "checksums.json references a missing or unsupported file.",
       });
     }
     const actualDigest = sha256Digest(await readFile(filePath));
     if (actualDigest.toLowerCase() !== expectedDigest.toLowerCase()) {
-      throw inspectionError(`checksum mismatch for '${rel}'`, {
+      throw inspectionError("checksum mismatch for sealed package file", {
         severity: "error",
         code: "checksum_mismatch",
-        pointer: `/checksums/files/${escapeJsonPointer(rel)}`,
-        message: `Checksum mismatch for '${rel}'.`,
+        pointer: "/checksums/files",
+        message: "A checksummed file does not match its recorded digest.",
       });
     }
   }
@@ -482,29 +665,29 @@ async function verifyNoUnsealedPackagePayloadEntries(
       continue;
     }
     if (metadata.isSymbolicLink()) {
-      throw inspectionError(`sealed package contains unsealed symlink '${rel}'`, {
+      throw inspectionError("sealed package contains unsealed symlink", {
         severity: "error",
         code: "unsealed_symlink",
-        pointer: `/${escapeJsonPointer(rel)}`,
-        message: `Sealed package must not contain symlink '${rel}'.`,
+        pointer: PUBLIC_PACKAGE_ENTRY_POINTER,
+        message: "Sealed package must not contain symlinks.",
       });
     }
     if (!metadata.isFile()) {
-      throw inspectionError(`sealed package contains unsupported file type '${rel}'`, {
+      throw inspectionError("sealed package contains unsupported file type", {
         severity: "error",
         code: "unsupported_package_entry_type",
-        pointer: `/${escapeJsonPointer(rel)}`,
-        message: `Sealed package entry '${rel}' must be a regular file.`,
+        pointer: PUBLIC_PACKAGE_ENTRY_POINTER,
+        message: "Sealed package entries must be regular files.",
       });
     }
     if (metadataPaths.has(rel) || Object.prototype.hasOwnProperty.call(checksumFiles, rel)) {
       continue;
     }
-    throw inspectionError(`sealed package contains unchecksummed payload file '${rel}'`, {
+    throw inspectionError("sealed package contains unchecksummed payload file", {
       severity: "error",
       code: "unchecksummed_payload_file",
-      pointer: `/${escapeJsonPointer(rel)}`,
-      message: `Payload file '${rel}' must be listed in checksums.json.`,
+      pointer: PUBLIC_PACKAGE_ENTRY_POINTER,
+      message: "Payload files must be listed in checksums.json.",
     });
   }
 }
@@ -536,37 +719,37 @@ async function verifyPackageCasPointers(packageDir: string, checksumFiles: JsonO
     const blobPath = resolvePackagePathUnderRoot(packageDir, blobRel, "package CAS pointer");
     const metadata = await stat(blobPath).catch(() => null);
     if (!metadata?.isFile()) {
-      throw inspectionError(`package CAS pointer '${rel}' references missing blob '${blobRel}'`, {
+      throw inspectionError("package CAS pointer references missing blob", {
         severity: "error",
         code: "missing_package_cas_blob",
-        pointer: `/${escapeJsonPointer(rel)}`,
-        message: `Package CAS pointer '${rel}' references missing blob '${blobRel}'.`,
+        pointer: PUBLIC_PACKAGE_ENTRY_POINTER,
+        message: "Package CAS pointer references a missing blob.",
       });
     }
     if (metadata.size !== pointer.size_bytes) {
-      throw inspectionError(`package CAS pointer '${rel}' blob size mismatch`, {
+      throw inspectionError("package CAS pointer blob size mismatch", {
         severity: "error",
         code: "package_cas_blob_size_mismatch",
-        pointer: `/${escapeJsonPointer(rel)}`,
-        message: `Package CAS blob '${blobRel}' size does not match pointer metadata.`,
+        pointer: PUBLIC_PACKAGE_ENTRY_POINTER,
+        message: "Package CAS blob size does not match pointer metadata.",
       });
     }
     const actualDigest = sha256Digest(await readFile(blobPath));
     const checksumDigest = checksumFiles[blobRel];
     if (actualDigest.toLowerCase() !== pointer.digest.toLowerCase()) {
-      throw inspectionError(`package CAS pointer '${rel}' blob digest mismatch`, {
+      throw inspectionError("package CAS pointer blob digest mismatch", {
         severity: "error",
         code: "package_cas_blob_digest_mismatch",
-        pointer: `/${escapeJsonPointer(rel)}`,
-        message: `Package CAS blob '${blobRel}' digest does not match pointer metadata.`,
+        pointer: PUBLIC_PACKAGE_ENTRY_POINTER,
+        message: "Package CAS blob digest does not match pointer metadata.",
       });
     }
     if (typeof checksumDigest !== "string" || checksumDigest.toLowerCase() !== pointer.digest.toLowerCase()) {
-      throw inspectionError(`package CAS blob '${blobRel}' checksum digest mismatch`, {
+      throw inspectionError("package CAS blob checksum digest mismatch", {
         severity: "error",
         code: "package_cas_checksum_mismatch",
-        pointer: `/checksums/files/${escapeJsonPointer(blobRel)}`,
-        message: `Package CAS blob '${blobRel}' must be checksummed with its pointer digest.`,
+        pointer: "/checksums/files",
+        message: "Package CAS blob must be checksummed with its pointer digest.",
       });
     }
   }

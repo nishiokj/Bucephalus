@@ -51,6 +51,7 @@ export interface ReapableRunnerProvisionRequestRecord extends RunnerProvisionReq
 
 export interface QueuedRunDemandRecord {
   run_id: string;
+  secret_refs?: Record<string, string>;
   run_requirements: {
     executor: string;
     requires: string[];
@@ -293,7 +294,7 @@ export class RunnerRepository {
     limit: number;
   }): Promise<QueuedRunDemandRecord[]> {
     const rows = await this.sql`
-      select run_id, run_requirements, created_at
+      select run_id, secret_refs, run_requirements, created_at
       from cloud.runs
       where status in ('created', 'waiting_for_runner')
       order by created_at asc

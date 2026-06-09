@@ -779,6 +779,42 @@ pub fn normalize_view_key(input: &str) -> String {
     input.trim().replace('-', "_").to_ascii_lowercase()
 }
 
+pub fn public_view_name(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return "(empty)".to_string();
+    }
+    if view_name_needs_redaction(trimmed) {
+        return "[REDACTED:view-name]".to_string();
+    }
+    let mut out = trimmed
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .take(80)
+        .collect::<String>();
+    if trimmed.chars().count() > 80 {
+        out.push_str("...");
+    }
+    out
+}
+
+fn view_name_needs_redaction(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    value.contains('/')
+        || value.contains('\\')
+        || value.contains('=')
+        || lower.contains("://")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("credential")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("authorization")
+        || lower.contains("bearer")
+        || lower.contains("private")
+}
+
 fn find_raw_view_name(raw_view_names: &[String], key: &str) -> Option<String> {
     raw_view_names
         .iter()
@@ -862,7 +898,7 @@ pub fn resolve_requested_view(
         .join(", ");
     anyhow::bail!(
         "unknown view '{}'. standardized views for {}: {}",
-        requested,
+        public_view_name(requested),
         view_set.as_str(),
         available
     );
@@ -1309,6 +1345,37 @@ mod tests {
             Some("ab_task_metrics_side_by_side")
         );
         assert!(resolved.spec.is_some());
+    }
+
+    #[test]
+    fn unknown_view_errors_use_public_requested_view_name() {
+        let raw = vec!["run_progress".to_string()];
+        let message = resolve_requested_view(
+            lab_analysis::ViewSet::CoreOnly,
+            &raw,
+            "/Users/alice/private/view token=raw-view-token",
+        )
+        .expect_err("unknown secret-like view should fail")
+        .to_string();
+
+        assert!(message.contains("unknown view '[REDACTED:view-name]'"));
+        assert!(message.contains("standardized views for core"));
+        for forbidden in ["/Users/alice", "private/view", "raw-view-token", "token="] {
+            assert!(
+                !message.contains(forbidden),
+                "unknown view error leaked forbidden text {forbidden}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_view_name_preserves_ordinary_typos() {
+        assert_eq!(public_view_name("task-metric"), "task-metric");
+        assert_eq!(public_view_name("  SCOREBOARD  "), "SCOREBOARD");
+        assert_eq!(
+            public_view_name("token=raw-view-token"),
+            "[REDACTED:view-name]"
+        );
     }
 
     #[test]

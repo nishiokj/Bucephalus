@@ -16,6 +16,14 @@ base image to appear in approved_base_images.
 USAGE
 }
 
+public_base_image_input_ref() {
+  printf '%s\n' "base-image://input"
+}
+
+public_base_image_policy_ref() {
+  printf '%s\n' "base-image-policy://input"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base-image)
@@ -35,7 +43,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "unknown argument: $1" >&2
+      echo "unknown argument" >&2
       usage >&2
       exit 2
       ;;
@@ -47,8 +55,15 @@ if [[ -z "${BASE_IMAGE}" ]]; then
   exit 2
 fi
 
+if [[ -L "${POLICY}" ]]; then
+  echo "refusing to read base image policy through a symlinked path" >&2
+  echo "policy_ref: $(public_base_image_policy_ref)" >&2
+  exit 1
+fi
+
 if [[ ! -f "${POLICY}" ]]; then
-  echo "base image policy does not exist: ${POLICY}" >&2
+  echo "base image policy does not exist" >&2
+  echo "policy_ref: $(public_base_image_policy_ref)" >&2
   exit 2
 fi
 
@@ -164,7 +179,7 @@ for (const [i, entry] of policy.candidate_base_images.entries()) {
 
 const approved = new Set(policy.approved_base_images.map((entry) => entry.image));
 if (push && !approved.has(baseImage)) {
-  fail(`pushed images require an approved base image policy entry: ${baseImage}`);
+  fail("pushed images require an approved base image policy entry\nbase_image_ref: base-image://input");
 }
 
 console.log(push ? "verified approved pushed base image" : "verified digest-addressed local base image");

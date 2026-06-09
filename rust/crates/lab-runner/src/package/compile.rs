@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::*;
 use crate::experiment::preflight::resolve_dataset_path;
@@ -39,8 +40,228 @@ pub(crate) fn sanitize_name_for_path(raw: &str) -> String {
     }
 }
 
+fn build_package_temp_out_path(out: &Path) -> PathBuf {
+    let parent = out.parent().unwrap_or_else(|| Path::new("."));
+    let name = out
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("package");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    parent.join(format!(
+        ".{}.package-build-tmp.{}.{}",
+        name,
+        std::process::id(),
+        nanos
+    ))
+}
+
+fn ensure_final_build_output_ready(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(anyhow!(
+                "build output target is a symlink\n\noutput_ref: {}\n\nRemove the symlink, choose an empty directory, or pass a different output path.",
+                public_build_output_target_ref(path)
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(anyhow!(
+                "build output target exists and is not a directory\n\noutput_ref: {}\n\nChoose an empty directory for the package output, remove the existing file, or pass a different output path.",
+                public_build_output_target_ref(path)
+            ));
+        }
+        Ok(_) => {
+            let mut entries = fs::read_dir(path)?;
+            if entries.next().is_some() {
+                return Err(anyhow!(
+                    "build output target directory must be empty\n\noutput_ref: {}\n\nMove or remove the existing contents, or pass a different output path.",
+                    public_build_output_target_ref(path)
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(anyhow!(
+                "failed to inspect build output target\n\noutput_ref: {}\n\nerror: {}",
+                public_build_output_target_ref(path),
+                err
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn public_build_output_target_ref(_path: &Path) -> &'static str {
+    "build-output://target"
+}
+
+fn public_build_output_temporary_ref(_path: &Path) -> &'static str {
+    "build-output://temporary"
+}
+
+fn public_build_output_staged_ref(_path: &Path) -> &'static str {
+    "build-output://staged"
+}
+
+fn build_result_for_package_dir(package_dir: PathBuf) -> BuildResult {
+    BuildResult {
+        manifest_path: package_dir.join("manifest.json"),
+        checksums_path: package_dir.join("checksums.json"),
+        package_checks_path: package_dir.join(PACKAGE_CHECKS_FILE),
+        package_dir,
+    }
+}
+
+fn cleanup_failed_build_output(path: &Path) {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            eprintln!(
+                "warning: failed to remove temporary build output {}: {}",
+                public_build_output_temporary_ref(path),
+                err
+            );
+        }
+    }
+}
+
+fn publish_staged_build_output(staged: &Path, final_out: &Path) -> Result<BuildResult> {
+    ensure_final_build_output_ready(final_out)?;
+    if final_out.exists() {
+        fs::remove_dir(final_out).with_context(|| {
+            format!(
+                "failed to replace empty build output directory {}",
+                public_build_output_target_ref(final_out)
+            )
+        })?;
+    }
+    fs::rename(staged, final_out).with_context(|| {
+        format!(
+            "failed to publish staged build output {} to {}",
+            public_build_output_staged_ref(staged),
+            public_build_output_target_ref(final_out)
+        )
+    })?;
+    Ok(build_result_for_package_dir(final_out.to_path_buf()))
+}
+
 pub(crate) fn as_portable_rel(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+pub(crate) fn public_source_input_ref(_path: &Path) -> &'static str {
+    "source://input"
+}
+
+pub(crate) fn public_runtime_asset_source_ref(source_root: &Path, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(source_root) else {
+        return "source://outside-tree".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return "source://.".to_string();
+    }
+    format!("source://{}", as_portable_rel(rel))
+}
+
+pub(crate) fn public_package_output_ref(_path: &Path) -> &'static str {
+    "package://output"
+}
+
+pub(crate) fn public_package_output_path_ref(package_dir: &Path, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(package_dir) else {
+        return "package://output".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return "package://.".to_string();
+    }
+    format!("package://{}", as_portable_rel(rel))
+}
+
+fn public_ref_path_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "item".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub(crate) fn public_declared_path_ref(scheme: &str, raw: &str) -> String {
+    let normalized = raw.trim().replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.starts_with('~')
+        || normalized.contains("://")
+        || normalized.contains(':')
+    {
+        return format!("{scheme}://input");
+    }
+    let parts = normalized
+        .split('/')
+        .filter_map(|part| match part {
+            "" | "." => None,
+            ".." => Some("parent".to_string()),
+            value => Some(public_ref_path_component(value)),
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        format!("{scheme}://input")
+    } else {
+        format!("{scheme}://{}", parts.join("/"))
+    }
+}
+
+pub(crate) fn public_relative_path_ref(scheme: &str, rel: &Path) -> String {
+    let rel = as_portable_rel(rel);
+    if rel.trim().is_empty() {
+        return format!("{scheme}://.");
+    }
+    let parts = rel
+        .split('/')
+        .filter_map(|part| match part {
+            "" | "." => None,
+            ".." => Some("parent".to_string()),
+            value => Some(public_ref_path_component(value)),
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        format!("{scheme}://.")
+    } else {
+        format!("{scheme}://{}", parts.join("/"))
+    }
+}
+
+fn public_case_asset_declared_ref(raw_source: &str) -> String {
+    public_declared_path_ref("case-asset", raw_source)
+}
+
+fn public_case_asset_resolved_ref(dataset_dir: &Path, resolved: &Path) -> String {
+    resolved
+        .strip_prefix(dataset_dir)
+        .map(|rel| public_relative_path_ref("dataset", rel))
+        .unwrap_or_else(|_| "case-asset://outside-dataset".to_string())
+}
+
+fn public_dataset_declared_ref(raw_source: &str) -> String {
+    public_declared_path_ref("dataset", raw_source)
+}
+
+fn public_dataset_resolved_ref(_path: &Path) -> &'static str {
+    "dataset://resolved"
 }
 
 pub(crate) fn copy_path_into_package(source: &Path, destination: &Path) -> Result<()> {
@@ -56,8 +277,9 @@ pub(crate) fn copy_path_into_package(source: &Path, destination: &Path) -> Resul
         return Ok(());
     }
     Err(anyhow!(
-        "package build expected file or directory source, got: {}",
-        source.display()
+        "package build expected a file or directory source\n\nsource_ref: {}\noutput_ref: {}",
+        public_source_input_ref(source),
+        public_package_output_ref(destination)
     ))
 }
 
@@ -85,14 +307,15 @@ pub(crate) fn copy_runtime_asset_into_package(
     }
     if !source.is_dir() {
         return Err(anyhow!(
-            "package build expected runtime asset file or directory source, got: {}",
-            source.display()
+            "package build expected a runtime asset file or directory source\n\nsource_ref: {}\npackage_ref: {}",
+            public_source_input_ref(source),
+            public_package_output_path_ref(package_dir, destination)
         ));
     }
     let source_root = fs::canonicalize(source).with_context(|| {
         format!(
             "failed to canonicalize runtime asset source directory {}",
-            source.display()
+            public_source_input_ref(source)
         )
     })?;
     ensure_dir(destination)?;
@@ -102,8 +325,8 @@ pub(crate) fn copy_runtime_asset_into_package(
         let rel = path.strip_prefix(source).with_context(|| {
             format!(
                 "runtime asset path {} escaped source root {}",
-                path.display(),
-                source.display()
+                public_runtime_asset_source_ref(source, path),
+                public_runtime_asset_source_ref(source, source)
             )
         })?;
         if rel.as_os_str().is_empty() {
@@ -116,31 +339,31 @@ pub(crate) fn copy_runtime_asset_into_package(
             let resolved = fs::canonicalize(path).with_context(|| {
                 format!(
                     "runtime asset symlink {} must resolve inside source tree {}",
-                    path.display(),
-                    source.display()
+                    public_runtime_asset_source_ref(source, path),
+                    public_runtime_asset_source_ref(source, source)
                 )
             })?;
             if !resolved.starts_with(&source_root) {
                 return Err(anyhow!(
-                    "runtime asset symlink {} resolves outside source tree {}: {}",
-                    path.display(),
-                    source.display(),
-                    resolved.display()
+                    "runtime asset symlink resolves outside its source tree\n\nsource_ref: {}\nsource_root_ref: {}\nresolved_ref: {}",
+                    public_runtime_asset_source_ref(source, path),
+                    public_runtime_asset_source_ref(source, source),
+                    public_runtime_asset_source_ref(&source_root, &resolved)
                 ));
             }
             let resolved_meta = fs::metadata(&resolved)?;
             if resolved_meta.is_dir() {
                 return Err(anyhow!(
-                    "runtime asset directory symlink is not supported: {} -> {}",
-                    path.display(),
-                    resolved.display()
+                    "runtime asset directory symlink is not supported\n\nsource_ref: {}\nresolved_ref: {}",
+                    public_runtime_asset_source_ref(source, path),
+                    public_runtime_asset_source_ref(&source_root, &resolved)
                 ));
             }
             if !resolved_meta.is_file() {
                 return Err(anyhow!(
-                    "runtime asset symlink {} resolves to unsupported file type: {}",
-                    path.display(),
-                    resolved.display()
+                    "runtime asset symlink resolves to an unsupported file type\n\nsource_ref: {}\nresolved_ref: {}",
+                    public_runtime_asset_source_ref(source, path),
+                    public_runtime_asset_source_ref(&source_root, &resolved)
                 ));
             }
             copy_runtime_asset_file_into_package(
@@ -303,31 +526,33 @@ fn stage_case_asset_into_package(
     if let Some(existing) = copies.get(&key) {
         return Ok(existing.clone());
     }
+    let asset_ref = public_case_asset_declared_ref(raw_source);
+    let resolved_ref = public_case_asset_resolved_ref(dataset_dir, &resolved);
     let meta = fs::metadata(&resolved).with_context(|| {
         format!(
-            "package build failed to read case asset '{}' resolved from '{}'",
-            resolved.display(),
-            raw_source
+            "package build failed to read case asset\n\nasset_ref: {asset_ref}\nresolved_ref: {resolved_ref}"
         )
     })?;
     if kind == "file" && !meta.is_file() {
         return Err(anyhow!(
-            "case asset '{}' declares type=file but resolved source is not a file: {}",
-            raw_source,
-            resolved.display()
+            "case asset declares type=file but resolved source is not a file\n\nasset_ref: {}\nresolved_ref: {}",
+            asset_ref,
+            resolved_ref
         ));
     }
     if kind == "directory" && !meta.is_dir() {
         return Err(anyhow!(
-            "case asset '{}' declares type=directory but resolved source is not a directory: {}",
-            raw_source,
-            resolved.display()
+            "case asset declares type=directory but resolved source is not a directory\n\nasset_ref: {}\nresolved_ref: {}",
+            asset_ref,
+            resolved_ref
         ));
     }
     let name = resolved
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow!("case asset '{}' must name a file or directory", raw_source))?;
+        .ok_or_else(|| {
+            anyhow!("case asset must name a file or directory\n\nasset_ref: {asset_ref}")
+        })?;
     let rel_path =
         PathBuf::from(PACKAGED_TASK_ASSETS_DIR).join(format!("{:03}_{}", *counter, name));
     let destination = package_dir.join(&rel_path);
@@ -405,9 +630,9 @@ fn rewrite_case_input_assets_value(
         )
         .map_err(|err| {
             anyhow!(
-                "failed to stage {} local asset path '{}' into sealed package: {}",
+                "failed to stage {} local asset into sealed package\n\nasset_ref: {}\n\n{}",
                 context,
-                raw_path,
+                public_case_asset_declared_ref(&raw_path),
                 err
             )
         })?;
@@ -465,9 +690,12 @@ pub(crate) fn compile_tasks_for_package(
     experiment: &Value,
 ) -> Result<Vec<Value>> {
     let image_rewrites = load_task_image_rewrite_rules(experiment)?;
-    let dataset_dir = dataset_path
-        .parent()
-        .ok_or_else(|| anyhow!("dataset path has no parent: {}", dataset_path.display()))?;
+    let dataset_dir = dataset_path.parent().ok_or_else(|| {
+        anyhow!(
+            "dataset path has no parent\n\ndataset_ref: {}",
+            public_dataset_resolved_ref(dataset_path)
+        )
+    })?;
     let mut case_asset_copies: BTreeMap<String, String> = BTreeMap::new();
     let mut case_asset_counter = 0usize;
     let mut compiled = Vec::with_capacity(tasks.len());
@@ -540,11 +768,14 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
         .filter(|value| !value.is_empty());
     let file = fs::File::open(path).with_context(|| match dataset_ref {
         Some(path_ref) => format!(
-            "failed to open dataset file '{}' (matrix.tasks.path='{}')",
-            path.display(),
-            path_ref
+            "failed to open dataset file\n\ndataset_ref: {}\nconfigured_ref: {}",
+            public_dataset_resolved_ref(path),
+            public_dataset_declared_ref(path_ref)
         ),
-        None => format!("failed to open dataset file '{}'", path.display()),
+        None => format!(
+            "failed to open dataset file\n\ndataset_ref: {}",
+            public_dataset_resolved_ref(path)
+        ),
     })?;
     let reader = BufReader::new(file);
     let mut tasks = Vec::new();
@@ -632,7 +863,7 @@ pub fn build_experiment_package(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("missing required /experiment/id after validation"))?;
-    let package_dir = if let Some(out_dir) = out_dir {
+    let final_package_dir = if let Some(out_dir) = out_dir {
         out_dir.to_path_buf()
     } else {
         let ts = Utc::now().format("%Y%m%d_%H%M%S_%6f");
@@ -642,142 +873,157 @@ pub fn build_experiment_package(
             ts
         ))
     };
-    if package_dir.exists() {
-        if !package_dir.is_dir() {
-            return Err(anyhow!(
-                "build output path exists and is not a directory: {}",
-                package_dir.display()
-            ));
-        }
-        let mut entries = fs::read_dir(&package_dir)?;
-        if entries.next().is_some() {
-            return Err(anyhow!(
-                "build output directory must be empty: {}",
-                package_dir.display()
-            ));
-        }
+    ensure_final_build_output_ready(&final_package_dir)?;
+    let stage_for_publish = out_dir.is_some();
+    let package_dir = if stage_for_publish {
+        build_package_temp_out_path(&final_package_dir)
     } else {
+        final_package_dir.clone()
+    };
+    if stage_for_publish && package_dir.exists() {
+        return Err(anyhow!(
+            "temporary build output path already exists\n\noutput_ref: {}\n\nRetry the build, or remove the stale temporary output if the problem persists.",
+            public_build_output_temporary_ref(&package_dir)
+        ));
+    }
+
+    let build_result = (|| -> Result<BuildResult> {
         ensure_dir(&package_dir)?;
-    }
 
-    ensure_dir(&package_dir.join("agent_builds"))?;
-    ensure_dir(&package_dir.join("tasks"))?;
-    ensure_dir(&package_dir.join("files"))?;
-    ensure_dir(&package_dir.join(PACKAGE_BLOBS_DIR))?;
-    ensure_dir(&package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR))?;
-    ensure_dir(&package_dir.join(HOST_GRADER_CAPABILITIES_DIR))?;
+        ensure_dir(&package_dir.join("agent_builds"))?;
+        ensure_dir(&package_dir.join("tasks"))?;
+        ensure_dir(&package_dir.join("files"))?;
+        ensure_dir(&package_dir.join(PACKAGE_BLOBS_DIR))?;
+        ensure_dir(&package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR))?;
+        ensure_dir(&package_dir.join(HOST_GRADER_CAPABILITIES_DIR))?;
 
-    let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)?;
-    let dataset_target = package_dir.join("tasks").join("tasks.jsonl");
-    let raw_tasks = load_task_rows_for_build(&dataset_path, &json_value)?;
-    let packaged_tasks =
-        compile_tasks_for_package(&raw_tasks, &dataset_path, &package_dir, &json_value)?;
-    write_packaged_tasks(&dataset_target, &packaged_tasks)?;
-    let dataset_rel = PathBuf::from("tasks").join("tasks.jsonl");
-    set_json_pointer_value(
-        &mut json_value,
-        "/matrix/tasks/path",
-        json!(as_portable_rel(&dataset_rel)),
-    )?;
+        let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)?;
+        let dataset_target = package_dir.join("tasks").join("tasks.jsonl");
+        let raw_tasks = load_task_rows_for_build(&dataset_path, &json_value)?;
+        let packaged_tasks =
+            compile_tasks_for_package(&raw_tasks, &dataset_path, &package_dir, &json_value)?;
+        write_packaged_tasks(&dataset_target, &packaged_tasks)?;
+        let dataset_rel = PathBuf::from("tasks").join("tasks.jsonl");
+        set_json_pointer_value(
+            &mut json_value,
+            "/matrix/tasks/path",
+            json!(as_portable_rel(&dataset_rel)),
+        )?;
 
-    let mut runtime_path_rewrite = RuntimePathRewriteContext::new(&loaded.exp_dir, &package_dir);
+        let mut runtime_path_rewrite =
+            RuntimePathRewriteContext::new(&loaded.exp_dir, &package_dir);
 
-    if let Some(trial_runtime) = json_value.pointer_mut("/trial_runtime") {
-        rewrite_trial_runtime_paths_for_package(trial_runtime, &mut runtime_path_rewrite)?;
-    }
-    if let Some(variants) = json_value
-        .pointer_mut("/matrix/variants")
-        .and_then(Value::as_array_mut)
-    {
-        for variant in variants.iter_mut() {
-            if let Some(runtime_overrides) = variant.get_mut("overrides") {
-                rewrite_trial_runtime_paths_for_package(
-                    runtime_overrides,
-                    &mut runtime_path_rewrite,
-                )?;
+        if let Some(trial_runtime) = json_value.pointer_mut("/trial_runtime") {
+            rewrite_trial_runtime_paths_for_package(trial_runtime, &mut runtime_path_rewrite)?;
+        }
+        if let Some(variants) = json_value
+            .pointer_mut("/matrix/variants")
+            .and_then(Value::as_array_mut)
+        {
+            for variant in variants.iter_mut() {
+                if let Some(runtime_overrides) = variant.get_mut("overrides") {
+                    rewrite_trial_runtime_paths_for_package(
+                        runtime_overrides,
+                        &mut runtime_path_rewrite,
+                    )?;
+                }
             }
         }
-    }
-    write_runtime_staging_manifest(
-        &package_dir,
-        &json_value,
-        &runtime_path_rewrite.staging_manifest_entries,
-    )?;
-    strip_packaging_only_trial_runtime_catalogs(&mut json_value);
-    strip_public_authoring_aliases_from_resolved_package(&mut json_value);
-    validate_packaged_runtime_artifacts(&package_dir, &json_value)?;
+        write_runtime_staging_manifest(
+            &package_dir,
+            &json_value,
+            &runtime_path_rewrite.staging_manifest_entries,
+        )?;
+        strip_packaging_only_trial_runtime_catalogs(&mut json_value);
+        strip_public_authoring_aliases_from_resolved_package(&mut json_value);
+        validate_packaged_runtime_artifacts(&package_dir, &json_value)?;
 
-    let resolved_for_manifest = json_value.clone();
-    atomic_write_json_pretty(
-        &package_dir.join("resolved_experiment.json"),
-        &resolved_for_manifest,
-    )?;
+        let resolved_for_manifest = json_value.clone();
+        atomic_write_json_pretty(
+            &package_dir.join("resolved_experiment.json"),
+            &resolved_for_manifest,
+        )?;
 
-    let manifest_path = package_dir.join("manifest.json");
-    let checksums_path = package_dir.join("checksums.json");
-    let lock_path = package_dir.join("package.lock");
-    let mut checksums: BTreeMap<String, String> = BTreeMap::new();
-    for entry in walkdir::WalkDir::new(&package_dir) {
-        let entry = entry?;
-        let path = entry.path();
-        if !entry.file_type().is_file() {
-            continue;
+        let manifest_path = package_dir.join("manifest.json");
+        let checksums_path = package_dir.join("checksums.json");
+        let lock_path = package_dir.join("package.lock");
+        let mut checksums: BTreeMap<String, String> = BTreeMap::new();
+        for entry in walkdir::WalkDir::new(&package_dir) {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if path == checksums_path || path == manifest_path || path == lock_path {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&package_dir)
+                .map(as_portable_rel)
+                .with_context(|| {
+                    format!(
+                        "package entry {} escaped root {}",
+                        public_build_output_staged_ref(path),
+                        public_build_output_staged_ref(&package_dir)
+                    )
+                })?;
+            checksums.insert(rel, sha256_file(path)?);
         }
-        if path == checksums_path || path == manifest_path || path == lock_path {
-            continue;
-        }
-        let rel = path
-            .strip_prefix(&package_dir)
-            .map(as_portable_rel)
-            .with_context(|| {
-                format!(
-                    "package entry {} escaped root {}",
-                    path.display(),
-                    package_dir.display()
-                )
-            })?;
-        checksums.insert(rel, sha256_file(path)?);
-    }
-    let checksums_value = json!({
-        "schema_version": "sealed_package_checksums_v2",
-        "files": checksums,
-    });
-    atomic_write_json_pretty(&checksums_path, &checksums_value)?;
-    let package_digest = canonical_json_digest(
-        checksums_value
-            .pointer("/files")
-            .ok_or_else(|| anyhow!("build failed to materialize checksums files map"))?,
-    );
-    let package_checks_path = package_dir.join(PACKAGE_CHECKS_FILE);
-    atomic_write_json_pretty(
-        &lock_path,
-        &json!({
-            "schema_version": "sealed_package_lock_v1",
-            "package_digest": package_digest.clone(),
-        }),
-    )?;
-    write_package_checks(
-        &package_dir,
-        &resolved_for_manifest,
-        &packaged_tasks,
-        &package_digest,
-    )?;
-    let package_manifest = json!({
-        "schema_version": "sealed_run_package_v2",
-        "created_at": Utc::now().to_rfc3339(),
-        "resolved_experiment": resolved_for_manifest,
-        "checksums_ref": "checksums.json",
-        "package_checks_ref": PACKAGE_CHECKS_FILE,
-        "package_digest": package_digest,
-    });
-    atomic_write_json_pretty(&manifest_path, &package_manifest)?;
+        let checksums_value = json!({
+            "schema_version": "sealed_package_checksums_v2",
+            "files": checksums,
+        });
+        atomic_write_json_pretty(&checksums_path, &checksums_value)?;
+        let package_digest = canonical_json_digest(
+            checksums_value
+                .pointer("/files")
+                .ok_or_else(|| anyhow!("build failed to materialize checksums files map"))?,
+        );
+        atomic_write_json_pretty(
+            &lock_path,
+            &json!({
+                "schema_version": "sealed_package_lock_v1",
+                "package_digest": package_digest.clone(),
+            }),
+        )?;
+        write_package_checks(
+            &package_dir,
+            &resolved_for_manifest,
+            &packaged_tasks,
+            &package_digest,
+        )?;
+        let package_manifest = json!({
+            "schema_version": "sealed_run_package_v2",
+            "created_at": Utc::now().to_rfc3339(),
+            "resolved_experiment": resolved_for_manifest,
+            "checksums_ref": "checksums.json",
+            "package_checks_ref": PACKAGE_CHECKS_FILE,
+            "package_digest": package_digest,
+        });
+        atomic_write_json_pretty(&manifest_path, &package_manifest)?;
 
-    Ok(BuildResult {
-        package_dir,
-        manifest_path,
-        checksums_path,
-        package_checks_path,
-    })
+        Ok(build_result_for_package_dir(package_dir.clone()))
+    })();
+
+    let build = match build_result {
+        Ok(build) => build,
+        Err(err) => {
+            cleanup_failed_build_output(&package_dir);
+            return Err(err);
+        }
+    };
+
+    if stage_for_publish {
+        match publish_staged_build_output(&build.package_dir, &final_package_dir) {
+            Ok(published) => Ok(published),
+            Err(err) => {
+                cleanup_failed_build_output(&build.package_dir);
+                Err(err)
+            }
+        }
+    } else {
+        Ok(build)
+    }
 }
 
 fn strip_public_authoring_aliases_from_resolved_package(json_value: &mut Value) {

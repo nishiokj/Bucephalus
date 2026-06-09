@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "unknown argument: $1" >&2
+      echo "unknown argument" >&2
       usage >&2
       exit 2
       ;;
@@ -69,9 +69,21 @@ require_command() {
 require_command bun
 
 for dir in "${ASSET_DIRS[@]}"; do
-  if [[ -z "${dir}" || ! -d "${dir}" ]]; then
-    echo "asset directory does not exist: ${dir}" >&2
+  if [[ -L "${dir}" ]]; then
+    echo "asset directory must not be a symlink" >&2
     exit 2
+  fi
+  if [[ -z "${dir}" || ! -d "${dir}" ]]; then
+    echo "asset directory does not exist" >&2
+    echo "asset_root_ref: release-assets://asset-root" >&2
+    exit 2
+  fi
+done
+
+for dir in "${ASSET_DIRS[@]}"; do
+  if find "${dir}" -type l -print -quit | grep -q .; then
+    echo "release asset directories must not contain symlinks" >&2
+    exit 1
   fi
 done
 
@@ -90,12 +102,14 @@ for dir in "${ASSET_DIRS[@]}"; do
       *.tar.gz|*.tar.gz.sha256|*.provenance.json)
         ;;
       *)
-        echo "unexpected release asset file: ${file}" >&2
+        echo "unexpected release asset file" >&2
+        echo "asset_file_ref: release-assets://unexpected-file" >&2
         exit 1
         ;;
     esac
-    if [[ "${file}" =~ (^|/)\.env(\.example)?$ ]] || [[ "${file}" =~ (^|[-_.])latest([-_.]|$) ]]; then
-      echo "forbidden release asset name: ${file}" >&2
+    if [[ "${file}" =~ (^|/)\.env(\.example)?$ ]] || [[ "${file}" =~ (^|[-_.])latest([-_.]|$) ]] || [[ "${file}" =~ (^|[-_./])(secret|token|password|credential|api[_-]?key|private)([-_./]|$) ]]; then
+      echo "forbidden release asset name" >&2
+      echo "asset_file_ref: release-assets://forbidden-name" >&2
       exit 1
     fi
   done < <(find "${dir}" -type f -print0)
@@ -104,12 +118,24 @@ done
 for archive in "${ARCHIVES[@]}"; do
   checksum="${archive}.sha256"
   provenance="${archive%.tar.gz}.provenance.json"
+  if [[ -L "${archive}" ]]; then
+    echo "release archive must not be a symlink: $(basename "${archive}")" >&2
+    exit 1
+  fi
   if [[ ! -f "${checksum}" ]]; then
-    echo "release archive is missing checksum: ${checksum}" >&2
+    echo "release archive is missing checksum: $(basename "${checksum}")" >&2
+    exit 1
+  fi
+  if [[ -L "${checksum}" ]]; then
+    echo "release archive checksum must not be a symlink: $(basename "${checksum}")" >&2
     exit 1
   fi
   if [[ ! -f "${provenance}" ]]; then
-    echo "release archive is missing provenance: ${provenance}" >&2
+    echo "release archive is missing provenance: $(basename "${provenance}")" >&2
+    exit 1
+  fi
+  if [[ -L "${provenance}" ]]; then
+    echo "release archive provenance must not be a symlink: $(basename "${provenance}")" >&2
     exit 1
   fi
 
@@ -129,7 +155,7 @@ for archive in "${ARCHIVES[@]}"; do
       "${ROOT_DIR}/scripts/release/verify-cloud-release-provenance.sh" "${provenance}" --release "${archive}"
       ;;
     *)
-      echo "unknown provenance schema for ${provenance}: ${schema}" >&2
+      echo "unknown provenance schema for release provenance" >&2
       exit 1
       ;;
   esac
@@ -159,10 +185,11 @@ REQUIRED_CLOUD_TARGETS_JSON="$(
 ASSET_DIRS_JSON="${ASSET_DIRS_JSON}" \
 REQUIRED_CORE_TARGETS_JSON="${REQUIRED_CORE_TARGETS_JSON}" \
 REQUIRED_CLOUD_TARGETS_JSON="${REQUIRED_CLOUD_TARGETS_JSON}" \
+ROOT_DIR="${ROOT_DIR}" \
 OUT="${OUT}" bun -e '
 import { createHash } from "node:crypto";
-import { readdirSync, statSync } from "node:fs";
-import { basename, dirname, relative } from "node:path";
+import { lstatSync, readdirSync } from "node:fs";
+import { basename, relative, resolve } from "node:path";
 
 const assetDirs = JSON.parse(process.env.ASSET_DIRS_JSON);
 const requiredTargets = {
@@ -170,6 +197,7 @@ const requiredTargets = {
   cloud: JSON.parse(process.env.REQUIRED_CLOUD_TARGETS_JSON),
 };
 const out = process.env.OUT;
+const rootDir = resolve(process.env.ROOT_DIR);
 const sha256 = /^[a-f0-9]{64}$/;
 
 function fail(message) {
@@ -177,12 +205,18 @@ function fail(message) {
   process.exit(1);
 }
 
-async function hashFile(path) {
+async function hashFile(path, label) {
+  requireRegularFile(path, label);
   return createHash("sha256").update(Buffer.from(await Bun.file(path).arrayBuffer())).digest("hex");
 }
 
+async function readTextFile(path, label) {
+  requireRegularFile(path, label);
+  return Bun.file(path).text();
+}
+
 function normalize(path) {
-  return relative(process.cwd(), path).split("\\").join("/");
+  return relative(rootDir, resolve(path)).split("\\").join("/");
 }
 
 function artifactPath(path, label) {
@@ -190,7 +224,45 @@ function artifactPath(path, label) {
   if (normalized === "" || normalized.startsWith("/") || normalized.includes("..") || normalized.includes("\\")) {
     fail(`${label} must be a stable artifact-local path`);
   }
+  if (looksLikeHostPath(normalized)) {
+    fail(`${label} must not look like a host filesystem path`);
+  }
+  if (/(^|\/)\.env(\.example)?$/.test(normalized) || /(^|[-_.])latest([-_.]|$)/.test(normalized) || /(^|[-_.\/])(secret|token|password|credential|api[_-]?key|private)([-_.\/]|$)/i.test(normalized)) {
+    fail(`${label} contains a forbidden release asset name`);
+  }
   return normalized;
+}
+
+function looksLikeHostPath(path) {
+  const normalized = path.replace(/^\.\//, "");
+  return /^(Users|home|private|tmp|var\/folders|Volumes|Desktop|Documents|Downloads|runner\/work|github\/workspace)\//.test(normalized);
+}
+
+function inspectNoSymlink(path, label) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    fail(`${label} does not exist or cannot be inspected`);
+  }
+  if (stat.isSymbolicLink()) {
+    fail(`${label} must not be a symlink`);
+  }
+  return stat;
+}
+
+function requireRegularFile(path, label) {
+  const stat = inspectNoSymlink(path, label);
+  if (!stat.isFile()) {
+    fail(`${label} must be a regular file`);
+  }
+}
+
+function requireAssetDirectory(path, label) {
+  const stat = inspectNoSymlink(path, label);
+  if (!stat.isDirectory()) {
+    fail(`${label} must be a directory`);
+  }
 }
 
 function walk(dir) {
@@ -198,7 +270,8 @@ function walk(dir) {
   function visit(path) {
     for (const name of readdirSync(path)) {
       const child = `${path}/${name}`;
-      const stat = statSync(child);
+      const childLabel = artifactPath(child, `${name} path`);
+      const stat = inspectNoSymlink(child, childLabel);
       if (stat.isDirectory()) {
         visit(child);
       } else if (stat.isFile()) {
@@ -210,6 +283,11 @@ function walk(dir) {
   return files.sort();
 }
 
+for (const dir of assetDirs) {
+  artifactPath(dir, `${basename(dir)} asset root`);
+  requireAssetDirectory(dir, `${basename(dir)} asset root`);
+}
+
 const archives = assetDirs.flatMap((dir) => walk(dir).filter((file) => file.endsWith(".tar.gz"))).sort();
 if (archives.length === 0) {
   fail("release asset index requires at least one archive");
@@ -219,33 +297,33 @@ const assets = [];
 for (const archive of archives) {
   const checksumPath = `${archive}.sha256`;
   const provenancePath = `${archive.slice(0, -".tar.gz".length)}.provenance.json`;
-  const checksumRaw = await Bun.file(checksumPath).text();
+  const checksumRaw = await readTextFile(checksumPath, `${basename(checksumPath)} checksum`);
   if (!checksumRaw.endsWith("\n") || checksumRaw.slice(0, -1).includes("\n")) {
-    fail(`${checksumPath} must contain exactly one checksum record`);
+    fail(`${basename(checksumPath)} checksum must contain exactly one checksum record`);
   }
   const checksumText = checksumRaw.slice(0, -1);
   const checksumValue = checksumText.slice(0, 64);
   if (!sha256.test(checksumValue)) {
-    fail(`${checksumPath} does not start with a lowercase sha256 digest`);
+    fail(`${basename(checksumPath)} checksum does not start with a lowercase sha256 digest`);
   }
   if (checksumText !== `${checksumValue}  ${basename(archive)}`) {
-    fail(`${checksumPath} must contain exactly one checksum record for ${basename(archive)}`);
+    fail(`${basename(checksumPath)} checksum must contain exactly one checksum record for ${basename(archive)}`);
   }
-  const archiveSha = await hashFile(archive);
+  const archiveSha = await hashFile(archive, `${basename(archive)} archive`);
   if (archiveSha !== checksumValue) {
-    fail(`${archive} sha256 does not match sibling checksum`);
+    fail(`${basename(archive)} archive sha256 does not match sibling checksum`);
   }
-  const provenance = JSON.parse(await Bun.file(provenancePath).text());
+  const provenance = JSON.parse(await readTextFile(provenancePath, `${basename(provenancePath)} provenance`));
   let kind;
   if (provenance.schema_version === "bucephalus_core_release_provenance_v1") {
     kind = "core";
   } else if (provenance.schema_version === "bucephalus_cloud_release_provenance_v1") {
     kind = "cloud";
   } else {
-    fail(`${provenancePath} has unknown schema_version`);
+    fail(`${basename(provenancePath)} provenance has unknown schema_version`);
   }
   if (provenance.release?.archive_sha256 !== archiveSha) {
-    fail(`${provenancePath} release.archive_sha256 does not match archive`);
+    fail(`${basename(provenancePath)} provenance release.archive_sha256 does not match archive`);
   }
   assets.push({
     kind,
@@ -255,11 +333,11 @@ for (const archive of archives) {
     checksum: {
       path: artifactPath(checksumPath, `${basename(checksumPath)} path`),
       value: checksumValue,
-      sha256: await hashFile(checksumPath),
+      sha256: await hashFile(checksumPath, `${basename(checksumPath)} checksum`),
     },
     provenance: {
       path: artifactPath(provenancePath, `${basename(provenancePath)} path`),
-      sha256: await hashFile(provenancePath),
+      sha256: await hashFile(provenancePath, `${basename(provenancePath)} provenance`),
       schema_version: provenance.schema_version,
       predicate_type: provenance.predicate_type,
       version: provenance.release.version,
@@ -322,7 +400,7 @@ const record = {
 };
 record.index_sha256 = createHash("sha256").update(JSON.stringify(record)).digest("hex");
 await Bun.write(out, `${JSON.stringify(record, null, 2)}\n`);
-console.log(`wrote release asset index ${out}`);
+console.log("wrote release asset index release-asset-index://output");
 '
 
 "${ROOT_DIR}/scripts/release/verify-release-asset-index.sh" "${OUT}"

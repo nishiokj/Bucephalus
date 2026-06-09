@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import { publicBoundaryText, publicBoundaryValue } from "./publicBoundary";
 
 const DEFAULT_MAX_JSON_BODY_BYTES = 1024 * 1024;
 
@@ -26,6 +27,18 @@ export function jsonResponse(value: unknown, init: ResponseInit = {}): Response 
 
 export async function readJsonObject(request: Request): Promise<Record<string, unknown>> {
   const text = await readBoundedRequestText(request, maxJsonBodyBytes());
+  const value = parseJson(text);
+  if (!isRecord(value)) {
+    throw new HttpError(400, "invalid_body", "Request body must be a JSON object");
+  }
+  return value;
+}
+
+export async function readOptionalJsonObject(request: Request): Promise<Record<string, unknown>> {
+  const text = await readBoundedRequestText(request, maxJsonBodyBytes());
+  if (text.trim().length === 0) {
+    return {};
+  }
   const value = parseJson(text);
   if (!isRecord(value)) {
     throw new HttpError(400, "invalid_body", "Request body must be a JSON object");
@@ -95,8 +108,8 @@ export function errorResponse(error: unknown): Response {
     return jsonResponse(
       {
         code: error.code,
-        message: error.message,
-        detail: error.detail ?? {},
+        message: publicBoundaryText(error.message),
+        detail: publicBoundaryValue(error.detail ?? {}),
       },
       { status: error.status },
     );
@@ -108,7 +121,7 @@ export function errorResponse(error: unknown): Response {
   return jsonResponse(
     {
       code: "internal_error",
-      message,
+      message: publicBoundaryText(message),
     },
     { status: 500 },
   );
@@ -143,6 +156,56 @@ export function optionalString(value: unknown, pointer: string): string | null {
     throw new HttpError(400, "invalid_request", `${pointer} must be a string`);
   }
   return value;
+}
+
+interface QueryIntegerBounds {
+  min: number;
+  max: number;
+}
+
+export function queryIntegerParam(
+  url: URL,
+  key: string,
+  bounds: QueryIntegerBounds & { defaultValue: number },
+): number;
+export function queryIntegerParam(url: URL, key: string, bounds: QueryIntegerBounds): number | undefined;
+export function queryIntegerParam(
+  url: URL,
+  key: string,
+  bounds: QueryIntegerBounds & { defaultValue?: number },
+): number | undefined {
+  const raw = url.searchParams.get(key);
+  if (raw === null) {
+    return bounds.defaultValue;
+  }
+  const normalized = raw.trim();
+  const rangeDescription = bounds.min === 0
+    ? `an integer from 0 to ${bounds.max}`
+    : `an integer from ${bounds.min} to ${bounds.max}`;
+  if (!/^[0-9]+$/.test(normalized)) {
+    throw new HttpError(400, "invalid_query_param", `${key} must be ${rangeDescription}`, {
+      param: key,
+      min: bounds.min,
+      max: bounds.max,
+    });
+  }
+  const parsed = Number.parseInt(normalized, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < bounds.min || parsed > bounds.max) {
+    throw new HttpError(400, "invalid_query_param", `${key} must be ${rangeDescription}`, {
+      param: key,
+      min: bounds.min,
+      max: bounds.max,
+    });
+  }
+  return parsed;
+}
+
+export function decodePathParam(value: string, pointer: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new HttpError(400, "invalid_path_param", `${pointer} must be valid percent-encoded UTF-8`);
+  }
 }
 
 export function requireRecord(value: unknown, pointer: string): Record<string, unknown> {

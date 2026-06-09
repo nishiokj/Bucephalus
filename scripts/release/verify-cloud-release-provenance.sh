@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROVENANCE=""
 RELEASE_INPUT=""
 WORK_DIR=""
@@ -18,6 +19,14 @@ verifies that the provenance describes that exact release artifact or directory.
 USAGE
 }
 
+public_provenance_input_ref() {
+  printf '%s\n' "release-provenance://input"
+}
+
+public_release_input_ref() {
+  printf '%s\n' "release-input://source"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --release)
@@ -33,7 +42,7 @@ while [[ $# -gt 0 ]]; do
         PROVENANCE="$1"
         shift
       else
-        echo "unknown argument: $1" >&2
+        echo "unknown argument" >&2
         usage >&2
         exit 2
       fi
@@ -47,7 +56,8 @@ if [[ -z "${PROVENANCE}" ]]; then
 fi
 
 if [[ ! -f "${PROVENANCE}" ]]; then
-  echo "provenance does not exist: ${PROVENANCE}" >&2
+  echo "provenance does not exist" >&2
+  echo "provenance_ref: $(public_provenance_input_ref)" >&2
   exit 2
 fi
 
@@ -83,20 +93,24 @@ if [[ -n "${RELEASE_INPUT}" ]]; then
       echo "required command not found: tar" >&2
       exit 2
     fi
+    "${ROOT_DIR}/scripts/release/verify-buc-release.sh" "${RELEASE_INPUT}"
     RELEASE_ARCHIVE_SHA="$(sha256_file "${RELEASE_INPUT}")"
     WORK_DIR="$(mktemp -d)"
     tar -xzf "${RELEASE_INPUT}" -C "${WORK_DIR}"
     RELEASE_DIR="$(find "${WORK_DIR}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
     if [[ -z "${RELEASE_DIR}" ]]; then
-      echo "archive did not contain a release directory: ${RELEASE_INPUT}" >&2
+      echo "archive did not contain a release directory" >&2
+      echo "release_ref: $(public_release_input_ref)" >&2
       exit 1
     fi
   else
-    echo "release input does not exist: ${RELEASE_INPUT}" >&2
+    echo "release input does not exist" >&2
+    echo "release_ref: $(public_release_input_ref)" >&2
     exit 2
   fi
   if [[ ! -f "${RELEASE_DIR}/release-manifest.json" ]]; then
-    echo "release input is missing release-manifest.json: ${RELEASE_INPUT}" >&2
+    echo "release input is missing release-manifest.json" >&2
+    echo "release_ref: $(public_release_input_ref)" >&2
     exit 1
   fi
 fi
@@ -133,6 +147,14 @@ function checkArtifactPath(value, label) {
   if (typeof value !== "string" || value.trim() === "" || value.startsWith("/") || value.includes("..") || value.includes("\\")) {
     fail(`${label} must be a stable artifact-local path`);
   }
+  if (looksLikeHostPath(value)) {
+    fail(`${label} must not look like a host filesystem path`);
+  }
+}
+
+function looksLikeHostPath(value) {
+  const normalized = value.replace(/^\.\//, "");
+  return /^(Users|home|private|tmp|var\/folders|Volumes|Desktop|Documents|Downloads|runner\/work|github\/workspace)\//.test(normalized);
 }
 
 function recompute(record) {
@@ -404,5 +426,5 @@ checkSha(provenance.provenance_sha256, "provenance_sha256");
 if (provenance.provenance_sha256 !== recompute(provenance)) {
   fail("provenance_sha256 does not match provenance content");
 }
-console.log(`verified release provenance ${path}`);
+console.log("verified release provenance release-provenance://input");
 ' "${PROVENANCE}"

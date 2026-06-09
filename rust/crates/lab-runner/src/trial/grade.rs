@@ -187,6 +187,14 @@ fn internal_exec_log_paths(trial_dir: &Path, label: &str) -> (PathBuf, PathBuf) 
     )
 }
 
+fn internal_exec_log_refs(label: &str) -> (String, String) {
+    let name = sanitize_for_fs(label);
+    (
+        format!("runtime-log://{name}/stdout"),
+        format!("runtime-log://{name}/stderr"),
+    )
+}
+
 fn run_exec_checked(
     docker: &DockerRuntime,
     handle: &ContainerHandle,
@@ -215,38 +223,65 @@ fn run_exec_checked(
         .wait_exec(&exec)
         .with_context(|| format!("wait for container command '{}'", label))?;
     if stream.timed_out {
-        let stdout = read_exec_log(&stdout_path);
-        let stderr = read_exec_log(&stderr_path);
+        let (stdout_ref, stderr_ref) = internal_exec_log_refs(label);
+        let stdout = read_exec_log(&stdout_path, &stdout_ref);
+        let stderr = read_exec_log(&stderr_path, &stderr_ref);
         return Err(anyhow!(
-            "container command '{}' timed out; stdout:\n{}\nstderr:\n{}\nlogs: {}, {}",
-            label,
-            stdout,
-            stderr,
-            stdout_path.display(),
-            stderr_path.display()
+            "{}",
+            internal_exec_timeout_message(label, &stdout, &stderr, &stdout_ref, &stderr_ref)
         ));
     }
     if status.exit_code != Some(0) {
-        let stdout = read_exec_log(&stdout_path);
-        let stderr = read_exec_log(&stderr_path);
+        let (stdout_ref, stderr_ref) = internal_exec_log_refs(label);
+        let stdout = read_exec_log(&stdout_path, &stdout_ref);
+        let stderr = read_exec_log(&stderr_path, &stderr_ref);
         return Err(anyhow!(
-            "container command '{}' failed with exit status {}; stdout:\n{}\nstderr:\n{}\nlogs: {}, {}",
-            label,
-            exit_status_label(status.exit_code),
-            stdout,
-            stderr,
-            stdout_path.display(),
-            stderr_path.display()
+            "{}",
+            internal_exec_exit_message(
+                label,
+                &exit_status_label(status.exit_code),
+                &stdout,
+                &stderr,
+                &stdout_ref,
+                &stderr_ref
+            )
         ));
     }
     Ok(())
 }
 
-fn read_exec_log(path: &Path) -> String {
+fn read_exec_log(path: &Path, public_ref: &str) -> String {
     match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(err) => format!("<failed to read {}: {}>", path.display(), err),
+        Err(err) => format!("<failed to read {public_ref}: {err}>"),
     }
+}
+
+fn internal_exec_timeout_message(
+    label: &str,
+    stdout: &str,
+    stderr: &str,
+    stdout_ref: &str,
+    stderr_ref: &str,
+) -> String {
+    format!(
+        "container command '{}' timed out; stdout:\n{}\nstderr:\n{}\nlogs: {}, {}",
+        label, stdout, stderr, stdout_ref, stderr_ref
+    )
+}
+
+fn internal_exec_exit_message(
+    label: &str,
+    exit_status: &str,
+    stdout: &str,
+    stderr: &str,
+    stdout_ref: &str,
+    stderr_ref: &str,
+) -> String {
+    format!(
+        "container command '{}' failed with exit status {}; stdout:\n{}\nstderr:\n{}\nlogs: {}, {}",
+        label, exit_status, stdout, stderr, stdout_ref, stderr_ref
+    )
 }
 
 fn container_parent_str<'a>(path: &'a str, field_name: &str) -> Result<&'a str> {
@@ -462,4 +497,69 @@ pub(crate) fn build_grading_sandbox_plan(
         },
         details,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_internal_exec_log_uses_public_ref() {
+        let private_root = std::env::temp_dir().join(format!(
+            "bucephalus_private_grader_logs_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        let private_log = private_root
+            .join("private-workspace")
+            .join("logs")
+            .join("runtime")
+            .join("hide_hidden_asset_0_stdout.log");
+
+        let message = read_exec_log(&private_log, "runtime-log://hide_hidden_asset_0/stdout");
+
+        assert!(message.contains("runtime-log://hide_hidden_asset_0/stdout"));
+        let private_root_text = private_root.to_string_lossy().to_string();
+        for forbidden in [
+            private_root_text.as_str(),
+            "private-workspace",
+            "hide_hidden_asset_0_stdout.log",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "missing exec log fallback leaked forbidden text {forbidden}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_exec_failure_messages_use_public_log_refs() {
+        let stdout_ref = "runtime-log://hide_hidden_asset_0/stdout";
+        let stderr_ref = "runtime-log://hide_hidden_asset_0/stderr";
+        let message = internal_exec_exit_message(
+            "hide_hidden_asset_0",
+            "1",
+            "stdout body",
+            "stderr body",
+            stdout_ref,
+            stderr_ref,
+        );
+        let timeout = internal_exec_timeout_message(
+            "hide_hidden_asset_0",
+            "stdout body",
+            "stderr body",
+            stdout_ref,
+            stderr_ref,
+        );
+
+        for rendered in [message, timeout] {
+            assert!(rendered.contains(stdout_ref));
+            assert!(rendered.contains(stderr_ref));
+            assert!(!rendered.contains("/tmp/"));
+            assert!(!rendered.contains("runtime/hide_hidden_asset_0"));
+        }
+    }
 }

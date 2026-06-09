@@ -4,6 +4,15 @@ locals {
   deploy_api_services           = var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller
   deploy_pool_controller        = var.deploy_control_plane_services || var.deploy_pool_controller
   runner_gce_zone               = coalesce(var.runner_gce_zone, "${var.region}-a")
+  runner_pool_capabilities = {
+    arch        = "x86_64"
+    cpu_count   = var.runner_gce_cpu_count
+    disk_mb     = var.runner_gce_boot_disk_size_gb * 1024
+    executors   = ["runner-docker"]
+    isolation   = ["reusable_vm", "single_use_vm"]
+    memory_mb   = var.runner_gce_memory_mb
+    resources   = ["core_runner", "docker_daemon", "registry_pull", "secret_resolver", "network_perimeter"]
+  }
 
   labels = merge(var.labels, {
     app         = "bucephalus-cloud"
@@ -423,7 +432,7 @@ resource "google_cloud_run_v2_service" "api" {
 
       env {
         name  = "BUCEPHALUS_CLOUD_DATA_DIR"
-        value = "/tmp/bucephalus-cloud"
+        value = ".data"
       }
 
       env {
@@ -597,6 +606,11 @@ resource "google_cloud_run_v2_service" "pool_controller" {
       }
 
       env {
+        name  = "BUCEPHALUS_POOL_CONTROLLER_CAPABILITIES_JSON"
+        value = jsonencode(local.runner_pool_capabilities)
+      }
+
+      env {
         name  = "BUCEPHALUS_GCP_PROJECT_ID"
         value = var.project_id
       }
@@ -639,6 +653,21 @@ resource "google_cloud_run_v2_service" "pool_controller" {
       env {
         name  = "BUCEPHALUS_GCP_RUNNER_MACHINE_TYPE"
         value = var.runner_gce_machine_type
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_RUNNER_CPU_COUNT"
+        value = tostring(var.runner_gce_cpu_count)
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_RUNNER_MEMORY_MB"
+        value = tostring(var.runner_gce_memory_mb)
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_RUNNER_DISK_MB"
+        value = tostring(var.runner_gce_boot_disk_size_gb * 1024)
       }
 
       env {

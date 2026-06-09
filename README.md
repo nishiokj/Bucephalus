@@ -21,8 +21,10 @@ Install the latest release:
 curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | sh
 ```
 
-The installer downloads the right prebuilt `bucephalus` binary for macOS or Linux,
-verifies its SHA-256 checksum, and installs it to `$HOME/.local/bin`.
+The installer downloads the right prebuilt archive for macOS or Linux, verifies
+its SHA-256 checksum and archive shape, and installs `bucephalus`,
+`bucephalus-cloud`, `bucephalus-modal-launcher`, and the bundled installer
+reference script to `$HOME/.local/bin`.
 
 ```bash
 bucephalus --help
@@ -48,15 +50,20 @@ bucephalus setup status
 bucephalus setup uninstall
 ```
 
+Cloud benchmark resolution uses `bucephalus login` for first-party user auth.
+Remove cached Cloud tokens with `bucephalus logout`; if
+`BUCEPHALUS_CLOUD_USER_TOKEN` is set in your shell, unset it as well.
+
 Update an installed release with:
 
 ```bash
 bucephalus update
 ```
 
-`update` installs into the same directory as the running `bucephalus` binary and
-refreshes daemon/MCP setup by default. Use `bucephalus update --setup=false` to
-replace only the binaries.
+`update` installs into the same directory as the running `bucephalus` binary,
+downloads the release-published installer plus `install.sh.sha256`, verifies the
+installer checksum before execution, and refreshes daemon/MCP setup by default.
+Use `bucephalus update --setup=false` to replace only the binaries.
 
 The installer adds `$HOME/.local/bin` to your `PATH` (via your shell profile) if
 it isn't already there — restart your shell afterward. To install elsewhere or
@@ -140,10 +147,12 @@ Common operator commands:
 | `bucephalus preflight` | Validate dynamic launch readiness before execution. |
 | `bucephalus build-run` | Advanced build-and-execute command for scripts. |
 | `bucephalus pause` / `bucephalus resume` | Pause and resume in-flight work when supported by persisted runtime state. |
-| `bucephalus recover` / `bucephalus continue` | Reconcile a stale run and continue the schedule. |
+| `bucephalus recover <run_id>` / `bucephalus continue <run_id>` | Reconcile a stale run and continue the schedule. |
 | `bucephalus kill` | Stop a running or paused experiment. |
 | `bucephalus runs` | List known runs from the account database. |
 | `bucephalus views` / `bucephalus query` | Inspect committed run facts and analysis views, served directly from the account SQLite database. |
+| `bucephalus publish` | Create a redacted support bundle for a run without raw logs, runtime state, or secret-looking files. |
+| `bucephalus-cloud deploy` / `bucephalus-cloud import sealed-package` | Build or import a sealed package for Cloud; archive membership and checksums are validated locally before upload. |
 
 Run `bucephalus <command> --help` for command-specific flags.
 

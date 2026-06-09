@@ -144,9 +144,71 @@ if ! command -v bun >/dev/null 2>&1; then
   exit 2
 fi
 
-mkdir -p "$(dirname "${OUT}")"
+reject_symlinked_existing_components() {
+  local path="$1"
+  local current=""
+  local part
+  local -a parts
+  if [[ -z "${path}" ]]; then
+    echo "deploy tfvars output directory is required" >&2
+    exit 2
+  fi
+  if [[ "${path}" == "/tmp" || "${path}" == /tmp/* ]]; then
+    if [[ -L /tmp && -d /private/tmp ]]; then
+      path="/private/tmp${path#/tmp}"
+    fi
+  elif [[ "${path}" == "/var" || "${path}" == /var/* ]]; then
+    if [[ -L /var && -d /private/var ]]; then
+      path="/private/var${path#/var}"
+    fi
+  fi
+  if [[ "${path}" == /* ]]; then
+    current="/"
+    path="${path#/}"
+  fi
+  IFS='/' read -r -a parts <<< "${path}"
+  for part in "${parts[@]}"; do
+    if [[ -z "${part}" || "${part}" == "." ]]; then
+      continue
+    fi
+    if [[ "${part}" == ".." ]]; then
+      echo "deploy tfvars output directory must be a stable path" >&2
+      exit 2
+    fi
+    if [[ -z "${current}" || "${current}" == "/" ]]; then
+      current="${current}${part}"
+    else
+      current="${current}/${part}"
+    fi
+    if [[ -L "${current}" ]]; then
+      echo "deploy tfvars output directory must not contain symlinks" >&2
+      exit 2
+    fi
+  done
+}
 
-OUT="${OUT}" \
+OUT_DIR="$(dirname "${OUT}")"
+reject_symlinked_existing_components "${OUT_DIR}"
+mkdir -p "${OUT_DIR}"
+reject_symlinked_existing_components "${OUT_DIR}"
+if [[ -L "${OUT}" ]]; then
+  echo "deploy tfvars output must not be a symlink" >&2
+  exit 2
+fi
+if [[ -e "${OUT}" && ! -f "${OUT}" ]]; then
+  echo "deploy tfvars output must be a regular file" >&2
+  exit 2
+fi
+
+OUT_TMP="$(mktemp "${OUT_DIR}/.gcp-deploy.tfvars.XXXXXX")"
+cleanup() {
+  if [[ -n "${OUT_TMP:-}" && -e "${OUT_TMP}" ]]; then
+    rm -f "${OUT_TMP}"
+  fi
+}
+trap cleanup EXIT
+
+OUT="${OUT_TMP}" \
 PROJECT_ID="${PROJECT_ID}" \
 REGION="${REGION}" \
 DEPLOYMENT_ENVIRONMENT="${DEPLOYMENT_ENVIRONMENT}" \
@@ -290,5 +352,17 @@ const lines = [
   "",
 ];
 await Bun.write(process.env.OUT, lines.join("\n"));
-console.log(`tfvars=${process.env.OUT}`);
+console.log("tfvars=tfvars://gcp-deploy");
 '
+
+reject_symlinked_existing_components "${OUT_DIR}"
+if [[ -L "${OUT}" ]]; then
+  echo "deploy tfvars output must not be a symlink" >&2
+  exit 2
+fi
+if [[ -e "${OUT}" && ! -f "${OUT}" ]]; then
+  echo "deploy tfvars output must be a regular file" >&2
+  exit 2
+fi
+mv -f "${OUT_TMP}" "${OUT}"
+OUT_TMP=""

@@ -14,7 +14,7 @@ POOL_ID="bucephalus-github"
 PROVIDER_ID="github"
 PUBLISHER_ACCOUNT_ID=""
 DEPLOY_ACCOUNT_ID=""
-GOOGLE_OAUTH_CLIENT_ID="380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
+GOOGLE_OAUTH_CLIENT_ID=""
 CLOUDFLARE_WORKER_NAME="bucephalus-cloud-ui"
 IMAGE_REPOSITORY=""
 BUN_BASE_IMAGE="oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4"
@@ -50,7 +50,7 @@ Options:
   --provider-id <id>             Workload Identity provider id. Default: github.
   --publisher-account-id <id>    Publisher service account id. Default: <prefix>-<env>-gh-publish.
   --deploy-account-id <id>       Deploy service account id. Default: <prefix>-<env>-gh-deploy.
-  --google-oauth-client-id <id>  Google OAuth client ID for API/UI deploys.
+  --google-oauth-client-id <id>  Google OAuth client ID for API/UI deploys. Required.
   --cloudflare-worker-name <n>   Cloudflare Worker name for UI deploys. Default: bucephalus-cloud-ui.
   --image-repository <prefix>    Release image repository prefix. Default: <region>-docker.pkg.dev/<project>/<prefix>-<env>-cloud/bucephalus-cloud.
   --bun-base-image <image>       Digest-pinned Bun base image used by release image builds.

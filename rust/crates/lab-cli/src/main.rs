@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -26,9 +26,9 @@ mod view_layout;
 mod view_spec;
 
 use crate::view_spec::{
-    present_table, renderer_for_resolved, resolve_requested_view, resolved_view_from_spec,
-    standard_view_source_label, standard_views_for_set, ResolvedView, ResolvedViewPlan,
-    ViewRenderer,
+    present_table, public_view_name, renderer_for_resolved, resolve_requested_view,
+    resolved_view_from_spec, standard_view_source_label, standard_views_for_set, ResolvedView,
+    ResolvedViewPlan, ViewRenderer,
 };
 
 #[derive(Parser)]
@@ -197,6 +197,13 @@ enum Commands {
         scope: Option<String>,
         #[arg(long)]
         no_browser: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Remove cached Bucephalus Cloud OAuth tokens")]
+    Logout {
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -416,7 +423,9 @@ enum Commands {
     #[command(about = "Continue a run-level schedule after interruption or recovery")]
     Continue {
         #[arg(long)]
-        run_dir: PathBuf,
+        run_dir: Option<PathBuf>,
+        #[arg(value_name = "RUN")]
+        run: Option<String>,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
         runtime_env: Vec<String>,
         #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
@@ -429,7 +438,9 @@ enum Commands {
     #[command(about = "Recover a durable run after stale owner crash/interruption")]
     Recover {
         #[arg(long)]
-        run_dir: PathBuf,
+        run_dir: Option<PathBuf>,
+        #[arg(value_name = "RUN")]
+        run: Option<String>,
         #[arg(long)]
         force: bool,
         #[arg(long)]
@@ -517,6 +528,18 @@ enum Commands {
     Clean {
         #[arg(long)]
         runs: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        include_active: bool,
+        #[arg(long)]
+        include_interrupted: bool,
+        #[arg(long)]
+        include_untracked: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -592,6 +615,39 @@ struct RunInventoryEntry {
 }
 
 #[derive(Clone, Debug)]
+struct CleanRunSummary {
+    run_id: String,
+    run_dir: PathBuf,
+    status: String,
+    active_trials: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CleanRunsReport {
+    runs_dir: PathBuf,
+    exists: bool,
+    dry_run: bool,
+    force: bool,
+    include_active: bool,
+    include_interrupted: bool,
+    include_untracked: bool,
+    run_count: usize,
+    active_run_count: usize,
+    active_runs: Vec<CleanRunSummary>,
+    interrupted_run_count: usize,
+    interrupted_runs: Vec<CleanRunSummary>,
+    untracked_entry_count: usize,
+    untracked_entries: Vec<CleanUntrackedEntry>,
+    will_remove: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CleanUntrackedEntry {
+    entry_ref: String,
+    entry_type: String,
+}
+
+#[derive(Clone, Debug)]
 struct RunMetrics {
     variants: usize,
     pass_rate: Option<f64>,
@@ -654,9 +710,13 @@ fn main() -> Result<()> {
                 emit_json(&json_error("command_failed", err.to_string(), json!({})));
                 std::process::exit(1);
             }
-            Err(err)
+            Err(public_cli_error(err))
         }
     }
+}
+
+fn public_cli_error(err: anyhow::Error) -> anyhow::Error {
+    anyhow!("{}", public_error_message(&err.to_string()))
 }
 
 fn current_unix_time_ms() -> i64 {
@@ -666,6 +726,12 @@ fn current_unix_time_ms() -> i64 {
             i64::try_from(duration.as_millis()).expect("Unix timestamp milliseconds must fit i64")
         })
         .expect("system time must be after Unix epoch")
+}
+
+fn default_publish_bundle_path(run_dir: &Path) -> PathBuf {
+    run_dir
+        .join("debug_bundles")
+        .join(format!("support-bundle-{}.zip", current_unix_time_ms()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,22 +745,7 @@ fn prompt_for_run_validation_action(
     package: &Path,
     validation: &lab_runner::ExperimentBundleValidation,
 ) -> Result<Option<RunValidationAction>> {
-    let prompt = {
-        let mut lines = Vec::new();
-        lines.push(String::new());
-        lines.push("This experiment bundle has not been smoke tested.".to_string());
-        lines.push(format!("package_digest: {}", validation.package_digest));
-        if let Some(experiment_id) = &validation.experiment_id {
-            lines.push(format!("experiment_id: {}", experiment_id));
-        }
-        lines.push(format!("package_dir: {}", package.display()));
-        lines.push(String::new());
-        lines.push("1. Run smoke test now".to_string());
-        lines.push("2. Run full experiment anyway".to_string());
-        lines.push("3. Cancel".to_string());
-        lines.push("Choose [1/2/3]: ".to_string());
-        lines.join("\n")
-    };
+    let prompt = run_validation_action_prompt(package, validation);
 
     let choice = if std::io::stdin().is_terminal() {
         print!("{}", prompt);
@@ -721,6 +772,29 @@ fn prompt_for_run_validation_action(
         "3" | "" => Ok(Some(RunValidationAction::Cancel)),
         other => Err(anyhow!("invalid validation choice '{}'", other)),
     }
+}
+
+fn run_validation_action_prompt(
+    package: &Path,
+    validation: &lab_runner::ExperimentBundleValidation,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push(String::new());
+    lines.push("This experiment bundle has not been smoke tested.".to_string());
+    lines.push(format!("package_digest: {}", validation.package_digest));
+    if let Some(experiment_id) = &validation.experiment_id {
+        lines.push(format!("experiment_id: {}", experiment_id));
+    }
+    lines.push(format!(
+        "package_ref: {}",
+        public_package_path_ref(package, package)
+    ));
+    lines.push(String::new());
+    lines.push("1. Run smoke test now".to_string());
+    lines.push("2. Run full experiment anyway".to_string());
+    lines.push("3. Cancel".to_string());
+    lines.push("Choose [1/2/3]: ".to_string());
+    lines.join("\n")
 }
 
 fn build_run_temp_out_path(out: &Path) -> PathBuf {
@@ -765,6 +839,18 @@ fn looks_like_bucephalus_package_dir(path: &Path) -> bool {
         || path.join("package.lock").is_file()
 }
 
+fn public_build_run_output_ref(_path: &Path) -> &'static str {
+    "build-output://target"
+}
+
+fn public_build_run_temporary_output_ref(_path: &Path) -> &'static str {
+    "build-output://temporary"
+}
+
+fn public_build_run_replaced_output_ref(_path: &Path) -> &'static str {
+    "build-output://previous"
+}
+
 fn publish_build_run_package(
     build: lab_runner::BuildResult,
     final_out: &Path,
@@ -772,42 +858,58 @@ fn publish_build_run_package(
     if let Some(parent) = final_out.parent() {
         fs::create_dir_all(parent)?;
     }
-    if final_out.exists() {
-        if !final_out.is_dir() {
+    match fs::symlink_metadata(final_out) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(anyhow!(
-                "build-run output path exists and is not a directory: {}",
-                final_out.display()
+                "build-run output target is a symlink\n\noutput_ref: {}\n\nRemove the symlink, choose a directory for --out, or pass a different --out path.",
+                public_build_run_output_ref(final_out)
             ));
         }
-        if !looks_like_bucephalus_package_dir(final_out) {
-            let mut entries = fs::read_dir(final_out)?;
-            if entries.next().is_some() {
-                return Err(anyhow!(
-                    "build-run output directory is non-empty and does not look like a Bucephalus package: {}",
-                    final_out.display()
-                ));
-            }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(anyhow!(
+                "build-run output target exists and is not a directory\n\noutput_ref: {}\n\nChoose a directory for --out, remove the existing file, or pass a different --out path.",
+                public_build_run_output_ref(final_out)
+            ));
         }
-        let replaced = build_run_replaced_out_path(final_out);
-        fs::rename(final_out, &replaced)?;
-        match fs::rename(&build.package_dir, final_out) {
-            Ok(()) => {
-                fs::remove_dir_all(replaced)?;
-            }
-            Err(err) => {
-                if let Err(rollback_err) = fs::rename(&replaced, final_out) {
+        Ok(_) => {
+            if !looks_like_bucephalus_package_dir(final_out) {
+                let mut entries = fs::read_dir(final_out)?;
+                if entries.next().is_some() {
                     return Err(anyhow!(
-                        "failed to publish build-run package to {}; also failed to restore replaced output from {}: {}",
-                        final_out.display(),
-                        replaced.display(),
-                        rollback_err
+                        "build-run output target is non-empty and does not look like a Bucephalus package\n\noutput_ref: {}\n\nMove or remove the existing directory contents, or choose a different --out path.",
+                        public_build_run_output_ref(final_out)
                     ));
                 }
-                return Err(err.into());
+            }
+            let replaced = build_run_replaced_out_path(final_out);
+            fs::rename(final_out, &replaced)?;
+            match fs::rename(&build.package_dir, final_out) {
+                Ok(()) => {
+                    fs::remove_dir_all(replaced)?;
+                }
+                Err(err) => {
+                    if let Err(rollback_err) = fs::rename(&replaced, final_out) {
+                        return Err(anyhow!(
+                            "failed to publish build-run package to {}; also failed to restore previous output from {}: {}",
+                            public_build_run_output_ref(final_out),
+                            public_build_run_replaced_output_ref(&replaced),
+                            public_error_message(&rollback_err.to_string())
+                        ));
+                    }
+                    return Err(err.into());
+                }
             }
         }
-    } else {
-        fs::rename(&build.package_dir, final_out)?;
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::rename(&build.package_dir, final_out)?;
+        }
+        Err(err) => {
+            return Err(anyhow!(
+                "failed to inspect build-run output target\n\noutput_ref: {}\n\nerror: {}",
+                public_build_run_output_ref(final_out),
+                public_error_message(&err.to_string())
+            ));
+        }
     }
 
     Ok(lab_runner::BuildResult {
@@ -836,8 +938,8 @@ fn build_experiment_package_for_build_run(
                 Err(cleanup_err) => {
                     eprintln!(
                         "warning: failed to remove temporary build-run output {}: {}",
-                        temp_out.display(),
-                        cleanup_err
+                        public_build_run_temporary_output_ref(&temp_out),
+                        public_error_message(&cleanup_err.to_string())
                     );
                 }
             }
@@ -853,7 +955,7 @@ fn experiment_bundle_validation_to_json(
     json!({
         "package_digest": validation.package_digest,
         "experiment_id": validation.experiment_id,
-        "package_dir": validation.package_dir.display().to_string(),
+        "package_ref": public_package_path_ref(&validation.package_dir, &validation.package_dir),
         "smoke_tested": validation.smoke_tested,
         "smoke_run_id": validation.smoke_run_id,
         "smoke_tested_at_ms": validation.smoke_tested_at_ms,
@@ -880,9 +982,9 @@ fn resolve_run_validation_action(
     }
     if json {
         return Err(anyhow!(
-            "experiment bundle {} is not smoke tested; run `bucephalus run {} --smoke-test`, or pass --run-dangerously to skip validation",
+            "experiment bundle {} is not smoke tested\n\npackage_ref: {}\n\nNext steps:\n  bucephalus run <package-dir> --smoke-test\n  bucephalus run <package-dir> --run-dangerously",
             validation.package_digest,
-            package.display()
+            public_package_path_ref(package, package)
         ));
     }
 
@@ -902,6 +1004,72 @@ fn package_checks_passed(report: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn package_check_report_to_json(report: &Value) -> Value {
+    let mut public = report.clone();
+    redact_package_check_report_json(&mut public);
+    public
+}
+
+fn redact_package_check_report_json(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            *text = public_error_message(text);
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_package_check_report_json(item);
+            }
+        }
+        Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                if let Some(marker) = package_check_public_redaction_for_key(key) {
+                    *child = Value::String(marker.to_string());
+                } else {
+                    redact_package_check_report_json(child);
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn package_check_public_redaction_for_key(key: &str) -> Option<&'static str> {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    if normalized.ends_with("ref") || normalized.ends_with("present") {
+        return None;
+    }
+    if normalized == "env" || normalized.ends_with("env") || normalized.contains("environment") {
+        return Some("[REDACTED:environment]");
+    }
+    const SECRET_FRAGMENTS: &[&str] = &[
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "apikey",
+        "authorization",
+        "bearer",
+        "privatekey",
+        "clientsecret",
+        "cookie",
+        "session",
+        "refresh",
+    ];
+    if normalized == "auth"
+        || normalized.ends_with("auth")
+        || SECRET_FRAGMENTS
+            .iter()
+            .any(|fragment| normalized.contains(fragment))
+    {
+        return Some("[REDACTED:secret]");
+    }
+    None
+}
+
 fn preflight_report_to_json(report: &lab_runner::PreflightReport) -> Value {
     json!({
         "ok": report.passed,
@@ -912,9 +1080,20 @@ fn preflight_report_to_json(report: &lab_runner::PreflightReport) -> Value {
                 lab_runner::PreflightSeverity::Error => "error",
                 lab_runner::PreflightSeverity::Warning => "warning",
             },
-            "message": check.message,
+            "message": public_error_message(&check.message),
         })).collect::<Vec<_>>()
     })
+}
+
+fn preflight_command_report_to_json(
+    package_dir: &Path,
+    report: &lab_runner::PreflightReport,
+) -> Value {
+    let mut payload = preflight_report_to_json(report);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("command".to_string(), json!("preflight"));
+    }
+    with_package_ref(payload, package_dir)
 }
 
 fn resolve_experiment_target(target: Option<&Path>) -> Result<PathBuf> {
@@ -926,15 +1105,22 @@ fn resolve_experiment_target(target: Option<&Path>) -> Result<PathBuf> {
         if experiment.is_file() {
             return Ok(experiment);
         }
-        return Err(anyhow!(
-            "no experiment.yaml found in directory: {}",
-            path.display()
+        return Err(experiment_target_error(
+            &path,
+            "target directory does not contain experiment.yaml",
         ));
     }
     if path.is_file() {
         return Ok(path);
     }
-    Err(anyhow!("experiment file not found: {}", path.display()))
+    Err(experiment_target_error(&path, "experiment file not found"))
+}
+
+fn experiment_target_error(path: &Path, reason: &str) -> anyhow::Error {
+    anyhow!(
+        "expected an experiment YAML target, but {reason}.\n\ntarget_ref: {}\n\nNext steps:\n  bucephalus init <workspace-dir>\n  bucephalus doctor <experiment-yaml>\n  bucephalus build <experiment-yaml> --out <package-dir>",
+        public_experiment_target_ref(path)
+    )
 }
 
 fn is_yaml_file(path: &Path) -> bool {
@@ -1133,22 +1319,120 @@ fn resolve_init_options(args: InitOptionArgs) -> Result<InitOptions> {
     })
 }
 
-fn init_write_file(path: &Path, content: &str, force: bool) -> Result<()> {
-    if path.exists() && !force {
-        return Err(anyhow!(
-            "refusing to overwrite {}; pass --force to replace generated files",
-            path.display()
+fn init_write_file(path: &Path, content: &str) -> Result<()> {
+    atomic_write_bytes(path, content.as_bytes())
+}
+
+fn init_preflight_writable_targets(root: &Path, targets: &[PathBuf], force: bool) -> Result<()> {
+    let mut blocked = BTreeSet::new();
+    let mut existing = BTreeSet::new();
+    for target in targets {
+        init_collect_blocked_parent_refs(root, target, &mut blocked)?;
+        match fs::symlink_metadata(target) {
+            Ok(metadata) => {
+                let target_ref = public_workspace_path_ref(root, target);
+                if metadata.file_type().is_symlink() || metadata.is_dir() {
+                    blocked.insert(target_ref);
+                } else if !force {
+                    existing.insert(target_ref);
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(err) => return Err(err).context("failed to inspect generated init target"),
+        }
+    }
+    if blocked.is_empty() && existing.is_empty() {
+        return Ok(());
+    }
+    let mut details = Vec::new();
+    if !blocked.is_empty() {
+        details.push(format!(
+            "blocked_refs:\n{}",
+            blocked
+                .iter()
+                .map(|reference| format!("  - {reference}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    if !existing.is_empty() {
+        details.push(format!(
+            "existing_refs:\n{}",
+            existing
+                .iter()
+                .map(|reference| format!("  - {reference}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
     }
-    fs::write(path, content)?;
+    let heading = if blocked.is_empty() {
+        "refusing to overwrite generated init files"
+    } else {
+        "refusing to write generated init files"
+    };
+    let guidance = if blocked.is_empty() {
+        "Pass --force to replace generated files, or choose an empty workspace directory."
+    } else if existing.is_empty() {
+        "Remove blocked paths or choose an empty workspace directory."
+    } else {
+        "Remove blocked paths, pass --force to replace existing generated files, or choose an empty workspace directory."
+    };
+    Err(anyhow!(
+        "{heading}\n\n{}\n\n{guidance}",
+        details.join("\n\n")
+    ))
+}
+
+fn init_collect_blocked_parent_refs(
+    root: &Path,
+    target: &Path,
+    blocked: &mut BTreeSet<String>,
+) -> Result<()> {
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    if parent == root {
+        return Ok(());
+    }
+    let Ok(relative_parent) = parent.strip_prefix(root) else {
+        blocked.insert("[REDACTED:local-path]".to_string());
+        return Ok(());
+    };
+    let mut current = root.to_path_buf();
+    for component in relative_parent.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    blocked.insert(public_workspace_path_ref(root, &current));
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(())
+            }
+            Err(err) => return Err(err).context("failed to inspect generated init parent"),
+        }
+    }
     Ok(())
 }
 
+fn yaml_string_scalar(value: &str) -> String {
+    serde_json::to_string(value).expect("string serialization is infallible")
+}
+
 fn generate_init_experiment_yaml(options: &InitOptions) -> String {
-    let id = slugify(&options.name);
+    let id = yaml_string_scalar(&slugify(&options.name));
+    let name = yaml_string_scalar(&options.name);
+    let mode = yaml_string_scalar(&options.mode);
     format!(
         r#"experiment:
   id: {id}
@@ -1219,8 +1503,8 @@ policy:
   task_sandbox: {{}}
 "#,
         id = id,
-        name = options.name,
-        mode = options.mode
+        name = name,
+        mode = mode
     )
 }
 
@@ -1387,36 +1671,48 @@ fn run_init(options: InitOptions) -> Result<Value> {
     let cases_path = options.dir.join("cases.jsonl");
     let agent_path = options.dir.join("agent").join("buc_agent.py");
     let agent_readme_path = options.dir.join("agent").join("README.md");
+    let targets = vec![
+        experiment_path.clone(),
+        cases_path.clone(),
+        agent_path.clone(),
+        agent_readme_path.clone(),
+    ];
     fs::create_dir_all(&options.dir)?;
-    init_write_file(
-        &experiment_path,
-        &generate_init_experiment_yaml(&options),
-        options.force,
-    )?;
-    init_write_file(&cases_path, &generate_init_cases_jsonl(), options.force)?;
-    init_write_file(&agent_path, &generate_init_agent(&options)?, options.force)?;
-    init_write_file(
-        &agent_readme_path,
-        &generate_init_agent_readme(&options),
-        options.force,
-    )?;
+    init_preflight_writable_targets(&options.dir, &targets, options.force)?;
+    init_write_file(&experiment_path, &generate_init_experiment_yaml(&options))?;
+    init_write_file(&cases_path, &generate_init_cases_jsonl())?;
+    init_write_file(&agent_path, &generate_init_agent(&options)?)?;
+    init_write_file(&agent_readme_path, &generate_init_agent_readme(&options))?;
+    let workspace_ref = public_project_ref(&options.dir);
+    let experiment_ref = public_workspace_path_ref(&options.dir, &experiment_path);
     Ok(json!({
         "ok": true,
         "command": "init",
         "client": init_client_label(options.client),
-        "dir": options.dir.display().to_string(),
-        "experiment": experiment_path.display().to_string(),
-        "cases": cases_path.display().to_string(),
-        "agent": agent_path.display().to_string(),
-        "next": [
-            format!("bucephalus dev {}", options.dir.display()),
-            format!("bucephalus run {}", experiment_path.display())
+        "workspace_ref": workspace_ref,
+        "experiment_ref": experiment_ref,
+        "cases_ref": public_workspace_path_ref(&options.dir, &cases_path),
+        "agent_ref": public_workspace_path_ref(&options.dir, &agent_path),
+        "next_actions": [
+            {
+                "type": "cli_command",
+                "command": "bucephalus dev <workspace-dir>",
+                "workspace_ref": workspace_ref,
+            },
+            {
+                "type": "cli_command",
+                "command": "bucephalus run <experiment-yaml>",
+                "experiment_ref": experiment_ref,
+            }
         ]
     }))
 }
 
 fn run_mcp_stdio() -> Result<()> {
     let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Err(anyhow!(direct_mcp_invocation_message()));
+    }
     let mut reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
     while let Some(message) = read_mcp_message(&mut reader)? {
@@ -1428,7 +1724,12 @@ fn run_mcp_stdio() -> Result<()> {
     Ok(())
 }
 
+fn direct_mcp_invocation_message() -> &'static str {
+    "`bucephalus mcp` is a stdio MCP server command for MCP clients, not an interactive shell command.\n\nNext steps:\n  bucephalus setup\n  bucephalus setup status\n  configure your MCP client to launch: bucephalus mcp"
+}
+
 const BUCEPHALUS_MCP_SERVER_NAME: &str = "bucephalus";
+const MCP_MAX_CONTENT_LENGTH: usize = 8 * 1024 * 1024;
 const LATCH_DAEMON_SERVICE_LABEL: &str = "dev.bucephalus.latchd";
 const BUCEPHALUS_CLOUD_USER_TOKEN_ENV: &str = "BUCEPHALUS_CLOUD_USER_TOKEN";
 const BUCEPHALUS_CLOUD_API_URL_ENV: &str = "BUCEPHALUS_CLOUD_API_URL";
@@ -1437,6 +1738,8 @@ const BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_CLIEN
 const BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_AUDIENCE";
 const BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_SCOPE";
 const DEFAULT_BUCEPHALUS_REPO: &str = "nishiokj/Bucephalus";
+const INVALID_UPDATE_BASE_URL_MESSAGE: &str = "invalid BUCEPHALUS_BASE_URL value: expected an https:// or file:// base URL without credentials, query, or fragment";
+const LOGOUT_SYMLINKED_AUTH_DIR_MESSAGE: &str = "refusing to remove Cloud auth tokens through symlinked auth directory; replace auth://current with a real directory or remove the symlink manually";
 const DISPATCH_SCHEMA: &str = "latch_dispatch_v1";
 
 #[derive(Debug, Clone)]
@@ -1465,6 +1768,14 @@ struct UpdateOptions {
     setup: bool,
     no_modify_path: bool,
     dry_run: bool,
+    capture_output: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallerScriptSource {
+    script_url: String,
+    checksum_url: String,
+    source: String,
 }
 
 fn run_setup(
@@ -1562,7 +1873,7 @@ fn run_setup_status(project: Option<&Path>) -> Result<Value> {
         "home": home,
         "daemon_service": daemon_service,
         "daemon_status": daemon_status,
-        "mcp": mcp_registration_status(project),
+        "mcp": mcp_registration_status(project, &exe),
         "auth": auth_status(&home)
     }))
 }
@@ -1610,34 +1921,87 @@ fn cloud_token_paths(home: &Path) -> CloudTokenPaths {
     }
 }
 
+fn auth_path_ref_for_paths(paths: &CloudTokenPaths, path: &Path) -> &'static str {
+    if path == paths.access {
+        "auth://access-token"
+    } else if path == paths.refresh {
+        "auth://refresh-token"
+    } else if path == paths.cache {
+        "auth://token-cache"
+    } else {
+        "[REDACTED:local-path]"
+    }
+}
+
 fn auth_status(home: &Path) -> Value {
     let paths = cloud_token_paths(home);
+    let cache = cloud_token_cache_status(&paths);
+    let api_url = std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV)
+        .ok()
+        .map(|value| public_urlish_value(&value));
     if std::env::var_os(BUCEPHALUS_CLOUD_USER_TOKEN_ENV).is_some() {
         return json!({
             "status": "ready",
             "source": "env",
             "env": BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
-            "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
+            "api_url": api_url
         });
     }
     if paths.access.is_file() {
         return json!({
             "status": "ready",
             "source": "file",
-            "path": paths.access,
-            "refresh_token_path": if paths.refresh.is_file() { Some(paths.refresh.display().to_string()) } else { None },
-            "cache_path": if paths.cache.is_file() { Some(paths.cache.display().to_string()) } else { None },
-            "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
+            "path_ref": auth_path_ref_for_paths(&paths, &paths.access),
+            "refresh_token_ref": if paths.refresh.is_file() { Some(auth_path_ref_for_paths(&paths, &paths.refresh)) } else { None },
+            "cache": cache,
+            "api_url": api_url
         });
     }
+    match cache.get("status").and_then(Value::as_str) {
+        Some("ready" | "refresh_required") => {
+            return json!({
+                "status": "ready",
+                "source": "cache",
+                "path_ref": auth_path_ref_for_paths(&paths, &paths.cache),
+                "cache": cache,
+                "api_url": api_url
+            });
+        }
+        Some("invalid" | "expired") => {
+            return json!({
+                "status": cache.get("status").and_then(Value::as_str).unwrap_or("invalid"),
+                "source": "cache",
+                "path_ref": auth_path_ref_for_paths(&paths, &paths.cache),
+                "cache": cache,
+                "api_url": api_url,
+                "note": "Cached Cloud auth is present but cannot be used as-is.",
+                "actions": [
+                    {
+                        "type": "cli_command",
+                        "command": "bucephalus login",
+                        "description": "Refresh Cloud OAuth credentials for this user."
+                    },
+                    {
+                        "type": "cli_command",
+                        "command": "bucephalus logout",
+                        "description": "Remove stale or malformed cached Cloud token files."
+                    }
+                ]
+            });
+        }
+        _ => {}
+    }
+    let expected = vec![
+        BUCEPHALUS_CLOUD_USER_TOKEN_ENV.to_string(),
+        auth_path_ref_for_paths(&paths, &paths.access).to_string(),
+        auth_path_ref_for_paths(&paths, &paths.cache).to_string(),
+    ];
     json!({
         "status": "missing",
         "source": null,
-        "expected": [
-            BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
-            paths.access.display().to_string()
-        ],
-        "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok(),
+        "expected": expected,
+        "cache": cache,
+        "api_url": api_url,
         "note": "Local Core and latch smoke fixtures do not require Cloud auth. Cloud benchmark resolution and upload require first-party user auth.",
         "actions": [
             {
@@ -1652,6 +2016,100 @@ fn auth_status(home: &Path) -> Value {
             "audience_env": BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV,
             "scope_env": BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV
         }
+    })
+}
+
+fn cloud_token_cache_status(paths: &CloudTokenPaths) -> Value {
+    if !paths.cache.exists() {
+        return json!({
+            "status": "absent",
+            "path_ref": auth_path_ref_for_paths(paths, &paths.cache)
+        });
+    }
+    let raw = match fs::read_to_string(&paths.cache) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return json!({
+                "status": "invalid",
+                "path_ref": auth_path_ref_for_paths(paths, &paths.cache),
+                "reason": "unreadable",
+                "error": err.to_string()
+            });
+        }
+    };
+    let cache: Value = match serde_json::from_str(&raw) {
+        Ok(cache) => cache,
+        Err(err) => {
+            return json!({
+                "status": "invalid",
+                "path_ref": auth_path_ref_for_paths(paths, &paths.cache),
+                "reason": "malformed_json",
+                "error": err.to_string()
+            });
+        }
+    };
+    if !cache.is_object() {
+        return json!({
+            "status": "invalid",
+            "path_ref": auth_path_ref_for_paths(paths, &paths.cache),
+            "reason": "not_json_object"
+        });
+    }
+    let access_token_present = cache
+        .get("access_token")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.trim().is_empty());
+    let refresh_token_present = cache
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.trim().is_empty());
+    let token_endpoint_present = cache
+        .get("token_endpoint")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let client_id_present = cache
+        .get("client_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let expires_at_ms = cache.get("expires_at_ms").and_then(Value::as_i64);
+
+    if !access_token_present {
+        return json!({
+            "status": "invalid",
+            "path_ref": auth_path_ref_for_paths(paths, &paths.cache),
+            "reason": "missing_access_token",
+            "refresh_token_present": refresh_token_present
+        });
+    }
+
+    if let Some(expires_at_ms) = expires_at_ms {
+        if expires_at_ms <= current_unix_time_ms() + 60_000 {
+            if refresh_token_present && token_endpoint_present && client_id_present {
+                return json!({
+                    "status": "refresh_required",
+                    "path_ref": auth_path_ref_for_paths(paths, &paths.cache),
+                    "expires_at_ms": expires_at_ms,
+                    "refresh_token_present": true,
+                    "note": "Cloud commands will refresh this cached token before use."
+                });
+            }
+            return json!({
+                "status": "expired",
+                "path_ref": auth_path_ref_for_paths(paths, &paths.cache),
+                "expires_at_ms": expires_at_ms,
+                "refresh_token_present": refresh_token_present,
+                "token_endpoint_present": token_endpoint_present,
+                "client_id_present": client_id_present,
+                "reason": "expired_without_refresh_metadata"
+            });
+        }
+    }
+
+    json!({
+        "status": "ready",
+        "path_ref": auth_path_ref_for_paths(paths, &paths.cache),
+        "expires_at_ms": expires_at_ms,
+        "refresh_token_present": refresh_token_present
     })
 }
 
@@ -1676,26 +2134,13 @@ fn run_login(options: DeviceLoginOptions) -> Result<Value> {
         .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV))
         .unwrap_or_else(|| "openid profile email".to_string());
     let (metadata_url, metadata) = fetch_oauth_metadata(&issuer)?;
-    let device_authorization_endpoint = metadata
-        .get("device_authorization_endpoint")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            anyhow!(
-                "OAuth metadata {} does not include device_authorization_endpoint",
-                metadata_url
-            )
-        })?
-        .to_string();
-    let token_endpoint = metadata
-        .get("token_endpoint")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            anyhow!(
-                "OAuth metadata {} does not include token_endpoint",
-                metadata_url
-            )
-        })?
-        .to_string();
+    let device_authorization_endpoint = required_oauth_metadata_endpoint(
+        &metadata_url,
+        &metadata,
+        "device_authorization_endpoint",
+    )?;
+    let token_endpoint =
+        required_oauth_metadata_endpoint(&metadata_url, &metadata, "token_endpoint")?;
     let client_id = options
         .client_id
         .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV))
@@ -1744,19 +2189,128 @@ fn run_login(options: DeviceLoginOptions) -> Result<Value> {
         &token_endpoint,
         &token,
     )?;
-    Ok(json!({
+    Ok(login_success_result(
+        &paths, issuer, client_id, audience, resource, scope,
+    ))
+}
+
+fn login_success_result(
+    paths: &CloudTokenPaths,
+    issuer: String,
+    client_id: String,
+    audience: Option<String>,
+    resource: Option<String>,
+    scope: String,
+) -> Value {
+    json!({
         "schema_version": "bucephalus_login_v1",
         "ok": true,
-        "home": home,
-        "issuer": issuer,
-        "client_id": client_id,
-        "audience": audience,
-        "resource": resource,
-        "scope": scope,
-        "token_path": paths.access,
-        "refresh_token_path": if paths.refresh.is_file() { Some(paths.refresh.display().to_string()) } else { None },
-        "cache_path": paths.cache
+        "auth_ref": "auth://current",
+        "issuer": public_urlish_value(&issuer),
+        "client_id": public_string_value(&client_id),
+        "audience": audience.as_deref().map(public_string_value),
+        "resource": resource.as_deref().map(public_urlish_value),
+        "scope": public_string_value(&scope),
+        "token_ref": auth_path_ref_for_paths(paths, &paths.access),
+        "refresh_token_ref": if paths.refresh.is_file() { Some(auth_path_ref_for_paths(paths, &paths.refresh)) } else { None },
+        "cache_ref": auth_path_ref_for_paths(paths, &paths.cache)
+    })
+}
+
+fn run_logout(dry_run: bool) -> Result<Value> {
+    let home = lab_runner::bucephalus_home()?;
+    run_logout_at_home(&home, dry_run)
+}
+
+fn run_logout_at_home(home: &Path, dry_run: bool) -> Result<Value> {
+    let paths = cloud_token_paths(home);
+    let token_files = [
+        ("access", paths.access.as_path()),
+        ("refresh", paths.refresh.as_path()),
+        ("cache", paths.cache.as_path()),
+    ];
+    let mut files = Vec::with_capacity(token_files.len());
+    let mut removed = 0usize;
+    let mut would_remove = 0usize;
+    let mut errors = 0usize;
+    let auth_dir_blocked = auth_dir_is_symlink(&paths)?;
+
+    for (kind, path) in token_files {
+        let existed = if auth_dir_blocked {
+            None
+        } else {
+            Some(path.exists())
+        };
+        let mut file = json!({
+            "kind": kind,
+            "path_ref": auth_path_ref_for_paths(&paths, path),
+            "existed": existed,
+        });
+        let object = file.as_object_mut().expect("object literal");
+        if auth_dir_blocked {
+            errors += 1;
+            object.insert("status".to_string(), json!("blocked"));
+            object.insert(
+                "reason".to_string(),
+                json!(LOGOUT_SYMLINKED_AUTH_DIR_MESSAGE),
+            );
+        } else if existed.unwrap_or(false) && dry_run {
+            would_remove += 1;
+            object.insert("status".to_string(), json!("would_remove"));
+        } else if existed.unwrap_or(false) {
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    removed += 1;
+                    object.insert("status".to_string(), json!("removed"));
+                }
+                Err(err) => {
+                    errors += 1;
+                    object.insert("status".to_string(), json!("error"));
+                    object.insert("reason".to_string(), json!(err.to_string()));
+                }
+            }
+        } else {
+            object.insert("status".to_string(), json!("absent"));
+        }
+        files.push(file);
+    }
+
+    let env_present = std::env::var_os(BUCEPHALUS_CLOUD_USER_TOKEN_ENV).is_some();
+    Ok(json!({
+        "schema_version": "bucephalus_logout_v1",
+        "ok": errors == 0,
+        "dry_run": dry_run,
+        "auth_ref": "auth://current",
+        "status": if auth_dir_blocked { "blocked" } else if dry_run { "planned" } else if errors == 0 { "complete" } else { "partial_error" },
+        "removed": removed,
+        "would_remove": would_remove,
+        "errors": errors,
+        "files": files,
+        "env": {
+            "name": BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
+            "present": env_present,
+            "note": if env_present {
+                Some(format!("Unset {BUCEPHALUS_CLOUD_USER_TOKEN_ENV} to fully log out of this shell."))
+            } else {
+                None
+            }
+        }
     }))
+}
+
+fn auth_dir_is_symlink(paths: &CloudTokenPaths) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        let Some(auth_dir) = paths.access.parent() else {
+            return Ok(false);
+        };
+        return secret_path_is_symlink(auth_dir);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        Ok(false)
+    }
 }
 
 fn env_trimmed(name: &str) -> Option<String> {
@@ -1775,7 +2329,7 @@ fn oauth_metadata_url(issuer: &str) -> Result<String> {
         return Ok(issuer.to_string());
     }
     let parsed = reqwest::Url::parse(issuer)
-        .with_context(|| format!("invalid OAuth issuer URL {}", issuer))?;
+        .with_context(|| format!("invalid OAuth issuer URL {}", redact_public_url(issuer)))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(anyhow!("OAuth issuer URL must use http or https"));
     }
@@ -1788,7 +2342,7 @@ fn openid_metadata_url(issuer: &str) -> Result<String> {
         return Ok(issuer.to_string());
     }
     let parsed = reqwest::Url::parse(issuer)
-        .with_context(|| format!("invalid OAuth issuer URL {}", issuer))?;
+        .with_context(|| format!("invalid OAuth issuer URL {}", redact_public_url(issuer)))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(anyhow!("OAuth issuer URL must use http or https"));
     }
@@ -1811,7 +2365,7 @@ fn fetch_oauth_metadata(issuer: &str) -> Result<(String, Value)> {
                 .with_context(|| {
                     format!(
                         "failed to fetch OAuth metadata from {} or OpenID metadata fallback",
-                        metadata_url
+                        redact_public_url(&metadata_url)
                     )
                 })
         }
@@ -1819,18 +2373,71 @@ fn fetch_oauth_metadata(issuer: &str) -> Result<(String, Value)> {
     }
 }
 
+fn required_oauth_metadata_endpoint(
+    metadata_url: &str,
+    metadata: &Value,
+    field: &str,
+) -> Result<String> {
+    metadata
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "OAuth metadata {} does not include {}",
+                redact_public_url(metadata_url),
+                field
+            )
+        })
+}
+
 fn http_get_json(url: &str) -> Result<Value> {
     let response = http_request(Method::GET, url, None, None)?;
     if !(200..300).contains(&response.status) {
-        let message = String::from_utf8_lossy(&response.body);
+        let message = redacted_response_body(&response.body);
         return Err(anyhow!(
             "GET {} failed with status {}: {}",
-            url,
+            redact_public_url(url),
             response.status,
-            message.trim()
+            message
         ));
     }
     Ok(serde_json::from_slice(&response.body)?)
+}
+
+fn redacted_response_body(bytes: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(bytes);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+    if let Ok(mut value) = serde_json::from_slice::<Value>(bytes) {
+        redact_dispatch_submission_json(&mut value);
+        let rendered = serde_json::to_string(&value).unwrap_or_else(|_| trimmed.to_string());
+        return truncate_response_message(&rendered);
+    }
+    let redacted = trimmed
+        .lines()
+        .map(|line| {
+            dispatch_redaction_for_string(line)
+                .map(str::to_string)
+                .unwrap_or_else(|| line.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    truncate_response_message(&redacted)
+}
+
+fn truncate_response_message(message: &str) -> String {
+    const MAX_RESPONSE_MESSAGE_CHARS: usize = 1000;
+    let mut out = message
+        .chars()
+        .take(MAX_RESPONSE_MESSAGE_CHARS)
+        .collect::<String>();
+    if message.chars().count() > MAX_RESPONSE_MESSAGE_CHARS {
+        out.push_str("... [truncated]");
+    }
+    out
 }
 
 fn dynamic_register_oauth_client(metadata: &Value, issuer: &str, scope: &str) -> Result<String> {
@@ -1850,15 +2457,20 @@ fn dynamic_register_oauth_client(metadata: &Value, issuer: &str, scope: &str) ->
         .header("content-type", "application/json")
         .body(serde_json::to_vec(&body)?)
         .send()
-        .with_context(|| format!("failed to register OAuth client with {}", issuer))?;
+        .map_err(|_| {
+            anyhow!(
+                "failed to register OAuth client with {}: transport error",
+                redact_public_url(issuer)
+            )
+        })?;
     let status = response.status().as_u16();
     let bytes = response.bytes()?.to_vec();
     if !(200..300).contains(&status) {
-        let message = String::from_utf8_lossy(&bytes);
+        let message = redacted_response_body(&bytes);
         return Err(anyhow!(
             "OAuth dynamic client registration failed with status {}: {}",
             status,
-            message.trim()
+            message
         ));
     }
     let value: Value = serde_json::from_slice(&bytes)?;
@@ -1897,19 +2509,20 @@ fn begin_device_authorization(
         form.push(("resource".to_string(), resource.to_string()));
     }
     let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(endpoint)
-        .form(&form)
-        .send()
-        .with_context(|| format!("failed to start device authorization at {}", endpoint))?;
+    let response = client.post(endpoint).form(&form).send().map_err(|_| {
+        anyhow!(
+            "failed to start device authorization at {}: transport error",
+            redact_public_url(endpoint)
+        )
+    })?;
     let status = response.status().as_u16();
     let bytes = response.bytes()?.to_vec();
     if !(200..300).contains(&status) {
-        let message = String::from_utf8_lossy(&bytes);
+        let message = redacted_response_body(&bytes);
         return Err(anyhow!(
             "device authorization failed with status {}: {}",
             status,
-            message.trim()
+            message
         ));
     }
     Ok(serde_json::from_slice(&bytes)?)
@@ -1945,13 +2558,18 @@ fn poll_device_token(token_endpoint: &str, client_id: &str, device: &Value) -> R
             .post(token_endpoint)
             .form(&form)
             .send()
-            .with_context(|| format!("failed to poll token endpoint {}", token_endpoint))?;
+            .map_err(|_| {
+                anyhow!(
+                    "failed to poll token endpoint {}: transport error",
+                    redact_public_url(token_endpoint)
+                )
+            })?;
         let status = response.status().as_u16();
         let bytes = response.bytes()?.to_vec();
         let value: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
             json!({
                 "error": "invalid_response",
-                "error_description": String::from_utf8_lossy(&bytes).to_string()
+                "error_description": redacted_response_body(&bytes)
             })
         });
         if (200..300).contains(&status) {
@@ -1970,6 +2588,7 @@ fn poll_device_token(token_endpoint: &str, client_id: &str, device: &Value) -> R
                     .get("error_description")
                     .and_then(Value::as_str)
                     .unwrap_or(other);
+                let detail = redacted_response_body(detail.as_bytes());
                 return Err(anyhow!(
                     "token endpoint failed with status {}: {}",
                     status,
@@ -2028,15 +2647,21 @@ fn write_cloud_token_cache(
 
 fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_secret_parent_dir(parent)?;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if secret_path_is_symlink(path)? {
+            return Err(anyhow!(
+                "refusing to write Cloud auth token through symlinked token file"
+            ));
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
             .mode(0o600)
             .open(path)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -2054,6 +2679,31 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         Ok(())
+    }
+}
+
+fn ensure_secret_parent_dir(parent: &Path) -> Result<()> {
+    fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(parent)?;
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "refusing to write Cloud auth token through symlinked auth directory"
+            ));
+        }
+        fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secret_path_is_symlink(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -2095,7 +2745,10 @@ fn run_update(options: UpdateOptions) -> Result<Value> {
         .version
         .or_else(|| env_trimmed("BUCEPHALUS_VERSION"))
         .unwrap_or_else(|| "latest".to_string());
-    let installer_url = install_script_url(&repo)?;
+    let base_url = options
+        .base_url
+        .or_else(|| env_trimmed("BUCEPHALUS_BASE_URL"));
+    let installer = installer_script_source(&repo, &version, base_url.as_deref())?;
     let mut env = BTreeMap::new();
     env.insert(
         "BUCEPHALUS_INSTALL_DIR".to_string(),
@@ -2110,105 +2763,622 @@ fn run_update(options: UpdateOptions) -> Result<Value> {
     if options.no_modify_path {
         env.insert("BUCEPHALUS_NO_MODIFY_PATH".to_string(), "1".to_string());
     }
-    if let Some(base_url) = options
-        .base_url
-        .or_else(|| env_trimmed("BUCEPHALUS_BASE_URL"))
-    {
+    if let Some(base_url) = base_url {
         env.insert("BUCEPHALUS_BASE_URL".to_string(), base_url);
     }
+    let public_env = public_update_env(&env);
+    let public_installer_url = redact_public_url(&installer.script_url);
+    let public_checksum_url = redact_public_url(&installer.checksum_url);
     let plan = json!({
         "schema_version": "bucephalus_update_v1",
         "ok": true,
         "dry_run": options.dry_run,
-        "installer_url": installer_url,
-        "install_dir": install_dir,
+        "installer_url": public_installer_url,
+        "installer_checksum_url": public_checksum_url,
+        "installer_source": installer.source,
+        "install_ref": public_install_ref(&install_dir),
         "version": version,
         "repo": repo,
         "setup": options.setup,
         "no_modify_path": options.no_modify_path,
-        "env": env
+        "env": public_env
     });
     if options.dry_run {
         return Ok(plan);
     }
 
-    let script = http_download_text(&installer_url)?;
+    let script =
+        download_verified_installer_script(&installer.script_url, &installer.checksum_url)?;
     let tmp_dir = update_temp_dir()?;
     let script_path = tmp_dir.join("install.sh");
-    let result = (|| {
-        fs::write(&script_path, script)?;
+    let mut installer_stdout = None;
+    let mut installer_stderr = None;
+    let install_result = (|| {
+        write_private_update_temp_file(&script_path, script.as_bytes())?;
         let mut command = Command::new("sh");
         command.arg(&script_path);
         for (key, value) in &env {
             command.env(key, value);
         }
-        let status = command.status()?;
-        if !status.success() {
-            return Err(anyhow!("installer failed with status {}", status));
+        let output = command.output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let public_stdout = redact_update_output(&stdout, &install_dir, &env);
+        let public_stderr = redact_update_output(&stderr, &install_dir, &env);
+        if options.capture_output {
+            installer_stdout = Some(public_stdout.clone());
+            installer_stderr = Some(public_stderr.clone());
+        }
+        if !output.status.success() {
+            return Err(anyhow!(
+                "installer failed with status {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                public_stdout,
+                public_stderr
+            ));
         }
         Ok(())
     })();
-    let _ = fs::remove_dir_all(&tmp_dir);
-    result?;
+    let cleanup = cleanup_update_temp_dir(&tmp_dir);
+    if let Err(err) = install_result {
+        if let Some(cleanup_message) = update_cleanup_error_message(&cleanup) {
+            return Err(anyhow!("{err}\n{cleanup_message}"));
+        }
+        return Err(err);
+    }
 
-    Ok(json!({
+    let mut result = json!({
         "schema_version": "bucephalus_update_v1",
         "ok": true,
         "dry_run": false,
-        "installer_url": plan["installer_url"],
-        "install_dir": plan["install_dir"],
+        "installer_url": public_installer_url,
+        "installer_checksum_url": public_checksum_url,
+        "installer_source": plan["installer_source"],
+        "install_ref": plan["install_ref"],
         "version": plan["version"],
         "repo": plan["repo"],
         "setup": plan["setup"],
         "no_modify_path": plan["no_modify_path"],
-        "updated": true
-    }))
+        "updated": true,
+        "cleanup": cleanup
+    });
+    if options.capture_output {
+        result["installer_stdout"] = json!(installer_stdout.unwrap_or_default());
+        result["installer_stderr"] = json!(installer_stderr.unwrap_or_default());
+    }
+    Ok(result)
 }
 
 fn default_update_install_dir() -> Result<PathBuf> {
     let exe = std::env::current_exe()
         .map_err(|err| anyhow!("failed to resolve current executable path: {}", err))?;
-    exe.parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("failed to resolve install directory from {}", exe.display()))
+    exe.parent().map(Path::to_path_buf).ok_or_else(|| {
+        anyhow!(
+            "failed to resolve install directory from {}",
+            public_binary_ref()
+        )
+    })
 }
 
-fn install_script_url(repo: &str) -> Result<String> {
-    let repo = repo.trim().trim_matches('/');
-    if repo.is_empty() || repo.contains("..") || repo.contains('\\') {
-        return Err(anyhow!("invalid BUCEPHALUS_REPO value: {}", repo));
+fn installer_script_source(
+    repo: &str,
+    version: &str,
+    base_url: Option<&str>,
+) -> Result<InstallerScriptSource> {
+    if let Some(base_url) = base_url.map(str::trim).filter(|value| !value.is_empty()) {
+        if base_url.contains('\n') || base_url.contains('\r') {
+            return Err(anyhow!(INVALID_UPDATE_BASE_URL_MESSAGE));
+        }
+        let parsed =
+            reqwest::Url::parse(base_url).with_context(|| INVALID_UPDATE_BASE_URL_MESSAGE)?;
+        if !matches!(parsed.scheme(), "https" | "file") {
+            return Err(anyhow!(INVALID_UPDATE_BASE_URL_MESSAGE));
+        }
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(anyhow!(INVALID_UPDATE_BASE_URL_MESSAGE));
+        }
+        let base = base_url.trim_end_matches('/');
+        return Ok(InstallerScriptSource {
+            script_url: format!("{base}/install.sh"),
+            checksum_url: format!("{base}/install.sh.sha256"),
+            source: "base_url".to_string(),
+        });
     }
-    Ok(format!(
-        "https://raw.githubusercontent.com/{repo}/main/scripts/install.sh"
-    ))
+
+    let repo = repo.trim().trim_matches('/');
+    let repo_parts: Vec<&str> = repo.split('/').collect();
+    if repo_parts.len() != 2
+        || repo_parts.iter().any(|part| {
+            part.is_empty()
+                || part == &"."
+                || part == &".."
+                || !part
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        })
+    {
+        return Err(anyhow!(
+            "invalid BUCEPHALUS_REPO value: expected owner/repo using letters, numbers, '.', '_' or '-'"
+        ));
+    }
+    let version = version.trim();
+    if version.is_empty() {
+        return Err(anyhow!("invalid BUCEPHALUS_VERSION value: empty"));
+    }
+    let script_url = if version == "latest" {
+        format!("https://github.com/{repo}/releases/latest/download/install.sh")
+    } else {
+        let tag = normalize_release_tag(version)?;
+        format!("https://github.com/{repo}/releases/download/{tag}/install.sh")
+    };
+    Ok(InstallerScriptSource {
+        checksum_url: format!("{script_url}.sha256"),
+        script_url,
+        source: "github_release_asset".to_string(),
+    })
+}
+
+fn normalize_release_tag(version: &str) -> Result<String> {
+    let version = version.trim();
+    if version.is_empty() {
+        return Err(anyhow!("invalid BUCEPHALUS_VERSION value: empty"));
+    }
+    if !is_safe_release_tag(version) {
+        return Err(anyhow!(
+            "invalid BUCEPHALUS_VERSION value: expected 'latest' or a release tag using letters, numbers, '.', '_', '-' or '+', without URL delimiters, whitespace, or traversal"
+        ));
+    }
+    Ok(if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{version}")
+    })
+}
+
+fn is_safe_release_tag(version: &str) -> bool {
+    !version.contains("..")
+        && version
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '+'))
+}
+
+fn download_verified_installer_script(script_url: &str, checksum_url: &str) -> Result<String> {
+    let script = http_download_bytes(script_url)?;
+    let checksum_text = http_download_text(checksum_url)?;
+    let expected = parse_single_sha256_record(&checksum_text, "install.sh").with_context(|| {
+        format!(
+            "malformed installer checksum file: {}",
+            redact_public_url(checksum_url)
+        )
+    })?;
+    let actual = sha256_bytes(&script)
+        .strip_prefix("sha256:")
+        .unwrap_or_default()
+        .to_string();
+    if actual != expected {
+        return Err(anyhow!(
+            "installer checksum mismatch for install.sh: expected {}, got {}",
+            expected,
+            actual
+        ));
+    }
+    String::from_utf8(script).context("downloaded installer was not valid UTF-8")
+}
+
+fn public_update_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .map(|(key, value)| {
+            let public_value = if key == "BUCEPHALUS_INSTALL_DIR" {
+                public_install_ref(Path::new(value))
+            } else if key == "BUCEPHALUS_BASE_URL" {
+                redact_public_url(value)
+            } else if let Some(marker) = dispatch_redaction_for_string(value) {
+                marker.to_string()
+            } else {
+                value.clone()
+            };
+            (key.clone(), public_value)
+        })
+        .collect()
+}
+
+fn update_result_to_json(result: &Value) -> Value {
+    let install_dir = result
+        .get("install_dir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let raw_env = result
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
+                .collect::<BTreeMap<String, String>>()
+        })
+        .unwrap_or_default();
+    let env = Value::Object(
+        raw_env
+            .iter()
+            .map(|(key, value)| {
+                let public_value = if key == "BUCEPHALUS_INSTALL_DIR" {
+                    public_install_ref(&install_dir)
+                } else if key == "BUCEPHALUS_BASE_URL" {
+                    redact_public_url(value)
+                } else if let Some(marker) = dispatch_redaction_for_string(value) {
+                    marker.to_string()
+                } else {
+                    value.clone()
+                };
+                (key.clone(), Value::String(public_value))
+            })
+            .collect::<serde_json::Map<String, Value>>(),
+    );
+    let mut public = json!({
+        "schema_version": result.get("schema_version").cloned().unwrap_or_else(|| json!("bucephalus_update_v1")),
+        "ok": result.get("ok").cloned().unwrap_or_else(|| json!(true)),
+        "dry_run": result.get("dry_run").cloned().unwrap_or_else(|| json!(false)),
+        "installer_url": result.get("installer_url").cloned().unwrap_or(Value::Null),
+        "installer_checksum_url": result.get("installer_checksum_url").cloned().unwrap_or(Value::Null),
+        "installer_source": result.get("installer_source").cloned().unwrap_or(Value::Null),
+        "install_ref": public_install_ref(&install_dir),
+        "version": result.get("version").cloned().unwrap_or(Value::Null),
+        "repo": result.get("repo").cloned().unwrap_or(Value::Null),
+        "setup": result.get("setup").cloned().unwrap_or_else(|| json!(false)),
+        "no_modify_path": result.get("no_modify_path").cloned().unwrap_or_else(|| json!(false)),
+        "env": env
+    });
+    if let Some(updated) = result.get("updated") {
+        public["updated"] = updated.clone();
+    }
+    if let Some(cleanup) = result.get("cleanup") {
+        public["cleanup"] = update_cleanup_to_json(cleanup);
+    }
+    if let Some(stdout) = result.get("installer_stdout").and_then(Value::as_str) {
+        public["installer_stdout"] = json!(redact_update_output(stdout, &install_dir, &raw_env));
+    }
+    if let Some(stderr) = result.get("installer_stderr").and_then(Value::as_str) {
+        public["installer_stderr"] = json!(redact_update_output(stderr, &install_dir, &raw_env));
+    }
+    public
+}
+
+fn update_handoff_lines(result: &Value) -> Vec<String> {
+    let public = update_result_to_json(result);
+    let mut lines = vec![
+        format!(
+            "update: {}",
+            if public["dry_run"].as_bool().unwrap_or(false) {
+                "planned"
+            } else {
+                "complete"
+            }
+        ),
+        format!(
+            "version: {}",
+            public["version"].as_str().unwrap_or("unknown")
+        ),
+        format!(
+            "install_ref: {}",
+            public["install_ref"]
+                .as_str()
+                .unwrap_or("[REDACTED:local-path]")
+        ),
+        format!(
+            "installer_source: {}",
+            public["installer_source"].as_str().unwrap_or("unknown")
+        ),
+        format!(
+            "installer_url: {}",
+            public["installer_url"].as_str().unwrap_or("unknown")
+        ),
+        format!(
+            "installer_checksum_url: {}",
+            public["installer_checksum_url"]
+                .as_str()
+                .unwrap_or("unknown")
+        ),
+        format!("setup: {}", public["setup"].as_bool().unwrap_or(false)),
+    ];
+    if let Some(cleanup) = public.get("cleanup") {
+        if let Some(status) = cleanup.get("status").and_then(Value::as_str) {
+            lines.push(format!("cleanup: {status}"));
+        }
+        if let Some(temp_ref) = cleanup.get("temp_ref").and_then(Value::as_str) {
+            lines.push(format!("cleanup_ref: {temp_ref}"));
+        }
+        if let Some(error) = cleanup.get("error").and_then(Value::as_str) {
+            lines.push(format!("cleanup_error: {error}"));
+        }
+    }
+    lines
+}
+
+fn update_cleanup_to_json(cleanup: &Value) -> Value {
+    let mut public = cleanup.clone();
+    let Some(object) = public.as_object_mut() else {
+        return json!({
+            "temp_ref": public_update_temp_ref(),
+            "status": "unknown"
+        });
+    };
+    object.insert("temp_ref".to_string(), json!(public_update_temp_ref()));
+    if let Some(error) = object.get("error").and_then(Value::as_str) {
+        object.insert("error".to_string(), json!(public_error_message(error)));
+    }
+    public
+}
+
+fn redact_update_output(raw: &str, install_dir: &Path, env: &BTreeMap<String, String>) -> String {
+    let install_dir = install_dir.display().to_string();
+    let mut replaced = if install_dir.is_empty() {
+        raw.to_string()
+    } else {
+        raw.replace(&install_dir, "[REDACTED:install-dir]")
+    };
+    for (key, value) in env {
+        if value.is_empty() {
+            continue;
+        }
+        let replacement = if key == "BUCEPHALUS_INSTALL_DIR" {
+            Some("[REDACTED:install-dir]".to_string())
+        } else if key == "BUCEPHALUS_BASE_URL" {
+            Some(redact_public_url(value))
+        } else if let Some(marker) = dispatch_redaction_for_key(key) {
+            Some(marker.to_string())
+        } else {
+            dispatch_redaction_for_string(value).map(str::to_string)
+        };
+        if let Some(replacement) = replacement {
+            if replacement != *value {
+                replaced = replaced.replace(value, &replacement);
+            }
+        }
+    }
+    let mut redacted = replaced
+        .lines()
+        .map(public_error_message)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if replaced.ends_with('\n') {
+        redacted.push('\n');
+    }
+    redacted
+}
+
+fn redact_public_url(url: &str) -> String {
+    if url == "file://[REDACTED:local-path]" {
+        return url.to_string();
+    }
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return dispatch_redaction_for_string(url)
+            .unwrap_or("[REDACTED:url]")
+            .to_string();
+    };
+    if parsed.scheme() == "file" {
+        return "file://[REDACTED:local-path]".to_string();
+    }
+    let redacted = !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some();
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let mut public = parsed.to_string();
+    if redacted {
+        public.push_str(" [redacted URL credentials/query]");
+    }
+    public
 }
 
 fn http_download_text(url: &str) -> Result<String> {
+    String::from_utf8(http_download_bytes(url)?).context("downloaded response was not valid UTF-8")
+}
+
+fn http_download_bytes(url: &str) -> Result<Vec<u8>> {
+    let parsed = reqwest::Url::parse(url)
+        .with_context(|| format!("invalid URL {}", redact_public_url(url)))?;
+    if parsed.scheme() == "file" {
+        let path = parsed
+            .to_file_path()
+            .map_err(|_| anyhow!("invalid file URL {}", redact_public_url(url)))?;
+        return fs::read(&path)
+            .with_context(|| format!("failed to read {}", redact_public_url(url)));
+    }
     let response = http_request(Method::GET, url, None, None)?;
     if !(200..300).contains(&response.status) {
-        let message = String::from_utf8_lossy(&response.body);
+        let message = redacted_response_body(&response.body);
         return Err(anyhow!(
             "download {} failed with status {}: {}",
-            url,
+            redact_public_url(url),
             response.status,
-            message.trim()
+            message
         ));
     }
-    String::from_utf8(response.body).context("downloaded installer was not valid UTF-8")
+    Ok(response.body)
+}
+
+fn parse_single_sha256_record(text: &str, expected_name: &str) -> Result<String> {
+    let mut lines = text.lines();
+    let line = lines
+        .next()
+        .ok_or_else(|| anyhow!("checksum file is empty"))?;
+    if lines.next().is_some() {
+        return Err(anyhow!("checksum file must contain exactly one record"));
+    }
+    let Some((digest, name)) = line.split_once("  ") else {
+        return Err(anyhow!("checksum record must be '<sha256>  <filename>'"));
+    };
+    if name != expected_name {
+        return Err(anyhow!(
+            "checksum record must name {}; found unexpected checksum filename",
+            expected_name
+        ));
+    }
+    if digest.len() != 64 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(anyhow!("checksum digest must be 64 hex characters"));
+    }
+    if !digest
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+    {
+        return Err(anyhow!("checksum digest must be lowercase hex"));
+    }
+    Ok(digest.to_string())
 }
 
 fn update_temp_dir() -> Result<PathBuf> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!(
-        "bucephalus-update-{}-{}",
-        std::process::id(),
-        nanos
-    ));
-    fs::create_dir_all(&path)?;
-    Ok(path)
+    let temp_root = std::env::temp_dir();
+    for attempt in 0..128 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = temp_root.join(format!(
+            "bucephalus-update-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            attempt
+        ));
+        match create_new_private_update_temp_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(anyhow!(
+                    "failed to create update temporary workspace {}: {}",
+                    public_update_temp_ref(),
+                    public_error_message(&err.to_string())
+                ));
+            }
+        }
+    }
+    Err(anyhow!(
+        "failed to create update temporary workspace {}: exhausted unique names",
+        public_update_temp_ref()
+    ))
+}
+
+fn create_new_private_update_temp_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(path)?;
+        if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+            let _ = fs::remove_dir_all(path);
+            return Err(err);
+        }
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
+}
+
+fn create_private_update_temp_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "refusing to use symlinked update temporary directory"
+            ));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn write_private_update_temp_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        create_private_update_temp_dir(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+fn cleanup_update_temp_dir(path: &Path) -> Value {
+    match fs::remove_dir_all(path) {
+        Ok(()) => json!({
+            "temp_ref": public_update_temp_ref(),
+            "status": "removed"
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => json!({
+            "temp_ref": public_update_temp_ref(),
+            "status": "absent"
+        }),
+        Err(err) => json!({
+            "temp_ref": public_update_temp_ref(),
+            "status": "error",
+            "error": public_error_message(&err.to_string()),
+            "action": "Remove the temporary update workspace after checking local permissions."
+        }),
+    }
+}
+
+fn update_cleanup_error_message(cleanup: &Value) -> Option<String> {
+    if cleanup.get("status").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    let temp_ref = cleanup
+        .get("temp_ref")
+        .and_then(Value::as_str)
+        .unwrap_or(public_update_temp_ref());
+    let error = cleanup
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("cleanup failed");
+    Some(format!(
+        "cleanup: error\ncleanup_ref: {temp_ref}\ncleanup_error: {error}"
+    ))
+}
+
+fn public_update_temp_ref() -> &'static str {
+    "update://temp"
+}
+
+fn ensure_private_daemon_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "refusing to use symlinked latch daemon state directory"
+            ));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn install_latch_daemon_service(
@@ -2302,13 +3472,17 @@ fn launchd_latch_daemon_service_status() -> Result<Value> {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false);
+    let config_error =
+        service_config_path_safety_error(&plist_path, "launchd", LATCH_DAEMON_SERVICE_LABEL);
+    let installed = config_error.is_none() && plist_path.is_file();
     Ok(json!({
         "manager": "launchd",
         "label": LATCH_DAEMON_SERVICE_LABEL,
         "path": plist_path,
-        "installed": plist_path.is_file(),
+        "installed": installed,
         "loaded": loaded,
-        "status": if loaded { "loaded" } else if plist_path.is_file() { "installed" } else { "missing" }
+        "status": if config_error.is_some() { "error" } else if loaded { "loaded" } else if installed { "installed" } else { "missing" },
+        "reason": config_error
     }))
 }
 
@@ -2324,9 +3498,7 @@ fn uninstall_launchd_latch_daemon_service(dry_run: bool) -> Result<Value> {
     ]];
     if !dry_run {
         let _ = run_command_status(&commands[0]);
-        if plist_path.exists() {
-            fs::remove_file(&plist_path)?;
-        }
+        remove_service_config_file_if_exists(&plist_path, "launchd", LATCH_DAEMON_SERVICE_LABEL)?;
     }
     Ok(json!({
         "status": if dry_run { "planned" } else { "removed" },
@@ -2369,14 +3541,21 @@ fn systemd_latch_daemon_service_status() -> Result<Value> {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false);
+    let config_error = service_config_path_safety_error(
+        &service_path,
+        "systemd-user",
+        "bucephalus-latchd.service",
+    );
+    let installed = config_error.is_none() && service_path.is_file();
     Ok(json!({
         "manager": "systemd-user",
         "label": "bucephalus-latchd.service",
         "path": service_path,
-        "installed": service_path.is_file(),
+        "installed": installed,
         "loaded": active,
         "enabled": enabled,
-        "status": if active { "loaded" } else if service_path.is_file() { "installed" } else { "missing" }
+        "status": if config_error.is_some() { "error" } else if active { "loaded" } else if installed { "installed" } else { "missing" },
+        "reason": config_error
     }))
 }
 
@@ -2399,9 +3578,11 @@ fn uninstall_systemd_latch_daemon_service(dry_run: bool) -> Result<Value> {
     ];
     if !dry_run {
         let _ = run_command_status(&commands[0]);
-        if service_path.exists() {
-            fs::remove_file(&service_path)?;
-        }
+        remove_service_config_file_if_exists(
+            &service_path,
+            "systemd-user",
+            "bucephalus-latchd.service",
+        )?;
         let _ = run_command_status(&commands[1]);
     }
     Ok(json!({
@@ -2485,9 +3666,13 @@ fn install_launchd_latch_daemon_service(
     ];
 
     if !dry_run {
-        fs::create_dir_all(&launch_agents)?;
-        fs::create_dir_all(&daemon_dir)?;
-        fs::write(&plist_path, plist)?;
+        ensure_private_daemon_dir(&daemon_dir)?;
+        write_service_config_file(
+            &plist_path,
+            "launchd",
+            LATCH_DAEMON_SERVICE_LABEL,
+            plist.as_bytes(),
+        )?;
         if start {
             let _ = run_command_status(&commands[0]);
             run_command_status(&commands[1])?;
@@ -2555,9 +3740,13 @@ WantedBy=default.target
         ],
     ];
     if !dry_run {
-        fs::create_dir_all(&systemd_dir)?;
-        fs::create_dir_all(&daemon_dir)?;
-        fs::write(&service_path, service)?;
+        ensure_private_daemon_dir(&daemon_dir)?;
+        write_service_config_file(
+            &service_path,
+            "systemd-user",
+            service_name,
+            service.as_bytes(),
+        )?;
         if start {
             run_command_status(&commands[0])?;
             run_command_status(&commands[1])?;
@@ -2573,6 +3762,125 @@ WantedBy=default.target
     }))
 }
 
+fn write_service_config_file(path: &Path, manager: &str, label: &str, bytes: &[u8]) -> Result<()> {
+    ensure_service_config_path_is_safe(path, manager, label)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            anyhow!(
+                "failed to create daemon service config directory\n\nconfig_ref: {}\n\nerror: {}",
+                public_service_config_ref(Some(manager), Some(label)),
+                public_error_message(&err.to_string())
+            )
+        })?;
+    }
+    ensure_service_config_path_is_safe(path, manager, label)?;
+    atomic_write_bytes(path, bytes).map_err(|err| {
+        anyhow!(
+            "failed to write daemon service config\n\nconfig_ref: {}\n\nerror: {}",
+            public_service_config_ref(Some(manager), Some(label)),
+            public_error_message(&err.to_string())
+        )
+    })
+}
+
+fn remove_service_config_file_if_exists(path: &Path, manager: &str, label: &str) -> Result<()> {
+    ensure_service_config_path_is_safe(path, manager, label)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => fs::remove_file(path).map_err(|err| {
+            anyhow!(
+                "failed to remove daemon service config\n\nconfig_ref: {}\n\nerror: {}",
+                public_service_config_ref(Some(manager), Some(label)),
+                public_error_message(&err.to_string())
+            )
+        }),
+        Ok(metadata) if metadata.is_dir() => Err(service_config_path_error(
+            manager,
+            label,
+            "refusing to use daemon service config path that is a directory",
+        )),
+        Ok(_) => Err(service_config_path_error(
+            manager,
+            label,
+            "refusing to use daemon service config path that is not a regular file",
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(anyhow!(
+            "failed to inspect daemon service config file\n\nconfig_ref: {}\n\nerror: {}",
+            public_service_config_ref(Some(manager), Some(label)),
+            public_error_message(&err.to_string())
+        )),
+    }
+}
+
+fn service_config_path_safety_error(path: &Path, manager: &str, label: &str) -> Option<String> {
+    ensure_service_config_path_is_safe(path, manager, label)
+        .err()
+        .map(|err| err.to_string())
+}
+
+fn ensure_service_config_path_is_safe(path: &Path, manager: &str, label: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(service_config_path_error(
+                    manager,
+                    label,
+                    "refusing to use symlinked daemon service config directory",
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(service_config_path_error(
+                    manager,
+                    label,
+                    "refusing to use daemon service config parent that is not a directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(anyhow!(
+                    "failed to inspect daemon service config directory\n\nconfig_ref: {}\n\nerror: {}",
+                    public_service_config_ref(Some(manager), Some(label)),
+                    public_error_message(&err.to_string())
+                ));
+            }
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(service_config_path_error(
+            manager,
+            label,
+            "refusing to use symlinked daemon service config file",
+        )),
+        Ok(metadata) if metadata.is_dir() => Err(service_config_path_error(
+            manager,
+            label,
+            "refusing to use daemon service config path that is a directory",
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => {
+            Err(service_config_path_error(
+                manager,
+                label,
+                "refusing to use daemon service config parent that is not a directory",
+            ))
+        }
+        Err(err) => Err(anyhow!(
+            "failed to inspect daemon service config file\n\nconfig_ref: {}\n\nerror: {}",
+            public_service_config_ref(Some(manager), Some(label)),
+            public_error_message(&err.to_string())
+        )),
+    }
+}
+
+fn service_config_path_error(manager: &str, label: &str, reason: &str) -> anyhow::Error {
+    anyhow!(
+        "{reason}\n\nconfig_ref: {}\n\nRemove the blocked daemon service config path, then rerun `bucephalus setup`.",
+        public_service_config_ref(Some(manager), Some(label))
+    )
+}
+
 fn register_mcp_clients(
     exe: &Path,
     requested_clients: Vec<SetupMcpClientArg>,
@@ -2580,11 +3888,7 @@ fn register_mcp_clients(
     dry_run: bool,
 ) -> Result<Value> {
     let clients = resolve_setup_clients(requested_clients, project)?;
-    let server_config = json!({
-        "type": "stdio",
-        "command": exe.display().to_string(),
-        "args": ["mcp"]
-    });
+    let server_config = mcp_server_config(exe);
     let mut results = Vec::new();
     for client in clients {
         results.push(register_mcp_client(
@@ -2595,19 +3899,25 @@ fn register_mcp_clients(
             dry_run,
         )?);
     }
+    let status = mcp_setup_status_from_clients(&results, dry_run);
     Ok(json!({
-        "status": "configured",
+        "status": status,
         "server_name": BUCEPHALUS_MCP_SERVER_NAME,
         "server_config": server_config,
         "clients": results
     }))
 }
 
-fn mcp_registration_status(project: Option<&Path>) -> Value {
-    let server_config = json!({
+fn mcp_server_config(exe: &Path) -> Value {
+    json!({
         "type": "stdio",
+        "command": exe.display().to_string(),
         "args": ["mcp"]
-    });
+    })
+}
+
+fn mcp_registration_status(project: Option<&Path>, exe: &Path) -> Value {
+    let server_config = mcp_server_config(exe);
     let mut clients = Vec::new();
     let claude_code_present = command_exists("claude");
     clients.push(json!({
@@ -2617,21 +3927,32 @@ fn mcp_registration_status(project: Option<&Path>) -> Value {
         "note": "Claude Code registration is managed by the claude CLI; run setup to refresh it."
     }));
     if let Some(path) = claude_desktop_config_path() {
-        clients.push(json!({
-            "client": "claude-desktop",
-            "status": if mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME) { "configured" } else { "missing" },
-            "configured": mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME),
-            "path": path
-        }));
+        clients.push(mcp_json_client_status(
+            "claude-desktop",
+            &path,
+            BUCEPHALUS_MCP_SERVER_NAME,
+            &server_config,
+            "bucephalus setup --client claude-desktop",
+        ));
     }
     if let Some(project) = project {
-        let path = project.join(".cursor").join("mcp.json");
-        clients.push(json!({
-            "client": "cursor-project",
-            "status": if mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME) { "configured" } else { "missing" },
-            "configured": mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME),
-            "path": path
-        }));
+        match cursor_project_mcp_config_path(project) {
+            Ok(path) => clients.push(mcp_json_client_status(
+                "cursor-project",
+                &path,
+                BUCEPHALUS_MCP_SERVER_NAME,
+                &server_config,
+                "bucephalus setup --client cursor-project --project <dir>",
+            )),
+            Err(err) => clients.push(json!({
+                "client": "cursor-project",
+                "status": "error",
+                "configured": false,
+                "reason": err.to_string(),
+                "path": project.join(".cursor").join("mcp.json"),
+                "action": "bucephalus setup --client cursor-project --project <dir>"
+            })),
+        }
     }
     json!({
         "status": "checked",
@@ -2639,6 +3960,95 @@ fn mcp_registration_status(project: Option<&Path>) -> Value {
         "expected_server_config": server_config,
         "clients": clients
     })
+}
+
+fn mcp_json_client_status(
+    client: &str,
+    path: &Path,
+    name: &str,
+    expected_server_config: &Value,
+    refresh_command: &str,
+) -> Value {
+    let mut base = json!({
+        "client": client,
+        "path": path,
+    });
+    let object = base.as_object_mut().expect("object literal");
+    if let Err(err) = ensure_mcp_config_path_is_safe(path, client) {
+        object.insert("status".to_string(), json!("error"));
+        object.insert("configured".to_string(), json!(false));
+        object.insert("reason".to_string(), json!(err.to_string()));
+        object.insert("action".to_string(), json!(refresh_command));
+        return base;
+    }
+
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            object.insert("status".to_string(), json!("missing"));
+            object.insert("configured".to_string(), json!(false));
+            object.insert("action".to_string(), json!(refresh_command));
+            return base;
+        }
+        Err(err) => {
+            object.insert("status".to_string(), json!("error"));
+            object.insert("configured".to_string(), json!(false));
+            object.insert(
+                "reason".to_string(),
+                json!(format!("failed to read MCP config: {err}")),
+            );
+            object.insert("action".to_string(), json!(refresh_command));
+            return base;
+        }
+    };
+    let root = match serde_json::from_str::<Value>(&raw) {
+        Ok(root) => root,
+        Err(err) => {
+            object.insert("status".to_string(), json!("invalid"));
+            object.insert("configured".to_string(), json!(false));
+            object.insert(
+                "reason".to_string(),
+                json!(format!("MCP config is not valid JSON: {err}")),
+            );
+            object.insert("action".to_string(), json!(refresh_command));
+            return base;
+        }
+    };
+    let Some(servers) = root.get("mcpServers") else {
+        object.insert("status".to_string(), json!("missing"));
+        object.insert("configured".to_string(), json!(false));
+        object.insert("action".to_string(), json!(refresh_command));
+        return base;
+    };
+    let Some(servers) = servers.as_object() else {
+        object.insert("status".to_string(), json!("invalid"));
+        object.insert("configured".to_string(), json!(false));
+        object.insert(
+            "reason".to_string(),
+            json!("mcpServers must be a JSON object"),
+        );
+        object.insert("action".to_string(), json!(refresh_command));
+        return base;
+    };
+    let Some(server) = servers.get(name) else {
+        object.insert("status".to_string(), json!("missing"));
+        object.insert("configured".to_string(), json!(false));
+        object.insert("action".to_string(), json!(refresh_command));
+        return base;
+    };
+    if server == expected_server_config {
+        object.insert("status".to_string(), json!("configured"));
+        object.insert("configured".to_string(), json!(true));
+    } else {
+        object.insert("status".to_string(), json!("stale"));
+        object.insert("configured".to_string(), json!(false));
+        object.insert(
+            "reason".to_string(),
+            json!("registered server command differs from the current bucephalus binary"),
+        );
+        object.insert("action".to_string(), json!(refresh_command));
+    }
+    base
 }
 
 fn cloud_api_base_url() -> Option<String> {
@@ -2663,7 +4073,7 @@ fn cloud_bearer_token() -> Result<Option<String>> {
         if cloud_token_cache_needs_refresh(&cache) {
             return refresh_cloud_token_cache(&paths, &cache)
                 .map(Some)
-                .context("failed to refresh cached Cloud OAuth token");
+                .map_err(cached_cloud_auth_refresh_error);
         } else {
             if let Some(token) = cache.get("access_token").and_then(Value::as_str) {
                 return Ok(Some(token.to_string()));
@@ -2674,6 +4084,19 @@ fn cloud_bearer_token() -> Result<Option<String>> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty()))
+}
+
+fn cached_cloud_auth_refresh_error(err: anyhow::Error) -> anyhow::Error {
+    let error = public_error_message(&format!("{err:#}"));
+    anyhow!(
+        "cached Cloud OAuth token could not be refreshed\n\n\
+         auth_ref: auth://current\n\
+         cache_ref: auth://token-cache\n\
+         error: {error}\n\n\
+         Next steps:\n\
+           bucephalus login\n\
+           bucephalus logout"
+    )
 }
 
 fn read_cloud_token_cache(paths: &CloudTokenPaths) -> Option<Value> {
@@ -2714,15 +4137,20 @@ fn refresh_cloud_token_cache(paths: &CloudTokenPaths, cache: &Value) -> Result<S
         .post(token_endpoint)
         .form(&form)
         .send()
-        .with_context(|| format!("failed to refresh Cloud token at {}", token_endpoint))?;
+        .map_err(|_| {
+            anyhow!(
+                "failed to refresh Cloud token at {}: transport error",
+                redact_public_url(token_endpoint)
+            )
+        })?;
     let status = response.status().as_u16();
     let bytes = response.bytes()?.to_vec();
     if !(200..300).contains(&status) {
-        let message = String::from_utf8_lossy(&bytes);
+        let message = redacted_response_body(&bytes);
         return Err(anyhow!(
             "Cloud token refresh failed with status {}: {}",
             status,
-            message.trim()
+            message
         ));
     }
     let token: Value = serde_json::from_slice(&bytes)?;
@@ -2768,12 +4196,12 @@ fn cloud_json_post(path: &str, body: &Value) -> Result<Value> {
     let bytes = serde_json::to_vec(body)?;
     let response = http_request(Method::POST, &url, Some(bytes), cloud_bearer_token()?)?;
     if !(200..300).contains(&response.status) {
-        let message = String::from_utf8_lossy(&response.body);
+        let message = redacted_response_body(&response.body);
         return Err(anyhow!(
             "Cloud request {} failed with status {}: {}",
             path,
             response.status,
-            message.trim()
+            message
         ));
     }
     Ok(serde_json::from_slice(&response.body)?)
@@ -2795,12 +4223,12 @@ fn cloud_bytes_put(path: &str, bytes: Vec<u8>, media_type: &str) -> Result<Value
         Some(media_type),
     )?;
     if !(200..300).contains(&response.status) {
-        let message = String::from_utf8_lossy(&response.body);
+        let message = redacted_response_body(&response.body);
         return Err(anyhow!(
             "Cloud upload {} failed with status {}: {}",
             path,
             response.status,
-            message.trim()
+            message
         ));
     }
     Ok(serde_json::from_slice(&response.body)?)
@@ -2811,7 +4239,7 @@ fn http_download(url: &str) -> Result<Vec<u8>> {
     if !(200..300).contains(&response.status) {
         return Err(anyhow!(
             "download {} failed with status {}",
-            url,
+            redact_public_url(url),
             response.status
         ));
     }
@@ -2861,11 +4289,12 @@ fn http_request_with_content_type(
     bearer: Option<String>,
     content_type: Option<&str>,
 ) -> Result<HttpResponseBody> {
-    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL {}", url))?;
+    let parsed = reqwest::Url::parse(url)
+        .with_context(|| format!("invalid URL {}", redact_public_url(url)))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(anyhow!(
             "unsupported URL scheme for {}; expected http:// or https://",
-            url
+            redact_public_url(url)
         ));
     }
     let client = reqwest::blocking::Client::new();
@@ -2884,13 +4313,16 @@ fn http_request_with_content_type(
         }
         request = request.body(body);
     }
-    let response = request
-        .send()
-        .with_context(|| format!("failed to send request to {}", url))?;
+    let response = request.send().map_err(|_| {
+        anyhow!(
+            "failed to send request to {}: transport error",
+            redact_public_url(url)
+        )
+    })?;
     let status = response.status().as_u16();
     let body = response
         .bytes()
-        .with_context(|| format!("failed to read response from {}", url))?
+        .with_context(|| format!("failed to read response from {}", redact_public_url(url)))?
         .to_vec();
     Ok(HttpResponseBody { status, body })
 }
@@ -2901,6 +4333,52 @@ fn dispatch_root() -> Result<PathBuf> {
 
 fn dispatch_dir(dispatch_id: &str) -> Result<PathBuf> {
     Ok(dispatch_root()?.join(sanitize_local_id(dispatch_id)?))
+}
+
+struct PendingDispatchDir {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl PendingDispatchDir {
+    fn create(dispatch_id: &str, path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                anyhow!(
+                    "failed to prepare dispatch workspace root for {}: {}",
+                    public_dispatch_ref(dispatch_id),
+                    err
+                )
+            })?;
+        }
+        fs::create_dir(&path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow!(
+                    "dispatch workspace already exists: {}",
+                    public_dispatch_ref(dispatch_id)
+                )
+            } else {
+                anyhow!(
+                    "failed to create dispatch workspace {}: {}",
+                    public_dispatch_ref(dispatch_id),
+                    err
+                )
+            }
+        })?;
+        Ok(Self { path, keep: false })
+    }
+
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for PendingDispatchDir {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 fn sanitize_local_id(value: &str) -> Result<String> {
@@ -2921,42 +4399,170 @@ fn dispatch_record_path(dispatch_id: &str) -> Result<PathBuf> {
     Ok(dispatch_dir(dispatch_id)?.join("dispatch.json"))
 }
 
-fn write_dispatch_record(record: &Value) -> Result<()> {
-    let path = record
-        .get("record_path")
+fn dispatch_id_from_record(record: &Value) -> Result<String> {
+    let dispatch_id = record
+        .get("dispatch_id")
         .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("dispatch record missing record_path"))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(record)?)?;
+        .ok_or_else(|| anyhow!("dispatch record is missing dispatch_id"))?;
+    sanitize_local_id(dispatch_id).map_err(|_| anyhow!("dispatch record has invalid dispatch_id"))
+}
+
+fn normalize_dispatch_record_paths(record: &mut Value) -> Result<()> {
+    let dispatch_id = dispatch_id_from_record(record)?;
+    let dir = dispatch_dir(&dispatch_id)?;
+    let object = record
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("dispatch record must be a JSON object"))?;
+    object.insert("record_path".to_string(), json!(dir.join("dispatch.json")));
+    let paths = object
+        .entry("paths".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("dispatch record paths must be a JSON object"))?;
+    paths.insert("dispatch_dir".to_string(), json!(dir.clone()));
+    paths.insert("live_view".to_string(), json!(dir.join("live.html")));
+    paths.insert(
+        "resolution".to_string(),
+        json!(dir.join("resolution").join("resolution.json")),
+    );
+    paths.insert(
+        "manifest".to_string(),
+        json!(dir.join("resolution").join("manifest.json")),
+    );
+    paths.insert("run_root".to_string(), json!(dir.join("runs")));
     Ok(())
+}
+
+fn write_dispatch_record(record: &Value) -> Result<()> {
+    let mut record = record.clone();
+    normalize_dispatch_record_paths(&mut record)?;
+    let dispatch_id = dispatch_id_from_record(&record)?;
+    let path = dispatch_record_path(&dispatch_id)?;
+    atomic_write_json_pretty(&path, &record)
 }
 
 fn read_dispatch_record(dispatch_id: &str) -> Result<Value> {
     let path = dispatch_record_path(dispatch_id)?;
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("failed to read dispatch record {}", path.display()))?;
-    Ok(serde_json::from_str(&raw)?)
+    let mut record: Value = serde_json::from_str(&raw)?;
+    match record.get("dispatch_id").and_then(Value::as_str) {
+        Some(id) if id == dispatch_id => {}
+        Some(_) => {
+            return Err(anyhow!(
+                "dispatch record is corrupt: dispatch_id does not match requested dispatch\n\ndispatch_ref: {}",
+                public_dispatch_ref(dispatch_id)
+            ));
+        }
+        None => {
+            let object = record
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("dispatch record must be a JSON object"))?;
+            object.insert(
+                "dispatch_id".to_string(),
+                Value::String(dispatch_id.to_string()),
+            );
+        }
+    }
+    normalize_dispatch_record_paths(&mut record)?;
+    Ok(record)
 }
 
 fn public_dispatch_record(record: &Value) -> Value {
+    let dispatch_id = record
+        .get("dispatch_id")
+        .and_then(Value::as_str)
+        .unwrap_or("current")
+        .to_string();
+    let dispatch_dir = record
+        .pointer("/paths/dispatch_dir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
     let mut public = record.clone();
     if let Some(object) = public.as_object_mut() {
+        object.insert(
+            "dispatch_id".to_string(),
+            json!(public_dispatch_id(&dispatch_id)),
+        );
+        object.insert(
+            "dispatch_ref".to_string(),
+            json!(public_dispatch_ref(&dispatch_id)),
+        );
         object.remove("internal");
         object.remove("record_path");
         if let Some(paths) = object.get_mut("paths").and_then(Value::as_object_mut) {
+            replace_dispatch_path_field(
+                paths,
+                dispatch_dir.as_deref(),
+                &dispatch_id,
+                "live_view",
+                "live_view_ref",
+            );
+            replace_dispatch_path_field(
+                paths,
+                dispatch_dir.as_deref(),
+                &dispatch_id,
+                "manifest",
+                "manifest_ref",
+            );
+            replace_dispatch_path_field(
+                paths,
+                dispatch_dir.as_deref(),
+                &dispatch_id,
+                "resolution",
+                "resolution_ref",
+            );
+            replace_dispatch_path_field(
+                paths,
+                dispatch_dir.as_deref(),
+                &dispatch_id,
+                "run_root",
+                "run_root_ref",
+            );
+            paths.insert(
+                "dispatch_ref".to_string(),
+                json!(public_dispatch_ref(&dispatch_id)),
+            );
             paths.remove("dispatch_dir");
-            paths.remove("manifest");
-            paths.remove("resolution");
-            paths.remove("run_root");
         }
         if let Some(summary) = object.get_mut("summary").and_then(Value::as_object_mut) {
-            summary.remove("run_dir");
+            if let Some(run_dir) = summary.remove("run_dir").and_then(|value| {
+                value
+                    .as_str()
+                    .filter(|path| !path.trim().is_empty())
+                    .map(PathBuf::from)
+            }) {
+                summary.insert("run_ref".to_string(), json!(public_run_ref(&run_dir)));
+            } else if let Some(run_id) = summary.get("run_id").and_then(Value::as_str) {
+                if !run_id.trim().is_empty() {
+                    summary.insert("run_ref".to_string(), json!(format!("run://{run_id}")));
+                }
+            }
         }
     }
+    redact_setup_public_json(&mut public);
     public
+}
+
+fn replace_dispatch_path_field(
+    object: &mut serde_json::Map<String, Value>,
+    dispatch_dir: Option<&Path>,
+    dispatch_id: &str,
+    path_key: &str,
+    ref_key: &str,
+) {
+    let Some(path) = object.remove(path_key).and_then(|value| {
+        value
+            .as_str()
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+    }) else {
+        return;
+    };
+    object.insert(
+        ref_key.to_string(),
+        json!(public_dispatch_path_ref(dispatch_dir, dispatch_id, &path)),
+    );
 }
 
 fn dispatch_status_from_daemon_status(daemon_status: &str) -> &'static str {
@@ -2970,7 +4576,15 @@ fn dispatch_status_from_daemon_status(daemon_status: &str) -> &'static str {
 }
 
 fn refresh_dispatch(dispatch_id: &str) -> Result<Value> {
-    let mut record = read_dispatch_record(dispatch_id)?;
+    let mut record = match read_dispatch_record(dispatch_id) {
+        Ok(record) => record,
+        Err(err) if err.to_string().contains("dispatch record is corrupt") => return Err(err),
+        Err(_) => {
+            return Err(anyhow::Error::from(GuidedError::dispatch_not_found(
+                dispatch_id,
+            )))
+        }
+    };
     let job_id = record
         .pointer("/internal/job_id")
         .and_then(Value::as_str)
@@ -3049,7 +4663,10 @@ fn refresh_dispatch(dispatch_id: &str) -> Result<Value> {
             }),
         );
         if let Some(internal) = object.get_mut("internal").and_then(Value::as_object_mut) {
-            internal.insert("last_daemon_status".to_string(), daemon);
+            internal.insert(
+                "last_daemon_status".to_string(),
+                redacted_dispatch_value(&daemon),
+            );
         }
     }
     write_dispatch_live_view(&record)?;
@@ -3121,7 +4738,7 @@ fn dispatch_submission_lifecycle(
         Ok(submission) => submission,
         Err(err) => json!({
             "status": "failed",
-            "reason": err.to_string(),
+            "reason": public_error_message(&err.to_string()),
             "source": "cloud_upload",
             "failed_at": Utc::now().to_rfc3339()
         }),
@@ -3130,12 +4747,9 @@ fn dispatch_submission_lifecycle(
 
 fn submit_dispatch_result(record: &mut Value, daemon: &Value) -> Result<Value> {
     let archive = create_dispatch_submission_archive(record, daemon)?;
-    let bytes = fs::read(&archive.path).with_context(|| {
-        format!(
-            "failed to read dispatch submission archive {}",
-            archive.path.display()
-        )
-    })?;
+    let archive_ref = public_dispatch_submission_archive_ref(&archive.dispatch_id);
+    let bytes = fs::read(&archive.path)
+        .with_context(|| format!("failed to read dispatch submission archive {archive_ref}"))?;
     let expected_digest = sha256_bytes(bytes.as_slice());
     let filename = format!("{}-latch-result.tgz", archive.dispatch_id);
     let upload = cloud_json_post(
@@ -3247,16 +4861,36 @@ fn register_latch_submission(
             "summary": summary,
             "lifecycle": lifecycle,
             "grading": grading,
-            "result": daemon.get("result").cloned().unwrap_or_else(|| json!({}))
+            "result": dispatch_result_for_cloud_submission(daemon)
         }),
     )
+}
+
+fn dispatch_result_for_cloud_submission(daemon: &Value) -> Value {
+    daemon
+        .get("result")
+        .map(redacted_dispatch_value)
+        .unwrap_or_else(|| json!({}))
 }
 
 fn dispatch_resolution_for_submission(record: &Value) -> Result<Value> {
     let Some(path) = record.pointer("/paths/resolution").and_then(Value::as_str) else {
         return Ok(json!({}));
     };
-    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let path = PathBuf::from(path);
+    let dispatch_id = record
+        .get("dispatch_id")
+        .and_then(Value::as_str)
+        .unwrap_or("current");
+    let dispatch_dir = record
+        .pointer("/paths/dispatch_dir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let resolution_ref = public_dispatch_path_ref(dispatch_dir.as_deref(), dispatch_id, &path);
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read dispatch resolution {resolution_ref}"))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse dispatch resolution {resolution_ref}"))?;
     Ok(value)
 }
 
@@ -3264,6 +4898,12 @@ struct DispatchSubmissionArchive {
     dispatch_id: String,
     path: PathBuf,
     byte_size: u64,
+}
+
+#[derive(Default)]
+struct DispatchSubmissionArchiveReport {
+    included: Vec<Value>,
+    skipped: Vec<Value>,
 }
 
 fn create_dispatch_submission_archive(
@@ -3282,30 +4922,72 @@ fn create_dispatch_submission_archive(
         .ok_or_else(|| anyhow!("dispatch record is missing paths.dispatch_dir"))?;
     let run_dir = dispatch_result_run_dir(record, daemon)?;
     let submission_dir = dispatch_dir.join("submission");
-    fs::create_dir_all(&submission_dir)?;
-    let metadata_path = submission_dir.join("metadata.json");
-    fs::write(
-        &metadata_path,
-        serde_json::to_vec_pretty(&json!({
+    let archive_path = submission_dir.join("latch_result.tgz");
+    let archive_ref = public_dispatch_submission_archive_ref(&dispatch_id);
+    let file = create_dispatch_submission_archive_file(&archive_path, &archive_ref)?;
+    let encoder = GzEncoder::new(file, Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    let mut report = DispatchSubmissionArchiveReport::default();
+    append_dispatch_json_value(
+        &mut archive,
+        &mut report,
+        "metadata.json",
+        &json!({
             "schema_version": "latch_dispatch_submission_v1",
             "dispatch": public_dispatch_record(record),
             "daemon": daemon,
             "created_at": Utc::now().to_rfc3339()
-        }))?,
+        }),
     )?;
-    let archive_path = submission_dir.join("latch_result.tgz");
-    let file = fs::File::create(&archive_path)
-        .with_context(|| format!("failed to create {}", archive_path.display()))?;
-    let encoder = GzEncoder::new(file, Compression::default());
-    let mut archive = tar::Builder::new(encoder);
-    archive.append_path_with_name(&metadata_path, "metadata.json")?;
     if let Some(manifest) = record.pointer("/paths/manifest").and_then(Value::as_str) {
-        append_existing_path(&mut archive, Path::new(manifest), "manifest.json")?;
+        append_dispatch_json_file(
+            &mut archive,
+            &mut report,
+            Path::new(manifest),
+            "manifest.json",
+        )?;
     }
     if let Some(resolution) = record.pointer("/paths/resolution").and_then(Value::as_str) {
-        append_existing_path(&mut archive, Path::new(resolution), "resolution.json")?;
+        append_dispatch_json_file(
+            &mut archive,
+            &mut report,
+            Path::new(resolution),
+            "resolution.json",
+        )?;
     }
-    archive.append_dir_all("run", &run_dir)?;
+    append_latch_run_submission_evidence(&mut archive, &mut report, &run_dir)?;
+    let manifest = json!({
+        "schema_version": "latch_dispatch_submission_manifest_v1",
+        "policy": {
+            "mode": "curated_latch_result_upload",
+            "includes": [
+                "dispatch metadata with local paths and secrets redacted",
+                "resolution and latch manifests with local paths and secrets redacted",
+                "latch result summaries with local paths and secrets redacted",
+                "declared result JSON and candidate patches as submission evidence"
+            ],
+            "excludes": [
+                "raw stdout/stderr logs",
+                "full workspaces",
+                "runtime state, temp files, event streams, and materialization logs",
+                "trial input prompts and agent-visible materialized inputs"
+            ],
+            "redacts": [
+                "secret-looking keys and values",
+                "environment-like keys",
+                "local path fields and local path strings",
+                "local launch command and argv fields"
+            ]
+        },
+        "included": report.included,
+        "skipped": report.skipped,
+    });
+    append_dispatch_bytes(
+        &mut archive,
+        "submission-manifest.json",
+        &serde_json::to_vec_pretty(&manifest)?,
+        0o644,
+    )?;
     archive.finish()?;
     let encoder = archive.into_inner()?;
     encoder.finish()?;
@@ -3317,15 +4999,405 @@ fn create_dispatch_submission_archive(
     })
 }
 
-fn append_existing_path(
+fn create_dispatch_submission_archive_file(path: &Path, archive_ref: &str) -> Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        ensure_dispatch_submission_archive_dir(parent, archive_ref)?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "refusing to create dispatch submission archive through symlinked file\n\narchive_ref: {archive_ref}"
+        )),
+        Ok(metadata) if metadata.is_dir() => Err(anyhow!(
+            "refusing to create dispatch submission archive over a directory\n\narchive_ref: {archive_ref}"
+        )),
+        Ok(_) => fs::File::create(path)
+            .with_context(|| format!("failed to create dispatch submission archive {archive_ref}")),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::File::create(path)
+            .with_context(|| format!("failed to create dispatch submission archive {archive_ref}")),
+        Err(err) => Err(anyhow!(
+            "failed to inspect dispatch submission archive\n\narchive_ref: {archive_ref}\n\nerror: {err}"
+        )),
+    }
+}
+
+fn ensure_dispatch_submission_archive_dir(path: &Path, archive_ref: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "refusing to create dispatch submission archive through symlinked directory\n\narchive_ref: {archive_ref}"
+        )),
+        Ok(metadata) if !metadata.is_dir() => Err(anyhow!(
+            "refusing to create dispatch submission archive because parent is not a directory\n\narchive_ref: {archive_ref}"
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                ensure_dispatch_submission_archive_dir(parent, archive_ref)?;
+            }
+            fs::create_dir(path).with_context(|| {
+                format!(
+                    "failed to create dispatch submission archive directory\n\narchive_ref: {archive_ref}"
+                )
+            })?;
+            Ok(())
+        }
+        Err(err) => Err(anyhow!(
+            "failed to inspect dispatch submission archive directory\n\narchive_ref: {archive_ref}\n\nerror: {err}"
+        )),
+    }
+}
+
+fn skip_dispatch_submission_entry(
+    report: &mut DispatchSubmissionArchiveReport,
+    archive_name: &str,
+    reason: &str,
+) {
+    report.skipped.push(json!({
+        "path": archive_name,
+        "reason": reason
+    }));
+}
+
+fn append_latch_run_submission_evidence(
     archive: &mut tar::Builder<GzEncoder<fs::File>>,
-    path: &Path,
-    name: &str,
+    report: &mut DispatchSubmissionArchiveReport,
+    run_dir: &Path,
 ) -> Result<()> {
-    if path.exists() {
-        archive.append_path_with_name(path, name)?;
+    append_dispatch_json_file(
+        archive,
+        report,
+        &run_dir.join("latch_manifest.json"),
+        "run/latch_manifest.json",
+    )?;
+    append_dispatch_json_file(
+        archive,
+        report,
+        &run_dir.join("latch_result.json"),
+        "run/latch_result.json",
+    )?;
+    let cases_dir = run_dir.join("cases");
+    match fs::symlink_metadata(&cases_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            skip_dispatch_submission_entry(report, "run/cases", "symlinked_directory_excluded");
+            return Ok(());
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            skip_dispatch_submission_entry(report, "run/cases", "non_directory");
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(anyhow!(
+                "failed to inspect latch case evidence directory {}: {}",
+                public_run_path_ref(run_dir, &cases_dir),
+                err
+            ));
+        }
+    }
+    let cases_ref = public_run_path_ref(run_dir, &cases_dir);
+    let mut cases = fs::read_dir(&cases_dir)
+        .with_context(|| format!("failed to read latch case evidence directory {cases_ref}"))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    cases.sort_by_key(|entry| entry.file_name());
+    for entry in cases {
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let case_name = safe_archive_component(&entry.file_name().to_string_lossy())?;
+        let case_dir = entry.path();
+        let case_prefix = format!("run/cases/{case_name}");
+        append_dispatch_json_file(
+            archive,
+            report,
+            &case_dir.join("case_manifest.json"),
+            &format!("{case_prefix}/case_manifest.json"),
+        )?;
+        append_dispatch_json_file(
+            archive,
+            report,
+            &case_dir.join("case_result.json"),
+            &format!("{case_prefix}/case_result.json"),
+        )?;
+        append_dispatch_json_file(
+            archive,
+            report,
+            &case_dir.join("out").join("result.json"),
+            &format!("{case_prefix}/out/result.json"),
+        )?;
+        append_dispatch_json_file(
+            archive,
+            report,
+            &case_dir.join("out").join("grader_output.json"),
+            &format!("{case_prefix}/out/grader_output.json"),
+        )?;
+        append_dispatch_text_file(
+            archive,
+            report,
+            &case_dir.join("out").join("candidate.patch"),
+            &format!("{case_prefix}/out/candidate.patch"),
+        )?;
+        for (relative, reason) in [
+            ("workspace", "full_workspace_excluded"),
+            ("in", "agent_input_excluded"),
+            ("events", "event_stream_excluded"),
+            ("runner", "runtime_state_excluded"),
+            ("tmp", "runtime_state_excluded"),
+            ("out/stdout.log", "raw_log_excluded"),
+            ("out/stderr.log", "raw_log_excluded"),
+            ("out/grader_stdout.log", "raw_log_excluded"),
+            ("out/grader_stderr.log", "raw_log_excluded"),
+        ] {
+            if case_dir.join(relative).exists() {
+                report.skipped.push(json!({
+                    "path": format!("{case_prefix}/{relative}"),
+                    "reason": reason
+                }));
+            }
+        }
     }
     Ok(())
+}
+
+fn append_dispatch_json_file(
+    archive: &mut tar::Builder<GzEncoder<fs::File>>,
+    report: &mut DispatchSubmissionArchiveReport,
+    path: &Path,
+    archive_name: &str,
+) -> Result<()> {
+    let evidence_ref = public_dispatch_submission_entry_ref(archive_name);
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            skip_dispatch_submission_entry(report, archive_name, "symlinked_file_excluded");
+            return Ok(());
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            skip_dispatch_submission_entry(report, archive_name, "non_regular_file");
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(anyhow!(
+                "failed to inspect dispatch submission evidence {evidence_ref}: {err}"
+            ));
+        }
+    }
+    let data = fs::read(path)
+        .with_context(|| format!("failed to read dispatch submission evidence {evidence_ref}"))?;
+    let mut value: Value = serde_json::from_slice(&data)
+        .with_context(|| format!("failed to parse dispatch submission evidence {evidence_ref}"))?;
+    let redacted_fields = redact_dispatch_submission_json(&mut value);
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    append_dispatch_bytes(archive, archive_name, &bytes, 0o644)?;
+    report.included.push(json!({
+        "path": archive_name,
+        "kind": "json",
+        "redacted_fields": redacted_fields
+    }));
+    Ok(())
+}
+
+fn append_dispatch_json_value(
+    archive: &mut tar::Builder<GzEncoder<fs::File>>,
+    report: &mut DispatchSubmissionArchiveReport,
+    archive_name: &str,
+    value: &Value,
+) -> Result<()> {
+    let mut value = value.clone();
+    let redacted_fields = redact_dispatch_submission_json(&mut value);
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    append_dispatch_bytes(archive, archive_name, &bytes, 0o644)?;
+    report.included.push(json!({
+        "path": archive_name,
+        "kind": "json",
+        "redacted_fields": redacted_fields
+    }));
+    Ok(())
+}
+
+fn redacted_dispatch_value(value: &Value) -> Value {
+    let mut redacted = value.clone();
+    redact_dispatch_submission_json(&mut redacted);
+    redacted
+}
+
+fn append_dispatch_text_file(
+    archive: &mut tar::Builder<GzEncoder<fs::File>>,
+    report: &mut DispatchSubmissionArchiveReport,
+    path: &Path,
+    archive_name: &str,
+) -> Result<()> {
+    let evidence_ref = public_dispatch_submission_entry_ref(archive_name);
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            skip_dispatch_submission_entry(report, archive_name, "symlinked_file_excluded");
+            return Ok(());
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            skip_dispatch_submission_entry(report, archive_name, "non_regular_file");
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(anyhow!(
+                "failed to inspect dispatch submission evidence {evidence_ref}: {err}"
+            ));
+        }
+    }
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read dispatch submission evidence {evidence_ref}"))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let (redacted, redacted_fields) = redact_dispatch_submission_text(&text);
+    append_dispatch_bytes(archive, archive_name, redacted.as_bytes(), 0o644)?;
+    report.included.push(json!({
+        "path": archive_name,
+        "kind": "text",
+        "redacted_fields": redacted_fields
+    }));
+    Ok(())
+}
+
+fn redact_dispatch_submission_text(text: &str) -> (String, usize) {
+    let mut redacted_fields = 0usize;
+    let mut redacted = text
+        .lines()
+        .map(|line| {
+            let public = redact_public_error_line(line);
+            if public != line {
+                redacted_fields += 1;
+            }
+            public
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.ends_with('\n') {
+        redacted.push('\n');
+    }
+    (redacted, redacted_fields)
+}
+
+fn append_dispatch_bytes(
+    archive: &mut tar::Builder<GzEncoder<fs::File>>,
+    archive_name: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(mode);
+    header.set_cksum();
+    archive.append_data(&mut header, Path::new(archive_name), Cursor::new(bytes))?;
+    Ok(())
+}
+
+fn safe_archive_component(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains('\0')
+    {
+        return Err(anyhow!("unsafe archive path component: {}", value));
+    }
+    Ok(value.to_string())
+}
+
+fn redact_dispatch_submission_json(value: &mut Value) -> usize {
+    match value {
+        Value::Object(map) => {
+            let mut count = 0;
+            for (key, child) in map.iter_mut() {
+                if let Some(marker) = dispatch_redaction_for_key(key) {
+                    *child = Value::String(marker.to_string());
+                    count += 1;
+                } else {
+                    count += redact_dispatch_submission_json(child);
+                }
+            }
+            count
+        }
+        Value::Array(values) => values.iter_mut().map(redact_dispatch_submission_json).sum(),
+        Value::String(text) => {
+            if let Some(marker) = dispatch_redaction_for_string(text) {
+                *value = Value::String(marker.to_string());
+                1
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn dispatch_redaction_for_key(key: &str) -> Option<&'static str> {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    if normalized == "env" || normalized.ends_with("env") || normalized.contains("environment") {
+        return Some("[REDACTED:environment]");
+    }
+    if normalized == "argv"
+        || normalized == "args"
+        || normalized.ends_with("command")
+        || normalized.contains("launch")
+    {
+        return Some("[REDACTED:local-command]");
+    }
+    if normalized == "path"
+        || normalized.ends_with("path")
+        || normalized.ends_with("dir")
+        || normalized.contains("workspace")
+        || normalized.contains("workdir")
+        || normalized.contains("mount")
+    {
+        return Some("[REDACTED:local-path]");
+    }
+    const SECRET_FRAGMENTS: &[&str] = &[
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "apikey",
+        "authorization",
+        "bearer",
+        "privatekey",
+        "clientsecret",
+        "cookie",
+        "session",
+        "refresh",
+    ];
+    if normalized == "auth"
+        || normalized.ends_with("auth")
+        || SECRET_FRAGMENTS
+            .iter()
+            .any(|fragment| normalized.contains(fragment))
+    {
+        return Some("[REDACTED:secret]");
+    }
+    None
+}
+
+fn dispatch_redaction_for_string(text: &str) -> Option<&'static str> {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("file://") || earliest_local_path_start(trimmed).is_some() {
+        return Some("[REDACTED:local-path]");
+    }
+    if lower.contains("authorization:")
+        || lower.contains("bearer ")
+        || lower.contains("api_key=")
+        || lower.contains("apikey=")
+        || lower.contains("token=")
+        || lower.contains("password=")
+        || trimmed.starts_with("sk-")
+    {
+        return Some("[REDACTED:secret-like]");
+    }
+    None
 }
 
 fn dispatch_result_run_dir(record: &Value, daemon: &Value) -> Result<PathBuf> {
@@ -3346,9 +5418,18 @@ fn dispatch_result_run_dir(record: &Value, daemon: &Value) -> Result<PathBuf> {
             return Ok(path);
         }
     }
+    let dispatch_id = record
+        .get("dispatch_id")
+        .and_then(Value::as_str)
+        .unwrap_or("current");
+    let dispatch_dir = record
+        .pointer("/paths/dispatch_dir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let run_root_ref = public_dispatch_path_ref(dispatch_dir.as_deref(), dispatch_id, &run_root);
     let mut candidates = Vec::new();
     for entry in fs::read_dir(&run_root)
-        .with_context(|| format!("failed to read run root {}", run_root.display()))?
+        .with_context(|| format!("failed to read dispatch run root {run_root_ref}"))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -3475,6 +5556,25 @@ fn latest_latch_result(run_root: &Path) -> Result<Option<Value>> {
     Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
 }
 
+/// Block a remote dispatch up front when the user is not signed in, so the agent
+/// gets `cloud_auth_required` with a login action instead of a raw 401 deep in
+/// resolution. Local smoke fixtures never need auth and pass through. When the
+/// Cloud API URL is not configured this stays silent and lets the existing
+/// configuration error surface — `bucephalus login` would not fix that case.
+fn require_cloud_auth_for_benchmark(benchmark: &str) -> Result<()> {
+    if normalize_latch_smoke_benchmark(benchmark).is_ok() || cloud_api_base_url().is_none() {
+        return Ok(());
+    }
+    let Ok(home) = lab_runner::bucephalus_home() else {
+        return Ok(());
+    };
+    let auth = auth_status(&home);
+    if auth.get("status").and_then(Value::as_str) == Some("ready") {
+        return Ok(());
+    }
+    Err(GuidedError::cloud_auth_required(benchmark, auth).into())
+}
+
 fn resolve_dispatch_benchmark(
     out: &Path,
     benchmark: &str,
@@ -3514,31 +5614,50 @@ fn materialize_cloud_latch_resolution(
     argv: Vec<String>,
     response: Value,
 ) -> Result<Value> {
-    fs::create_dir_all(out)?;
-    let resolution_path = out.join("resolution.json");
-    fs::write(&resolution_path, serde_json::to_vec_pretty(&response)?)?;
-    let mut manifest = response
-        .get("manifest")
-        .or_else(|| response.get("latch_manifest"))
-        .cloned()
-        .ok_or_else(|| anyhow!("Cloud latch resolution did not include manifest"))?;
-    if manifest.get("schema_version").and_then(Value::as_str)
-        != Some(lab_runner::LATCH_MANIFEST_SCHEMA)
-    {
-        return Err(anyhow!(
-            "Cloud latch resolution manifest must use schema_version {}",
-            lab_runner::LATCH_MANIFEST_SCHEMA
-        ));
+    ensure_latch_resolution_output_ready(out)?;
+    let staging_dir = latch_resolution_temp_out_path(out);
+    create_private_latch_resolution_stage(&staging_dir)?;
+    let build_result = (|| -> Result<(Value, usize)> {
+        let mut manifest = response
+            .get("manifest")
+            .or_else(|| response.get("latch_manifest"))
+            .cloned()
+            .ok_or_else(|| anyhow!("Cloud latch resolution did not include manifest"))?;
+        if manifest.get("schema_version").and_then(Value::as_str)
+            != Some(lab_runner::LATCH_MANIFEST_SCHEMA)
+        {
+            return Err(anyhow!(
+                "Cloud latch resolution manifest must use schema_version {}",
+                lab_runner::LATCH_MANIFEST_SCHEMA
+            ));
+        }
+        inject_dispatch_launch(&mut manifest, argv)?;
+        let materials =
+            materialize_latch_materials(&staging_dir, response.get("materials"), &mut manifest)?;
+        let resolution_path = staging_dir.join("resolution.json");
+        atomic_write_json_pretty(&resolution_path, &response)?;
+        let manifest_path = staging_dir.join("manifest.json");
+        atomic_write_json_pretty(&manifest_path, &manifest)?;
+        let case_count = manifest
+            .get("cases")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        Ok((materials, case_count))
+    })();
+    let (materials, case_count) = match build_result {
+        Ok(result) => result,
+        Err(err) => {
+            cleanup_latch_resolution_stage(&staging_dir);
+            return Err(err);
+        }
+    };
+    if let Err(err) = publish_latch_resolution_stage(&staging_dir, out) {
+        cleanup_latch_resolution_stage(&staging_dir);
+        return Err(err);
     }
-    inject_dispatch_launch(&mut manifest, argv)?;
-    let materials = materialize_latch_materials(out, response.get("materials"), &mut manifest)?;
+    let resolution_path = out.join("resolution.json");
     let manifest_path = out.join("manifest.json");
-    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
-    let case_count = manifest
-        .get("cases")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
     Ok(json!({
         "schema_version": "latch_resolution_v1",
         "resolution_path": resolution_path,
@@ -3566,6 +5685,118 @@ fn materialize_cloud_latch_resolution(
             format!("bucephalus latch run {} --json", manifest_path.display())
         ]
     }))
+}
+
+fn latch_resolution_temp_out_path(out: &Path) -> PathBuf {
+    let parent = out.parent().unwrap_or_else(|| Path::new("."));
+    let name = out
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("latch-resolution");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    parent.join(format!(
+        ".{}.latch-resolution-tmp.{}.{}",
+        name,
+        std::process::id(),
+        nanos
+    ))
+}
+
+fn ensure_latch_resolution_output_ready(out: &Path) -> Result<()> {
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to prepare latch resolution output parent\n\noutput_ref: {}",
+                public_latch_path_ref(out, out)
+            )
+        })?;
+    }
+    match fs::symlink_metadata(out) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "latch resolution output target is a symlink\n\noutput_ref: {}\n\nRemove the symlink, choose an empty directory, or pass a different --out path.",
+            public_latch_path_ref(out, out)
+        )),
+        Ok(metadata) if !metadata.is_dir() => Err(anyhow!(
+            "latch resolution output target exists and is not a directory\n\noutput_ref: {}\n\nChoose an empty directory for --out, remove the existing file, or pass a different --out path.",
+            public_latch_path_ref(out, out)
+        )),
+        Ok(_) => {
+            let mut entries = fs::read_dir(out).with_context(|| {
+                format!(
+                    "failed to inspect latch resolution output target\n\noutput_ref: {}",
+                    public_latch_path_ref(out, out)
+                )
+            })?;
+            if entries.next().is_some() {
+                return Err(anyhow!(
+                    "latch resolution output target directory must be empty\n\noutput_ref: {}\n\nMove or remove the existing contents, or pass a different --out path.",
+                    public_latch_path_ref(out, out)
+                ));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(anyhow!(
+            "failed to inspect latch resolution output target\n\noutput_ref: {}\n\nerror: {}",
+            public_latch_path_ref(out, out),
+            public_error_message(&err.to_string())
+        )),
+    }
+}
+
+fn create_private_latch_resolution_stage(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("failed to prepare latch resolution staging parent")?;
+    }
+    fs::create_dir(path).map_err(|err| {
+        anyhow!(
+            "failed to create latch resolution staging directory\n\nstaging_ref: latch://staging\n\nerror: {}",
+            public_error_message(&err.to_string())
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+            cleanup_latch_resolution_stage(path);
+            return Err(err).context("failed to secure latch resolution staging directory");
+        }
+    }
+    Ok(())
+}
+
+fn publish_latch_resolution_stage(staging: &Path, out: &Path) -> Result<()> {
+    ensure_latch_resolution_output_ready(out)?;
+    if out.exists() {
+        fs::remove_dir(out).map_err(|err| {
+            anyhow!(
+                "failed to replace empty latch resolution output target\n\noutput_ref: {}\n\nerror: {}",
+                public_latch_path_ref(out, out),
+                public_error_message(&err.to_string())
+            )
+        })?;
+    }
+    fs::rename(staging, out).map_err(|err| {
+        anyhow!(
+            "failed to publish latch resolution output\n\nstaging_ref: latch://staging\noutput_ref: {}\n\nerror: {}",
+            public_latch_path_ref(out, out),
+            public_error_message(&err.to_string())
+        )
+    })
+}
+
+fn cleanup_latch_resolution_stage(path: &Path) {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => eprintln!(
+            "warning: failed to remove latch resolution staging directory latch://staging: {}",
+            public_error_message(&err.to_string())
+        ),
+    }
 }
 
 fn inject_dispatch_launch(manifest: &mut Value, argv: Vec<String>) -> Result<()> {
@@ -3627,7 +5858,7 @@ fn materialize_latch_materials(
             fs::create_dir_all(parent)?;
         }
         let bytes = material_bytes(material)?;
-        fs::write(&output_path, bytes)?;
+        atomic_write_bytes(&output_path, &bytes)?;
         let digest = sha256_file(&output_path)?;
         if let Some(expected) = object.get("digest").and_then(Value::as_str) {
             if expected != digest {
@@ -3760,33 +5991,16 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
         .get("benchmark")
         .and_then(Value::as_str)
         .unwrap_or(LOCAL_LATCH_SMOKE_BENCHMARK);
-    let cases = arguments
-        .get("cases")
-        .and_then(Value::as_u64)
-        .map(usize::try_from)
-        .transpose()?
-        .unwrap_or(2);
-    let command_value = arguments
-        .get("headless_command")
-        .or_else(|| arguments.get("command"))
-        .ok_or_else(|| anyhow!("dispatch_benchmark requires headless_command.argv"))?;
-    let argv = command_value
-        .get("argv")
-        .map(parse_mcp_string_array)
-        .transpose()?
-        .ok_or_else(|| anyhow!("dispatch_benchmark requires headless_command.argv"))?;
-    if argv.is_empty() {
-        return Err(anyhow!(
-            "dispatch_benchmark headless_command.argv must not be empty"
-        ));
-    }
+    let cases = mcp_dispatch_case_limit(arguments.get("cases"), "dispatch_benchmark", 2)?;
+    let argv = mcp_dispatch_headless_argv(arguments, "dispatch_benchmark")?;
+    require_cloud_auth_for_benchmark(benchmark)?;
     let label = arguments
         .get("label")
         .and_then(Value::as_str)
         .unwrap_or("dispatch");
     let dispatch_id = format!("dispatch_{}", Utc::now().format("%Y%m%d_%H%M%S_%6f"));
     let dir = dispatch_dir(&dispatch_id)?;
-    fs::create_dir_all(&dir)?;
+    let mut pending_dir = PendingDispatchDir::create(&dispatch_id, dir.clone())?;
     let resolution_dir = dir.join("resolution");
     let run_root = dir.join("runs");
     let live_view_path = dir.join("live.html");
@@ -3801,11 +6015,13 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
             "manifest_path": manifest_path,
             "run_root": run_root,
         }),
-    })?;
+    })
+    .map_err(|err| anyhow::Error::from(GuidedError::daemon_unavailable(&err)))?;
     let job_id = daemon_job
         .get("job_id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("daemon did not return job_id for dispatch"))?;
+    pending_dir.keep();
     let now = Utc::now().to_rfc3339();
     let argv_bytes = serde_json::to_vec(&argv)?;
     let record = json!({
@@ -3865,7 +6081,7 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
         "record_path": record_path,
         "internal": {
             "job_id": job_id,
-            "daemon_job": daemon_job
+            "daemon_job": redacted_dispatch_value(&daemon_job)
         }
     });
     write_dispatch_live_view(&record)?;
@@ -3874,37 +6090,34 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
 }
 
 fn write_dispatch_live_view(record: &Value) -> Result<()> {
-    let path = record
-        .pointer("/paths/live_view")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("dispatch record missing live view path"))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let dispatch_id = record
+    let mut record = record.clone();
+    normalize_dispatch_record_paths(&mut record)?;
+    let dispatch_id = dispatch_id_from_record(&record)?;
+    let path = dispatch_dir(&dispatch_id)?.join("live.html");
+    let public = mcp_public_payload(public_dispatch_record(&record));
+    let dispatch_id = public
         .get("dispatch_id")
         .and_then(Value::as_str)
         .unwrap_or("dispatch");
-    let status = record
+    let dispatch_ref = public
+        .get("dispatch_ref")
+        .and_then(Value::as_str)
+        .unwrap_or("dispatch://current");
+    let status = public
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let label = record.get("label").and_then(Value::as_str).unwrap_or("");
-    let benchmark = record
+    let label = public.get("label").and_then(Value::as_str).unwrap_or("");
+    let benchmark = public
         .pointer("/benchmark/id")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let summary = record.get("summary").cloned().unwrap_or_else(|| json!({}));
-    let mut public_summary = summary.clone();
-    if let Some(summary) = public_summary.as_object_mut() {
-        summary.remove("run_dir");
-    }
-    let lifecycle = record
+    let public_summary = public.get("summary").cloned().unwrap_or_else(|| json!({}));
+    let lifecycle = public
         .get("lifecycle")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let updated_at = record
+    let updated_at = public
         .get("updated_at")
         .and_then(Value::as_str)
         .unwrap_or("");
@@ -3947,14 +6160,13 @@ fn write_dispatch_live_view(record: &Value) -> Result<()> {
         html_escape(dispatch_id),
         html_escape(status),
         html_escape(if label.is_empty() { dispatch_id } else { label }),
-        html_escape(dispatch_id),
+        html_escape(dispatch_ref),
         html_escape(benchmark),
         html_escape(updated_at),
         html_escape(&serde_json::to_string_pretty(&lifecycle)?),
         html_escape(&serde_json::to_string_pretty(&public_summary)?)
     );
-    fs::write(path, html)?;
-    Ok(())
+    atomic_write_bytes(&path, html.as_bytes())
 }
 
 fn unregister_mcp_clients(project: Option<&Path>, dry_run: bool) -> Result<Value> {
@@ -3982,33 +6194,130 @@ fn unregister_mcp_clients(project: Option<&Path>, dry_run: bool) -> Result<Value
         }));
     }
     if let Some(path) = claude_desktop_config_path() {
-        let existed = mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME);
-        if !dry_run {
-            remove_mcp_server_config(&path, BUCEPHALUS_MCP_SERVER_NAME)?;
-        }
-        clients.push(json!({
-            "client": "claude-desktop",
-            "status": if dry_run { "planned" } else if existed { "removed" } else { "missing" },
-            "path": path
-        }));
+        clients.push(unregister_json_mcp_client_result(
+            "claude-desktop",
+            &path,
+            dry_run,
+        ));
     }
     if let Some(project) = project {
-        let path = project.join(".cursor").join("mcp.json");
-        let existed = mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME);
-        if !dry_run {
-            remove_mcp_server_config(&path, BUCEPHALUS_MCP_SERVER_NAME)?;
-        }
-        clients.push(json!({
-            "client": "cursor-project",
-            "status": if dry_run { "planned" } else if existed { "removed" } else { "missing" },
-            "path": path
-        }));
+        clients.push(unregister_cursor_project_mcp_client_result(
+            project, dry_run,
+        ));
     }
+    let status = mcp_uninstall_status_from_clients(&clients, dry_run);
     Ok(json!({
-        "status": if dry_run { "planned" } else { "removed" },
+        "status": status,
         "server_name": BUCEPHALUS_MCP_SERVER_NAME,
         "clients": clients
     }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum McpConfigServerState {
+    Present,
+    Missing,
+    Invalid(String),
+    Error(String),
+}
+
+fn mcp_setup_status_from_clients(clients: &[Value], dry_run: bool) -> &'static str {
+    if clients.iter().any(mcp_setup_client_has_issue) {
+        "partial_error"
+    } else if dry_run
+        || clients
+            .iter()
+            .any(|client| value_status(client) == Some("planned"))
+    {
+        "planned"
+    } else {
+        "configured"
+    }
+}
+
+fn mcp_uninstall_status_from_clients(clients: &[Value], dry_run: bool) -> &'static str {
+    if clients.iter().any(mcp_uninstall_client_has_issue) {
+        "partial_error"
+    } else if dry_run
+        || clients
+            .iter()
+            .any(|client| value_status(client) == Some("planned"))
+    {
+        "planned"
+    } else {
+        "removed"
+    }
+}
+
+fn mcp_setup_client_has_issue(client: &Value) -> bool {
+    matches!(
+        value_status(client),
+        Some("error" | "invalid" | "skipped" | "unsupported")
+    )
+}
+
+fn mcp_uninstall_client_has_issue(client: &Value) -> bool {
+    matches!(value_status(client), Some("error" | "invalid"))
+}
+
+fn value_status(value: &Value) -> Option<&str> {
+    value.get("status").and_then(Value::as_str)
+}
+
+fn unregister_json_mcp_client_result(client: &str, path: &Path, dry_run: bool) -> Value {
+    match mcp_config_server_state(path, client, BUCEPHALUS_MCP_SERVER_NAME) {
+        McpConfigServerState::Present if dry_run => json!({
+            "client": client,
+            "status": "planned",
+            "path": path
+        }),
+        McpConfigServerState::Present => {
+            match remove_mcp_server_config(path, client, BUCEPHALUS_MCP_SERVER_NAME) {
+                Ok(()) => json!({
+                    "client": client,
+                    "status": "removed",
+                    "path": path
+                }),
+                Err(err) => json!({
+                    "client": client,
+                    "status": "error",
+                    "reason": err.to_string(),
+                    "path": path
+                }),
+            }
+        }
+        McpConfigServerState::Missing => json!({
+            "client": client,
+            "status": "missing",
+            "path": path
+        }),
+        McpConfigServerState::Invalid(reason) => json!({
+            "client": client,
+            "status": "invalid",
+            "reason": reason,
+            "path": path,
+            "action": "fix the MCP config JSON, then rerun bucephalus setup uninstall"
+        }),
+        McpConfigServerState::Error(reason) => json!({
+            "client": client,
+            "status": "error",
+            "reason": reason,
+            "path": path
+        }),
+    }
+}
+
+fn unregister_cursor_project_mcp_client_result(project: &Path, dry_run: bool) -> Value {
+    match cursor_project_mcp_config_path(project) {
+        Ok(path) => unregister_json_mcp_client_result("cursor-project", &path, dry_run),
+        Err(err) => json!({
+            "client": "cursor-project",
+            "status": "error",
+            "reason": err.to_string(),
+            "path": project.join(".cursor").join("mcp.json"),
+            "action": "fix the MCP project path, then rerun bucephalus setup uninstall"
+        }),
+    }
 }
 
 fn resolve_setup_clients(
@@ -4100,7 +6409,20 @@ fn register_mcp_client(
                 }));
             };
             if !dry_run {
-                merge_mcp_server_config(&path, BUCEPHALUS_MCP_SERVER_NAME, server_config)?;
+                if let Err(err) = merge_mcp_server_config(
+                    &path,
+                    setup_client_name(client),
+                    BUCEPHALUS_MCP_SERVER_NAME,
+                    server_config,
+                ) {
+                    return Ok(json!({
+                        "client": setup_client_name(client),
+                        "status": "error",
+                        "reason": err.to_string(),
+                        "path": path,
+                        "manual_config": server_config
+                    }));
+                }
             }
             Ok(json!({
                 "client": setup_client_name(client),
@@ -4112,9 +6434,35 @@ fn register_mcp_client(
             let project = project
                 .map(Path::to_path_buf)
                 .unwrap_or(std::env::current_dir()?);
-            let path = project.join(".cursor").join("mcp.json");
+            let path = match cursor_project_mcp_config_path(&project) {
+                Ok(path) => path,
+                Err(err) => {
+                    return Ok(json!({
+                        "client": setup_client_name(client),
+                        "status": "error",
+                        "reason": err.to_string(),
+                        "scope": "project",
+                        "path": project.join(".cursor").join("mcp.json"),
+                        "manual_config": server_config
+                    }));
+                }
+            };
             if !dry_run {
-                merge_mcp_server_config(&path, BUCEPHALUS_MCP_SERVER_NAME, server_config)?;
+                if let Err(err) = merge_mcp_server_config(
+                    &path,
+                    setup_client_name(client),
+                    BUCEPHALUS_MCP_SERVER_NAME,
+                    server_config,
+                ) {
+                    return Ok(json!({
+                        "client": setup_client_name(client),
+                        "status": "error",
+                        "reason": err.to_string(),
+                        "scope": "project",
+                        "path": path,
+                        "manual_config": server_config
+                    }));
+                }
             }
             Ok(json!({
                 "client": setup_client_name(client),
@@ -4126,59 +6474,262 @@ fn register_mcp_client(
     }
 }
 
-fn merge_mcp_server_config(path: &Path, name: &str, server_config: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+fn cursor_project_mcp_config_path(project: &Path) -> Result<PathBuf> {
+    ensure_cursor_project_root_is_safe(project)?;
+    Ok(project.join(".cursor").join("mcp.json"))
+}
+
+fn ensure_cursor_project_root_is_safe(project: &Path) -> Result<()> {
+    let client = "cursor-project";
+    match fs::symlink_metadata(project) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(mcp_config_path_error(
+            client,
+            "refusing to use symlinked MCP project directory",
+        )),
+        Ok(metadata) if !metadata.is_dir() => Err(mcp_config_path_error(
+            client,
+            "refusing to use MCP project path that is not a directory",
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = project.parent() {
+                ensure_mcp_config_parent_is_safe(parent, client)?;
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => Err(mcp_config_path_error(
+            client,
+            "refusing to use MCP project parent that is not a directory",
+        )),
+        Err(err) => Err(anyhow!(
+            "failed to inspect MCP project directory\n\nconfig_ref: {}\n\nerror: {}",
+            public_mcp_config_ref(client),
+            public_error_message(&err.to_string())
+        )),
     }
+}
+
+fn merge_mcp_server_config(
+    path: &Path,
+    client: &str,
+    name: &str,
+    server_config: &Value,
+) -> Result<()> {
+    ensure_mcp_config_path_is_safe(path, client)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            anyhow!(
+                "failed to create MCP config directory\n\nconfig_ref: {}\n\nerror: {}",
+                public_mcp_config_ref(client),
+                public_error_message(&err.to_string())
+            )
+        })?;
+    }
+    ensure_mcp_config_path_is_safe(path, client)?;
     let mut root = if path.exists() {
-        serde_json::from_str::<Value>(&fs::read_to_string(path)?)?
+        let raw = fs::read_to_string(path).context("failed to read MCP config")?;
+        serde_json::from_str::<Value>(&raw).context("MCP config is not valid JSON")?
     } else {
         json!({})
     };
     if !root.is_object() {
-        return Err(anyhow!(
-            "MCP config {} is not a JSON object",
-            path.display()
-        ));
+        return Err(anyhow!("MCP config must be a JSON object"));
     }
     let root_object = root.as_object_mut().expect("checked object");
     let mcp_servers = root_object
         .entry("mcpServers".to_string())
         .or_insert_with(|| json!({}));
     if !mcp_servers.is_object() {
-        return Err(anyhow!(
-            "MCP config {} has non-object mcpServers",
-            path.display()
-        ));
+        return Err(anyhow!("MCP config has non-object mcpServers"));
     }
     mcp_servers
         .as_object_mut()
         .expect("checked object")
         .insert(name.to_string(), server_config.clone());
-    fs::write(path, serde_json::to_vec_pretty(&root)?)?;
+    atomic_write_json_pretty(path, &root).context("failed to write MCP config")?;
     Ok(())
 }
 
-fn mcp_config_has_server(path: &Path, name: &str) -> bool {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return false;
+fn mcp_config_server_state(path: &Path, client: &str, name: &str) -> McpConfigServerState {
+    if let Err(err) = ensure_mcp_config_path_is_safe(path, client) {
+        return McpConfigServerState::Error(err.to_string());
+    }
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return McpConfigServerState::Missing;
+        }
+        Err(err) => {
+            return McpConfigServerState::Error(format!("failed to read MCP config: {err}"));
+        }
     };
-    let Ok(root) = serde_json::from_str::<Value>(&raw) else {
-        return false;
+    let root = match serde_json::from_str::<Value>(&raw) {
+        Ok(root) => root,
+        Err(err) => {
+            return McpConfigServerState::Invalid(format!("MCP config is not valid JSON: {err}"));
+        }
     };
-    root.pointer(&format!("/mcpServers/{name}")).is_some()
+    if !root.is_object() {
+        return McpConfigServerState::Invalid("MCP config must be a JSON object".to_string());
+    }
+    let Some(servers) = root.get("mcpServers") else {
+        return McpConfigServerState::Missing;
+    };
+    let Some(servers) = servers.as_object() else {
+        return McpConfigServerState::Invalid("MCP config has non-object mcpServers".to_string());
+    };
+    if servers.contains_key(name) {
+        McpConfigServerState::Present
+    } else {
+        McpConfigServerState::Missing
+    }
 }
 
-fn remove_mcp_server_config(path: &Path, name: &str) -> Result<()> {
+fn remove_mcp_server_config(path: &Path, client: &str, name: &str) -> Result<()> {
+    ensure_mcp_config_path_is_safe(path, client)?;
     if !path.exists() {
         return Ok(());
     }
-    let mut root = serde_json::from_str::<Value>(&fs::read_to_string(path)?)?;
+    let raw = fs::read_to_string(path).context("failed to read MCP config")?;
+    let mut root = serde_json::from_str::<Value>(&raw).context("MCP config is not valid JSON")?;
     let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) else {
         return Ok(());
     };
     servers.remove(name);
-    fs::write(path, serde_json::to_vec_pretty(&root)?)?;
+    atomic_write_json_pretty(path, &root).context("failed to write MCP config")?;
+    Ok(())
+}
+
+fn ensure_mcp_config_path_is_safe(path: &Path, client: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_mcp_config_parent_is_safe(parent, client)?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(mcp_config_path_error(
+            client,
+            "refusing to use symlinked MCP config file",
+        )),
+        Ok(metadata) if metadata.is_dir() => Err(mcp_config_path_error(
+            client,
+            "refusing to use MCP config path that is a directory",
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => Err(mcp_config_path_error(
+            client,
+            "refusing to use MCP config parent that is not a directory",
+        )),
+        Err(err) => Err(anyhow!(
+            "failed to inspect MCP config file\n\nconfig_ref: {}\n\nerror: {}",
+            public_mcp_config_ref(client),
+            public_error_message(&err.to_string())
+        )),
+    }
+}
+
+fn ensure_mcp_config_parent_is_safe(parent: &Path, client: &str) -> Result<()> {
+    for ancestor in parent.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(mcp_config_path_error(
+                    client,
+                    "refusing to use symlinked MCP config directory",
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(mcp_config_path_error(
+                    client,
+                    "refusing to use MCP config parent that is not a directory",
+                ));
+            }
+            Ok(_) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(anyhow!(
+                    "failed to inspect MCP config directory\n\nconfig_ref: {}\n\nerror: {}",
+                    public_mcp_config_ref(client),
+                    public_error_message(&err.to_string())
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mcp_config_path_error(client: &str, reason: &str) -> anyhow::Error {
+    anyhow!(
+        "{reason}\n\nconfig_ref: {}\n\nRemove the blocked MCP config path or choose a different MCP client target.",
+        public_mcp_config_ref(client)
+    )
+}
+
+fn atomic_write_json_pretty(path: &Path, value: &Value) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    atomic_write_bytes(path, &bytes)
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("failed to create output directory")?;
+    }
+    let tmp = atomic_write_temp_path(path)?;
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .context("failed to create temporary output file")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(path) {
+                file.set_permissions(fs::Permissions::from_mode(
+                    metadata.permissions().mode() & 0o777,
+                ))
+                .context("failed to preserve output file permissions")?;
+            }
+        }
+        file.write_all(bytes)
+            .context("failed to write temporary output file")?;
+        file.sync_all()
+            .context("failed to sync temporary output file")?;
+        replace_file(&tmp, path).context("failed to replace output file")?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .context("failed to sync output directory")?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn atomic_write_temp_path(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("output path must name a file"))?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(parent.join(format!(".{}.tmp.{}.{}", name, std::process::id(), nanos)))
+}
+
+fn replace_file(from: &Path, to: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if to.exists() {
+        fs::remove_file(to)?;
+    }
+    fs::rename(from, to)?;
     Ok(())
 }
 
@@ -4295,6 +6846,10 @@ fn shell_join(argv: &[String]) -> String {
 
 const LOCAL_LATCH_SMOKE_SCHEMA: &str = "latch_local_resolution_v1";
 const LOCAL_LATCH_SMOKE_BENCHMARK: &str = "local:file-edit-smoke";
+const MCP_DISPATCH_CASE_LIMIT_MIN: u64 = 1;
+const MCP_DISPATCH_CASE_LIMIT_MAX: u64 = 200;
+const MCP_LATCH_TAIL_DEFAULT_LINES: u64 = 80;
+const MCP_LATCH_TAIL_MAX_LINES: u64 = 500;
 
 fn default_latch_smoke_argv() -> Vec<String> {
     let script = r#"set -eu
@@ -4513,6 +7068,13 @@ fn read_mcp_message<R: BufRead + Read>(reader: &mut R) -> Result<Option<Value>> 
                 .trim()
                 .parse::<usize>()
                 .map_err(|_| anyhow!("invalid MCP Content-Length header"))?;
+            if len > MCP_MAX_CONTENT_LENGTH {
+                return Err(anyhow!(
+                    "MCP Content-Length {} exceeds the {} byte limit",
+                    len,
+                    MCP_MAX_CONTENT_LENGTH
+                ));
+            }
             loop {
                 line.clear();
                 let n = reader.read_line(&mut line)?;
@@ -4573,7 +7135,11 @@ fn handle_mcp_message(message: Value) -> Option<Value> {
                                 "type": "string",
                                 "description": "Benchmark id or alias. Use local:file-edit-smoke for local rehearsal; remote ids resolve through the Cloud latch API."
                             },
-                            "cases": {"type": "integer", "minimum": 1},
+                            "cases": {
+                                "type": "integer",
+                                "minimum": MCP_DISPATCH_CASE_LIMIT_MIN,
+                                "maximum": MCP_DISPATCH_CASE_LIMIT_MAX
+                            },
                             "label": {"type": "string"},
                             "headless_command": {
                                 "type": "object",
@@ -4618,17 +7184,27 @@ fn handle_mcp_message(message: Value) -> Option<Value> {
             "id": id,
             "error": {
                 "code": -32000,
-                "message": err.to_string()
+                "message": public_error_message(&err.to_string())
             }
         }),
     })
 }
 
 fn handle_mcp_tool_call(params: Value) -> Result<Value> {
+    match handle_mcp_tool_call_inner(params) {
+        Ok(value) => Ok(value),
+        Err(err) => match err.downcast::<GuidedError>() {
+            Ok(guided) => mcp_guided_result(guided),
+            Err(err) => Err(err),
+        },
+    }
+}
+
+fn handle_mcp_tool_call_inner(params: Value) -> Result<Value> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("tools/call requires params.name"))?;
+        .ok_or_else(|| anyhow::Error::from(GuidedError::tool_name_required()))?;
     let arguments = params
         .get("arguments")
         .cloned()
@@ -4636,14 +7212,13 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
     match name {
         "status" => {
             let home_path = lab_runner::bucephalus_home().ok();
-            let home = home_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "unavailable".to_string());
             let local_runtime = match latch_daemon::ensure_latch_daemon() {
-                Ok(_) => json!({
+                Ok(info) => json!({
                     "status": "ready",
                     "mode": "managed_local_runtime",
+                    "address": info.address,
+                    "state_path": info.state_path,
+                    "log_path": info.log_path,
                 }),
                 Err(err) => json!({
                     "status": "error",
@@ -4656,34 +7231,30 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                     "error": "Bucephalus home unavailable"
                 })
             });
-            mcp_tool_result(json!({
-                "ok": true,
-                "binary": "bucephalus",
-                "version": env!("CARGO_PKG_VERSION"),
-                "home": home,
-                "local_runtime": local_runtime,
-                "latch": {
-                    "status": "ready",
-                    "supported_manifest_schema": lab_runner::LATCH_MANIFEST_SCHEMA
-                },
-                "auth": auth
-            }))
+            mcp_tool_result(mcp_status_payload(
+                home_path.as_deref(),
+                &local_runtime,
+                &auth,
+                recent_dispatches(10),
+            ))
         }
-        "dispatch_benchmark" => mcp_tool_result(start_smoke_dispatch(&arguments)?),
+        "dispatch_benchmark" => mcp_public_tool_result(start_smoke_dispatch(&arguments)?),
         "dispatch_status" => {
             let dispatch_id = arguments
                 .get("dispatch_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("dispatch_status requires dispatch_id"))?;
-            mcp_tool_result(refresh_dispatch(dispatch_id)?)
+                .ok_or_else(|| anyhow::Error::from(GuidedError::dispatch_id_required()))?;
+            mcp_public_tool_result(refresh_dispatch(dispatch_id)?)
         }
-        "latch_run_manifest" | "latch_progress" | "latch_cancel" | "latch_tail"
-        | "latch_demo_manifest" | "latch_smoke_test"
+        "latch_run_manifest"
+        | "latch_progress"
+        | "latch_cancel"
+        | "latch_tail"
+        | "latch_demo_manifest"
+        | "latch_smoke_test"
             if std::env::var_os("BUCEPHALUS_MCP_DEBUG_LATCH_TOOLS").is_none() =>
         {
-            Err(anyhow!(
-                "low-level latch MCP tools are disabled; use dispatch_benchmark or set BUCEPHALUS_MCP_DEBUG_LATCH_TOOLS=1 for local debugging"
-            ))
+            Err(GuidedError::low_level_tool_disabled(name).into())
         }
         "latch_run_manifest" => {
             let manifest_path = arguments
@@ -4717,14 +7288,14 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 method: "start".to_string(),
                 params: Value::Object(params),
             })?;
-            mcp_tool_result(result)
+            mcp_latch_daemon_tool_result(result)
         }
         "latch_progress" => {
             let job_id = arguments
                 .get("job_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("latch_progress requires job_id"))?;
-            mcp_tool_result(latch_daemon::call_latch_daemon(
+            mcp_latch_daemon_tool_result(latch_daemon::call_latch_daemon(
                 latch_daemon::LatchDaemonRequest {
                     method: "progress".to_string(),
                     params: json!({ "job_id": job_id }),
@@ -4736,7 +7307,7 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .get("job_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("latch_cancel requires job_id"))?;
-            mcp_tool_result(latch_daemon::call_latch_daemon(
+            mcp_latch_daemon_tool_result(latch_daemon::call_latch_daemon(
                 latch_daemon::LatchDaemonRequest {
                     method: "cancel".to_string(),
                     params: json!({ "job_id": job_id }),
@@ -4752,11 +7323,8 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .get("stream")
                 .and_then(Value::as_str)
                 .unwrap_or("stderr");
-            let max_lines = arguments
-                .get("max_lines")
-                .and_then(Value::as_u64)
-                .unwrap_or(80);
-            mcp_tool_result(latch_daemon::call_latch_daemon(
+            let max_lines = mcp_latch_tail_max_lines(arguments.get("max_lines"))?;
+            mcp_latch_daemon_tool_result(latch_daemon::call_latch_daemon(
                 latch_daemon::LatchDaemonRequest {
                     method: "tail".to_string(),
                     params: json!({
@@ -4772,19 +7340,16 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .get("out")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("latch_demo_manifest requires out"))?;
-            mcp_tool_result(write_latch_demo(&PathBuf::from(out))?)
+            let out = PathBuf::from(out);
+            let result = write_latch_demo(&out)?;
+            mcp_public_tool_result(latch_generation_result_to_json(&out, &result))
         }
         "latch_smoke_test" => {
             let benchmark = arguments
                 .get("benchmark")
                 .and_then(Value::as_str)
                 .unwrap_or(LOCAL_LATCH_SMOKE_BENCHMARK);
-            let cases = arguments
-                .get("cases")
-                .and_then(Value::as_u64)
-                .map(usize::try_from)
-                .transpose()?
-                .unwrap_or(2);
+            let cases = mcp_dispatch_case_limit(arguments.get("cases"), "latch_smoke_test", 2)?;
             let out = arguments
                 .get("out")
                 .and_then(Value::as_str)
@@ -4823,13 +7388,13 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                     "run_root": run_root,
                 }),
             })?;
-            mcp_tool_result(json!({
+            mcp_public_tool_result(json!({
                 "schema_version": "latch_smoke_job_v1",
-                "resolution": resolution,
-                "job": result
+                "resolution": latch_generation_result_to_json(&out, &resolution),
+                "job": mcp_latch_daemon_payload(lab_runner::bucephalus_home().ok().as_deref(), &result)
             }))
         }
-        other => Err(anyhow!("unknown MCP tool '{}'", other)),
+        other => Err(GuidedError::unknown_tool(other).into()),
     }
 }
 
@@ -4847,6 +7412,58 @@ fn parse_mcp_string_array(value: &Value) -> Result<Vec<String>> {
         .collect()
 }
 
+fn mcp_dispatch_headless_argv(arguments: &Value, tool: &str) -> Result<Vec<String>> {
+    let Some(command) = arguments
+        .get("headless_command")
+        .or_else(|| arguments.get("command"))
+    else {
+        return Err(GuidedError::headless_command_required(tool).into());
+    };
+    let Some(argv_value) = command.get("argv") else {
+        return Err(GuidedError::headless_command_required(tool).into());
+    };
+    let Some(array) = argv_value.as_array() else {
+        return Err(GuidedError::headless_command_invalid(tool).into());
+    };
+    if array.is_empty() {
+        return Err(GuidedError::headless_command_invalid(tool).into());
+    }
+    array
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| GuidedError::headless_command_invalid(tool).into())
+        })
+        .collect()
+}
+
+fn mcp_dispatch_case_limit(value: Option<&Value>, tool: &str, default: usize) -> Result<usize> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let Some(raw) = value.as_u64() else {
+        return Err(GuidedError::case_limit_invalid(tool).into());
+    };
+    if !(MCP_DISPATCH_CASE_LIMIT_MIN..=MCP_DISPATCH_CASE_LIMIT_MAX).contains(&raw) {
+        return Err(GuidedError::case_limit_invalid(tool).into());
+    }
+    usize::try_from(raw).map_err(|_| GuidedError::case_limit_invalid(tool).into())
+}
+
+fn mcp_latch_tail_max_lines(value: Option<&Value>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(MCP_LATCH_TAIL_DEFAULT_LINES);
+    };
+    let Some(raw) = value.as_u64() else {
+        return Err(GuidedError::tail_limit_invalid().into());
+    };
+    if raw == 0 || raw > MCP_LATCH_TAIL_MAX_LINES {
+        return Err(GuidedError::tail_limit_invalid().into());
+    }
+    Ok(raw)
+}
+
 fn mcp_tool_result(value: Value) -> Result<Value> {
     Ok(json!({
         "content": [
@@ -4860,6 +7477,751 @@ fn mcp_tool_result(value: Value) -> Result<Value> {
     }))
 }
 
+fn mcp_public_tool_result(value: Value) -> Result<Value> {
+    mcp_tool_result(mcp_public_payload(value))
+}
+
+fn mcp_latch_daemon_tool_result(value: Value) -> Result<Value> {
+    let home = lab_runner::bucephalus_home().ok();
+    mcp_tool_result(mcp_latch_daemon_payload(home.as_deref(), &value))
+}
+
+fn mcp_latch_daemon_payload(home: Option<&Path>, value: &Value) -> Value {
+    let mut public = value.clone();
+    publicize_latch_daemon_payload(home, &mut public);
+    mcp_public_payload(public)
+}
+
+fn publicize_latch_daemon_payload(home: Option<&Path>, value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            let job_id = object
+                .get("job_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(job_id) = job_id.as_deref() {
+                object.insert("job_id".to_string(), json!(public_daemon_job_id(job_id)));
+            }
+            if let Some(path) = object.remove("manifest_path") {
+                object.insert(
+                    "manifest_ref".to_string(),
+                    public_latch_daemon_manifest_value(home, &path),
+                );
+            }
+            if let Some(path) = object.remove("run_root") {
+                object.insert(
+                    "run_root_ref".to_string(),
+                    public_latch_daemon_path_value(home, job_id.as_deref(), &path, "run-root"),
+                );
+            }
+            if let Some(path) = object.remove("stdout_path") {
+                object.insert(
+                    "stdout_ref".to_string(),
+                    public_latch_daemon_path_value(home, job_id.as_deref(), &path, "stdout"),
+                );
+            }
+            if let Some(path) = object.remove("stderr_path") {
+                object.insert(
+                    "stderr_ref".to_string(),
+                    public_latch_daemon_path_value(home, job_id.as_deref(), &path, "stderr"),
+                );
+            }
+            if let Some(path) = object.remove("path") {
+                object.insert(
+                    "path_ref".to_string(),
+                    public_latch_daemon_path_value(home, job_id.as_deref(), &path, "tail"),
+                );
+            }
+            if let Some(result) = object.get_mut("result") {
+                publicize_latch_daemon_result(home, result);
+            }
+            for value in object.values_mut() {
+                publicize_latch_daemon_payload(home, value);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                publicize_latch_daemon_payload(home, item);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn publicize_latch_daemon_result(home: Option<&Path>, value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        if let Some(run_dir) = object.remove("run_dir").and_then(|value| {
+            value
+                .as_str()
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from)
+        }) {
+            object.insert("run_ref".to_string(), json!(public_run_ref(&run_dir)));
+        }
+    }
+    publicize_latch_daemon_payload(home, value);
+}
+
+fn public_latch_daemon_manifest_value(home: Option<&Path>, value: &Value) -> Value {
+    let Some(raw) = value.as_str() else {
+        return json!("[REDACTED:local-path]");
+    };
+    let path = Path::new(raw);
+    if let Some(ref_value) = home.and_then(|home| public_dispatch_path_ref_from_home(home, path)) {
+        return json!(ref_value);
+    }
+    let root = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    json!(public_latch_path_ref(root, path))
+}
+
+fn public_latch_daemon_path_value(
+    home: Option<&Path>,
+    job_id: Option<&str>,
+    value: &Value,
+    fallback_component: &str,
+) -> Value {
+    let Some(raw) = value.as_str() else {
+        return json!("[REDACTED:local-path]");
+    };
+    json!(public_latch_daemon_path_ref(
+        home,
+        job_id,
+        Path::new(raw),
+        fallback_component,
+    ))
+}
+
+fn public_latch_daemon_path_ref(
+    home: Option<&Path>,
+    job_id: Option<&str>,
+    path: &Path,
+    fallback_component: &str,
+) -> String {
+    if let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) {
+        let daemon_ref = public_daemon_path_ref(home, path);
+        if daemon_ref != "[REDACTED:local-path]" {
+            return daemon_ref;
+        }
+        if let Some(dispatch_ref) = public_dispatch_path_ref_from_home(home, path) {
+            return dispatch_ref;
+        }
+        let runs_dir = home.join("runs");
+        if path.strip_prefix(&runs_dir).is_ok() {
+            return public_run_path_ref(&runs_dir, path);
+        }
+    }
+    if let Some(job_id) = job_id.filter(|job_id| !job_id.trim().is_empty()) {
+        return format!(
+            "daemon://jobs/{}/{}",
+            public_daemon_job_ref_component(job_id),
+            public_ref_component(fallback_component)
+        );
+    }
+    "[REDACTED:local-path]".to_string()
+}
+
+fn public_daemon_job_ref_component(job_id: &str) -> String {
+    let trimmed = job_id.trim();
+    if is_public_daemon_job_id(trimmed) {
+        public_ref_component(trimmed)
+    } else {
+        "redacted".to_string()
+    }
+}
+
+fn public_daemon_job_id(job_id: &str) -> String {
+    let trimmed = job_id.trim();
+    if is_public_daemon_job_id(trimmed) {
+        public_ref_component(trimmed)
+    } else {
+        "redacted".to_string()
+    }
+}
+
+fn is_public_daemon_job_id(job_id: &str) -> bool {
+    job_id.starts_with("job_")
+        && job_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn mcp_status_payload(
+    home: Option<&Path>,
+    local_runtime: &Value,
+    auth: &Value,
+    recent_dispatches: Value,
+) -> Value {
+    mcp_public_payload(json!({
+        "ok": true,
+        "binary_ref": public_binary_ref(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "home": mcp_status_home(home),
+        "local_runtime": mcp_local_runtime_status_to_json(home, local_runtime),
+        "latch": {
+            "status": "ready",
+            "supported_manifest_schema": lab_runner::LATCH_MANIFEST_SCHEMA
+        },
+        "auth": mcp_auth_status_to_json(home, auth),
+        "recent_dispatches": recent_dispatches
+    }))
+}
+
+fn mcp_status_home(home: Option<&Path>) -> Value {
+    if home.is_some() {
+        json!({
+            "status": "available",
+            "home_ref": public_home_ref()
+        })
+    } else {
+        json!({
+            "status": "unavailable"
+        })
+    }
+}
+
+fn mcp_local_runtime_status_to_json(home: Option<&Path>, local_runtime: &Value) -> Value {
+    let home = home.unwrap_or_else(|| Path::new(""));
+    let mut public = setup_daemon_status_to_json(home, local_runtime);
+    if let Some(object) = public.as_object_mut() {
+        if object.get("status").and_then(Value::as_str) == Some("error") {
+            object.insert("error_code".to_string(), json!("local_runtime_unavailable"));
+            if let Some(error) = object
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
+                object.insert(
+                    "error".to_string(),
+                    json!(setup_public_string_value(&error)),
+                );
+            }
+            object.insert(
+                "next_actions".to_string(),
+                json!([
+                    {
+                        "type": "cli_command",
+                        "command": "bucephalus setup",
+                        "description": "Install or repair the local daemon service and MCP registration."
+                    },
+                    {
+                        "type": "cli_command",
+                        "command": "bucephalus setup status",
+                        "description": "Check daemon, MCP, and Cloud auth readiness."
+                    }
+                ]),
+            );
+        }
+    }
+    redact_setup_public_json(&mut public);
+    public
+}
+
+fn mcp_auth_status_to_json(home: Option<&Path>, auth: &Value) -> Value {
+    let mut public = if let Some(home) = home {
+        auth_status_to_json(home, auth)
+    } else {
+        auth.clone()
+    };
+    redact_setup_public_json(&mut public);
+    public
+}
+
+fn mcp_public_payload(value: Value) -> Value {
+    let mut public = value;
+    redact_mcp_public_json(&mut public, McpRedactionContext::default());
+    public
+}
+
+#[derive(Clone, Copy, Default)]
+struct McpRedactionContext {
+    in_next_actions: bool,
+    in_next_action_arguments: bool,
+}
+
+impl McpRedactionContext {
+    fn child(self, key: &str) -> Self {
+        let normalized = normalized_json_key(key);
+        Self {
+            in_next_actions: self.in_next_actions || normalized == "nextactions",
+            in_next_action_arguments: self.in_next_action_arguments
+                || (self.in_next_actions && normalized == "arguments"),
+        }
+    }
+}
+
+fn redact_mcp_public_json(value: &mut Value, context: McpRedactionContext) -> usize {
+    match value {
+        Value::Object(map) => {
+            let mut count = 0;
+            for (key, child) in map.iter_mut() {
+                let child_context = context.child(key);
+                if !mcp_action_argument_key_is_public(key, child_context) {
+                    if let Some(marker) = mcp_public_redaction_for_key(key) {
+                        *child = Value::String(marker.to_string());
+                        count += 1;
+                        continue;
+                    }
+                }
+                count += redact_mcp_public_json(child, child_context);
+            }
+            count
+        }
+        Value::Array(values) => values
+            .iter_mut()
+            .map(|item| redact_mcp_public_json(item, context))
+            .sum(),
+        Value::String(text) => {
+            let public = public_error_message(text);
+            if public != *text {
+                *value = Value::String(public);
+                1
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn mcp_action_argument_key_is_public(key: &str, context: McpRedactionContext) -> bool {
+    if !context.in_next_action_arguments {
+        return false;
+    }
+    let normalized = normalized_json_key(key);
+    normalized == "argv"
+        || normalized == "args"
+        || normalized.ends_with("argv")
+        || normalized.ends_with("args")
+}
+
+fn mcp_public_redaction_for_key(key: &str) -> Option<&'static str> {
+    let normalized = normalized_json_key(key);
+    if normalized.ends_with("ref") {
+        return None;
+    }
+    if normalized == "env" || normalized.ends_with("env") || normalized.contains("environment") {
+        return Some("[REDACTED:environment]");
+    }
+    if normalized == "argv"
+        || normalized == "args"
+        || normalized.ends_with("argv")
+        || normalized.ends_with("args")
+    {
+        return Some("[REDACTED:arguments]");
+    }
+    if normalized == "path"
+        || normalized.ends_with("path")
+        || normalized.ends_with("dir")
+        || normalized.contains("workspace")
+        || normalized.contains("workdir")
+        || normalized.contains("mount")
+    {
+        return Some("[REDACTED:local-path]");
+    }
+    if normalized.ends_with("present") {
+        return None;
+    }
+    const SECRET_FRAGMENTS: &[&str] = &[
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "apikey",
+        "authorization",
+        "bearer",
+        "privatekey",
+        "clientsecret",
+        "cookie",
+        "session",
+        "refresh",
+    ];
+    if SECRET_FRAGMENTS
+        .iter()
+        .any(|fragment| normalized.contains(fragment))
+    {
+        return Some("[REDACTED:secret]");
+    }
+    None
+}
+
+fn normalized_json_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+/// Stable documentation pointer carried by every guided outcome. A single file
+/// reference (not a line anchor) so it cannot silently drift out of date.
+const LATCH_DOCS_REF: &str = "docs/user/latch.md";
+
+/// Closed set of recoverable conditions an MCP caller can act on. Each variant
+/// maps to one stable machine code. The exhaustive match is the point: a new
+/// agent-facing dead end cannot be introduced without naming it here and giving
+/// the caller a way out via a `GuidedError` constructor below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuidedCode {
+    ToolNameRequired,
+    UnknownTool,
+    LowLevelToolDisabled,
+    HeadlessCommandRequired,
+    HeadlessCommandInvalid,
+    DispatchIdRequired,
+    DispatchNotFound,
+    DaemonUnavailable,
+    CloudAuthRequired,
+    CaseLimitInvalid,
+    TailLimitInvalid,
+}
+
+impl GuidedCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            GuidedCode::ToolNameRequired => "tool_name_required",
+            GuidedCode::UnknownTool => "unknown_tool",
+            GuidedCode::LowLevelToolDisabled => "low_level_tool_disabled",
+            GuidedCode::HeadlessCommandRequired => "headless_command_required",
+            GuidedCode::HeadlessCommandInvalid => "headless_command_invalid",
+            GuidedCode::DispatchIdRequired => "dispatch_id_required",
+            GuidedCode::DispatchNotFound => "dispatch_not_found",
+            GuidedCode::DaemonUnavailable => "daemon_unavailable",
+            GuidedCode::CloudAuthRequired => "cloud_auth_required",
+            GuidedCode::CaseLimitInvalid => "case_limit_invalid",
+            GuidedCode::TailLimitInvalid => "tail_limit_invalid",
+        }
+    }
+}
+
+/// A recoverable condition. It is rendered into an MCP tool result with
+/// `isError: true` and explicit `next_actions`, so the model sees it and
+/// self-corrects. It is deliberately never emitted as a JSON-RPC protocol error:
+/// MCP clients surface those as hard tool failures the agent abandons instead of
+/// retrying into. It flows up through `anyhow::Error` and is downcast back at the
+/// MCP boundary, so helpers can raise it without threading a new return type.
+#[derive(Debug)]
+struct GuidedError {
+    code: GuidedCode,
+    summary: String,
+    next_actions: Vec<Value>,
+    details: Value,
+}
+
+impl std::fmt::Display for GuidedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.summary)
+    }
+}
+
+impl std::error::Error for GuidedError {}
+
+fn action_cli(command: impl Into<String>, description: impl Into<String>) -> Value {
+    json!({
+        "type": "cli_command",
+        "command": command.into(),
+        "description": description.into(),
+    })
+}
+
+fn action_tool(tool: &str, arguments: Value, description: impl Into<String>) -> Value {
+    json!({
+        "type": "mcp_tool",
+        "tool": tool,
+        "arguments": arguments,
+        "description": description.into(),
+    })
+}
+
+/// Example headless command shown in recovery hints. Mirrors the manifest doc so
+/// the agent always sees a runnable shape, not just a parameter name.
+fn example_headless_dispatch_arguments() -> Value {
+    json!({
+        "benchmark": LOCAL_LATCH_SMOKE_BENCHMARK,
+        "cases": 1,
+        "headless_command": { "argv": ["codex", "exec", "{TASK_PROMPT}"] }
+    })
+}
+
+impl GuidedError {
+    fn new(code: GuidedCode, summary: impl Into<String>, next_actions: Vec<Value>) -> Self {
+        GuidedError {
+            code,
+            summary: summary.into(),
+            next_actions,
+            details: Value::Null,
+        }
+    }
+
+    fn with_details(mut self, details: Value) -> Self {
+        self.details = details;
+        self
+    }
+
+    fn tool_name_required() -> Self {
+        GuidedError::new(
+            GuidedCode::ToolNameRequired,
+            "MCP tools/call requires params.name so Bucephalus knows which tool to run.",
+            vec![action_tool(
+                "status",
+                json!({}),
+                "Call status to re-orient, then choose dispatch_benchmark or dispatch_status.",
+            )],
+        )
+    }
+
+    fn unknown_tool(tool: &str) -> Self {
+        GuidedError::new(
+            GuidedCode::UnknownTool,
+            format!("Bucephalus does not expose an MCP tool named '{tool}'."),
+            vec![action_tool(
+                "status",
+                json!({}),
+                "Call status to see local readiness and recent dispatches; use tools/list for the supported tool names.",
+            )],
+        )
+        .with_details(json!({ "requested_tool": tool }))
+    }
+
+    fn low_level_tool_disabled(tool: &str) -> Self {
+        GuidedError::new(
+            GuidedCode::LowLevelToolDisabled,
+            format!(
+                "The low-level latch MCP tool '{tool}' is disabled on the default surface."
+            ),
+            vec![
+                action_tool(
+                    "dispatch_benchmark",
+                    example_headless_dispatch_arguments(),
+                    "Use the supported dispatch workflow; it resolves, runs, and returns public refs.",
+                ),
+                action_tool(
+                    "status",
+                    json!({}),
+                    "Check local runtime, Cloud auth, and recent dispatches before retrying.",
+                ),
+            ],
+        )
+        .with_details(json!({
+            "requested_tool": tool,
+            "debug_override": "BUCEPHALUS_MCP_DEBUG_LATCH_TOOLS=1"
+        }))
+    }
+
+    fn headless_command_required(tool: &str) -> Self {
+        GuidedError::new(
+            GuidedCode::HeadlessCommandRequired,
+            "This dispatch needs the command that runs your agent headlessly in a workspace.",
+            vec![action_tool(
+                tool,
+                example_headless_dispatch_arguments(),
+                "Resubmit with headless_command.argv; {TASK_PROMPT} is substituted per case.",
+            )],
+        )
+    }
+
+    fn headless_command_invalid(tool: &str) -> Self {
+        GuidedError::new(
+            GuidedCode::HeadlessCommandInvalid,
+            "headless_command.argv must be a non-empty array of strings.",
+            vec![action_tool(
+                tool,
+                example_headless_dispatch_arguments(),
+                "Resubmit with headless_command.argv as an argv array; do not pass a shell string unless it is inside sh -c.",
+            )],
+        )
+        .with_details(json!({
+            "param": "headless_command.argv",
+            "shape": {
+                "type": "array",
+                "min_items": 1,
+                "items": "string"
+            }
+        }))
+    }
+
+    fn case_limit_invalid(tool: &str) -> Self {
+        GuidedError::new(
+            GuidedCode::CaseLimitInvalid,
+            format!(
+                "cases must be an integer from {} to {}.",
+                MCP_DISPATCH_CASE_LIMIT_MIN, MCP_DISPATCH_CASE_LIMIT_MAX
+            ),
+            vec![action_tool(
+                tool,
+                json!({
+                    "benchmark": LOCAL_LATCH_SMOKE_BENCHMARK,
+                    "cases": MCP_DISPATCH_CASE_LIMIT_MIN,
+                    "headless_command": { "argv": ["codex", "exec", "{TASK_PROMPT}"] }
+                }),
+                "Retry with a bounded case count; start with one case to validate the loop.",
+            )],
+        )
+        .with_details(json!({
+            "param": "cases",
+            "min": MCP_DISPATCH_CASE_LIMIT_MIN,
+            "max": MCP_DISPATCH_CASE_LIMIT_MAX
+        }))
+    }
+
+    fn tail_limit_invalid() -> Self {
+        GuidedError::new(
+            GuidedCode::TailLimitInvalid,
+            format!(
+                "max_lines must be an integer from 1 to {}.",
+                MCP_LATCH_TAIL_MAX_LINES
+            ),
+            vec![action_tool(
+                "latch_tail",
+                json!({
+                    "job_id": "<job_id>",
+                    "stream": "stderr",
+                    "max_lines": MCP_LATCH_TAIL_DEFAULT_LINES
+                }),
+                "Retry with the job_id returned by latch_run_manifest and a bounded tail size.",
+            )],
+        )
+        .with_details(json!({
+            "param": "max_lines",
+            "min": 1,
+            "max": MCP_LATCH_TAIL_MAX_LINES
+        }))
+    }
+
+    fn dispatch_id_required() -> Self {
+        GuidedError::new(
+            GuidedCode::DispatchIdRequired,
+            "dispatch_status needs the dispatch_id returned by dispatch_benchmark.",
+            vec![action_tool(
+                "status",
+                json!({}),
+                "Call status to list recent dispatches, then retry with one of their ids.",
+            )],
+        )
+    }
+
+    fn dispatch_not_found(dispatch_id: &str) -> Self {
+        GuidedError::new(
+            GuidedCode::DispatchNotFound,
+            "No dispatch matching the supplied dispatch_id exists on this host.",
+            vec![action_tool(
+                "status",
+                json!({}),
+                "Call status to list recent dispatches, then retry with one of their ids.",
+            )],
+        )
+        .with_details(json!({ "dispatch_ref": public_dispatch_ref(dispatch_id) }))
+    }
+
+    fn daemon_unavailable(source: &anyhow::Error) -> Self {
+        GuidedError::new(
+            GuidedCode::DaemonUnavailable,
+            "The local Bucephalus runtime is not reachable, so the dispatch could not start.",
+            vec![
+                action_cli(
+                    "bucephalus setup",
+                    "Install or repair the local daemon service and MCP registration.",
+                ),
+                action_cli(
+                    "bucephalus setup status",
+                    "Report daemon, MCP, and Cloud auth readiness.",
+                ),
+            ],
+        )
+        .with_details(json!({ "runtime_error": source.to_string() }))
+    }
+
+    fn cloud_auth_required(benchmark: &str, auth: Value) -> Self {
+        GuidedError::new(
+            GuidedCode::CloudAuthRequired,
+            format!(
+                "Cloud benchmark '{benchmark}' requires Bucephalus Cloud sign-in; local fixtures do not."
+            ),
+            vec![
+                action_cli(
+                    "bucephalus login",
+                    "Start OAuth device login and cache Cloud tokens for this user.",
+                ),
+                action_tool(
+                    "dispatch_benchmark",
+                    example_headless_dispatch_arguments(),
+                    "Or rehearse the whole flow now with the local smoke fixture, which needs no sign-in.",
+                ),
+            ],
+        )
+        .with_details(json!({ "benchmark": benchmark, "auth": auth }))
+    }
+}
+
+/// Render a recoverable condition as an MCP tool result. `isError: true` is the
+/// MCP signal that the call did not accomplish the request; `status: "blocked"`
+/// plus `next_actions` is the contract that tells the agent exactly how to
+/// proceed. Every response is therefore closed under next-action: a tool never
+/// returns a dead end.
+fn mcp_guided_result(error: GuidedError) -> Result<Value> {
+    let body = mcp_public_payload(json!({
+        "status": "blocked",
+        "because": error.code.as_str(),
+        "summary": error.summary,
+        "next_actions": error.next_actions,
+        "details": error.details,
+        "docs": LATCH_DOCS_REF,
+    }));
+    Ok(json!({
+        "content": [
+            {
+                "type": "text",
+                "text": serde_json::to_string_pretty(&body)?
+            }
+        ],
+        "structuredContent": body,
+        "isError": true
+    }))
+}
+
+/// Recent dispatches on this host, newest first. This is the escape hatch from
+/// the "I lost the dispatch_id across a turn" and cold-start states: `status`
+/// always re-orients the caller to what exists and what it can poll.
+fn recent_dispatches(limit: usize) -> Value {
+    let Ok(root) = dispatch_root() else {
+        return json!([]);
+    };
+    let Ok(entries) = fs::read_dir(&root) else {
+        return json!([]);
+    };
+    let mut records: Vec<(String, Value)> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let id = entry.file_name().to_string_lossy().to_string();
+            let record = read_dispatch_record(&id).ok()?;
+            Some((id, record))
+        })
+        .collect();
+    records.sort_by(|a, b| {
+        let left = a.1.get("created_at").and_then(Value::as_str).unwrap_or("");
+        let right = b.1.get("created_at").and_then(Value::as_str).unwrap_or("");
+        right.cmp(left)
+    });
+    let items: Vec<Value> = records
+        .into_iter()
+        .take(limit)
+        .map(|(id, record)| {
+            json!({
+                "dispatch_id": public_dispatch_id(&id),
+                "dispatch_ref": public_dispatch_ref(&id),
+                "status": record.get("status").cloned().unwrap_or(Value::Null),
+                "label": record.get("label").cloned().unwrap_or(Value::Null),
+                "benchmark": record.pointer("/benchmark/id").cloned().unwrap_or(Value::Null),
+                "created_at": record.get("created_at").cloned().unwrap_or(Value::Null),
+                "updated_at": record.get("updated_at").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+    Value::Array(items)
+}
+
 fn package_directory_for_input(path: &Path) -> PathBuf {
     if path.is_file()
         && path
@@ -4870,6 +8232,59 @@ fn package_directory_for_input(path: &Path) -> PathBuf {
         return path.parent().unwrap_or(path).to_path_buf();
     }
     path.to_path_buf()
+}
+
+fn resolve_package_command_target(command: &str, path: &Path) -> Result<PathBuf> {
+    if path.is_dir() {
+        if looks_like_bucephalus_package_dir(path) {
+            return Ok(path.to_path_buf());
+        }
+        if path.join("experiment.yaml").is_file() {
+            return Err(package_command_target_error(
+                command,
+                path,
+                "target is an experiment directory, not a sealed package",
+            ));
+        }
+        return Err(package_command_target_error(
+            command,
+            path,
+            "directory does not contain package metadata",
+        ));
+    }
+    if path.is_file() {
+        if is_yaml_file(path) {
+            return Err(package_command_target_error(
+                command,
+                path,
+                "target is an experiment YAML, not a sealed package",
+            ));
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "manifest.json")
+        {
+            return Ok(path.parent().unwrap_or(path).to_path_buf());
+        }
+        return Err(package_command_target_error(
+            command,
+            path,
+            "file is not a package manifest.json",
+        ));
+    }
+    Err(package_command_target_error(
+        command,
+        path,
+        "target does not exist",
+    ))
+}
+
+fn package_command_target_error(command: &str, path: &Path, reason: &str) -> anyhow::Error {
+    anyhow!(
+        "{command} expected a sealed package directory or package manifest.json, but {reason}.\n\ntarget_ref: {}\n\nNext steps:\n  bucephalus build experiment.yaml --out <package-dir>\n  bucephalus {command} <package-dir>\n  bucephalus doctor experiment.yaml",
+        public_command_target_ref(path)
+    )
 }
 
 fn experiment_input_path(path: &Path) -> Result<Option<PathBuf>> {
@@ -4889,6 +8304,7 @@ fn experiment_input_path(path: &Path) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+#[derive(Debug)]
 enum DoctorTarget {
     Experiment(PathBuf),
     Package(PathBuf),
@@ -4906,9 +8322,9 @@ fn resolve_doctor_target(target: Option<&Path>) -> Result<DoctorTarget> {
         if experiment.is_file() {
             return Ok(DoctorTarget::Experiment(experiment));
         }
-        return Err(anyhow!(
-            "no experiment.yaml or sealed package found in directory: {}",
-            path.display()
+        return Err(doctor_target_error(
+            path,
+            "target directory is neither an experiment workspace nor a sealed package",
         ));
     }
     if path.is_file() {
@@ -4917,7 +8333,14 @@ fn resolve_doctor_target(target: Option<&Path>) -> Result<DoctorTarget> {
         }
         return Ok(DoctorTarget::Package(path.to_path_buf()));
     }
-    Err(anyhow!("doctor target not found: {}", path.display()))
+    Err(doctor_target_error(path, "target does not exist"))
+}
+
+fn doctor_target_error(path: &Path, reason: &str) -> anyhow::Error {
+    anyhow!(
+        "doctor expected an experiment YAML, experiment directory, package directory, or package manifest.json, but {reason}.\n\ntarget_ref: {}\n\nNext steps:\n  bucephalus doctor <experiment-yaml>\n  bucephalus build <experiment-yaml> --out <package-dir>\n  bucephalus doctor <package-dir>",
+        public_doctor_target_ref(path)
+    )
 }
 
 fn run_command(command: Commands) -> Result<Option<Value>> {
@@ -4950,22 +8373,10 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 force,
             })?)?;
             if json {
-                return Ok(Some(result));
+                return Ok(Some(init_result_to_json(&result)));
             }
-            println!(
-                "created: {}",
-                result["experiment"].as_str().unwrap_or("experiment.yaml")
-            );
-            println!(
-                "agent: {}",
-                result["agent"].as_str().unwrap_or("agent/buc_agent.py")
-            );
-            if let Some(next) = result["next"].as_array() {
-                for command in next {
-                    if let Some(command) = command.as_str() {
-                        println!("next: {command}");
-                    }
-                }
+            for line in init_handoff_lines(&result) {
+                println!("{line}");
             }
         }
         Commands::Mcp => {
@@ -4989,17 +8400,22 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 no_browser,
             })?;
             if json {
-                return Ok(Some(result));
+                return Ok(Some(login_result_to_json(&result)));
             }
-            println!("login: ready");
-            println!(
-                "token_path: {}",
-                result["token_path"].as_str().unwrap_or("unknown")
-            );
-            if let Some(path) = result["refresh_token_path"].as_str() {
-                println!("refresh_token_path: {path}");
+            for line in login_handoff_lines(&result) {
+                println!("{line}");
             }
-            return Ok(Some(result));
+            return Ok(None);
+        }
+        Commands::Logout { dry_run, json } => {
+            let result = run_logout(dry_run)?;
+            if json {
+                return Ok(Some(logout_result_to_json(&result)));
+            }
+            for line in logout_handoff_lines(&result) {
+                println!("{line}");
+            }
+            return Ok(None);
         }
         Commands::Update {
             version,
@@ -5019,21 +8435,15 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 setup,
                 no_modify_path: !modify_path,
                 dry_run,
+                capture_output: json,
             })?;
             if json {
-                return Ok(Some(result));
+                return Ok(Some(update_result_to_json(&result)));
             }
-            println!("update: {}", if dry_run { "planned" } else { "complete" });
-            println!(
-                "version: {}",
-                result["version"].as_str().unwrap_or("unknown")
-            );
-            println!(
-                "install_dir: {}",
-                result["install_dir"].as_str().unwrap_or("unknown")
-            );
-            println!("setup: {}", result["setup"].as_bool().unwrap_or(false));
-            return Ok(Some(result));
+            for line in update_handoff_lines(&result) {
+                println!("{line}");
+            }
+            return Ok(None);
         }
         Commands::Daemon => {
             latch_daemon::run_latch_daemon()?;
@@ -5048,11 +8458,12 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             dry_run,
             json,
         } => {
+            let parent_json = json;
             let result = match command {
                 Some(SetupCommands::Status { project, json }) => {
                     let result = run_setup_status(project.as_deref())?;
-                    if json {
-                        return Ok(Some(result));
+                    if parent_json || json {
+                        return Ok(Some(setup_result_to_json(&result)));
                     }
                     result
                 }
@@ -5069,8 +8480,8 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                         no_mcp,
                         dry_run,
                     )?;
-                    if json {
-                        return Ok(Some(result));
+                    if parent_json || json {
+                        return Ok(Some(setup_result_to_json(&result)));
                     }
                     result
                 }
@@ -5083,89 +8494,16 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                         no_mcp,
                         dry_run,
                     )?;
-                    if json {
-                        return Ok(Some(result));
+                    if parent_json {
+                        return Ok(Some(setup_result_to_json(&result)));
                     }
                     result
                 }
             };
-            if result["schema_version"] == "bucephalus_setup_status_v1" {
-                println!("binary: {}", result["binary"].as_str().unwrap_or(""));
-                println!("home: {}", result["home"].as_str().unwrap_or(""));
-                println!(
-                    "daemon_service: {}",
-                    result["daemon_service"]["status"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                );
-                println!(
-                    "daemon_status: {}",
-                    result["daemon_status"]["status"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                );
-                println!(
-                    "auth: {}",
-                    result["auth"]["status"].as_str().unwrap_or("unknown")
-                );
-                if let Some(clients) = result["mcp"]["clients"].as_array() {
-                    for client in clients {
-                        println!(
-                            "mcp_client: {} {}",
-                            client["client"].as_str().unwrap_or("unknown"),
-                            client["status"].as_str().unwrap_or("unknown")
-                        );
-                    }
-                }
-                return Ok(Some(result));
+            for line in setup_handoff_lines(&result) {
+                println!("{line}");
             }
-            if result["schema_version"] == "bucephalus_setup_uninstall_v1" {
-                println!(
-                    "daemon_service: {}",
-                    result["daemon_service"]["status"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                );
-                println!(
-                    "mcp: {}",
-                    result["mcp"]["status"].as_str().unwrap_or("unknown")
-                );
-                return Ok(Some(result));
-            }
-            println!("binary: {}", result["binary"].as_str().unwrap_or(""));
-            println!("home: {}", result["home"].as_str().unwrap_or(""));
-            println!(
-                "daemon_service: {}",
-                result["daemon_service"]["status"]
-                    .as_str()
-                    .unwrap_or("unknown")
-            );
-            if let Some(path) = result["daemon_service"]["path"].as_str() {
-                println!("daemon_service_path: {path}");
-            }
-            println!(
-                "daemon_status: {}",
-                result["daemon_status"]["status"]
-                    .as_str()
-                    .unwrap_or("unknown")
-            );
-            if let Some(clients) = result["mcp"]["clients"].as_array() {
-                for client in clients {
-                    println!(
-                        "mcp_client: {} {}",
-                        client["client"].as_str().unwrap_or("unknown"),
-                        client["status"].as_str().unwrap_or("unknown")
-                    );
-                    if let Some(path) = client["path"].as_str() {
-                        println!("mcp_config_path: {path}");
-                    }
-                }
-            }
-            println!(
-                "auth: {}",
-                result["auth"]["status"].as_str().unwrap_or("unknown")
-            );
-            return Ok(Some(result));
+            return Ok(None);
         }
         Commands::Dev {
             target,
@@ -5180,7 +8518,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         } => {
             let experiment = resolve_experiment_target(target.as_deref())?;
             if !json {
-                eprintln!("building package from: {}", experiment.display());
+                eprintln!("{}", build_package_progress_line(&experiment));
             }
             let build = build_experiment_package_for_build_run(
                 &experiment,
@@ -5204,7 +8542,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             )?;
             if !json {
                 execution.stdout_progress = true;
-                eprintln!("running preflight...");
+                eprintln!("{}", running_preflight_progress_line(&build.package_dir));
             }
             let preflight =
                 lab_runner::preflight_experiment_with_options(&build.package_dir, &execution)?;
@@ -5217,7 +8555,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let summary =
                 lab_runner::experiment_summary_with_options(&build.package_dir, &execution)?;
             if !json {
-                print_summary(&summary);
+                print_summary(&build.package_dir, &summary);
                 eprintln!("launching smoke test...");
             }
             let result =
@@ -5227,26 +8565,22 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 &result.run_id,
             )?;
             if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "dev",
-                    "package_dir": build.package_dir.display().to_string(),
-                    "manifest_path": build.manifest_path.display().to_string(),
-                    "checksums_path": build.checksums_path.display().to_string(),
-                    "package_checks_path": build.package_checks_path.display().to_string(),
-                    "package_checks": package_checks,
-                    "preflight": preflight_report_to_json(&preflight),
-                    "summary": summary_to_json(&summary),
-                    "run": run_result_to_json(&result),
-                    "validation": experiment_bundle_validation_to_json(&validation),
-                })));
+                return Ok(Some(with_build_refs(
+                    json!({
+                        "ok": true,
+                        "command": "dev",
+                        "package_checks": package_check_report_to_json(&package_checks),
+                        "preflight": preflight_report_to_json(&preflight),
+                        "summary": summary_to_json(&build.package_dir, &summary),
+                        "run": run_result_to_json(&result),
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                    }),
+                    &build,
+                )));
             }
-            println!("package_dir: {}", build.package_dir.display());
-            println!("manifest: {}", build.manifest_path.display());
-            println!("package_checks: {}", build.package_checks_path.display());
+            print_build_handoff(&build);
             println!("package_digest: {}", validation.package_digest);
-            println!("smoke_run_id: {}", result.run_id);
-            println!("smoke_run_dir: {}", result.run_dir.display());
+            print_run_handoff(Some("smoke"), &result);
             println!("smoke_tested: true");
         }
         Commands::Doctor {
@@ -5263,7 +8597,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let build = match doctor_target {
                 DoctorTarget::Experiment(experiment) => {
                     if !json {
-                        eprintln!("building package from: {}", experiment.display());
+                        eprintln!("{}", build_package_progress_line(&experiment));
                     }
                     build_experiment_package_for_build_run(&experiment, overrides.as_deref(), None)?
                 }
@@ -5273,10 +8607,10 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                             "--overrides can only be used with an experiment YAML target"
                         ));
                     }
-                    if !json {
-                        eprintln!("checking package: {}", package.display());
-                    }
                     let package_dir = package_directory_for_input(&package);
+                    if !json {
+                        eprintln!("{}", checking_package_progress_line(&package_dir));
+                    }
                     lab_runner::BuildResult {
                         manifest_path: package_dir.join("manifest.json"),
                         checksums_path: package_dir.join("checksums.json"),
@@ -5292,14 +8626,16 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             if !package_checks_passed(&package_checks) {
                 if json {
-                    return Ok(Some(json!({
-                        "ok": false,
-                        "command": "doctor",
-                        "failed_at": "package_checks",
-                        "package_dir": build.package_dir.display().to_string(),
-                        "validation": experiment_bundle_validation_to_json(&validation),
-                        "package_checks": package_checks,
-                    })));
+                    return Ok(Some(with_build_refs(
+                        json!({
+                            "ok": false,
+                            "command": "doctor",
+                            "failed_at": "package_checks",
+                            "validation": experiment_bundle_validation_to_json(&validation),
+                            "package_checks": package_check_report_to_json(&package_checks),
+                        }),
+                        &build,
+                    )));
                 }
                 return Err(anyhow!("doctor found package check failures"));
             }
@@ -5312,7 +8648,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 &secret_file,
             )?;
             if !json {
-                eprintln!("running preflight...");
+                eprintln!("{}", running_preflight_progress_line(&build.package_dir));
             }
             let preflight =
                 lab_runner::preflight_experiment_with_options(&build.package_dir, &execution)?;
@@ -5321,33 +8657,37 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             if !preflight.passed {
                 if json {
-                    return Ok(Some(json!({
-                        "ok": false,
-                        "command": "doctor",
-                        "failed_at": "preflight",
-                        "package_dir": build.package_dir.display().to_string(),
-                        "validation": experiment_bundle_validation_to_json(&validation),
-                        "package_checks": package_checks,
-                        "preflight": preflight_report_to_json(&preflight),
-                    })));
+                    return Ok(Some(with_build_refs(
+                        json!({
+                            "ok": false,
+                            "command": "doctor",
+                            "failed_at": "preflight",
+                            "validation": experiment_bundle_validation_to_json(&validation),
+                            "package_checks": package_check_report_to_json(&package_checks),
+                            "preflight": preflight_report_to_json(&preflight),
+                        }),
+                        &build,
+                    )));
                 }
                 return Err(anyhow!("doctor found preflight failures"));
             }
             if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "doctor",
-                    "package_dir": build.package_dir.display().to_string(),
-                    "manifest_path": build.manifest_path.display().to_string(),
-                    "checksums_path": build.checksums_path.display().to_string(),
-                    "package_checks_path": build.package_checks_path.display().to_string(),
-                    "validation": experiment_bundle_validation_to_json(&validation),
-                    "package_checks": package_checks,
-                    "preflight": preflight_report_to_json(&preflight),
-                })));
+                return Ok(Some(with_build_refs(
+                    json!({
+                        "ok": true,
+                        "command": "doctor",
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                        "package_checks": package_check_report_to_json(&package_checks),
+                        "preflight": preflight_report_to_json(&preflight),
+                    }),
+                    &build,
+                )));
             }
             println!("doctor_ok: true");
-            println!("package_dir: {}", build.package_dir.display());
+            println!(
+                "package_ref: {}",
+                public_package_path_ref(&build.package_dir, &build.package_dir)
+            );
             println!("package_digest: {}", validation.package_digest);
         }
         Commands::Build {
@@ -5357,7 +8697,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             json,
         } => {
             if !json {
-                eprintln!("building package from: {}", experiment.display());
+                eprintln!("{}", build_package_progress_line(&experiment));
             }
             let build = lab_runner::build_experiment_package(
                 &experiment,
@@ -5366,32 +8706,31 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             )?;
             let validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
             if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "build",
-                    "package_dir": build.package_dir.display().to_string(),
-                    "manifest_path": build.manifest_path.display().to_string(),
-                    "checksums_path": build.checksums_path.display().to_string(),
-                    "package_checks_path": build.package_checks_path.display().to_string(),
-                    "validation": experiment_bundle_validation_to_json(&validation),
-                })));
+                return Ok(Some(with_build_refs(
+                    json!({
+                        "ok": true,
+                        "command": "build",
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                    }),
+                    &build,
+                )));
             }
-            println!("package_dir: {}", build.package_dir.display());
-            println!("manifest: {}", build.manifest_path.display());
-            println!("checksums: {}", build.checksums_path.display());
-            println!("package_checks: {}", build.package_checks_path.display());
+            print_build_handoff(&build);
             println!("package_digest: {}", validation.package_digest);
             println!("smoke_tested: {}", validation.smoke_tested);
         }
         Commands::CheckPackage { package, json } => {
+            let package = resolve_package_command_target("check-package", &package)?;
             let report = lab_runner::check_package(&package)?;
             if json {
-                return Ok(Some(json!({
-                    "ok": report.get("passed").and_then(Value::as_bool).unwrap_or(false),
-                    "command": "check-package",
-                    "package_dir": package.display().to_string(),
-                    "report": report,
-                })));
+                return Ok(Some(with_package_ref(
+                    json!({
+                        "ok": report.get("passed").and_then(Value::as_bool).unwrap_or(false),
+                        "command": "check-package",
+                        "report": package_check_report_to_json(&report),
+                    }),
+                    &package,
+                )));
             }
             print_package_check_report(&report);
             if !report
@@ -5411,11 +8750,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             skip_existing,
             json,
         } => {
+            let package = resolve_package_command_target("prepare-runtime-images", &package)?;
             if !json {
-                eprintln!(
-                    "preparing runtime images from package: {}",
-                    package.display()
-                );
+                eprintln!("{}", preparing_runtime_images_progress_line(&package));
             }
             let report = lab_runner::prepare_runtime_images(
                 &package,
@@ -5428,17 +8765,14 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 },
             )?;
             if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "prepare-runtime-images",
-                    "map_path": report.map_path.display().to_string(),
-                    "built": report.built,
-                    "skipped": report.skipped,
-                    "dry_run": report.dry_run,
-                    "entries": report.entries,
-                })));
+                return Ok(Some(prepared_runtime_image_report_to_json(
+                    &package, &report,
+                )));
             }
-            println!("map: {}", report.map_path.display());
+            println!(
+                "map_ref: {}",
+                public_package_path_ref(&package, &report.map_path)
+            );
             println!("entries: {}", report.entries.len());
             println!("built: {}", report.built);
             println!("skipped: {}", report.skipped);
@@ -5463,7 +8797,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             json,
         } => {
             if !json {
-                eprintln!("building package from: {}", experiment.display());
+                eprintln!("{}", build_package_progress_line(&experiment));
             }
             let build = build_experiment_package_for_build_run(
                 &experiment,
@@ -5517,27 +8851,22 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     &result.run_id,
                 )?;
                 if json {
-                    return Ok(Some(json!({
-                        "ok": true,
-                        "command": "build-run",
-                        "mode": "smoke_test",
-                        "package_dir": build.package_dir.display().to_string(),
-                        "manifest_path": build.manifest_path.display().to_string(),
-                        "checksums_path": build.checksums_path.display().to_string(),
-                        "package_checks_path": build.package_checks_path.display().to_string(),
-                        "summary": summary_to_json(&summary),
-                        "run": run_result_to_json(&result),
-                        "executor": execution.executor.map(|e| e.as_str()),
-                        "materialize": execution.materialize.map(|m| m.as_str()),
-                        "validation": experiment_bundle_validation_to_json(&validation),
-                    })));
+                    return Ok(Some(with_build_refs(
+                        json!({
+                            "ok": true,
+                            "command": "build-run",
+                            "mode": "smoke_test",
+                            "summary": summary_to_json(&build.package_dir, &summary),
+                            "run": run_result_to_json(&result),
+                            "executor": execution.executor.map(|e| e.as_str()),
+                            "materialize": execution.materialize.map(|m| m.as_str()),
+                            "validation": experiment_bundle_validation_to_json(&validation),
+                        }),
+                        &build,
+                    )));
                 }
-                println!("package_dir: {}", build.package_dir.display());
-                println!("manifest: {}", build.manifest_path.display());
-                println!("checksums: {}", build.checksums_path.display());
-                println!("package_checks: {}", build.package_checks_path.display());
-                println!("smoke_run_id: {}", result.run_id);
-                println!("smoke_run_dir: {}", result.run_dir.display());
+                print_build_handoff(&build);
+                print_run_handoff(Some("smoke"), &result);
                 println!("smoke_tested: true");
                 return Ok(None);
             }
@@ -5552,8 +8881,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     &result.run_id,
                 )?;
                 if !json {
-                    println!("smoke_run_id: {}", result.run_id);
-                    println!("smoke_run_dir: {}", result.run_dir.display());
+                    print_run_handoff(Some("smoke"), &result);
                     println!("smoke_tested: true");
                 }
                 Some(result)
@@ -5561,36 +8889,31 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 None
             };
             if !json {
-                print_summary(&summary);
+                print_summary(&build.package_dir, &summary);
                 eprintln!("launching run...");
             }
             let result =
                 lab_runner::run_experiment_with_options(&build.package_dir, execution.clone())?;
             if json {
                 let post_run = try_post_run_stats_json(&result.run_dir);
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "build-run",
-                    "package_dir": build.package_dir.display().to_string(),
-                    "manifest_path": build.manifest_path.display().to_string(),
-                    "checksums_path": build.checksums_path.display().to_string(),
-                        "package_checks_path": build.package_checks_path.display().to_string(),
-                        "summary": summary_to_json(&summary),
+                return Ok(Some(with_build_refs(
+                    json!({
+                        "ok": true,
+                        "command": "build-run",
+                        "summary": summary_to_json(&build.package_dir, &summary),
                         "smoke_run": smoke_result.as_ref().map(run_result_to_json),
                         "run": run_result_to_json(&result),
                         "artifacts": run_artifacts_to_json(&result),
                         "executor": execution.executor.map(|e| e.as_str()),
-                    "materialize": execution.materialize.map(|m| m.as_str()),
-                    "validation": experiment_bundle_validation_to_json(&validation),
-                    "post_run_stats": post_run
-                })));
+                        "materialize": execution.materialize.map(|m| m.as_str()),
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                        "post_run_stats": post_run
+                    }),
+                    &build,
+                )));
             }
-            println!("package_dir: {}", build.package_dir.display());
-            println!("manifest: {}", build.manifest_path.display());
-            println!("checksums: {}", build.checksums_path.display());
-            println!("package_checks: {}", build.package_checks_path.display());
-            println!("run_id: {}", result.run_id);
-            println!("run_dir: {}", result.run_dir.display());
+            print_build_handoff(&build);
+            print_run_handoff(None, &result);
             try_print_post_run_stats(&result.run_dir, &result.run_id);
         }
         Commands::Run {
@@ -5607,7 +8930,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         } => {
             let built = if let Some(experiment) = experiment_input_path(&package)? {
                 if !json {
-                    eprintln!("building package from: {}", experiment.display());
+                    eprintln!("{}", build_package_progress_line(&experiment));
                 }
                 Some(build_experiment_package_for_build_run(
                     &experiment,
@@ -5615,8 +8938,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     None,
                 )?)
             } else {
+                let package_input_dir = package_directory_for_input(&package);
                 if !json {
-                    eprintln!("loading package: {}", package.display());
+                    eprintln!("{}", loading_package_progress_line(&package_input_dir));
                 }
                 None
             };
@@ -5685,21 +9009,22 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 validation =
                     lab_runner::mark_experiment_bundle_smoke_tested(package_dir, &result.run_id)?;
                 if json {
-                    return Ok(Some(json!({
-                        "ok": true,
-                        "command": "run",
-                        "mode": "smoke_test",
-                        "input": if yaml_input { "experiment" } else { "package" },
-                        "package_dir": package_dir.display().to_string(),
-                        "summary": summary_to_json(&summary),
-                        "run": run_result_to_json(&result),
-                        "executor": execution.executor.map(|e| e.as_str()),
-                        "materialize": execution.materialize.map(|m| m.as_str()),
-                        "validation": experiment_bundle_validation_to_json(&validation),
-                    })));
+                    return Ok(Some(with_package_ref(
+                        json!({
+                            "ok": true,
+                            "command": "run",
+                            "mode": "smoke_test",
+                            "input": if yaml_input { "experiment" } else { "package" },
+                            "summary": summary_to_json(package_dir, &summary),
+                            "run": run_result_to_json(&result),
+                            "executor": execution.executor.map(|e| e.as_str()),
+                            "materialize": execution.materialize.map(|m| m.as_str()),
+                            "validation": experiment_bundle_validation_to_json(&validation),
+                        }),
+                        package_dir,
+                    )));
                 }
-                println!("smoke_run_id: {}", result.run_id);
-                println!("smoke_run_dir: {}", result.run_dir.display());
+                print_run_handoff(Some("smoke"), &result);
                 println!("smoke_tested: true");
                 return Ok(None);
             }
@@ -5712,8 +9037,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 validation =
                     lab_runner::mark_experiment_bundle_smoke_tested(package_dir, &result.run_id)?;
                 if !json {
-                    println!("smoke_run_id: {}", result.run_id);
-                    println!("smoke_run_dir: {}", result.run_dir.display());
+                    print_run_handoff(Some("smoke"), &result);
                     println!("smoke_tested: true");
                 }
                 Some(result)
@@ -5721,40 +9045,48 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 None
             };
             if !json {
-                print_summary(&summary);
+                print_summary(package_dir, &summary);
                 eprintln!("launching run...");
             }
             let result = lab_runner::run_experiment_with_options(package_dir, execution.clone())?;
             if json {
                 let post_run = try_post_run_stats_json(&result.run_dir);
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "run",
-                    "input": if yaml_input { "experiment" } else { "package" },
-                    "package_dir": package_dir.display().to_string(),
-                    "summary": summary_to_json(&summary),
-                    "smoke_run": smoke_result.as_ref().map(run_result_to_json),
-                    "run": run_result_to_json(&result),
-                    "artifacts": run_artifacts_to_json(&result),
-                    "executor": execution.executor.map(|e| e.as_str()),
-                    "materialize": execution.materialize.map(|m| m.as_str()),
-                    "validation": experiment_bundle_validation_to_json(&validation),
-                    "post_run_stats": post_run
-                })));
+                return Ok(Some(with_package_ref(
+                    json!({
+                        "ok": true,
+                        "command": "run",
+                        "input": if yaml_input { "experiment" } else { "package" },
+                        "summary": summary_to_json(package_dir, &summary),
+                        "smoke_run": smoke_result.as_ref().map(run_result_to_json),
+                        "run": run_result_to_json(&result),
+                        "artifacts": run_artifacts_to_json(&result),
+                        "executor": execution.executor.map(|e| e.as_str()),
+                        "materialize": execution.materialize.map(|m| m.as_str()),
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                        "post_run_stats": post_run
+                    }),
+                    package_dir,
+                )));
             }
-            println!("run_id: {}", result.run_id);
-            println!("run_dir: {}", result.run_dir.display());
+            print_run_handoff(None, &result);
             try_print_post_run_stats(&result.run_dir, &result.run_id);
         }
         Commands::Latch {
             command: LatchCommands::Validate { manifest, json },
         } => {
             let result = lab_runner::validate_latch_manifest_file(&manifest)?;
-            let result_json = serde_json::to_value(&result)?;
             if json {
-                return Ok(Some(result_json));
+                return Ok(Some(latch_manifest_validation_to_json(&result)));
             }
-            println!("manifest: {}", result.manifest_path.display());
+            let latch_root = result
+                .manifest_path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            println!(
+                "manifest_ref: {}",
+                public_latch_path_ref(latch_root, &result.manifest_path)
+            );
             println!("schema_version: {}", result.schema_version);
             println!("case_count: {}", result.case_count);
             println!("default_launch_present: {}", result.default_launch_present);
@@ -5762,28 +9094,19 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 "default_workspace_seed_present: {}",
                 result.default_workspace_seed_present
             );
-            return Ok(Some(result_json));
+            return Ok(None);
         }
         Commands::Latch {
             command: LatchCommands::Demo { out, json },
         } => {
             let result = write_latch_demo(&out)?;
             if json {
-                return Ok(Some(result));
+                return Ok(Some(latch_generation_result_to_json(&out, &result)));
             }
-            println!(
-                "manifest: {}",
-                result["manifest_path"].as_str().unwrap_or("")
-            );
-            println!("seed_dir: {}", result["seed_dir"].as_str().unwrap_or(""));
-            if let Some(next) = result["next"].as_array() {
-                for command in next {
-                    if let Some(command) = command.as_str() {
-                        println!("next: {command}");
-                    }
-                }
+            for line in latch_generation_handoff_lines(&out, &result, true) {
+                println!("{line}");
             }
-            return Ok(Some(result));
+            return Ok(None);
         }
         Commands::Latch {
             command:
@@ -5813,36 +9136,20 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 run_root,
                 launch_override: None,
             })?;
-            let run_json = serde_json::to_value(&result)?;
-            let result_json = json!({
-                "schema_version": "latch_smoke_result_v1",
-                "resolution": resolution,
-                "run": run_json
-            });
             if json {
-                return Ok(Some(result_json));
+                return Ok(Some(json!({
+                    "schema_version": "latch_smoke_result_v1",
+                    "resolution": latch_generation_result_to_json(&out, &resolution),
+                    "run": latch_run_result_to_json(&result)
+                })));
             }
-            println!(
-                "resolution: {}",
-                result_json["resolution"]["resolution_path"]
-                    .as_str()
-                    .unwrap_or("")
-            );
-            println!(
-                "manifest: {}",
-                result_json["resolution"]["manifest_path"]
-                    .as_str()
-                    .unwrap_or("")
-            );
-            println!("latch_run_id: {}", result.run_id);
-            println!("run_dir: {}", result.run_dir.display());
-            for case in &result.cases {
-                println!(
-                    "case {}: {:?} exit={:?}",
-                    case.case_id, case.status, case.exit_code
-                );
+            for line in latch_generation_handoff_lines(&out, &resolution, false) {
+                println!("{line}");
             }
-            return Ok(Some(result_json));
+            for line in latch_run_handoff_lines(&result, false) {
+                println!("{line}");
+            }
+            return Ok(None);
         }
         Commands::Latch {
             command:
@@ -5858,27 +9165,13 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 run_root,
                 launch_override: (!argv.is_empty()).then_some(argv),
             })?;
-            let result_json = serde_json::to_value(&result)?;
             if json {
-                return Ok(Some(result_json));
+                return Ok(Some(latch_run_result_to_json(&result)));
             }
-            println!("latch_run_id: {}", result.run_id);
-            println!("run_dir: {}", result.run_dir.display());
-            for case in &result.cases {
-                let patch = case
-                    .workspace_diff_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "no diff".to_string());
-                println!(
-                    "case {}: {:?} exit={:?} patch={}",
-                    case.case_id, case.status, case.exit_code, patch
-                );
-                if let Some(error) = case.capture_error.as_ref() {
-                    println!("  capture: {error}");
-                }
+            for line in latch_run_handoff_lines(&result, true) {
+                println!("{line}");
             }
-            return Ok(Some(result_json));
+            return Ok(None);
         }
         Commands::Replay {
             run_dir,
@@ -5895,7 +9188,10 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 })));
             }
             println!("replay_id: {}", result.replay_id);
-            println!("replay_dir: {}", result.replay_dir.display());
+            println!(
+                "replay_ref: {}",
+                public_child_run_path_ref(&result.replay_dir)
+            );
             println!("parent_trial_id: {}", result.parent_trial_id);
             println!("strict: {}", result.strict);
             println!("replay_grade: {}", result.replay_grade);
@@ -5919,7 +9215,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 })));
             }
             println!("fork_id: {}", result.fork_id);
-            println!("fork_dir: {}", result.fork_dir.display());
+            println!("fork_ref: {}", public_child_run_path_ref(&result.fork_dir));
             println!("parent_trial_id: {}", result.parent_trial_id);
             println!("selector: {}", result.selector);
             println!("strict: {}", result.strict);
@@ -5990,12 +9286,13 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             if let Some(fork) = result.fork.as_ref() {
                 println!("fork_id: {}", fork.fork_id);
-                println!("fork_dir: {}", fork.fork_dir.display());
+                println!("fork_ref: {}", public_child_run_path_ref(&fork.fork_dir));
                 println!("replay_grade: {}", fork.replay_grade);
                 println!("harness_status: {}", fork.harness_status);
             }
         }
         Commands::Continue {
+            run,
             run_dir,
             runtime_env,
             runtime_env_file,
@@ -6013,6 +9310,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             if !json {
                 execution.stdout_progress = true;
             }
+            let run_dir = resolve_run_selector("continue", run.as_deref(), run_dir.as_deref())?;
             let result = lab_runner::continue_run_with_options(&run_dir, execution)?;
             if json {
                 return Ok(Some(json!({
@@ -6021,14 +9319,15 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "run": run_result_to_json(&result),
                 })));
             }
-            println!("run_id: {}", result.run_id);
-            println!("run_dir: {}", result.run_dir.display());
+            print_run_handoff(None, &result);
         }
         Commands::Recover {
+            run,
             run_dir,
             force,
             json,
         } => {
+            let run_dir = resolve_run_selector("recover", run.as_deref(), run_dir.as_deref())?;
             let result = lab_runner::recover_run(&run_dir, force)?;
             if json {
                 return Ok(Some(json!({
@@ -6063,17 +9362,10 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let run_dir = resolve_run_dir_arg(&run)?;
             let result = lab_runner::kill_run(&run_dir)?;
             if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "kill",
-                    "run_id": result.run_id,
-                    "run_dir": result.run_dir.display().to_string(),
-                    "previous_status": result.previous_status,
-                    "killed_trials": result.killed_trials,
-                })));
+                return Ok(Some(kill_result_to_json(&result)));
             }
             println!("killed: {}", result.run_id);
-            println!("run_dir: {}", result.run_dir.display());
+            println!("run_ref: {}", public_run_ref(&result.run_dir));
             println!("previous_status: {}", result.previous_status);
             if result.killed_trials.is_empty() {
                 println!("killed_trials: (none active)");
@@ -6143,7 +9435,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     return Ok(Some(json!({
                         "ok": true,
                         "command": "views",
-                        "run_dir": run_dir.display().to_string(),
+                        "run_ref": public_run_ref(&run_dir),
                         "view_set": view_set,
                         "view_count": standard_views.len(),
                         "raw_view_count": raw_view_names.len(),
@@ -6171,7 +9463,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     print_views_html_document(&run_dir, &view_set, &rendered);
                     return Ok(None);
                 }
-                println!("run_dir: {}", run_dir.display());
+                println!("run_ref: {}", public_run_ref(&run_dir));
                 println!("view_set: {}", view_set);
                 for (resolved, table) in rendered {
                     println!("\n== {} ==", resolved.name);
@@ -6190,7 +9482,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     return Ok(Some(json!({
                         "ok": true,
                         "command": "views",
-                        "run_dir": run_dir.display().to_string(),
+                        "run_ref": public_run_ref(&run_dir),
                         "view_set": view_set,
                         "view": resolved.name,
                         "source_view": resolved.source,
@@ -6209,7 +9501,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     print_single_view_html(&run_dir, &view_set, &resolved, &table);
                     return Ok(None);
                 }
-                println!("run_dir: {}", run_dir.display());
+                println!("run_ref: {}", public_run_ref(&run_dir));
                 println!("view_set: {}", view_set);
                 println!("view: {}", resolved.name);
                 if let Some(source) = resolved.source.as_deref() {
@@ -6245,7 +9537,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 return Ok(Some(json!({
                     "ok": true,
                     "command": "views",
-                    "run_dir": run_dir.display().to_string(),
+                    "run_ref": public_run_ref(&run_dir),
                     "view_set": view_set,
                     "available_views": standard_views.iter().map(|def| json!({
                         "name": def.name,
@@ -6267,7 +9559,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 print_table_html_document("available_views", &listing_table);
                 return Ok(None);
             }
-            println!("run_dir: {}", run_dir.display());
+            println!("run_ref: {}", public_run_ref(&run_dir));
             println!("view_set: {}", view_set);
             print_query_table(&listing_table);
             let hidden = raw_view_names.len().saturating_sub(standard_views.len());
@@ -6328,7 +9620,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                             eprintln!("warning: failed to flush live view clear: {}", err);
                         }
                     }
-                    println!("run_dir: {}", run_dir.display());
+                    println!("run_ref: {}", public_run_ref(&run_dir));
                     println!("status: {}", read_run_status(&run_dir));
                     println!("updated_unix_s: {}", unix_now_seconds());
                     println!("view: {}", resolved_view.name);
@@ -6367,13 +9659,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let run_dir = resolve_run_dir_arg(&run)?;
             let table = analysis::query_run(&run_dir, &sql)?;
             if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "query",
-                    "run_dir": run_dir.display().to_string(),
-                    "sql": sql,
-                    "result": query_table_to_json(&table),
-                })));
+                return Ok(Some(query_command_result_to_json(&run_dir, &sql, &table)));
             }
             if csv {
                 print_query_table_csv(&table);
@@ -6388,52 +9674,64 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let project_root = resolve_project_root(std::env::current_dir()?.as_path());
             let table = build_runs_table(&project_root)?;
             if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "runs",
-                    "project_root": project_root.display().to_string(),
-                    "result": query_table_to_json(&table),
-                })));
+                return Ok(Some(runs_command_result_to_json(&project_root, &table)));
             }
             if csv {
                 print_query_table_csv(&table);
                 return Ok(None);
             }
+            if table.rows.is_empty() {
+                for line in runs_empty_handoff_lines(&project_root) {
+                    println!("{line}");
+                }
+                return Ok(None);
+            }
             print_query_table(&table);
         }
         Commands::SchemaValidate { schema, file, json } => {
-            let compiled = schemas::compile_schema(&schema)?;
-            let data = std::fs::read_to_string(file)?;
-            let value: serde_json::Value = serde_json::from_str(&data)?;
+            ensure_schema_name_for_validation(&schema)?;
+            let compiled = schemas::compile_schema(&schema)
+                .map_err(|err| schema_compile_error(&schema, err))?;
+            let value = read_schema_validation_input(&file)?;
             if let Err(errors) = compiled.validate(&value) {
-                for e in errors {
-                    eprintln!("schema error: {}", e);
+                let messages = errors.map(|error| error.to_string()).collect::<Vec<_>>();
+                if json {
+                    emit_json(&schema_validation_failure_to_json(
+                        &schema, &file, &messages,
+                    ));
+                    std::process::exit(1);
+                }
+                eprintln!("input_ref: {}", public_schema_input_ref(&file));
+                eprintln!("schema: {}", public_schema_name(&schema));
+                for message in messages {
+                    eprintln!("schema error: {}", public_error_message(&message));
                 }
                 std::process::exit(1);
             }
             if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "schema-validate",
-                    "valid": true,
-                    "schema": schema
-                })));
+                return Ok(Some(schema_validation_success_to_json(&schema, &file)));
             }
             println!("ok");
         }
         Commands::Publish { run_dir, out, json } => {
-            let out_path = out.unwrap_or(run_dir.join("debug_bundles").join("bundle.zip"));
-            std::fs::create_dir_all(out_path.parent().unwrap_or_else(|| Path::new(".")))?;
-            provenance::build_debug_bundle(&run_dir, &out_path)?;
+            let used_default_out = out.is_none();
+            let out_path = out.unwrap_or_else(|| default_publish_bundle_path(&run_dir));
+            let report = provenance::build_debug_bundle(&run_dir, &out_path)?;
             if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "publish",
-                    "bundle": out_path.display().to_string(),
-                    "run_dir": run_dir.display().to_string()
-                })));
+                return Ok(Some(publish_report_to_json(
+                    &run_dir,
+                    &report,
+                    used_default_out,
+                )));
             }
-            println!("bundle: {}", out_path.display());
+            println!(
+                "bundle_ref: {}",
+                public_run_path_ref(&run_dir, &report.bundle_path)
+            );
+            println!("included_files: {}", report.included_count());
+            println!("redacted_files: {}", report.redacted_count());
+            println!("skipped_files: {}", report.skipped_count());
+            println!("review: inspect the redacted support bundle before sharing");
         }
         Commands::Preflight {
             package,
@@ -6442,8 +9740,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             secret_file,
             json,
         } => {
+            let package = resolve_package_command_target("preflight", &package)?;
             if !json {
-                eprintln!("running preflight: {}", package.display());
+                eprintln!("{}", running_preflight_progress_line(&package));
             }
             let execution = build_run_execution_options(
                 None,
@@ -6455,33 +9754,45 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             )?;
             let report = lab_runner::preflight_experiment_with_options(&package, &execution)?;
             if json {
-                return Ok(Some(json!({
-                    "ok": report.passed,
-                    "command": "preflight",
-                    "checks": report.checks.iter().map(|c| json!({
-                        "name": c.name,
-                        "passed": c.passed,
-                        "severity": match c.severity {
-                            lab_runner::PreflightSeverity::Error => "error",
-                            lab_runner::PreflightSeverity::Warning => "warning",
-                        },
-                        "message": c.message,
-                    })).collect::<Vec<_>>()
-                })));
+                return Ok(Some(preflight_command_report_to_json(&package, &report)));
             }
             print_preflight_report(&report);
             if !report.passed {
                 std::process::exit(1);
             }
         }
-        Commands::Clean { runs } => {
-            if runs {
-                let runs_dir = lab_runner::default_run_root()?;
-                if runs_dir.exists() {
-                    std::fs::remove_dir_all(&runs_dir)?;
-                    println!("removed: {}", runs_dir.display());
-                }
+        Commands::Clean {
+            runs,
+            force,
+            include_active,
+            include_interrupted,
+            include_untracked,
+            dry_run,
+            json,
+        } => {
+            if !runs {
+                return Err(anyhow!(
+                    "nothing selected to clean; try `bucephalus clean --runs --dry-run`"
+                ));
             }
+            let runs_dir = lab_runner::default_run_root()?;
+            let inventory = collect_run_inventory(&runs_dir)?;
+            let report = clean_runs_preflight(
+                &runs_dir,
+                &inventory,
+                force,
+                include_active,
+                include_interrupted,
+                include_untracked,
+                dry_run,
+            )?;
+            if report.will_remove && !dry_run {
+                remove_clean_runs_root(&runs_dir)?;
+            }
+            if json {
+                return Ok(Some(clean_runs_report_to_json(&report)));
+            }
+            print_clean_runs_report(&report);
         }
     }
     Ok(None)
@@ -6501,21 +9812,427 @@ fn json_error(code: &str, message: String, details: Value) -> Value {
         "ok": false,
         "error": {
             "code": code,
-            "message": message,
+            "message": public_error_message(&message),
             "details": details
         }
     })
+}
+
+fn ensure_schema_name_for_validation(schema: &str) -> Result<()> {
+    let mut names = schemas::schema_names();
+    names.sort();
+    if names.iter().any(|name| name == schema) {
+        return Ok(());
+    }
+    let available = names.join(", ");
+    Err(anyhow!(
+        "schema not found: {}\n\navailable_schemas: {}\n\nNext steps:\n  Choose one of the bundled schema names and retry `bucephalus schema-validate --schema <name> --file <json>`.",
+        public_schema_name(schema),
+        available
+    ))
+}
+
+fn schema_compile_error(schema: &str, err: anyhow::Error) -> anyhow::Error {
+    anyhow!(
+        "failed to compile bundled schema\n\nschema: {}\n\nerror: {}",
+        public_schema_name(schema),
+        public_error_message(&err.to_string())
+    )
+}
+
+fn read_schema_validation_input(file: &Path) -> Result<Value> {
+    let data = fs::read_to_string(file).map_err(|err| {
+        anyhow!(
+            "failed to read schema input\n\ninput_ref: {}\n\nNext steps:\n  Check the path passed to --file and retry.\n\nerror: {}",
+            public_schema_input_ref(file),
+            public_error_message(&err.to_string())
+        )
+    })?;
+    serde_json::from_str(&data).map_err(|err| {
+        anyhow!(
+            "failed to parse schema input as JSON\n\ninput_ref: {}\n\nerror: {}",
+            public_schema_input_ref(file),
+            public_error_message(&err.to_string())
+        )
+    })
+}
+
+fn public_schema_input_ref(_file: &Path) -> &'static str {
+    "schema-input://file"
+}
+
+fn public_schema_name(schema: &str) -> String {
+    let trimmed = schema.trim();
+    if trimmed.is_empty() {
+        return "(empty)".to_string();
+    }
+    if schema_name_needs_redaction(trimmed) {
+        return "[REDACTED:schema-name]".to_string();
+    }
+    let mut out = trimmed
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .take(100)
+        .collect::<String>();
+    if trimmed.chars().count() > 100 {
+        out.push_str("...");
+    }
+    out
+}
+
+fn schema_name_needs_redaction(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    value.contains('/')
+        || value.contains('\\')
+        || value.contains('=')
+        || lower.contains("://")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("credential")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("authorization")
+        || lower.contains("bearer")
+        || lower.contains("private")
+}
+
+fn schema_validation_success_to_json(schema: &str, file: &Path) -> Value {
+    json!({
+        "ok": true,
+        "command": "schema-validate",
+        "valid": true,
+        "schema": public_schema_name(schema),
+        "input_ref": public_schema_input_ref(file)
+    })
+}
+
+fn schema_validation_failure_to_json(schema: &str, file: &Path, errors: &[String]) -> Value {
+    json!({
+        "ok": false,
+        "command": "schema-validate",
+        "valid": false,
+        "schema": public_schema_name(schema),
+        "input_ref": public_schema_input_ref(file),
+        "error_count": errors.len(),
+        "errors": errors
+            .iter()
+            .map(|message| json!({
+                "message": public_error_message(message),
+            }))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn public_error_message(message: &str) -> String {
+    let redacted = message
+        .lines()
+        .map(redact_public_error_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    truncate_response_message(&redacted)
+}
+
+fn redact_public_error_line(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("authorization:") || lower.contains("bearer ") {
+        return "[REDACTED:secret-like]".to_string();
+    }
+    let url_redacted = redact_urls_in_text(line);
+    let path_redacted = redact_local_paths_in_text(&url_redacted);
+    path_redacted
+        .split_inclusive(char::is_whitespace)
+        .map(|chunk| {
+            if chunk.chars().last().is_some_and(char::is_whitespace) {
+                let token = &chunk[..chunk.len() - chunk.chars().last().unwrap().len_utf8()];
+                format!(
+                    "{}{}",
+                    redact_public_error_token(token),
+                    chunk.chars().last().unwrap()
+                )
+            } else {
+                redact_public_error_token(chunk)
+            }
+        })
+        .collect::<String>()
+}
+
+fn redact_public_error_token(token: &str) -> String {
+    let trimmed_start = token.trim_start_matches(public_error_token_prefix);
+    let prefix_len = token.len() - trimmed_start.len();
+    let trimmed_core = trimmed_start.trim_end_matches(public_error_token_suffix);
+    let suffix_len = trimmed_start.len() - trimmed_core.len();
+    let prefix = &token[..prefix_len];
+    let suffix = &token[token.len() - suffix_len..];
+    let lower = trimmed_core.to_ascii_lowercase();
+
+    if trimmed_core.contains("[REDACTED:") {
+        return token.to_string();
+    }
+
+    let redacted_core = if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("file://")
+    {
+        Some(redact_public_url(trimmed_core))
+    } else if looks_like_local_path(trimmed_core) {
+        Some("[REDACTED:local-path]".to_string())
+    } else if let Some((key, value)) = trimmed_core.split_once('=') {
+        let key_lower = key.to_ascii_lowercase();
+        if key_lower.contains("token")
+            || key_lower.contains("secret")
+            || key_lower.contains("password")
+            || key_lower.contains("apikey")
+            || key_lower.contains("api_key")
+            || key_lower.contains("credential")
+        {
+            Some(format!("{key}=[REDACTED:secret-like]"))
+        } else if looks_like_local_path(value) {
+            Some(format!("{key}=[REDACTED:local-path]"))
+        } else if reqwest::Url::parse(value).is_ok() {
+            Some(format!("{key}={}", redact_public_url(value)))
+        } else {
+            None
+        }
+    } else if lower.starts_with("sk-") {
+        Some("[REDACTED:secret-like]".to_string())
+    } else {
+        None
+    };
+
+    match redacted_core {
+        Some(core) => format!("{prefix}{core}{suffix}"),
+        None => token.to_string(),
+    }
+}
+
+fn public_error_token_prefix(ch: char) -> bool {
+    matches!(ch, '(' | '[' | '{' | '<' | '"' | '\'' | '`')
+}
+
+fn public_error_token_suffix(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ',' | ';' | ')' | ']' | '}' | '>' | '"' | '\'' | '`'
+    )
+}
+
+fn looks_like_local_path(value: &str) -> bool {
+    earliest_local_path_start(value.trim()) == Some(0)
+}
+
+fn redact_urls_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = earliest_url_start(rest) {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        let end = urlish_end(after_start);
+        let candidate = &after_start[..end];
+        if candidate.starts_with("file://[REDACTED:local-path]") {
+            out.push_str(candidate);
+            rest = &after_start[end..];
+            continue;
+        }
+        let trimmed = candidate.trim_end_matches(public_error_token_suffix);
+        let suffix = &candidate[trimmed.len()..];
+        out.push_str(&redact_public_url(trimmed));
+        out.push_str(suffix);
+        rest = &after_start[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn earliest_url_start(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    ["https://", "http://", "file://"]
+        .iter()
+        .filter_map(|scheme| lower.find(scheme))
+        .min()
+}
+
+fn urlish_end(text: &str) -> usize {
+    for (idx, ch) in text.char_indices() {
+        if ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '<' | '>') {
+            return idx;
+        }
+    }
+    text.len()
+}
+
+fn redact_local_paths_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = earliest_local_path_start(rest) {
+        out.push_str(&rest[..start]);
+        out.push_str("[REDACTED:local-path]");
+        let after_start = &rest[start..];
+        let end = local_path_end(after_start);
+        rest = &after_start[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn earliest_local_path_start(text: &str) -> Option<usize> {
+    let mut best = None;
+    for (idx, _) in text.char_indices() {
+        if !local_path_start_boundary(text, idx) {
+            continue;
+        }
+        if is_posix_local_path_start(text, idx)
+            || is_wsl_windows_user_path_start(text, idx)
+            || is_windows_drive_path_start(text, idx)
+            || is_windows_profile_env_path_start(text, idx)
+            || is_home_relative_path_start(text, idx)
+        {
+            best = Some(best.map_or(idx, |current: usize| current.min(idx)));
+        }
+    }
+    best
+}
+
+fn local_path_start_boundary(text: &str, idx: usize) -> bool {
+    idx == 0
+        || text[..idx].chars().next_back().is_some_and(|ch| {
+            ch.is_whitespace() || matches!(ch, '=' | '(' | '[' | '{' | '<' | '"' | '\'' | '`')
+        })
+}
+
+fn is_posix_local_path_start(text: &str, idx: usize) -> bool {
+    [
+        "/Users/",
+        "/home/",
+        "/private/",
+        "/tmp/",
+        "/var/folders/",
+        "/Volumes/",
+    ]
+    .iter()
+    .any(|prefix| text[idx..].starts_with(prefix))
+}
+
+fn is_wsl_windows_user_path_start(text: &str, idx: usize) -> bool {
+    let rest = &text[idx..];
+    let bytes = rest.as_bytes();
+    bytes.len() > 13
+        && rest.starts_with("/mnt/")
+        && bytes[5].is_ascii_alphabetic()
+        && bytes[6] == b'/'
+        && rest[7..].to_ascii_lowercase().starts_with("users/")
+}
+
+fn is_windows_drive_path_start(text: &str, idx: usize) -> bool {
+    let bytes = text.as_bytes();
+    idx + 3 < bytes.len()
+        && bytes[idx].is_ascii_alphabetic()
+        && bytes[idx + 1] == b':'
+        && matches!(bytes[idx + 2], b'\\' | b'/')
+        && !matches!(bytes[idx + 3], b'\\' | b'/')
+}
+
+fn is_windows_profile_env_path_start(text: &str, idx: usize) -> bool {
+    let rest = &text[idx..];
+    if !rest.starts_with('%') {
+        return false;
+    }
+    let Some(end_percent) = rest[1..].find('%').map(|offset| offset + 1) else {
+        return false;
+    };
+    let Some(after_percent) = rest.as_bytes().get(end_percent + 1) else {
+        return false;
+    };
+    if !matches!(after_percent, b'\\' | b'/') {
+        return false;
+    }
+    let env_name = rest[1..end_percent].to_ascii_uppercase();
+    [
+        "USERPROFILE",
+        "HOME",
+        "TEMP",
+        "TMP",
+        "APPDATA",
+        "LOCALAPPDATA",
+    ]
+    .iter()
+    .any(|name| env_name.contains(name))
+}
+
+fn is_home_relative_path_start(text: &str, idx: usize) -> bool {
+    text[idx..].starts_with("~/") || text[idx..].starts_with("~\\")
+}
+
+fn local_path_end(text: &str) -> usize {
+    let mut idx = 0;
+    while idx < text.len() {
+        let ch = text[idx..].chars().next().unwrap();
+        if is_local_path_hard_delimiter(ch, idx) {
+            return idx;
+        }
+        let next_idx = idx + ch.len_utf8();
+        if ch.is_whitespace() && following_token_is_connector_boundary(&text[next_idx..]) {
+            return idx;
+        }
+        if ch.is_whitespace() && following_token_is_assignment(&text[next_idx..]) {
+            return idx;
+        }
+        idx = next_idx;
+    }
+    text.len()
+}
+
+fn is_local_path_hard_delimiter(ch: char, idx: usize) -> bool {
+    matches!(
+        ch,
+        '\n' | '\r' | '\t' | '"' | '\'' | '`' | '<' | '>' | '|' | ',' | ';' | ')' | ']' | '}'
+    ) || (ch == ':' && idx != 1)
+}
+
+fn following_token_is_connector_boundary(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    for connector in ["with", "via", "using"] {
+        let Some(after_connector) = trimmed.strip_prefix(connector) else {
+            continue;
+        };
+        if !after_connector
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+        {
+            continue;
+        }
+        let after_connector = after_connector.trim_start();
+        if following_token_is_assignment(after_connector)
+            || earliest_url_start(after_connector) == Some(0)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn following_token_is_assignment(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let key_len = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    key_len > 0 && trimmed.as_bytes().get(key_len) == Some(&b'=')
 }
 
 fn command_json_mode(command: &Commands) -> bool {
     match command {
         Commands::Init { json, .. }
         | Commands::Login { json, .. }
+        | Commands::Logout { json, .. }
         | Commands::Update { json, .. }
         | Commands::Dev { json, .. }
         | Commands::Doctor { json, .. }
         | Commands::Build { json, .. }
         | Commands::CheckPackage { json, .. }
+        | Commands::PrepareRuntimeImages { json, .. }
         | Commands::BuildRun { json, .. }
         | Commands::Run { json, .. }
         | Commands::Replay { json, .. }
@@ -6530,11 +10247,16 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Runs { json, .. }
         | Commands::SchemaValidate { json, .. }
         | Commands::Publish { json, .. }
-        | Commands::Preflight { json, .. } => *json,
-        Commands::Setup { command, json, .. } => match command {
+        | Commands::Preflight { json, .. }
+        | Commands::Clean { json, .. } => *json,
+        Commands::Setup {
+            command,
+            json: parent_json,
+            ..
+        } => match command {
             Some(SetupCommands::Status { json, .. })
-            | Some(SetupCommands::Uninstall { json, .. }) => *json,
-            None => *json,
+            | Some(SetupCommands::Uninstall { json, .. }) => *parent_json || *json,
+            None => *parent_json,
         },
         Commands::Latch {
             command:
@@ -6550,9 +10272,739 @@ fn command_json_mode(command: &Commands) -> bool {
 fn run_result_to_json(result: &lab_runner::RunResult) -> Value {
     json!({
         "run_id": result.run_id,
-        "run_dir": result.run_dir.display().to_string(),
-        "run_store_location": result.account_db_path.display().to_string()
+        "run_ref": public_run_ref(&result.run_dir),
+        "run_store_ref": public_run_path_ref(&result.run_dir, &result.account_db_path)
     })
+}
+
+fn init_result_to_json(result: &Value) -> Value {
+    let workspace = result
+        .get("dir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let workspace_ref = result
+        .get("workspace_ref")
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("workspace://"))
+        .map(str::to_string)
+        .unwrap_or_else(|| public_project_ref(&workspace));
+    json!({
+        "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(true),
+        "command": "init",
+        "client": result.get("client").and_then(Value::as_str).unwrap_or("unknown"),
+        "workspace_ref": workspace_ref,
+        "experiment_ref": init_result_workspace_ref(&workspace, result, "experiment_ref", "experiment"),
+        "cases_ref": init_result_workspace_ref(&workspace, result, "cases_ref", "cases"),
+        "agent_ref": init_result_workspace_ref(&workspace, result, "agent_ref", "agent"),
+        "next_actions": [
+            {
+                "type": "cli_command",
+                "command": "bucephalus dev <workspace-dir>",
+                "workspace_ref": workspace_ref,
+            },
+            {
+                "type": "cli_command",
+                "command": "bucephalus run <experiment-yaml>",
+                "experiment_ref": init_result_workspace_ref(&workspace, result, "experiment_ref", "experiment"),
+            }
+        ]
+    })
+}
+
+fn init_result_workspace_ref(
+    workspace: &Path,
+    result: &Value,
+    ref_key: &str,
+    path_key: &str,
+) -> String {
+    if let Some(raw) = result.get(ref_key).and_then(Value::as_str) {
+        if raw.starts_with("workspace://") {
+            return raw.to_string();
+        }
+    }
+    result
+        .get(path_key)
+        .and_then(Value::as_str)
+        .map(|path| public_workspace_path_ref(workspace, Path::new(path)))
+        .unwrap_or_else(|| "[REDACTED:local-path]".to_string())
+}
+
+fn init_handoff_lines(result: &Value) -> Vec<String> {
+    let public = init_result_to_json(result);
+    let mut lines = vec![
+        format!(
+            "workspace_ref: {}",
+            public["workspace_ref"]
+                .as_str()
+                .unwrap_or("workspace://current")
+        ),
+        format!(
+            "experiment_ref: {}",
+            public["experiment_ref"]
+                .as_str()
+                .unwrap_or("[REDACTED:local-path]")
+        ),
+        format!(
+            "cases_ref: {}",
+            public["cases_ref"]
+                .as_str()
+                .unwrap_or("[REDACTED:local-path]")
+        ),
+        format!(
+            "agent_ref: {}",
+            public["agent_ref"]
+                .as_str()
+                .unwrap_or("[REDACTED:local-path]")
+        ),
+    ];
+    if let Some(actions) = public["next_actions"].as_array() {
+        for action in actions {
+            if let Some(command) = action["command"].as_str() {
+                if let Some(workspace_ref) = action["workspace_ref"].as_str() {
+                    lines.push(format!("next: {command} ({workspace_ref})"));
+                } else if let Some(experiment_ref) = action["experiment_ref"].as_str() {
+                    lines.push(format!("next: {command} ({experiment_ref})"));
+                } else {
+                    lines.push(format!("next: {command}"));
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn setup_result_to_json(result: &Value) -> Value {
+    let home = auth_home_from_result(result);
+    let mut public = result.clone();
+    if let Some(object) = public.as_object_mut() {
+        if object.remove("binary").is_some() {
+            object.insert("binary_ref".to_string(), json!(public_binary_ref()));
+        }
+        if object.remove("home").is_some() {
+            object.insert("home_ref".to_string(), json!(public_home_ref()));
+        }
+        if let Some(daemon_service) = result.get("daemon_service") {
+            object.insert(
+                "daemon_service".to_string(),
+                setup_daemon_service_to_json(daemon_service),
+            );
+        }
+        if let Some(daemon_status) = result.get("daemon_status") {
+            object.insert(
+                "daemon_status".to_string(),
+                setup_daemon_status_to_json(home.as_path(), daemon_status),
+            );
+        }
+        if let Some(mcp) = result.get("mcp") {
+            object.insert("mcp".to_string(), setup_mcp_result_to_json(mcp));
+        }
+        if let Some(auth) = result.get("auth") {
+            object.insert(
+                "auth".to_string(),
+                auth_status_to_json(home.as_path(), auth),
+            );
+        }
+    }
+    redact_setup_public_json(&mut public);
+    public
+}
+
+fn setup_handoff_lines(result: &Value) -> Vec<String> {
+    let public = setup_result_to_json(result);
+    let schema = public["schema_version"].as_str().unwrap_or("");
+    let mut lines = Vec::new();
+
+    if schema != "bucephalus_setup_uninstall_v1" {
+        if let Some(binary_ref) = public["binary_ref"].as_str() {
+            lines.push(format!("binary_ref: {binary_ref}"));
+        }
+        if let Some(home_ref) = public["home_ref"].as_str() {
+            lines.push(format!("home_ref: {home_ref}"));
+        }
+    }
+
+    lines.push(format!(
+        "daemon_service: {}",
+        public["daemon_service"]["status"]
+            .as_str()
+            .unwrap_or("unknown")
+    ));
+    if let Some(service_ref) = public["daemon_service"]["service_ref"].as_str() {
+        lines.push(format!("daemon_service_ref: {service_ref}"));
+    }
+    if let Some(config_ref) = public["daemon_service"]["config_ref"].as_str() {
+        lines.push(format!("daemon_service_config_ref: {config_ref}"));
+    }
+    if let Some(reason) = public["daemon_service"]["reason"].as_str() {
+        lines.push(format!("daemon_service_reason: {reason}"));
+    }
+
+    if schema != "bucephalus_setup_uninstall_v1" {
+        lines.push(format!(
+            "daemon_status: {}",
+            public["daemon_status"]["status"]
+                .as_str()
+                .unwrap_or("unknown")
+        ));
+        if let Some(address_ref) = public["daemon_status"]["address_ref"].as_str() {
+            lines.push(format!("daemon_address_ref: {address_ref}"));
+        }
+        if let Some(state_ref) = public["daemon_status"]["state_ref"].as_str() {
+            lines.push(format!("daemon_state_ref: {state_ref}"));
+        }
+        if let Some(log_ref) = public["daemon_status"]["log_ref"].as_str() {
+            lines.push(format!("daemon_log_ref: {log_ref}"));
+        }
+    }
+
+    let is_uninstall = schema == "bucephalus_setup_uninstall_v1";
+    lines.push(format!(
+        "mcp: {}",
+        public["mcp"]["status"].as_str().unwrap_or("unknown")
+    ));
+
+    if let Some(clients) = public["mcp"]["clients"].as_array() {
+        for client in clients {
+            let client_name = client["client"].as_str().unwrap_or("unknown");
+            lines.push(format!(
+                "mcp_client: {} {}",
+                client_name,
+                client["status"].as_str().unwrap_or("unknown")
+            ));
+            if let Some(reason) = client["reason"].as_str() {
+                lines.push(format!("mcp_reason: {client_name}: {reason}"));
+            }
+            if let Some(config_ref) = client["config_ref"].as_str() {
+                lines.push(format!("mcp_config_ref: {config_ref}"));
+            }
+            if let Some(command_ref) = client["command_ref"].as_str() {
+                lines.push(format!("mcp_command_ref: {command_ref}"));
+            }
+            if let Some(action) = client["action"].as_str() {
+                lines.push(format!("mcp_next: {client_name}: {action}"));
+            }
+        }
+    }
+
+    if is_uninstall {
+        return lines;
+    }
+
+    lines.push(format!(
+        "auth: {}",
+        public["auth"]["status"].as_str().unwrap_or("unknown")
+    ));
+    if let Some(auth_ref) = public["auth"]["auth_ref"].as_str() {
+        lines.push(format!("auth_ref: {auth_ref}"));
+    }
+    if let Some(path_ref) = public["auth"]["path_ref"].as_str() {
+        lines.push(format!("auth_token_ref: {path_ref}"));
+    }
+    if let Some(refresh_ref) = public["auth"]["refresh_token_ref"].as_str() {
+        lines.push(format!("auth_refresh_token_ref: {refresh_ref}"));
+    }
+    if let Some(cache_ref) = public["auth"]["cache"]["path_ref"].as_str() {
+        lines.push(format!("auth_cache_ref: {cache_ref}"));
+    }
+    if let Some(command) = first_auth_action_command(&public["auth"]) {
+        lines.push(format!("auth_next: {command}"));
+    }
+    lines
+}
+
+fn setup_daemon_service_to_json(service: &Value) -> Value {
+    let mut public = service.clone();
+    let Some(object) = public.as_object_mut() else {
+        return public;
+    };
+    let manager = object
+        .get("manager")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let label = object
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let manager = manager.as_deref();
+    let label = label.as_deref();
+    if manager.is_some() || label.is_some() {
+        object.insert(
+            "service_ref".to_string(),
+            json!(public_service_ref(manager, label)),
+        );
+    }
+    if object.remove("path").is_some() {
+        object.insert(
+            "config_ref".to_string(),
+            json!(public_service_config_ref(manager, label)),
+        );
+    }
+    if let Some(commands) = object.remove("commands") {
+        object.insert(
+            "actions".to_string(),
+            setup_service_actions_to_json(manager, label, &commands),
+        );
+    }
+    public
+}
+
+fn setup_daemon_status_to_json(home: &Path, status: &Value) -> Value {
+    let mut public = status.clone();
+    let Some(object) = public.as_object_mut() else {
+        return public;
+    };
+    if let Some(address) = object.remove("address") {
+        object.insert(
+            "address_ref".to_string(),
+            public_daemon_path_value(home, &address),
+        );
+    }
+    if let Some(state_path) = object.remove("state_path") {
+        object.insert(
+            "state_ref".to_string(),
+            public_daemon_path_value(home, &state_path),
+        );
+    }
+    if let Some(log_path) = object.remove("log_path") {
+        object.insert(
+            "log_ref".to_string(),
+            public_daemon_path_value(home, &log_path),
+        );
+    }
+    public
+}
+
+fn setup_service_actions_to_json(
+    manager: Option<&str>,
+    label: Option<&str>,
+    commands: &Value,
+) -> Value {
+    let Some(commands) = commands.as_array() else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        commands
+            .iter()
+            .filter_map(|command| setup_service_action_to_json(manager, label, command))
+            .collect(),
+    )
+}
+
+fn setup_service_action_to_json(
+    manager: Option<&str>,
+    label: Option<&str>,
+    command: &Value,
+) -> Option<Value> {
+    let command = command.as_array()?;
+    let program = command.first().and_then(Value::as_str).unwrap_or("unknown");
+    let operation = command
+        .iter()
+        .skip(1)
+        .filter_map(Value::as_str)
+        .find(|part| {
+            !part.starts_with('-')
+                && !part.starts_with('/')
+                && !part.starts_with("gui/")
+                && !part.contains(std::path::MAIN_SEPARATOR)
+        })
+        .unwrap_or("run");
+    Some(json!({
+        "type": "service_command",
+        "program": public_string_value(program),
+        "operation": public_string_value(operation),
+        "service_ref": public_service_ref(manager, label)
+    }))
+}
+
+fn setup_mcp_result_to_json(mcp: &Value) -> Value {
+    let mut public = mcp.clone();
+    let Some(object) = public.as_object_mut() else {
+        return public;
+    };
+    if let Some(server_config) = object.remove("server_config") {
+        object.insert(
+            "server_config".to_string(),
+            public_mcp_server_config_to_json(&server_config),
+        );
+    }
+    if let Some(server_config) = object.remove("expected_server_config") {
+        object.insert(
+            "expected_server_config".to_string(),
+            public_mcp_server_config_to_json(&server_config),
+        );
+    }
+    if let Some(clients) = mcp.get("clients").and_then(Value::as_array) {
+        object.insert(
+            "clients".to_string(),
+            Value::Array(clients.iter().map(setup_mcp_client_to_json).collect()),
+        );
+    }
+    public
+}
+
+fn setup_mcp_client_to_json(client: &Value) -> Value {
+    let mut public = client.clone();
+    let Some(object) = public.as_object_mut() else {
+        return public;
+    };
+    let name = object
+        .get("client")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let name = public_mcp_client_name(&name);
+    object.insert("client".to_string(), json!(name));
+    let name = name.as_str();
+    if object.remove("path").is_some() {
+        object.insert("config_ref".to_string(), json!(public_mcp_config_ref(name)));
+    }
+    if let Some(config) = object.remove("manual_config") {
+        object.insert(
+            "manual_config".to_string(),
+            public_mcp_server_config_to_json(&config),
+        );
+    }
+    if object.remove("command").is_some() {
+        object.insert(
+            "command_ref".to_string(),
+            json!(public_mcp_command_ref(name)),
+        );
+    }
+    if let Some(reason) = object.get("reason").and_then(Value::as_str) {
+        object.insert("reason".to_string(), json!(public_error_message(reason)));
+    }
+    public
+}
+
+fn public_mcp_server_config_to_json(config: &Value) -> Value {
+    let mut public = config.clone();
+    let Some(object) = public.as_object_mut() else {
+        return public;
+    };
+    if object.remove("command").is_some() {
+        object.insert("command_ref".to_string(), json!(public_binary_ref()));
+    }
+    public
+}
+
+fn login_result_to_json(result: &Value) -> Value {
+    let home = auth_home_from_result(result);
+    json!({
+        "schema_version": result.get("schema_version").cloned().unwrap_or_else(|| json!("bucephalus_login_v1")),
+        "ok": result.get("ok").cloned().unwrap_or_else(|| json!(true)),
+        "auth_ref": "auth://current",
+        "issuer": public_urlish_result_field(result, "issuer"),
+        "client_id": public_string_result_field(result, "client_id"),
+        "audience": public_string_result_field(result, "audience"),
+        "resource": public_urlish_result_field(result, "resource"),
+        "scope": public_string_result_field(result, "scope"),
+        "token_ref": auth_result_ref(&home, result, "token_ref", "token_path"),
+        "refresh_token_ref": auth_optional_result_ref(&home, result, "refresh_token_ref", "refresh_token_path"),
+        "cache_ref": auth_result_ref(&home, result, "cache_ref", "cache_path")
+    })
+}
+
+fn login_handoff_lines(result: &Value) -> Vec<String> {
+    let public = login_result_to_json(result);
+    let mut lines = vec![
+        "login: ready".to_string(),
+        format!(
+            "auth_ref: {}",
+            public["auth_ref"].as_str().unwrap_or("auth://current")
+        ),
+        format!(
+            "token_ref: {}",
+            public["token_ref"]
+                .as_str()
+                .unwrap_or("[REDACTED:local-path]")
+        ),
+    ];
+    if let Some(refresh_ref) = public["refresh_token_ref"].as_str() {
+        lines.push(format!("refresh_token_ref: {refresh_ref}"));
+    }
+    if let Some(cache_ref) = public["cache_ref"].as_str() {
+        lines.push(format!("cache_ref: {cache_ref}"));
+    }
+    lines
+}
+
+fn logout_result_to_json(result: &Value) -> Value {
+    let home = auth_home_from_result(result);
+    let files = result
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .map(|file| {
+                    let mut public_file = json!({
+                        "kind": file.get("kind").cloned().unwrap_or(Value::Null),
+                        "path_ref": logout_file_path_ref(&home, file),
+                        "existed": file.get("existed").cloned().unwrap_or(Value::Null),
+                        "status": file.get("status").cloned().unwrap_or(Value::Null),
+                    });
+                    if let Some(reason) = file.get("reason").and_then(Value::as_str) {
+                        public_file["reason"] = json!(public_error_message(reason));
+                    }
+                    public_file
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "schema_version": result.get("schema_version").cloned().unwrap_or_else(|| json!("bucephalus_logout_v1")),
+        "ok": result.get("ok").cloned().unwrap_or_else(|| json!(true)),
+        "dry_run": result.get("dry_run").cloned().unwrap_or_else(|| json!(false)),
+        "auth_ref": "auth://current",
+        "status": result.get("status").cloned().unwrap_or_else(|| json!("unknown")),
+        "removed": result.get("removed").cloned().unwrap_or_else(|| json!(0)),
+        "would_remove": result.get("would_remove").cloned().unwrap_or_else(|| json!(0)),
+        "errors": result.get("errors").cloned().unwrap_or_else(|| json!(0)),
+        "files": files,
+        "env": result.get("env").cloned().unwrap_or_else(|| json!({}))
+    })
+}
+
+fn logout_handoff_lines(result: &Value) -> Vec<String> {
+    let public = logout_result_to_json(result);
+    let mut lines = vec![
+        format!("logout: {}", public["status"].as_str().unwrap_or("unknown")),
+        format!("dry_run: {}", public["dry_run"].as_bool().unwrap_or(false)),
+        format!(
+            "auth_ref: {}",
+            public["auth_ref"].as_str().unwrap_or("auth://current")
+        ),
+    ];
+    if let Some(files) = public["files"].as_array() {
+        for file in files {
+            lines.push(format!(
+                "auth_file: {} {}",
+                file["kind"].as_str().unwrap_or("unknown"),
+                file["status"].as_str().unwrap_or("unknown")
+            ));
+            lines.push(format!(
+                "auth_file_ref: {}",
+                file["path_ref"].as_str().unwrap_or("[REDACTED:local-path]")
+            ));
+            if let Some(reason) = file["reason"].as_str() {
+                lines.push(format!(
+                    "auth_file_reason: {} {}",
+                    file["kind"].as_str().unwrap_or("unknown"),
+                    reason
+                ));
+            }
+        }
+    }
+    if public["env"]["present"].as_bool().unwrap_or(false) {
+        let env_name = public["env"]["name"]
+            .as_str()
+            .unwrap_or(BUCEPHALUS_CLOUD_USER_TOKEN_ENV);
+        lines.push(format!("env_token: still_set ({env_name})"));
+        if let Some(note) = public["env"]["note"].as_str() {
+            lines.push(format!("env_next: {}", public_error_message(note)));
+        }
+    }
+    lines
+}
+
+fn auth_status_to_json(home: &Path, status: &Value) -> Value {
+    let mut public = status.clone();
+    let Some(object) = public.as_object_mut() else {
+        return public;
+    };
+    object.insert("auth_ref".to_string(), json!("auth://current"));
+    if let Some(path) = object.remove("path") {
+        object.insert("path_ref".to_string(), public_auth_path_value(home, &path));
+    }
+    if let Some(path) = object.remove("refresh_token_path") {
+        object.insert(
+            "refresh_token_ref".to_string(),
+            public_optional_auth_path_value(home, &path),
+        );
+    }
+    if let Some(cache) = status.get("cache") {
+        object.insert("cache".to_string(), auth_cache_status_to_json(home, cache));
+    }
+    if let Some(expected) = status.get("expected").and_then(Value::as_array) {
+        object.insert(
+            "expected".to_string(),
+            Value::Array(
+                expected
+                    .iter()
+                    .map(|value| public_auth_expected_value(home, value))
+                    .collect(),
+            ),
+        );
+    }
+    redact_urlish_object_field(object, "api_url");
+    public
+}
+
+fn auth_cache_status_to_json(home: &Path, cache: &Value) -> Value {
+    let mut public = cache.clone();
+    if let Some(object) = public.as_object_mut() {
+        if let Some(path) = object.remove("path") {
+            object.insert("path_ref".to_string(), public_auth_path_value(home, &path));
+        }
+    }
+    public
+}
+
+fn auth_home_from_result(result: &Value) -> PathBuf {
+    result
+        .get("home")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+fn auth_result_ref(home: &Path, result: &Value, ref_key: &str, path_key: &str) -> String {
+    if let Some(raw) = result.get(ref_key).and_then(Value::as_str) {
+        return public_or_raw_auth_path_ref(home, raw);
+    }
+    result
+        .get(path_key)
+        .and_then(Value::as_str)
+        .map(|path| public_auth_path_ref(home, Path::new(path)))
+        .unwrap_or_else(|| "[REDACTED:local-path]".to_string())
+}
+
+fn auth_optional_result_ref(home: &Path, result: &Value, ref_key: &str, path_key: &str) -> Value {
+    if let Some(value) = result.get(ref_key) {
+        return public_optional_auth_path_value(home, value);
+    }
+    result
+        .get(path_key)
+        .map(|value| public_optional_auth_path_value(home, value))
+        .unwrap_or(Value::Null)
+}
+
+fn logout_file_path_ref(home: &Path, file: &Value) -> String {
+    if let Some(raw) = file.get("path_ref").and_then(Value::as_str) {
+        return public_or_raw_auth_path_ref(home, raw);
+    }
+    file.get("path")
+        .and_then(Value::as_str)
+        .map(|path| public_auth_path_ref(home, Path::new(path)))
+        .unwrap_or_else(|| "[REDACTED:local-path]".to_string())
+}
+
+fn public_optional_auth_path_value(home: &Path, value: &Value) -> Value {
+    value
+        .as_str()
+        .map(|path| json!(public_or_raw_auth_path_ref(home, path)))
+        .unwrap_or(Value::Null)
+}
+
+fn public_auth_path_value(home: &Path, value: &Value) -> Value {
+    value
+        .as_str()
+        .map(|path| json!(public_or_raw_auth_path_ref(home, path)))
+        .unwrap_or_else(|| json!("[REDACTED:local-path]"))
+}
+
+fn public_auth_expected_value(home: &Path, value: &Value) -> Value {
+    let Some(raw) = value.as_str() else {
+        return value.clone();
+    };
+    if raw == BUCEPHALUS_CLOUD_USER_TOKEN_ENV || raw.starts_with("auth://") {
+        return json!(raw);
+    }
+    json!(public_auth_path_ref(home, Path::new(raw)))
+}
+
+fn public_or_raw_auth_path_ref(home: &Path, raw: &str) -> String {
+    if raw.starts_with("auth://") {
+        raw.to_string()
+    } else {
+        public_auth_path_ref(home, Path::new(raw))
+    }
+}
+
+fn public_string_result_field(result: &Value, key: &str) -> Value {
+    result
+        .get(key)
+        .and_then(Value::as_str)
+        .map(public_string_value)
+        .map(Value::String)
+        .unwrap_or(Value::Null)
+}
+
+fn public_urlish_result_field(result: &Value, key: &str) -> Value {
+    result
+        .get(key)
+        .and_then(Value::as_str)
+        .map(public_urlish_value)
+        .map(Value::String)
+        .unwrap_or(Value::Null)
+}
+
+fn public_string_value(value: &str) -> String {
+    dispatch_redaction_for_string(value)
+        .unwrap_or(value)
+        .to_string()
+}
+
+fn public_urlish_value(value: &str) -> String {
+    if reqwest::Url::parse(value).is_ok() {
+        redact_public_url(value)
+    } else {
+        public_string_value(value)
+    }
+}
+
+fn redact_setup_public_json(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            *text = setup_public_string_value(text);
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_setup_public_json(item);
+            }
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                redact_setup_public_json(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn setup_public_string_value(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if is_public_ref_string(&lower) {
+        return value.to_string();
+    }
+    public_error_message(value)
+}
+
+fn is_public_ref_string(lower: &str) -> bool {
+    [
+        "auth://",
+        "binary://",
+        "daemon://",
+        "dispatch://",
+        "install://",
+        "latch://",
+        "mcp://",
+        "package://",
+        "run://",
+        "runs://",
+        "service://",
+        "state://",
+        "workspace://",
+    ]
+    .iter()
+    .any(|scheme| lower.starts_with(scheme))
+}
+
+fn redact_urlish_object_field(object: &mut serde_json::Map<String, Value>, key: &str) {
+    if let Some(value) = object.get(key).and_then(Value::as_str) {
+        object.insert(key.to_string(), json!(public_urlish_value(value)));
+    }
 }
 
 fn run_artifacts_to_json(result: &lab_runner::RunResult) -> Value {
@@ -6560,13 +11012,510 @@ fn run_artifacts_to_json(result: &lab_runner::RunResult) -> Value {
     let summary_dir = result.run_dir.join("evaluation");
     let summary_path = existing_evaluation_summary_path(&result.run_dir);
     json!({
-        "run_store_location": result.account_db_path.display().to_string(),
-        "objects_dir": objects.display().to_string(),
-        "evaluation_summary_dir": summary_dir.display().to_string(),
-        "evaluation_summary_path": summary_path
+        "run_store_ref": public_run_path_ref(&result.run_dir, &result.account_db_path),
+        "objects_ref": public_run_path_ref(&result.run_dir, &objects),
+        "evaluation_summary_ref": summary_path
             .as_ref()
-            .map(|path| path.display().to_string())
+            .map(|path| public_run_path_ref(&result.run_dir, path))
+            .unwrap_or_else(|| public_run_path_ref(&result.run_dir, &summary_dir))
     })
+}
+
+fn publish_report_to_json(
+    run_dir: &Path,
+    report: &provenance::DebugBundleReport,
+    used_default_out: bool,
+) -> Value {
+    let included: Vec<_> = report
+        .included
+        .iter()
+        .map(|entry| {
+            json!({
+                "path": public_debug_bundle_entry_path(run_dir, &entry.path),
+                "kind": &entry.kind,
+                "redacted": entry.redacted
+            })
+        })
+        .collect();
+    let skipped: Vec<_> = report
+        .skipped
+        .iter()
+        .map(|entry| {
+            json!({
+                "path": public_debug_bundle_entry_path(run_dir, &entry.path),
+                "reason": public_error_message(&entry.reason)
+            })
+        })
+        .collect();
+    json!({
+        "ok": true,
+        "command": "publish",
+        "run_ref": public_run_ref(run_dir),
+        "bundle_ref": public_run_path_ref(run_dir, &report.bundle_path),
+        "default_output": used_default_out,
+        "included_files": report.included_count(),
+        "redacted_files": report.redacted_count(),
+        "skipped_files": report.skipped_count(),
+        "included": included,
+        "skipped": skipped,
+        "review": "inspect the redacted support bundle before sharing"
+    })
+}
+
+fn public_debug_bundle_entry_path(run_dir: &Path, value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "[REDACTED:local-path]".to_string();
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return public_run_path_ref(run_dir, path);
+    }
+    public_error_message(trimmed)
+}
+
+fn latch_manifest_validation_to_json(result: &lab_runner::LatchManifestValidation) -> Value {
+    let root = result
+        .manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    json!({
+        "schema_version": result.schema_version,
+        "manifest_ref": public_latch_path_ref(root, &result.manifest_path),
+        "case_count": result.case_count,
+        "default_launch_present": result.default_launch_present,
+        "default_workspace_seed_present": result.default_workspace_seed_present,
+    })
+}
+
+fn latch_generation_result_to_json(root: &Path, result: &Value) -> Value {
+    let mut public = result.clone();
+    if let Some(object) = public.as_object_mut() {
+        object.insert(
+            "output_ref".to_string(),
+            Value::String(public_latch_path_ref(root, root)),
+        );
+        replace_latch_path_field(object, root, "resolution_path", "resolution_ref");
+        replace_latch_path_field(object, root, "manifest_path", "manifest_ref");
+        replace_latch_path_field(object, root, "seed_dir", "seed_ref");
+        if object.remove("next").is_some() {
+            object.insert(
+                "next_actions".to_string(),
+                json!([
+                    {
+                        "type": "cli_command",
+                        "command": "bucephalus latch validate <manifest-path>",
+                        "manifest_ref": public_latch_path_ref(root, &root.join("manifest.json")),
+                    },
+                    {
+                        "type": "cli_command",
+                        "command": "bucephalus latch run <manifest-path> --json",
+                        "manifest_ref": public_latch_path_ref(root, &root.join("manifest.json")),
+                    }
+                ]),
+            );
+        }
+        if let Some(materials) = object.get("materials").cloned() {
+            object.insert(
+                "materials".to_string(),
+                public_latch_materials_to_json(root, &materials),
+            );
+        }
+    }
+    if let Some(resolution) = public.get_mut("resolution").and_then(Value::as_object_mut) {
+        replace_latch_path_field(resolution, root, "manifest_path", "manifest_ref");
+        replace_latch_path_field(resolution, root, "seed_dir", "seed_ref");
+        if let Some(materials) = resolution.get("materials").cloned() {
+            resolution.insert(
+                "materials".to_string(),
+                public_latch_materials_to_json(root, &materials),
+            );
+        }
+    }
+    public
+}
+
+fn public_latch_materials_to_json(root: &Path, materials: &Value) -> Value {
+    let mut public = materials.clone();
+    if let Some(items) = public.get_mut("items").and_then(Value::as_array_mut) {
+        for item in items {
+            let Some(object) = item.as_object_mut() else {
+                continue;
+            };
+            let Some(path) = object
+                .remove("path")
+                .and_then(|value| value.as_str().map(str::to_string))
+            else {
+                continue;
+            };
+            let path = PathBuf::from(path);
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            };
+            object.insert(
+                "path_ref".to_string(),
+                json!(public_latch_path_ref(root, &absolute)),
+            );
+        }
+    }
+    public
+}
+
+fn latch_generation_handoff_lines(
+    root: &Path,
+    result: &Value,
+    include_next_actions: bool,
+) -> Vec<String> {
+    let public = latch_generation_result_to_json(root, result);
+    let mut lines = Vec::new();
+    for key in ["output_ref", "resolution_ref", "manifest_ref", "seed_ref"] {
+        if let Some(value) = public.get(key).and_then(Value::as_str) {
+            lines.push(format!("{key}: {value}"));
+        }
+    }
+    if let Some(resolution) = public.get("resolution") {
+        if let Some(benchmark) = resolution
+            .pointer("/benchmark/id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(format!("benchmark: {benchmark}"));
+        }
+        if let Some(case_count) = resolution.get("case_count").and_then(Value::as_u64) {
+            lines.push(format!("case_count: {case_count}"));
+        }
+        if let Some(launch_source) = resolution
+            .get("launch_source")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(format!("launch_source: {launch_source}"));
+        }
+    }
+    if include_next_actions {
+        if let Some(actions) = public.get("next_actions").and_then(Value::as_array) {
+            for action in actions {
+                if let Some(command) = action.get("command").and_then(Value::as_str) {
+                    let manifest_ref = action
+                        .get("manifest_ref")
+                        .and_then(Value::as_str)
+                        .map(|value| format!(" ({value})"))
+                        .unwrap_or_default();
+                    lines.push(format!("next: {command}{manifest_ref}"));
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn replace_latch_path_field(
+    object: &mut serde_json::Map<String, Value>,
+    root: &Path,
+    path_key: &str,
+    ref_key: &str,
+) {
+    if let Some(raw) = object.remove(path_key) {
+        let rendered = raw
+            .as_str()
+            .map(|path| public_latch_path_ref(root, Path::new(path)))
+            .unwrap_or_else(|| "[REDACTED:local-path]".to_string());
+        object.insert(ref_key.to_string(), Value::String(rendered));
+    }
+}
+
+fn latch_run_result_to_json(result: &lab_runner::LatchRunResult) -> Value {
+    json!({
+        "schema_version": result.schema_version,
+        "run_id": result.run_id,
+        "run_ref": public_run_ref(&result.run_dir),
+        "enforcement_level": result.enforcement_level,
+        "cases": result
+            .cases
+            .iter()
+            .map(|case| latch_case_result_to_json(&result.run_dir, case))
+            .collect::<Vec<_>>(),
+        "started_at": result.started_at,
+        "ended_at": result.ended_at,
+    })
+}
+
+fn latch_run_handoff_lines(
+    result: &lab_runner::LatchRunResult,
+    include_workspace_diff: bool,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("latch_run_id: {}", public_error_message(&result.run_id)),
+        format!("run_ref: {}", public_run_ref(&result.run_dir)),
+    ];
+    for case in &result.cases {
+        let case_id = public_error_message(&case.case_id);
+        let mut line = format!(
+            "case {}: {:?} exit={:?}",
+            case_id, case.status, case.exit_code
+        );
+        if include_workspace_diff {
+            let patch = case
+                .workspace_diff_path
+                .as_ref()
+                .map(|path| public_run_path_ref(&result.run_dir, path))
+                .unwrap_or_else(|| "no diff".to_string());
+            line.push_str(&format!(" patch={patch}"));
+        }
+        lines.push(line);
+        if let Some(error) = case.capture_error.as_ref() {
+            lines.push(format!("  capture: {}", public_error_message(error)));
+        }
+    }
+    lines
+}
+
+fn latch_case_result_to_json(run_dir: &Path, case: &lab_runner::LatchCaseResult) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("case_id".to_string(), json!(&case.case_id));
+    object.insert("task_id".to_string(), json!(&case.task_id));
+    object.insert("status".to_string(), json!(case.status));
+    if let Some(exit_code) = case.exit_code {
+        object.insert("exit_code".to_string(), json!(exit_code));
+    }
+    object.insert(
+        "enforcement_level".to_string(),
+        json!(case.enforcement_level),
+    );
+    object.insert("started_at".to_string(), json!(&case.started_at));
+    object.insert("ended_at".to_string(), json!(&case.ended_at));
+    object.insert(
+        "workspace_ref".to_string(),
+        Value::String(public_run_path_ref(run_dir, &case.workspace_dir)),
+    );
+    object.insert(
+        "stdout_ref".to_string(),
+        Value::String(public_run_path_ref(run_dir, &case.stdout_path)),
+    );
+    object.insert(
+        "stderr_ref".to_string(),
+        Value::String(public_run_path_ref(run_dir, &case.stderr_path)),
+    );
+    if let Some(path) = case.result_path.as_ref() {
+        object.insert(
+            "result_ref".to_string(),
+            Value::String(public_run_path_ref(run_dir, path)),
+        );
+    }
+    if let Some(path) = case.workspace_diff_path.as_ref() {
+        object.insert(
+            "workspace_diff_ref".to_string(),
+            Value::String(public_run_path_ref(run_dir, path)),
+        );
+    }
+    if let Some(digest) = case.workspace_diff_digest.as_ref() {
+        object.insert("workspace_diff_digest".to_string(), json!(digest));
+    }
+    if let Some(error) = case.capture_error.as_ref() {
+        object.insert(
+            "capture_error".to_string(),
+            json!(public_error_message(error)),
+        );
+    }
+    if let Some(upload) = case.upload.as_ref() {
+        object.insert("upload".to_string(), latch_upload_to_json(upload));
+    }
+    if let Some(grade) = case.grade.as_ref() {
+        object.insert(
+            "grade".to_string(),
+            latch_grade_result_to_json(run_dir, grade),
+        );
+    }
+    Value::Object(object)
+}
+
+fn latch_upload_to_json(upload: &lab_runner::UploadSpec) -> Value {
+    json!({
+        "result_url": upload.result_url.as_ref().map(|url| redact_public_url(url)),
+        "headers_redacted": !upload.headers.is_empty(),
+    })
+}
+
+fn latch_grade_result_to_json(run_dir: &Path, grade: &lab_runner::LatchGradeResult) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("status".to_string(), json!(grade.status));
+    object.insert("grader_kind".to_string(), json!(&grade.grader_kind));
+    object.insert("locus".to_string(), json!(&grade.locus));
+    object.insert(
+        "requires".to_string(),
+        serde_json::to_value(&grade.requires).unwrap_or_else(|_| json!([])),
+    );
+    if let Some(reason) = grade.reason.as_ref() {
+        object.insert("reason".to_string(), json!(public_error_message(reason)));
+    }
+    if let Some(score) = grade.score {
+        object.insert("score".to_string(), json!(score));
+    }
+    if let Some(path) = grade.stdout_path.as_ref() {
+        object.insert(
+            "stdout_ref".to_string(),
+            Value::String(public_run_path_ref(run_dir, path)),
+        );
+    }
+    if let Some(path) = grade.stderr_path.as_ref() {
+        object.insert(
+            "stderr_ref".to_string(),
+            Value::String(public_run_path_ref(run_dir, path)),
+        );
+    }
+    if let Some(path) = grade.output_path.as_ref() {
+        object.insert(
+            "output_ref".to_string(),
+            Value::String(public_run_path_ref(run_dir, path)),
+        );
+    }
+    Value::Object(object)
+}
+
+fn with_package_ref(mut payload: Value, package_dir: &Path) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "package_ref".to_string(),
+            Value::String(public_package_path_ref(package_dir, package_dir)),
+        );
+    }
+    payload
+}
+
+fn with_build_refs(mut payload: Value, build: &lab_runner::BuildResult) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "package_ref".to_string(),
+            Value::String(public_package_path_ref(
+                &build.package_dir,
+                &build.package_dir,
+            )),
+        );
+        object.insert(
+            "manifest_ref".to_string(),
+            Value::String(public_package_path_ref(
+                &build.package_dir,
+                &build.manifest_path,
+            )),
+        );
+        object.insert(
+            "checksums_ref".to_string(),
+            Value::String(public_package_path_ref(
+                &build.package_dir,
+                &build.checksums_path,
+            )),
+        );
+        object.insert(
+            "package_checks_ref".to_string(),
+            Value::String(public_package_path_ref(
+                &build.package_dir,
+                &build.package_checks_path,
+            )),
+        );
+    }
+    payload
+}
+
+fn print_build_handoff(build: &lab_runner::BuildResult) {
+    for (key, value) in build_handoff_fields(build) {
+        println!("{key}: {value}");
+    }
+}
+
+fn build_handoff_fields(build: &lab_runner::BuildResult) -> Vec<(String, String)> {
+    vec![
+        (
+            "package_ref".to_string(),
+            public_package_path_ref(&build.package_dir, &build.package_dir),
+        ),
+        (
+            "manifest_ref".to_string(),
+            public_package_path_ref(&build.package_dir, &build.manifest_path),
+        ),
+        (
+            "checksums_ref".to_string(),
+            public_package_path_ref(&build.package_dir, &build.checksums_path),
+        ),
+        (
+            "package_checks_ref".to_string(),
+            public_package_path_ref(&build.package_dir, &build.package_checks_path),
+        ),
+    ]
+}
+
+fn build_package_progress_line(experiment: &Path) -> String {
+    format!(
+        "building package from: {}",
+        public_experiment_input_ref(experiment)
+    )
+}
+
+fn checking_package_progress_line(package_dir: &Path) -> String {
+    format!(
+        "checking package: {}",
+        public_package_input_ref(package_dir)
+    )
+}
+
+fn loading_package_progress_line(package_dir: &Path) -> String {
+    format!("loading package: {}", public_package_input_ref(package_dir))
+}
+
+fn preparing_runtime_images_progress_line(package_dir: &Path) -> String {
+    format!(
+        "preparing runtime images from package: {}",
+        public_package_input_ref(package_dir)
+    )
+}
+
+fn running_preflight_progress_line(package_dir: &Path) -> String {
+    format!(
+        "running preflight: {}",
+        public_package_input_ref(package_dir)
+    )
+}
+
+fn public_experiment_input_ref(experiment: &Path) -> String {
+    let Some(parent) = experiment
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return experiment
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("workspace://{name}"))
+            .unwrap_or_else(|| "[REDACTED:local-path]".to_string());
+    };
+    public_workspace_path_ref(parent, experiment)
+}
+
+fn public_experiment_target_ref(path: &Path) -> String {
+    if path.is_dir() {
+        return public_project_ref(path);
+    }
+    public_experiment_input_ref(path)
+}
+
+fn public_package_input_ref(package_dir: &Path) -> String {
+    public_package_path_ref(package_dir, package_dir)
+}
+
+fn public_command_target_ref(path: &Path) -> String {
+    if is_yaml_file(path) {
+        return public_experiment_input_ref(path);
+    }
+    let package_dir = package_directory_for_input(path);
+    public_package_input_ref(&package_dir)
+}
+
+fn public_doctor_target_ref(path: &Path) -> String {
+    if path.is_dir() || is_yaml_file(path) {
+        return public_experiment_target_ref(path);
+    }
+    public_command_target_ref(path)
 }
 
 fn run_id_from_dir(run_dir: &Path) -> Option<String> {
@@ -6611,7 +11560,7 @@ fn load_runtime_value_file(run_dir: &Path, key: &str) -> Option<Value> {
 fn replay_result_to_json(result: &lab_runner::ReplayResult) -> Value {
     json!({
         "replay_id": result.replay_id,
-        "replay_dir": result.replay_dir.display().to_string(),
+        "replay_ref": public_child_run_path_ref(&result.replay_dir),
         "parent_trial_id": result.parent_trial_id,
         "strict": result.strict,
         "replay_grade": result.replay_grade,
@@ -6622,13 +11571,24 @@ fn replay_result_to_json(result: &lab_runner::ReplayResult) -> Value {
 fn fork_result_to_json(result: &lab_runner::ForkResult) -> Value {
     json!({
         "fork_id": result.fork_id,
-        "fork_dir": result.fork_dir.display().to_string(),
+        "fork_ref": public_child_run_path_ref(&result.fork_dir),
         "parent_trial_id": result.parent_trial_id,
         "selector": result.selector,
         "strict": result.strict,
         "source_checkpoint": result.source_checkpoint,
         "replay_grade": result.replay_grade,
         "harness_status": result.harness_status,
+    })
+}
+
+fn kill_result_to_json(result: &lab_runner::KillResult) -> Value {
+    json!({
+        "ok": true,
+        "command": "kill",
+        "run_id": result.run_id,
+        "run_ref": public_run_ref(&result.run_dir),
+        "previous_status": result.previous_status,
+        "killed_trials": result.killed_trials,
     })
 }
 
@@ -6664,6 +11624,326 @@ fn recover_result_to_json(result: &lab_runner::RecoverResult) -> Value {
     })
 }
 
+fn prepared_runtime_image_report_to_json(
+    package_dir: &Path,
+    report: &lab_runner::PreparedRuntimeImageReport,
+) -> Value {
+    json!({
+        "ok": true,
+        "command": "prepare-runtime-images",
+        "map_ref": public_package_path_ref(package_dir, &report.map_path),
+        "built": report.built,
+        "skipped": report.skipped,
+        "dry_run": report.dry_run,
+        "entries": report
+            .entries
+            .iter()
+            .map(prepared_runtime_image_entry_to_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn prepared_runtime_image_entry_to_json(entry: &lab_runner::PreparedRuntimeImageMapEntry) -> Value {
+    json!({
+        "base_image": public_error_message(&entry.base_image),
+        "agent_artifact_digest": public_error_message(&entry.agent_artifact_digest),
+        "agent_artifact_mount_path": public_error_message(&entry.agent_artifact_mount_path),
+        "runner_contract_version": public_error_message(&entry.runner_contract_version),
+        "platform": entry.platform.as_deref().map(public_error_message),
+        "prepared_image": public_error_message(&entry.prepared_image),
+    })
+}
+
+fn clean_runs_preflight(
+    runs_dir: &Path,
+    inventory: &[RunInventoryEntry],
+    force: bool,
+    include_active: bool,
+    include_interrupted: bool,
+    include_untracked: bool,
+    dry_run: bool,
+) -> Result<CleanRunsReport> {
+    let exists = clean_runs_root_exists_for_cleanup(runs_dir)?;
+    let local_runs = inventory
+        .iter()
+        .filter(|entry| clean_inventory_run_dir_is_local(runs_dir, &entry.run_dir))
+        .collect::<Vec<_>>();
+    let untracked_entries = if exists {
+        clean_untracked_run_root_entries(runs_dir, &local_runs)?
+    } else {
+        Vec::new()
+    };
+    let active_runs = local_runs
+        .iter()
+        .filter(|entry| entry.control.is_active)
+        .map(|entry| CleanRunSummary {
+            run_id: entry.run_id.clone(),
+            run_dir: entry.run_dir.clone(),
+            status: entry.control.status_display.clone(),
+            active_trials: entry.control.active_trials,
+        })
+        .collect::<Vec<_>>();
+    let interrupted_runs = local_runs
+        .iter()
+        .filter(|entry| entry.control.status == "interrupted")
+        .map(|entry| CleanRunSummary {
+            run_id: entry.run_id.clone(),
+            run_dir: entry.run_dir.clone(),
+            status: entry.control.status_display.clone(),
+            active_trials: entry.control.active_trials,
+        })
+        .collect::<Vec<_>>();
+    if !dry_run && !active_runs.is_empty() && !include_active {
+        return Err(anyhow!(
+            "clean --runs found {} active run(s) under {}. Stop or recover them first, or rerun with --include-active --force if you intentionally want to remove active run state.\n\nPreview safely with:\n  bucephalus clean --runs --dry-run",
+            active_runs.len(),
+            public_runs_root_ref(runs_dir)
+        ));
+    }
+    if !dry_run && !interrupted_runs.is_empty() && !include_interrupted {
+        let first = interrupted_runs
+            .first()
+            .map(|run| public_run_command_arg(&run.run_id))
+            .unwrap_or_else(|| "<run_id>".to_string());
+        return Err(anyhow!(
+            "clean --runs found {} recoverable interrupted run(s) under {}. Recover or continue them first, or rerun with --include-interrupted --force if you intentionally want to remove interrupted run state.\n\nNext steps:\n  bucephalus recover {}\n  bucephalus continue {}\n  bucephalus clean --runs --dry-run",
+            interrupted_runs.len(),
+            public_runs_root_ref(runs_dir),
+            first,
+            first
+        ));
+    }
+    if !dry_run && !untracked_entries.is_empty() && !include_untracked {
+        return Err(anyhow!(
+            "clean --runs found {} untracked entr{} under {}. These may be partial runs, corrupt run-store state, or files not created by Bucephalus. Inspect the run root or move anything you need, then rerun with --include-untracked --force if you intentionally want to remove them.\n\nPreview safely with:\n  bucephalus clean --runs --dry-run",
+            untracked_entries.len(),
+            if untracked_entries.len() == 1 { "y" } else { "ies" },
+            public_runs_root_ref(runs_dir)
+        ));
+    }
+    if exists && !dry_run && !force {
+        return Err(anyhow!(
+            "clean --runs removes local run directories under {}. Rerun with --dry-run to preview or --force to delete.",
+            public_runs_root_ref(runs_dir)
+        ));
+    }
+
+    Ok(CleanRunsReport {
+        runs_dir: runs_dir.to_path_buf(),
+        exists,
+        dry_run,
+        force,
+        include_active,
+        include_interrupted,
+        include_untracked,
+        run_count: local_runs.len(),
+        active_run_count: active_runs.len(),
+        active_runs,
+        interrupted_run_count: interrupted_runs.len(),
+        interrupted_runs,
+        untracked_entry_count: untracked_entries.len(),
+        untracked_entries,
+        will_remove: exists,
+    })
+}
+
+fn clean_runs_root_exists_for_cleanup(runs_dir: &Path) -> Result<bool> {
+    match fs::symlink_metadata(runs_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "clean --runs refuses to inspect or remove a symlinked runs root under {}.\n\nNext steps:\n  Inspect the symlink manually.\n  Set BUCEPHALUS_HOME to the real Bucephalus home you intend to clean.",
+            public_runs_root_ref(runs_dir)
+        )),
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(anyhow!(
+            "clean --runs expected a directory at {}.\n\nMove or remove the non-directory entry, then retry `bucephalus clean --runs --dry-run`.",
+            public_runs_root_ref(runs_dir)
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(anyhow!(
+            "failed to inspect {} before cleanup: {}",
+            public_runs_root_ref(runs_dir),
+            public_error_message(&err.to_string())
+        )),
+    }
+}
+
+fn clean_inventory_run_dir_is_local(runs_dir: &Path, run_dir: &Path) -> bool {
+    let Ok(rel) = run_dir.strip_prefix(runs_dir) else {
+        return false;
+    };
+    if rel.as_os_str().is_empty() {
+        return false;
+    }
+
+    let mut current = runs_dir.to_path_buf();
+    for component in rel.components() {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        current.push(name);
+        let Ok(metadata) = fs::symlink_metadata(&current) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+    }
+    true
+}
+
+fn remove_clean_runs_root(runs_dir: &Path) -> Result<()> {
+    if !clean_runs_root_exists_for_cleanup(runs_dir)? {
+        return Ok(());
+    }
+    fs::remove_dir_all(runs_dir).map_err(|err| {
+        anyhow!(
+            "failed to remove {}: {}",
+            public_runs_root_ref(runs_dir),
+            public_error_message(&err.to_string())
+        )
+    })
+}
+
+fn clean_untracked_run_root_entries(
+    runs_dir: &Path,
+    local_runs: &[&RunInventoryEntry],
+) -> Result<Vec<CleanUntrackedEntry>> {
+    if !clean_runs_root_exists_for_cleanup(runs_dir)? {
+        return Ok(Vec::new());
+    }
+    let known_paths = local_runs
+        .iter()
+        .map(|entry| entry.run_dir.clone())
+        .collect::<BTreeSet<_>>();
+    let mut raw_entries = Vec::new();
+    let entries = fs::read_dir(runs_dir).map_err(|err| {
+        anyhow!(
+            "failed to inspect {} before cleanup: {}",
+            public_runs_root_ref(runs_dir),
+            err
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            anyhow!(
+                "failed to inspect {} before cleanup: {}",
+                public_runs_root_ref(runs_dir),
+                err
+            )
+        })?;
+        let path = entry.path();
+        if known_paths.contains(&path) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let entry_type = match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => "directory",
+            Ok(file_type) if file_type.is_file() => "file",
+            Ok(file_type) if file_type.is_symlink() => "symlink",
+            Ok(_) => "other",
+            Err(_) => "unknown",
+        };
+        raw_entries.push((name, entry_type.to_string()));
+    }
+    raw_entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(raw_entries
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (_, entry_type))| CleanUntrackedEntry {
+            entry_ref: format!("runs://local/untracked/{}", idx + 1),
+            entry_type,
+        })
+        .collect())
+}
+
+fn clean_runs_report_to_json(report: &CleanRunsReport) -> Value {
+    json!({
+        "ok": true,
+        "command": "clean",
+        "runs_ref": public_runs_root_ref(&report.runs_dir),
+        "exists": report.exists,
+        "dry_run": report.dry_run,
+        "force": report.force,
+        "include_active": report.include_active,
+        "include_interrupted": report.include_interrupted,
+        "include_untracked": report.include_untracked,
+        "run_count": report.run_count,
+        "active_run_count": report.active_run_count,
+        "interrupted_run_count": report.interrupted_run_count,
+        "untracked_entry_count": report.untracked_entry_count,
+        "will_remove": report.will_remove,
+        "removed": report.will_remove && !report.dry_run,
+        "active_runs": report.active_runs.iter().map(|run| json!({
+            "run_id": public_error_message(&run.run_id),
+            "run_ref": public_run_ref(&run.run_dir),
+            "status": public_error_message(&run.status),
+            "active_trials": run.active_trials,
+        })).collect::<Vec<_>>(),
+        "interrupted_runs": report.interrupted_runs.iter().map(|run| json!({
+            "run_id": public_error_message(&run.run_id),
+            "run_ref": public_run_ref(&run.run_dir),
+            "status": public_error_message(&run.status),
+            "active_trials": run.active_trials,
+        })).collect::<Vec<_>>(),
+        "untracked_entries": report.untracked_entries.iter().map(|entry| json!({
+            "entry_ref": entry.entry_ref,
+            "entry_type": entry.entry_type,
+        })).collect::<Vec<_>>()
+    })
+}
+
+fn print_clean_runs_report(report: &CleanRunsReport) {
+    for line in clean_runs_report_display_lines(report) {
+        println!("{line}");
+    }
+}
+
+fn clean_runs_report_display_lines(report: &CleanRunsReport) -> Vec<String> {
+    let mut lines = vec![
+        format!("runs_ref: {}", public_runs_root_ref(&report.runs_dir)),
+        format!("exists: {}", report.exists),
+        format!("run_count: {}", report.run_count),
+        format!("active_run_count: {}", report.active_run_count),
+        format!("interrupted_run_count: {}", report.interrupted_run_count),
+        format!("untracked_entry_count: {}", report.untracked_entry_count),
+    ];
+    if report.dry_run {
+        lines.push("dry_run: true".to_string());
+        lines.push(format!("would_remove: {}", report.will_remove));
+    } else {
+        lines.push(format!("removed: {}", report.will_remove));
+    }
+    if !report.active_runs.is_empty() {
+        for run in &report.active_runs {
+            lines.push(format!(
+                "active_run: {} {} active_trials={}",
+                public_error_message(&run.run_id),
+                public_error_message(&run.status),
+                run.active_trials
+            ));
+        }
+    }
+    if !report.interrupted_runs.is_empty() {
+        for run in &report.interrupted_runs {
+            lines.push(format!(
+                "interrupted_run: {} {} active_trials={}",
+                public_error_message(&run.run_id),
+                public_error_message(&run.status),
+                run.active_trials
+            ));
+        }
+    }
+    if !report.untracked_entries.is_empty() {
+        for entry in &report.untracked_entries {
+            lines.push(format!(
+                "untracked_entry: {} {}",
+                entry.entry_ref, entry.entry_type
+            ));
+        }
+    }
+    lines
+}
+
 fn parse_set_bindings(values: &[String]) -> Result<BTreeMap<String, Value>> {
     let mut out = BTreeMap::new();
     for raw in values {
@@ -6688,10 +11968,10 @@ fn parse_runtime_env_bindings(values: &[String]) -> Result<BTreeMap<String, Stri
     for raw in values {
         let (key_raw, value_raw) = raw
             .split_once('=')
-            .ok_or_else(|| anyhow!("invalid --env '{}': expected KEY=VALUE", raw))?;
+            .ok_or_else(|| anyhow!("invalid --env: expected KEY=VALUE"))?;
         let key = key_raw.trim();
         if key.is_empty() {
-            return Err(anyhow!("invalid --env '{}': key cannot be empty", raw));
+            return Err(anyhow!("invalid --env: key cannot be empty"));
         }
         out.insert(key.to_string(), value_raw.to_string());
     }
@@ -6703,20 +11983,14 @@ fn parse_secret_file_bindings(values: &[String]) -> Result<BTreeMap<String, Path
     for raw in values {
         let (key_raw, value_raw) = raw
             .split_once('=')
-            .ok_or_else(|| anyhow!("invalid --secret-file '{}': expected ID=PATH", raw))?;
+            .ok_or_else(|| anyhow!("invalid --secret-file: expected ID=PATH"))?;
         let key = key_raw.trim();
         if key.is_empty() {
-            return Err(anyhow!(
-                "invalid --secret-file '{}': id cannot be empty",
-                raw
-            ));
+            return Err(anyhow!("invalid --secret-file: id cannot be empty"));
         }
         let value = value_raw.trim();
         if value.is_empty() {
-            return Err(anyhow!(
-                "invalid --secret-file '{}': path cannot be empty",
-                raw
-            ));
+            return Err(anyhow!("invalid --secret-file: path cannot be empty"));
         }
         out.insert(key.to_string(), PathBuf::from(value));
     }
@@ -6742,56 +12016,170 @@ fn build_run_execution_options(
     })
 }
 
-fn summary_to_json(summary: &lab_runner::ExperimentSummary) -> Value {
+fn summary_to_json(package_dir: &Path, summary: &lab_runner::ExperimentSummary) -> Value {
     json!({
         "experiment": summary.exp_id,
         "workload_type": summary.workload_type,
-        "dataset": summary.dataset_path.display().to_string(),
+        "dataset_ref": public_package_path_ref(package_dir, &summary.dataset_path),
         "tasks": summary.task_count,
         "replications": summary.replications,
         "variant_count": summary.variant_count,
         "total_trials": summary.total_trials,
-        "agent_runtime": summary.agent_runtime_command,
-        "image": summary.image,
+        "agent_runtime": public_command_argv(&summary.agent_runtime_command),
+        "image": summary.image.as_deref().map(public_error_message),
         "network": summary.network_mode,
-        "trajectory_path": summary.trajectory_path,
-        "causal_extraction": summary.causal_extraction,
+        "trajectory_path": summary.trajectory_path.as_deref().map(public_error_message),
+        "causal_extraction": summary.causal_extraction.as_deref().map(public_error_message),
         "scheduling": summary.scheduling,
         "state_policy": summary.state_policy,
         "comparison": summary.comparison,
         "retry_max_attempts": summary.retry_max_attempts,
-        "preflight_warnings": summary.preflight_warnings
+        "preflight_warnings": summary
+            .preflight_warnings
+            .iter()
+            .map(|warning| public_error_message(warning))
+            .collect::<Vec<_>>()
     })
 }
 
-fn print_summary(summary: &lab_runner::ExperimentSummary) {
-    println!("experiment: {}", summary.exp_id);
-    println!("workload_type: {}", summary.workload_type);
-    println!("dataset: {}", summary.dataset_path.display());
-    println!("tasks: {}", summary.task_count);
-    println!("replications: {}", summary.replications);
-    println!("variant_count: {}", summary.variant_count);
-    println!("total_trials: {}", summary.total_trials);
-    println!("agent_runtime: {:?}", summary.agent_runtime_command);
-    if let Some(image) = &summary.image {
-        println!("image: {}", image);
-    }
-    println!("network: {}", summary.network_mode);
-    if let Some(path) = &summary.trajectory_path {
-        println!("trajectory_path: {}", path);
-    }
-    if let Some(mode) = &summary.causal_extraction {
-        println!("causal_extraction: {}", mode);
-    }
-    if !summary.preflight_warnings.is_empty() {
-        println!("preflight_warnings:");
-        for w in &summary.preflight_warnings {
-            println!("  - {}", w);
+fn public_command_argv(argv: &[String]) -> Vec<String> {
+    let mut public = Vec::with_capacity(argv.len());
+    let mut redact_next = false;
+    for arg in argv {
+        if redact_next {
+            public.push("[REDACTED:secret-like]".to_string());
+            redact_next = false;
+            continue;
         }
+        if let Some(redacted) = public_secret_command_arg(arg) {
+            redact_next = !arg.contains('=');
+            public.push(redacted);
+        } else {
+            public.push(public_error_message(arg));
+        }
+    }
+    public
+}
+
+fn public_secret_command_arg(arg: &str) -> Option<String> {
+    let (key, has_inline_value) = arg
+        .split_once('=')
+        .map(|(key, _)| (key, true))
+        .unwrap_or((arg, false));
+    let normalized: String = key
+        .trim_start_matches('-')
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    if normalized.is_empty() {
+        return None;
+    }
+    const SECRET_FRAGMENTS: &[&str] = &[
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "apikey",
+        "authorization",
+        "bearer",
+        "privatekey",
+        "clientsecret",
+        "cookie",
+        "session",
+        "refresh",
+    ];
+    if !SECRET_FRAGMENTS
+        .iter()
+        .any(|fragment| normalized.contains(fragment))
+    {
+        return None;
+    }
+    if has_inline_value {
+        Some(format!("{key}=[REDACTED:secret-like]"))
+    } else {
+        Some(arg.to_string())
     }
 }
 
+fn print_summary(package_dir: &Path, summary: &lab_runner::ExperimentSummary) {
+    for line in summary_display_lines(package_dir, summary) {
+        println!("{line}");
+    }
+}
+
+fn summary_display_lines(
+    package_dir: &Path,
+    summary: &lab_runner::ExperimentSummary,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("experiment: {}", public_error_message(&summary.exp_id)),
+        format!(
+            "workload_type: {}",
+            public_error_message(&summary.workload_type)
+        ),
+        format!(
+            "dataset_ref: {}",
+            public_package_path_ref(package_dir, &summary.dataset_path)
+        ),
+        format!("tasks: {}", summary.task_count),
+        format!("replications: {}", summary.replications),
+        format!("variant_count: {}", summary.variant_count),
+        format!("total_trials: {}", summary.total_trials),
+        format!(
+            "agent_runtime: {:?}",
+            public_command_argv(&summary.agent_runtime_command)
+        ),
+    ];
+    if let Some(image) = &summary.image {
+        lines.push(format!("image: {}", public_error_message(image)));
+    }
+    lines.push(format!(
+        "network: {}",
+        public_error_message(&summary.network_mode)
+    ));
+    if let Some(path) = &summary.trajectory_path {
+        lines.push(format!("trajectory_path: {}", public_error_message(path)));
+    }
+    if let Some(mode) = &summary.causal_extraction {
+        lines.push(format!("causal_extraction: {}", public_error_message(mode)));
+    }
+    if !summary.preflight_warnings.is_empty() {
+        lines.push("preflight_warnings:".to_string());
+        for warning in &summary.preflight_warnings {
+            lines.push(format!("  - {}", public_error_message(warning)));
+        }
+    }
+    lines
+}
+
+fn print_run_handoff(prefix: Option<&str>, result: &lab_runner::RunResult) {
+    for (key, value) in run_handoff_fields(prefix, &result.run_id, &result.run_dir) {
+        println!("{key}: {value}");
+    }
+}
+
+fn run_handoff_fields(prefix: Option<&str>, run_id: &str, run_dir: &Path) -> Vec<(String, String)> {
+    let id_label = prefix
+        .map(|prefix| format!("{prefix}_run_id"))
+        .unwrap_or_else(|| "run_id".to_string());
+    let ref_label = prefix
+        .map(|prefix| format!("{prefix}_run_ref"))
+        .unwrap_or_else(|| "run_ref".to_string());
+    vec![
+        (id_label, public_error_message(run_id)),
+        (ref_label, public_run_ref(run_dir)),
+    ]
+}
+
 fn print_preflight_report(report: &lab_runner::PreflightReport) {
+    for line in preflight_report_display_lines(report) {
+        println!("{line}");
+    }
+}
+
+fn preflight_report_display_lines(report: &lab_runner::PreflightReport) -> Vec<String> {
+    let mut lines = Vec::new();
     for check in &report.checks {
         let icon = if check.passed {
             "PASS"
@@ -6801,18 +12189,31 @@ fn print_preflight_report(report: &lab_runner::PreflightReport) {
                 lab_runner::PreflightSeverity::Warning => "WARN",
             }
         };
-        println!("[{}] {}: {}", icon, check.name, check.message);
+        lines.push(format!(
+            "[{}] {}: {}",
+            icon,
+            public_error_message(&check.name),
+            public_error_message(&check.message)
+        ));
     }
+    lines.push(String::new());
     if report.passed {
-        println!("\npreflight: all checks passed");
+        lines.push("preflight: all checks passed".to_string());
     } else {
-        println!("\npreflight: FAILED — resolve errors above before running");
+        lines.push("preflight: FAILED - resolve errors above before running".to_string());
     }
+    lines
 }
 
 fn print_package_check_report(report: &Value) {
+    for line in package_check_report_display_lines(report) {
+        println!("{line}");
+    }
+}
+
+fn package_check_report_display_lines(report: &Value) -> Vec<String> {
     let summary = report.get("summary").unwrap_or(&Value::Null);
-    println!(
+    let mut lines = vec![format!(
         "package_checks: passed={} checks={} failed={} warnings={}",
         report
             .get("passed")
@@ -6821,45 +12222,102 @@ fn print_package_check_report(report: &Value) {
         summary.get("checks").and_then(Value::as_u64).unwrap_or(0),
         summary.get("failed").and_then(Value::as_u64).unwrap_or(0),
         summary.get("warnings").and_then(Value::as_u64).unwrap_or(0)
-    );
+    )];
     if let Some(checks) = report.get("checks").and_then(Value::as_array) {
         for check in checks {
             let status = check
                 .get("status")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_ascii_uppercase();
+                .map(public_package_check_status)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
             let id = check.get("id").and_then(Value::as_str).unwrap_or("<check>");
-            let reason = check.get("reason").and_then(Value::as_str).unwrap_or("");
-            println!("[{}] {}: {}", status, id, reason);
+            let reason = check
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(public_error_message)
+                .unwrap_or_default();
+            lines.push(format!(
+                "[{}] {}: {}",
+                status,
+                public_error_message(id),
+                reason
+            ));
         }
     }
+    lines
+}
+
+fn public_package_check_status(status: &str) -> String {
+    if status
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        status.to_ascii_uppercase()
+    } else {
+        public_error_message(status)
+    }
+}
+
+fn first_auth_action_command(auth: &Value) -> Option<&str> {
+    if auth.get("status").and_then(Value::as_str) == Some("ready") {
+        return None;
+    }
+    auth.get("actions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|action| action.get("command").and_then(Value::as_str))
 }
 
 fn resolve_run_dir_arg(run: &str) -> Result<PathBuf> {
     let raw = PathBuf::from(run);
     if raw.exists() {
-        return raw
-            .canonicalize()
-            .map_err(|_| anyhow::anyhow!(format!("run path not found: {}", raw.display())));
+        return raw.canonicalize().map_err(|err| {
+            anyhow::anyhow!(
+                "run path is not accessible: {} ({})",
+                public_run_ref(&raw),
+                err
+            )
+        });
     }
 
     let cwd = std::env::current_dir()?;
     if let Some(run_dir) = lab_runner::resolve_run_dir_from_store(run, cwd.as_path())? {
         return run_dir.canonicalize().map_err(|err| {
             anyhow::anyhow!(
-                "stored run path for '{}' is not accessible: {} ({})",
+                "stored run path for '{}' ({}) is not accessible: {}\n\nNext steps:\n  bucephalus runs\n  bucephalus clean --runs --dry-run",
                 run,
-                run_dir.display(),
+                public_run_ref(&run_dir),
                 err
             )
         });
     }
 
     Err(anyhow::anyhow!(format!(
-        "run '{}' not found in the configured runtime store",
+        "run '{}' not found in the configured runtime store.\n\nNext steps:\n  bucephalus runs\n  bucephalus run <package-dir>",
         run
     )))
+}
+
+fn resolve_run_selector(
+    command: &str,
+    run: Option<&str>,
+    run_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    match (run, run_dir) {
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "{} accepts either a run id/path argument or --run-dir, not both",
+            command
+        )),
+        (Some(run), None) => resolve_run_dir_arg(run),
+        (None, Some(run_dir)) => Ok(run_dir.to_path_buf()),
+        (None, None) => Err(anyhow::anyhow!(
+            "{} requires a run id/path.\n\nNext steps:\n  bucephalus runs\n  bucephalus {} <run_id>\n  bucephalus {} --run-dir <run_dir>",
+            command,
+            command,
+            command
+        )),
+    }
 }
 
 fn resolve_project_root(start: &Path) -> PathBuf {
@@ -7088,13 +12546,14 @@ fn run_interactive_views_browser(
                 current_view = Some(resolved_view.clone());
 
                 let table = query_resolved_view(run_dir, &resolved_view, limit)?;
+                let public_table = public_query_table(&table);
                 let display_mode = display_mode_for_view(&resolved_view);
                 let (display, legend, split_labels) =
-                    if resolved_view.name == "trace" && has_ab_trace_columns(&table) {
-                        let (d, l, s) = prepare_trace_split_view(&table);
+                    if resolved_view.name == "trace" && has_ab_trace_columns(&public_table) {
+                        let (d, l, s) = prepare_trace_split_view(&public_table);
                         (d, l, Some(s))
                     } else {
-                        let presented = present_table(resolved_view.spec, &table);
+                        let presented = present_table(resolved_view.spec, &public_table);
                         (presented.table, presented.legend, None)
                     };
 
@@ -7336,13 +12795,14 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                 current_view = Some(resolved_view.clone());
 
                 let table = query_resolved_view(run_dir, &resolved_view, 0)?;
+                let public_table = public_query_table(&table);
                 let display_mode = display_mode_for_view(&resolved_view);
                 let (display, legend, split_labels) =
-                    if resolved_view.name == "trace" && has_ab_trace_columns(&table) {
-                        let (d, l, s) = prepare_trace_split_view(&table);
+                    if resolved_view.name == "trace" && has_ab_trace_columns(&public_table) {
+                        let (d, l, s) = prepare_trace_split_view(&public_table);
                         (d, l, Some(s))
                     } else {
-                        let presented = present_table(resolved_view.spec, &table);
+                        let presented = present_table(resolved_view.spec, &public_table);
                         (presented.table, presented.legend, None)
                     };
 
@@ -7516,7 +12976,8 @@ fn build_detail_snapshot(
         .iter()
         .find_map(|key| {
             let idx = table.columns.iter().position(|c| c == key)?;
-            let raw = row.get(idx).map(render_json_cell).unwrap_or_default();
+            let value = row.get(idx).cloned().unwrap_or(Value::Null);
+            let raw = render_json_cell(&public_query_table_cell(key, value));
             if raw.is_empty() {
                 None
             } else {
@@ -7530,13 +12991,13 @@ fn build_detail_snapshot(
     for (idx, column) in table.columns.iter().enumerate() {
         let value = row.get(idx).cloned().unwrap_or(Value::Null);
         if column == "payload_json" || column == "payload" {
-            let pretty = view_layout::pretty_payload(&value);
+            let pretty = view_layout::pretty_payload(&public_query_payload_cell(column, &value));
             if !pretty.trim().is_empty() && pretty != "null" {
                 payload = Some(pretty);
             }
             continue;
         }
-        let rendered = render_json_cell(&value);
+        let rendered = render_json_cell(&public_query_table_cell(column, value));
         if rendered.is_empty() {
             continue;
         }
@@ -7586,7 +13047,7 @@ fn query_state_backed_source_view(
         "latest_agent_output" => Ok(build_latest_agent_output_table(run_dir)),
         other => Err(anyhow!(
             "view '{}' requires the analysis query engine; live state views are available for run_progress, health, latest_agent_output, and scoreboard",
-            other
+            public_view_name(other)
         )),
     }
 }
@@ -7910,7 +13371,17 @@ fn print_scoreboard_table(table: &analysis::QueryTable, term_width: usize) {
     let rendered_rows: Vec<Vec<String>> = table
         .rows
         .iter()
-        .map(|row| row.iter().map(render_json_cell).collect::<Vec<String>>())
+        .map(|row| {
+            table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(idx, column)| {
+                    let value = row.get(idx).unwrap_or(&Value::Null);
+                    render_public_query_cell(column, value)
+                })
+                .collect::<Vec<String>>()
+        })
         .collect();
 
     let numeric_cols: Vec<bool> = (0..table.columns.len())
@@ -8192,7 +13663,7 @@ fn build_latest_agent_output_table(run_dir: &Path) -> analysis::QueryTable {
 
     let mut rows = Vec::new();
     for attempt in attempts {
-        append_latest_agent_output_rows(&mut rows, &attempt);
+        append_latest_agent_output_rows(&mut rows, run_dir, &attempt);
     }
 
     analysis::QueryTable {
@@ -8310,7 +13781,11 @@ fn collect_trial_attempt_states(run_dir: &Path) -> Vec<TrialAttemptOutputState> 
     attempts
 }
 
-fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAttemptOutputState) {
+fn append_latest_agent_output_rows(
+    rows: &mut Vec<Vec<Value>>,
+    run_dir: &Path,
+    attempt: &TrialAttemptOutputState,
+) {
     let agent_result_path = agent_result_path(attempt);
     let agent_stdout_path = state_string(&attempt.state, "/agent_phase/stdout_path");
     let agent_stderr_path = state_string(&attempt.state, "/agent_phase/stderr_path");
@@ -8343,7 +13818,7 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
             json!(preview),
             agent_result_json,
             agent_result_path
-                .map(|path| json!(path.display().to_string()))
+                .map(|path| latest_agent_output_path_value(run_dir, path))
                 .unwrap_or(Value::Null),
             if candidate_state.is_empty() {
                 Value::Null
@@ -8359,14 +13834,14 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
             if agent_stdout_path.is_empty() {
                 Value::Null
             } else {
-                json!(agent_stdout_path)
+                latest_agent_output_path_string_value(run_dir, &agent_stdout_path)
             },
             if agent_stderr_path.is_empty() {
                 Value::Null
             } else {
-                json!(agent_stderr_path)
+                latest_agent_output_path_string_value(run_dir, &agent_stderr_path)
             },
-            json!(attempt.state_path.display().to_string()),
+            latest_agent_output_path_value(run_dir, &attempt.state_path),
             if attempt.updated_at.is_empty() {
                 Value::Null
             } else {
@@ -8432,6 +13907,45 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
         agent_result_path.as_deref(),
         candidate_payload,
     );
+}
+
+fn latest_agent_output_path_value(run_dir: &Path, path: &Path) -> Value {
+    json!(latest_agent_output_path_display(
+        run_dir,
+        &path.display().to_string()
+    ))
+}
+
+fn latest_agent_output_path_string_value(run_dir: &Path, raw: &str) -> Value {
+    json!(latest_agent_output_path_display(run_dir, raw))
+}
+
+fn latest_agent_output_path_display(run_dir: &Path, raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let path = Path::new(trimmed);
+    if let Some(rel) = path.strip_prefix(run_dir).ok() {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel.is_empty() {
+            return "run://.".to_string();
+        }
+        return format!("run://{}", rel);
+    }
+    if path.is_absolute() && !is_bucephalus_contract_path(trimmed) {
+        return dispatch_redaction_for_string(trimmed)
+            .unwrap_or("[REDACTED:local-path]")
+            .to_string();
+    }
+    trimmed.to_string()
+}
+
+fn is_bucephalus_contract_path(path: &str) -> bool {
+    path == "/bucephalus"
+        || path.starts_with("/bucephalus/")
+        || path == "/bucephalus-events"
+        || path.starts_with("/bucephalus-events/")
 }
 
 fn agent_result_path(attempt: &TrialAttemptOutputState) -> Option<PathBuf> {
@@ -8693,20 +14207,187 @@ fn shorten_display_columns(table: &analysis::QueryTable) -> analysis::QueryTable
     }
 }
 
+fn query_command_result_to_json(run_dir: &Path, sql: &str, table: &analysis::QueryTable) -> Value {
+    json!({
+        "ok": true,
+        "command": "query",
+        "run_ref": public_run_ref(run_dir),
+        "sql": public_error_message(sql),
+        "result": query_table_to_json(table),
+    })
+}
+
 fn query_table_to_json(table: &analysis::QueryTable) -> Value {
+    let public_columns = public_query_column_names(&table.columns);
     let mut objects = Vec::with_capacity(table.rows.len());
     for row in &table.rows {
         let mut obj = serde_json::Map::new();
         for (idx, column) in table.columns.iter().enumerate() {
-            obj.insert(column.clone(), row.get(idx).cloned().unwrap_or(Value::Null));
+            let cell = row.get(idx).cloned().unwrap_or(Value::Null);
+            let public_column = public_columns
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| public_query_column_name(column));
+            obj.insert(public_column, public_query_table_cell(column, cell));
         }
         objects.push(Value::Object(obj));
     }
     json!({
-        "columns": table.columns,
+        "columns": public_columns,
         "rows": objects,
         "row_count": table.rows.len()
     })
+}
+
+fn public_query_table(table: &analysis::QueryTable) -> analysis::QueryTable {
+    let public_columns = public_query_column_names(&table.columns);
+    analysis::QueryTable {
+        columns: public_columns,
+        rows: table
+            .rows
+            .iter()
+            .map(|row| {
+                table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, column)| {
+                        let cell = row.get(idx).cloned().unwrap_or(Value::Null);
+                        public_query_table_cell(column, cell)
+                    })
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
+fn public_query_column_names(columns: &[String]) -> Vec<String> {
+    let mut used = BTreeSet::new();
+    columns
+        .iter()
+        .map(|column| {
+            let base = public_query_column_name(column);
+            if used.insert(base.clone()) {
+                return base;
+            }
+            let mut suffix = 2usize;
+            loop {
+                let candidate = format!("{base}_{suffix}");
+                if used.insert(candidate.clone()) {
+                    return candidate;
+                }
+                suffix += 1;
+            }
+        })
+        .collect()
+}
+
+fn public_query_column_name(column: &str) -> String {
+    let public = public_error_message(column);
+    if public.trim().is_empty() {
+        "column".to_string()
+    } else {
+        public
+    }
+}
+
+fn public_query_table_cell(column: &str, value: Value) -> Value {
+    if let Some(marker) = public_analysis_redaction_for_key(column) {
+        return Value::String(marker.to_string());
+    }
+    if let Value::String(text) = value {
+        if public_analysis_structured_string_column(column) {
+            if let Ok(mut parsed) = serde_json::from_str::<Value>(&text) {
+                redact_public_analysis_json(&mut parsed);
+                let rendered =
+                    serde_json::to_string(&parsed).unwrap_or_else(|_| public_error_message(&text));
+                return Value::String(rendered);
+            }
+        }
+        return Value::String(public_error_message(&text));
+    }
+    let mut value = value;
+    redact_public_analysis_json(&mut value);
+    value
+}
+
+fn public_query_payload_cell(column: &str, value: &Value) -> Value {
+    if let Some(marker) = public_analysis_redaction_for_key(column) {
+        return Value::String(marker.to_string());
+    }
+    let mut public = match value {
+        Value::String(text) => {
+            serde_json::from_str::<Value>(text).unwrap_or_else(|_| Value::String(text.clone()))
+        }
+        other => other.clone(),
+    };
+    redact_public_analysis_json(&mut public);
+    public
+}
+
+fn public_analysis_structured_string_column(column: &str) -> bool {
+    let normalized = column.to_ascii_lowercase();
+    normalized == "payload" || normalized == "payload_json" || normalized.ends_with("_json")
+}
+
+fn redact_public_analysis_json(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            *text = public_error_message(text);
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_public_analysis_json(item);
+            }
+        }
+        Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                if let Some(marker) = public_analysis_redaction_for_key(key) {
+                    *child = Value::String(marker.to_string());
+                } else {
+                    redact_public_analysis_json(child);
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn public_analysis_redaction_for_key(key: &str) -> Option<&'static str> {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    if normalized.ends_with("ref") || normalized.ends_with("present") {
+        return None;
+    }
+    if normalized == "env" || normalized.ends_with("env") || normalized.contains("environment") {
+        return Some("[REDACTED:environment]");
+    }
+    const SECRET_FRAGMENTS: &[&str] = &[
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "apikey",
+        "authorization",
+        "bearer",
+        "privatekey",
+        "clientsecret",
+        "cookie",
+        "session",
+        "refresh",
+    ];
+    if normalized == "auth"
+        || normalized.ends_with("auth")
+        || SECRET_FRAGMENTS
+            .iter()
+            .any(|fragment| normalized.contains(fragment))
+    {
+        return Some("[REDACTED:secret]");
+    }
+    None
 }
 
 fn elide_constant_columns(
@@ -8733,7 +14414,10 @@ fn elide_constant_columns(
             .all(|row| row.get(col_idx).cloned().unwrap_or(Value::Null) == first_val);
 
         if all_same {
-            elided.push((col_name.clone(), render_json_cell(&first_val)));
+            elided.push((
+                col_name.clone(),
+                render_public_query_cell(col_name, &first_val),
+            ));
         } else {
             keep_indices.push(col_idx);
         }
@@ -8773,7 +14457,8 @@ fn print_query_table(table: &analysis::QueryTable) {
         return;
     }
 
-    let (filtered, elided) = elide_constant_columns(table);
+    let public_table = public_query_table(table);
+    let (filtered, elided) = elide_constant_columns(&public_table);
     let display = shorten_display_columns(&filtered);
 
     if !elided.is_empty() {
@@ -8864,7 +14549,7 @@ fn format_raw_events_stdout(table: &analysis::QueryTable) -> Vec<String> {
             if value.is_null() {
                 continue;
             }
-            let rendered = render_json_cell(value);
+            let rendered = render_public_query_cell(name, value);
             if rendered.trim().is_empty() || rendered == "null" {
                 continue;
             }
@@ -8880,20 +14565,14 @@ fn format_raw_events_stdout(table: &analysis::QueryTable) -> Vec<String> {
         }
         if let Some(idx) = event_idx {
             let value = row.get(idx).unwrap_or(&Value::Null);
-            let rendered = render_json_cell(value);
+            let rendered =
+                view_layout::pretty_payload(&public_query_payload_cell("event_json", value));
             if !rendered.trim().is_empty() && rendered != "null" {
-                lines.extend(pretty_event_payload(&rendered).lines().map(str::to_string));
+                lines.extend(rendered.lines().map(str::to_string));
             }
         }
     }
     lines
-}
-
-fn pretty_event_payload(payload: &str) -> String {
-    serde_json::from_str::<Value>(payload)
-        .ok()
-        .and_then(|value| serde_json::to_string_pretty(&value).ok())
-        .unwrap_or_else(|| payload.to_string())
 }
 
 fn print_ab_task_outcomes_table(table: &analysis::QueryTable) {
@@ -8944,11 +14623,12 @@ fn first_non_null_column_value(table: &analysis::QueryTable, column_name: &str) 
     };
     for row in &table.rows {
         let value = row.get(idx).unwrap_or(&Value::Null);
+        let value = public_query_table_cell(column_name, value.clone());
         match value {
             Value::Null => {}
             Value::String(s) if s.trim().is_empty() => {}
             Value::String(s) => return s.to_string(),
-            other => return render_json_cell(other),
+            other => return render_json_cell(&other),
         }
     }
     String::new()
@@ -9012,11 +14692,11 @@ fn build_trace_sections(table: &analysis::QueryTable) -> Vec<TraceSection> {
     for row in &table.rows {
         let task = row
             .get(task_col)
-            .map(render_json_cell)
+            .map(|value| render_public_query_cell("task_id", value))
             .unwrap_or_else(|| "unknown".to_string());
         let repl = row
             .get(repl_col)
-            .map(render_json_cell)
+            .map(|value| render_public_query_cell("repl_idx", value))
             .unwrap_or_else(|| "unknown".to_string());
         grouped.entry((task, repl)).or_default().push(row.clone());
     }
@@ -9102,11 +14782,12 @@ fn print_query_table_no_elision(table: &analysis::QueryTable) {
         println!("(ok)");
         return;
     }
+    let public_table = public_query_table(table);
     let term_w = terminal_width();
-    if should_chunk_query_table(table, term_w) {
-        print_query_table_in_column_chunks(table, term_w);
+    if should_chunk_query_table(&public_table, term_w) {
+        print_query_table_in_column_chunks(&public_table, term_w);
     } else {
-        print_scoreboard_table(table, term_w);
+        print_scoreboard_table(&public_table, term_w);
     }
 }
 
@@ -9332,22 +15013,40 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
-fn print_query_table_csv(table: &analysis::QueryTable) {
+fn render_query_table_csv(table: &analysis::QueryTable) -> String {
+    let public_columns = public_query_column_names(&table.columns);
     let header = table
         .columns
         .iter()
-        .map(|c| csv_escape(c))
+        .enumerate()
+        .map(|(idx, c)| {
+            csv_escape(
+                public_columns
+                    .get(idx)
+                    .map(String::as_str)
+                    .unwrap_or_else(|| c.as_str()),
+            )
+        })
         .collect::<Vec<_>>()
         .join(",");
-    println!("{}", header);
+    let mut lines = vec![header];
     for row in &table.rows {
         let line = row
             .iter()
-            .map(|v| csv_escape(&render_json_cell(v)))
+            .enumerate()
+            .map(|(idx, value)| {
+                let column = table.columns.get(idx).map(String::as_str).unwrap_or("");
+                csv_escape(&render_public_query_cell(column, value))
+            })
             .collect::<Vec<_>>()
             .join(",");
-        println!("{}", line);
+        lines.push(line);
     }
+    lines.join("\n")
+}
+
+fn print_query_table_csv(table: &analysis::QueryTable) {
+    println!("{}", render_query_table_csv(table));
 }
 
 fn markdown_escape_cell(value: &str) -> String {
@@ -9362,10 +15061,10 @@ fn render_query_table_markdown(table: &analysis::QueryTable) -> String {
     if table.columns.is_empty() {
         return "(ok)".to_string();
     }
+    let public_columns = public_query_column_names(&table.columns);
     let header = format!(
         "| {} |",
-        table
-            .columns
+        public_columns
             .iter()
             .map(|col| markdown_escape_cell(col))
             .collect::<Vec<_>>()
@@ -9386,9 +15085,9 @@ fn render_query_table_markdown(table: &analysis::QueryTable) -> String {
             .columns
             .iter()
             .enumerate()
-            .map(|(idx, _)| {
+            .map(|(idx, column)| {
                 let value = row.get(idx).unwrap_or(&Value::Null);
-                markdown_escape_cell(&render_json_cell(value))
+                markdown_escape_cell(&render_public_query_cell(column, value))
             })
             .collect::<Vec<_>>();
         lines.push(format!("| {} |", cells.join(" | ")));
@@ -9409,9 +15108,10 @@ fn render_query_table_html_fragment(table: &analysis::QueryTable) -> String {
     if table.columns.is_empty() {
         return "<p>(ok)</p>".to_string();
     }
+    let public_columns = public_query_column_names(&table.columns);
     let mut out = String::new();
     out.push_str("<table><thead><tr>");
-    for col in &table.columns {
+    for col in &public_columns {
         out.push_str("<th>");
         out.push_str(&html_escape(col));
         out.push_str("</th>");
@@ -9419,10 +15119,10 @@ fn render_query_table_html_fragment(table: &analysis::QueryTable) -> String {
     out.push_str("</tr></thead><tbody>");
     for row in &table.rows {
         out.push_str("<tr>");
-        for (idx, _) in table.columns.iter().enumerate() {
+        for (idx, column) in table.columns.iter().enumerate() {
             let value = row.get(idx).unwrap_or(&Value::Null);
             out.push_str("<td>");
-            out.push_str(&html_escape(&render_json_cell(value)));
+            out.push_str(&html_escape(&render_public_query_cell(column, value)));
             out.push_str("</td>");
         }
         out.push_str("</tr>");
@@ -9557,7 +15257,7 @@ fn print_single_view_markdown(
 ) {
     println!("# Bucephalus view");
     println!();
-    println!("run_dir: `{}`", run_dir.display());
+    println!("run: `{}`", public_run_ref(run_dir));
     println!();
     println!("view_set: `{}`", view_set);
     println!();
@@ -9589,8 +15289,8 @@ fn print_single_view_html(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Bucephalus view</title><style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:20px;line-height:1.4}table{border-collapse:collapse;width:100%}th,td{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top}th{background:#f5f5f5;position:sticky;top:0}tr:nth-child(even) td{background:#fafafa}code{background:#f3f3f3;padding:1px 4px;border-radius:4px}.trace-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}.trace-task{margin-top:20px;padding-top:4px;border-top:1px solid #ddd}</style></head><body>",
     );
     out.push_str("<h1>Bucephalus view</h1>");
-    out.push_str("<p><strong>run_dir:</strong> <code>");
-    out.push_str(&html_escape(&run_dir.display().to_string()));
+    out.push_str("<p><strong>run:</strong> <code>");
+    out.push_str(&html_escape(&public_run_ref(run_dir)));
     out.push_str("</code></p>");
     out.push_str("<p><strong>view_set:</strong> <code>");
     out.push_str(&html_escape(view_set));
@@ -9625,7 +15325,7 @@ fn print_views_markdown_document(
 ) {
     println!("# Bucephalus views");
     println!();
-    println!("run_dir: `{}`", run_dir.display());
+    println!("run: `{}`", public_run_ref(run_dir));
     println!();
     println!("view_set: `{}`", view_set);
     for (resolved, table) in rendered {
@@ -9658,8 +15358,8 @@ fn print_views_html_document(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Bucephalus views</title><style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:20px;line-height:1.4}table{border-collapse:collapse;width:100%;margin-bottom:26px}th,td{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top}th{background:#f5f5f5;position:sticky;top:0}tr:nth-child(even) td{background:#fafafa}code{background:#f3f3f3;padding:1px 4px;border-radius:4px}h2{margin-top:32px}.trace-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}.trace-task{margin-top:20px;padding-top:4px;border-top:1px solid #ddd}</style></head><body>",
     );
     out.push_str("<h1>Bucephalus views</h1>");
-    out.push_str("<p><strong>run_dir:</strong> <code>");
-    out.push_str(&html_escape(&run_dir.display().to_string()));
+    out.push_str("<p><strong>run:</strong> <code>");
+    out.push_str(&html_escape(&public_run_ref(run_dir)));
     out.push_str("</code></p>");
     out.push_str("<p><strong>view_set:</strong> <code>");
     out.push_str(&html_escape(view_set));
@@ -9689,6 +15389,346 @@ fn print_views_html_document(
     println!("{}", out);
 }
 
+fn public_run_ref(run_dir: &Path) -> String {
+    let run_id = run_id_from_dir(run_dir)
+        .as_deref()
+        .map(public_run_ref_component)
+        .unwrap_or_else(|| "current".to_string());
+    format!("run://{}", run_id)
+}
+
+fn public_run_ref_component(run_id: &str) -> String {
+    if is_plain_public_run_id(run_id) {
+        public_ref_component(run_id)
+    } else if run_id.trim().is_empty() {
+        "current".to_string()
+    } else {
+        "redacted".to_string()
+    }
+}
+
+fn public_run_command_arg(run_id: &str) -> String {
+    if is_plain_public_run_id(run_id) {
+        public_error_message(run_id)
+    } else {
+        "<run-id>".to_string()
+    }
+}
+
+fn is_plain_public_run_id(run_id: &str) -> bool {
+    let trimmed = run_id.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn public_runs_root_ref(_runs_dir: &Path) -> String {
+    "runs://local".to_string()
+}
+
+fn public_dispatch_ref(dispatch_id: &str) -> String {
+    format!("dispatch://{}", public_dispatch_ref_component(dispatch_id))
+}
+
+fn public_dispatch_id(dispatch_id: &str) -> String {
+    public_dispatch_ref_component(dispatch_id)
+}
+
+fn public_dispatch_ref_component(dispatch_id: &str) -> String {
+    let trimmed = dispatch_id.trim();
+    if trimmed.is_empty() || trimmed == "current" {
+        "current".to_string()
+    } else if is_public_dispatch_id(trimmed) {
+        public_ref_component(trimmed)
+    } else {
+        "redacted".to_string()
+    }
+}
+
+fn is_public_dispatch_id(dispatch_id: &str) -> bool {
+    dispatch_id.starts_with("dispatch_")
+        && dispatch_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn public_dispatch_submission_archive_ref(dispatch_id: &str) -> String {
+    format!(
+        "{}/submission/latch_result.tgz",
+        public_dispatch_ref(dispatch_id)
+    )
+}
+
+fn public_dispatch_submission_entry_ref(archive_name: &str) -> String {
+    let normalized = archive_name.trim().replace('\\', "/");
+    let path = normalized
+        .split('/')
+        .map(public_ref_path_component)
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if path.is_empty() {
+        return "dispatch-submission://entry".to_string();
+    }
+    format!("dispatch-submission://{path}")
+}
+
+fn public_dispatch_path_ref(dispatch_dir: Option<&Path>, dispatch_id: &str, path: &Path) -> String {
+    let Some(dispatch_dir) = dispatch_dir else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    let Ok(rel) = path.strip_prefix(dispatch_dir) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return public_dispatch_ref(dispatch_id);
+    }
+    let rel = public_dispatch_relative_path_ref(rel);
+    format!("{}/{rel}", public_dispatch_ref(dispatch_id))
+}
+
+fn public_dispatch_path_ref_from_home(home: &Path, path: &Path) -> Option<String> {
+    let dispatches = home.join("dispatches");
+    let rel = path.strip_prefix(dispatches).ok()?;
+    let mut components = rel.components();
+    let dispatch_id = components.next()?.as_os_str().to_string_lossy().to_string();
+    if dispatch_id.trim().is_empty() {
+        return None;
+    }
+    let rest = components.as_path();
+    if rest.as_os_str().is_empty() {
+        return Some(public_dispatch_ref(&dispatch_id));
+    }
+    let rest = public_dispatch_relative_path_ref(rest);
+    Some(format!("{}/{rest}", public_dispatch_ref(&dispatch_id)))
+}
+
+fn public_dispatch_relative_path_ref(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => part.to_str().map(public_ref_path_component),
+            std::path::Component::CurDir => None,
+            std::path::Component::ParentDir => Some("parent".to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn public_ref_path_component(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let component = public_ref_component(value);
+    if component.is_empty() {
+        return "value".to_string();
+    }
+    if [
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "private",
+        "clientsecret",
+        "cookie",
+        "session",
+        "refresh",
+    ]
+    .iter()
+    .any(|fragment| lower.contains(fragment))
+    {
+        "redacted".to_string()
+    } else {
+        component
+    }
+}
+
+fn public_run_path_ref(run_dir: &Path, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(run_dir) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return public_run_ref(run_dir);
+    }
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("run://{rel}")
+}
+
+fn public_child_run_path_ref(path: &Path) -> String {
+    let Some(run_dir) = path.parent().and_then(Path::parent) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    let Some(kind) = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+    else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if !matches!(kind, "replays" | "forks") {
+        return "[REDACTED:local-path]".to_string();
+    }
+    public_run_path_ref(run_dir, path)
+}
+
+fn public_package_path_ref(package_dir: &Path, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(package_dir) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return "package://.".to_string();
+    }
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("package://{rel}")
+}
+
+fn public_latch_path_ref(root: &Path, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return "latch://.".to_string();
+    }
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("latch://{rel}")
+}
+
+fn public_project_ref(_project_root: &Path) -> String {
+    "workspace://current".to_string()
+}
+
+fn public_install_ref(_install_dir: &Path) -> String {
+    "install://current".to_string()
+}
+
+fn public_binary_ref() -> &'static str {
+    "binary://current"
+}
+
+fn public_home_ref() -> &'static str {
+    "state://home"
+}
+
+fn public_service_ref(manager: Option<&str>, label: Option<&str>) -> String {
+    let manager = manager
+        .map(public_ref_component)
+        .unwrap_or_else(|| "local".to_string());
+    let label = label
+        .map(public_ref_component)
+        .unwrap_or_else(|| "daemon".to_string());
+    format!("service://{manager}/{label}")
+}
+
+fn public_service_config_ref(manager: Option<&str>, label: Option<&str>) -> String {
+    format!("{}/config", public_service_ref(manager, label))
+}
+
+fn public_daemon_path_value(home: &Path, value: &Value) -> Value {
+    value
+        .as_str()
+        .map(|path| json!(public_daemon_path_ref(home, Path::new(path))))
+        .unwrap_or_else(|| json!("[REDACTED:local-path]"))
+}
+
+fn public_daemon_path_ref(home: &Path, path: &Path) -> String {
+    if home.as_os_str().is_empty() {
+        return "[REDACTED:local-path]".to_string();
+    }
+    let daemon_dir = home.join("daemon");
+    let Ok(rel) = path.strip_prefix(&daemon_dir) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return "daemon://current".to_string();
+    }
+    if rel == Path::new("latchd.json") {
+        return "daemon://state".to_string();
+    }
+    if rel == Path::new("latchd.log") {
+        return "daemon://log".to_string();
+    }
+    if rel == Path::new("latchd.sock") {
+        return "daemon://socket".to_string();
+    }
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("daemon://{rel}")
+}
+
+fn public_mcp_config_ref(client: &str) -> String {
+    format!("mcp://{}/config", public_mcp_client_name(client))
+}
+
+fn public_mcp_command_ref(client: &str) -> String {
+    format!("mcp://{}/setup-command", public_mcp_client_name(client))
+}
+
+fn public_mcp_client_name(client: &str) -> String {
+    match client {
+        "claude-code" | "claude-desktop" | "cursor-project" => client.to_string(),
+        _ => public_ref_path_component(client),
+    }
+}
+
+fn public_auth_path_ref(home: &Path, path: &Path) -> String {
+    let paths = cloud_token_paths(home);
+    if path == paths.access {
+        return "auth://access-token".to_string();
+    }
+    if path == paths.refresh {
+        return "auth://refresh-token".to_string();
+    }
+    if path == paths.cache {
+        return "auth://token-cache".to_string();
+    }
+    let auth_dir = home.join("auth");
+    let Ok(rel) = path.strip_prefix(&auth_dir) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return "auth://current".to_string();
+    }
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("auth://{rel}")
+}
+
+fn public_ref_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn public_workspace_path_ref(project_root: &Path, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(project_root) else {
+        return "[REDACTED:local-path]".to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        return public_project_ref(project_root);
+    }
+    let rel = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("workspace://{rel}")
+}
+
 fn render_json_cell(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
@@ -9697,6 +15737,10 @@ fn render_json_cell(value: &Value) -> String {
         Value::String(v) => v.clone(),
         Value::Array(_) | Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
     }
+}
+
+fn render_public_query_cell(column: &str, value: &Value) -> String {
+    render_json_cell(&public_query_table_cell(column, value.clone()))
 }
 
 fn truncate_cell(value: &str, width: usize) -> String {
@@ -9747,7 +15791,10 @@ fn try_print_post_run_stats(run_dir: &Path, run_id: &str) {
     }
     if let Some(path) = &report.evaluation_summary_path {
         println!();
-        println!("evaluation summary: {}", path.display());
+        println!(
+            "evaluation_summary_ref: {}",
+            public_run_path_ref(run_dir, path)
+        );
     }
     println!();
     println!("inspect:");
@@ -9780,9 +15827,9 @@ fn try_post_run_stats_json(run_dir: &Path) -> Value {
         "view_set": report.view_set.as_str(),
         "summary": Value::Object(summary),
         "sections": sections,
-        "evaluation_summary_path": report
+        "evaluation_summary_ref": report
             .evaluation_summary_path
-            .map(|path| path.display().to_string()),
+            .map(|path| public_run_path_ref(run_dir, &path)),
     })
 }
 
@@ -10095,12 +16142,60 @@ fn push_post_run_section(
     }
 }
 
+fn runs_command_result_to_json(project_root: &Path, table: &analysis::QueryTable) -> Value {
+    let mut payload = json!({
+        "ok": true,
+        "command": "runs",
+        "project_ref": public_project_ref(project_root),
+        "result": query_table_to_json(table),
+    });
+    if table.rows.is_empty() {
+        payload["next_actions"] = json!(runs_empty_next_actions(project_root));
+    }
+    payload
+}
+
+fn runs_empty_next_actions(project_root: &Path) -> Vec<Value> {
+    vec![
+        json!({
+            "type": "cli_command",
+            "command": "bucephalus init <workspace-dir>",
+            "workspace_ref": public_project_ref(project_root),
+        }),
+        json!({
+            "type": "cli_command",
+            "command": "bucephalus run <experiment-yaml>",
+            "experiment_ref": public_workspace_path_ref(project_root, &project_root.join("experiment.yaml")),
+        }),
+    ]
+}
+
+fn runs_empty_handoff_lines(project_root: &Path) -> Vec<String> {
+    let mut lines = vec![
+        format!("project_ref: {}", public_project_ref(project_root)),
+        "runs: none".to_string(),
+    ];
+    for action in runs_empty_next_actions(project_root) {
+        if let Some(command) = action.get("command").and_then(Value::as_str) {
+            let ref_suffix = action
+                .get("workspace_ref")
+                .or_else(|| action.get("experiment_ref"))
+                .and_then(Value::as_str)
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default();
+            lines.push(format!("next: {command}{ref_suffix}"));
+        }
+    }
+    lines
+}
+
 fn build_runs_table(project_root: &Path) -> Result<analysis::QueryTable> {
     let entries = collect_run_inventory(project_root)?;
     let rows = entries
         .into_iter()
         .map(|entry| {
             let metrics = read_run_metrics(&entry.run_dir);
+            let next_action = run_next_action(&entry);
             vec![
                 Value::String(entry.control.status_display),
                 Value::String(entry.started_at_display),
@@ -10112,6 +16207,7 @@ fn build_runs_table(project_root: &Path) -> Result<analysis::QueryTable> {
                     Some(pr) => json!((pr * 10000.0).round() / 10000.0),
                     None => Value::Null,
                 },
+                Value::String(next_action),
             ]
         })
         .collect();
@@ -10125,6 +16221,7 @@ fn build_runs_table(project_root: &Path) -> Result<analysis::QueryTable> {
             "live".into(),
             "variants".into(),
             "pass_rate".into(),
+            "next_action".into(),
         ],
         rows,
     })
@@ -10137,13 +16234,36 @@ fn collect_run_inventory(project_root: &Path) -> Result<Vec<RunInventoryEntry>> 
         .collect::<Vec<_>>();
 
     entries.sort_by(|a, b| {
-        b.control
-            .is_active
-            .cmp(&a.control.is_active)
+        run_inventory_sort_rank(a)
+            .cmp(&run_inventory_sort_rank(b))
             .then_with(|| b.started_at.cmp(&a.started_at))
             .then_with(|| a.run_id.cmp(&b.run_id))
     });
     Ok(entries)
+}
+
+fn run_inventory_sort_rank(entry: &RunInventoryEntry) -> u8 {
+    if entry.control.is_active {
+        0
+    } else if entry.control.status == "interrupted" {
+        1
+    } else {
+        2
+    }
+}
+
+fn run_next_action(entry: &RunInventoryEntry) -> String {
+    if entry.control.status == "interrupted" {
+        return format!("recover: bucephalus recover {}", entry.run_id);
+    }
+    if entry.control.is_active {
+        return format!("watch: bucephalus views-live {} run_progress", entry.run_id);
+    }
+    match entry.control.status.as_str() {
+        "completed" => format!("inspect: bucephalus views {} observability", entry.run_id),
+        "failed" | "killed" => format!("diagnose: bucephalus views {} observability", entry.run_id),
+        _ => format!("inspect: bucephalus views {}", entry.run_id),
+    }
 }
 
 fn inspect_run_inventory_entry(
@@ -10392,9 +16512,23 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     static ACCOUNT_DB_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static CLOUD_AUTH_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static DISPATCH_HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_account_db_env() -> MutexGuard<'static, ()> {
         ACCOUNT_DB_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_cloud_auth_env() -> MutexGuard<'static, ()> {
+        CLOUD_AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_dispatch_home_env() -> MutexGuard<'static, ()> {
+        DISPATCH_HOME_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -10411,6 +16545,21 @@ mod tests {
                 .collect::<Vec<_>>();
             for name in vars {
                 std::env::remove_var(name);
+            }
+            Self { saved }
+        }
+
+        fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
+                .collect::<Vec<_>>();
+            for (name, value) in vars {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
             }
             Self { saved }
         }
@@ -10452,6 +16601,53 @@ mod tests {
     }
 
     #[test]
+    fn runtime_env_parse_errors_do_not_echo_secret_values() {
+        let raw_missing_equals = "OPENAI_API_KEY sk-live-token".to_string();
+        let err = parse_runtime_env_bindings(std::slice::from_ref(&raw_missing_equals))
+            .expect_err("missing '=' must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("expected KEY=VALUE"));
+        assert!(!msg.contains("sk-live-token"), "unexpected error: {msg}");
+        assert!(
+            !msg.contains(&raw_missing_equals),
+            "unexpected error: {msg}"
+        );
+
+        let raw_empty_key = "=sk-empty-key-token".to_string();
+        let err = parse_runtime_env_bindings(std::slice::from_ref(&raw_empty_key))
+            .expect_err("empty key must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("key cannot be empty"));
+        assert!(
+            !msg.contains("sk-empty-key-token"),
+            "unexpected error: {msg}"
+        );
+        assert!(!msg.contains(&raw_empty_key), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn secret_file_parse_errors_do_not_echo_raw_paths() {
+        let raw_missing_equals = "/Users/alice/.config/bucephalus/codex-oauth.json".to_string();
+        let err = parse_secret_file_bindings(std::slice::from_ref(&raw_missing_equals))
+            .expect_err("missing '=' must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("expected ID=PATH"));
+        assert!(!msg.contains("/Users/alice"), "unexpected error: {msg}");
+        assert!(
+            !msg.contains(&raw_missing_equals),
+            "unexpected error: {msg}"
+        );
+
+        let raw_empty_id = "=/Users/alice/.config/bucephalus/codex-oauth.json".to_string();
+        let err = parse_secret_file_bindings(std::slice::from_ref(&raw_empty_id))
+            .expect_err("empty id must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("id cannot be empty"));
+        assert!(!msg.contains("/Users/alice"), "unexpected error: {msg}");
+        assert!(!msg.contains(&raw_empty_id), "unexpected error: {msg}");
+    }
+
+    #[test]
     fn oauth_metadata_url_uses_rfc8414_authorization_server_metadata() {
         assert_eq!(
             oauth_metadata_url("https://auth.example/tenant/").unwrap(),
@@ -10465,6 +16661,29 @@ mod tests {
     }
 
     #[test]
+    fn oauth_metadata_missing_endpoint_error_redacts_metadata_url() {
+        let err = required_oauth_metadata_endpoint(
+            "https://user:super-secret@auth.example/tenant/.well-known/oauth-authorization-server?token=raw-query#frag",
+            &json!({}),
+            "token_endpoint",
+        )
+        .expect_err("missing metadata endpoint must fail");
+        let message = err.to_string();
+
+        assert!(message.contains(
+            "OAuth metadata https://auth.example/tenant/.well-known/oauth-authorization-server"
+        ));
+        assert!(message.contains("[redacted URL credentials/query]"));
+        assert!(message.contains("token_endpoint"));
+        for forbidden in ["user:super-secret", "super-secret", "raw-query", "#frag"] {
+            assert!(
+                !message.contains(forbidden),
+                "OAuth metadata error leaked forbidden text {forbidden}: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn dynamic_client_registration_body_uses_requested_scope() {
         let body = dynamic_client_registration_body("openid profile cloud.write");
         assert_eq!(body["scope"], "openid profile cloud.write");
@@ -10472,12 +16691,679 @@ mod tests {
     }
 
     #[test]
+    fn response_body_errors_are_redacted_before_display() {
+        let body = br#"{
+            "message": "Authorization: Bearer live-token",
+            "access_token": "sk-live-access",
+            "refresh_token": "refresh-live",
+            "details": {
+                "workspace_path": "/Users/alice/project",
+                "env": {"OPENAI_API_KEY": "sk-live-env"}
+            },
+            "notes": ["token=raw-query-token", "ordinary hint"]
+        }"#;
+
+        let redacted = redacted_response_body(body);
+
+        for forbidden in [
+            "live-token",
+            "sk-live-access",
+            "refresh-live",
+            "/Users/alice",
+            "sk-live-env",
+            "raw-query-token",
+        ] {
+            assert!(
+                !redacted.contains(forbidden),
+                "response body leaked forbidden text: {forbidden}"
+            );
+        }
+        assert!(redacted.contains("[REDACTED:secret]"));
+        assert!(redacted.contains("[REDACTED:secret-like]"));
+        assert!(redacted.contains("[REDACTED:local-path]"));
+        assert!(redacted.contains("[REDACTED:environment]"));
+        assert!(redacted.contains("ordinary hint"));
+
+        let plain = redacted_response_body(b"token=plain-secret\nretry later");
+        assert!(!plain.contains("plain-secret"));
+        assert!(plain.contains("[REDACTED:secret-like]"));
+        assert!(plain.contains("retry later"));
+    }
+
+    #[test]
+    fn json_error_messages_are_public_boundary_safe() {
+        let payload = json_error(
+            "command_failed",
+            "failed to read /Users/alice/work/run.json: Permission denied\nmirror https://mirror-user:mirror-secret@mirror.example/releases?token=raw-query#frag\nworker token=raw-worker-token\nlocal file:///private/tmp/bucephalus/install.sh".to_string(),
+            json!({}),
+        );
+        let encoded = serde_json::to_string(&payload).unwrap();
+        let message = payload["error"]["message"].as_str().unwrap();
+
+        assert!(message.contains("failed to read"));
+        assert!(message.contains("Permission denied"));
+        assert!(message.contains("https://mirror.example/releases"));
+        assert!(message.contains("[redacted URL credentials/query]"));
+        assert!(message.contains("token=[REDACTED:secret-like]"));
+        assert!(message.contains("file://[REDACTED:local-path]"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "mirror-user",
+            "mirror-secret",
+            "raw-query",
+            "raw-worker-token",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "JSON error leaked forbidden text: {forbidden}\n{encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn human_cli_error_boundary_is_public_boundary_safe() {
+        let err = anyhow!(
+            "failed to read /Users/alice/work/run.json: Permission denied\nmirror https://mirror-user:mirror-secret@mirror.example/releases?token=raw-query#frag\nworker token=raw-worker-token\nlocal file:///private/tmp/bucephalus/install.sh"
+        );
+
+        let public = public_cli_error(err);
+        let message = public.to_string();
+
+        assert!(message.contains("failed to read"));
+        assert!(message.contains("Permission denied"));
+        assert!(message.contains("https://mirror.example/releases"));
+        assert!(message.contains("[redacted URL credentials/query]"));
+        assert!(message.contains("token=[REDACTED:secret-like]"));
+        assert!(message.contains("file://[REDACTED:local-path]"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "mirror-user",
+            "mirror-secret",
+            "raw-query",
+            "raw-worker-token",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "human CLI error leaked forbidden text: {forbidden}\n{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_error_message_is_idempotent_for_redaction_markers() {
+        let message = "token=[REDACTED:secret-like]\npath=[REDACTED:local-path]\nplain retry later";
+
+        let once = public_error_message(message);
+        let twice = public_error_message(&once);
+
+        assert_eq!(once, message);
+        assert_eq!(twice, once);
+        assert!(!twice.contains("[REDACTED:secret-like]]"));
+        assert!(!twice.contains("[REDACTED:local-path]]"));
+    }
+
+    #[test]
+    fn public_error_message_redacts_cross_platform_local_paths() {
+        let message = public_error_message(
+            &[
+                "mac=/Volumes/Backup Drive/customer package/run.json token=raw-mac-token",
+                r"win=C:\Users\Alice\AppData\Local\Temp\buc.log",
+                r"env=%USERPROFILE%\Documents\bench\run.json",
+                "home=~/Library/Application Support/bucephalus/state.json",
+                "wsl=/mnt/c/Users/Alice/AppData/Local/Temp/buc.log",
+            ]
+            .join("\n"),
+        );
+
+        assert!(message.contains("mac=[REDACTED:local-path] token=[REDACTED:secret-like]"));
+        assert!(message.contains("win=[REDACTED:local-path]"));
+        assert!(message.contains("env=[REDACTED:local-path]"));
+        assert!(message.contains("home=[REDACTED:local-path]"));
+        assert!(message.contains("wsl=[REDACTED:local-path]"));
+        for forbidden in [
+            "/Volumes/Backup",
+            "Drive/customer",
+            r"C:\Users\Alice",
+            "%USERPROFILE%",
+            "~/Library",
+            "Application Support",
+            "/mnt/c/Users/Alice",
+            "raw-mac-token",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "public error leaked forbidden text {forbidden}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_error_message_preserves_connectors_before_redacted_urls() {
+        let message = public_error_message(
+            "failed in /Users/alice/project with callback=https://user:secret@example.com/cb?token=raw-url-token#frag\narchive /Users/alice/private/support.tgz via https://upload-user:upload-secret@example.com/upload?token=raw-upload-token#frag",
+        );
+
+        assert!(message.contains(
+            "failed in [REDACTED:local-path] with callback=https://example.com/cb [redacted URL credentials/query]"
+        ));
+        assert!(message.contains(
+            "archive [REDACTED:local-path] via https://example.com/upload [redacted URL credentials/query]"
+        ));
+        for forbidden in [
+            "/Users/alice",
+            "user:secret",
+            "upload-user",
+            "upload-secret",
+            "raw-url-token",
+            "raw-upload-token",
+            "#frag",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "public error leaked forbidden text {forbidden}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_validation_json_failure_is_public_boundary_safe() {
+        let errors = vec![
+            "instance /runtime/env/OPENAI_API_KEY failed in /Users/alice/private/experiment.yaml: token=raw-schema-token".to_string(),
+            "remote schema mirror https://mirror-user:mirror-secret@mirror.example/schema?token=raw-query#frag failed; cache file:///private/tmp/schema.json".to_string(),
+        ];
+        let input = Path::new("/Users/alice/private/experiment.json");
+        let payload =
+            schema_validation_failure_to_json("resolved_experiment.jsonschema", input, &errors);
+        let encoded = serde_json::to_string(&payload).unwrap();
+
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["command"], "schema-validate");
+        assert_eq!(payload["valid"], false);
+        assert_eq!(payload["schema"], "resolved_experiment.jsonschema");
+        assert_eq!(payload["input_ref"], "schema-input://file");
+        assert_eq!(payload["error_count"], 2);
+        assert!(payload["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:local-path]"));
+        assert!(payload["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("token=[REDACTED:secret-like]"));
+        assert!(payload["errors"][1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("https://mirror.example/schema"));
+        assert!(payload["errors"][1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("[redacted URL credentials/query]"));
+        assert!(payload["errors"][1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("file://[REDACTED:local-path]"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "private/experiment",
+            "raw-schema-token",
+            "mirror-user",
+            "mirror-secret",
+            "?token=raw-query",
+            "#frag",
+            "/Users/alice/private/experiment.json",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "schema validation JSON leaked forbidden text: {forbidden}\n{encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_validation_unknown_schema_error_is_curated_and_public() {
+        let message =
+            ensure_schema_name_for_validation("/Users/alice/private/schema token=raw-schema-token")
+                .expect_err("unknown schema should fail")
+                .to_string();
+
+        assert!(message.contains("schema not found: [REDACTED:schema-name]"));
+        assert!(message.contains("available_schemas:"));
+        assert!(message.contains("resolved_experiment.jsonschema"));
+        assert!(message.contains("bucephalus schema-validate --schema <name> --file <json>"));
+        for forbidden in [
+            "/Users/alice",
+            "private/schema",
+            "raw-schema-token",
+            "token=",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "unknown schema error leaked forbidden text {forbidden}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_validation_input_read_errors_use_public_refs() {
+        let missing = Path::new("/Users/alice/private/input token=raw-file-token.json");
+        let message = read_schema_validation_input(missing)
+            .expect_err("missing input should fail")
+            .to_string();
+
+        assert!(message.contains("failed to read schema input"));
+        assert!(message.contains("input_ref: schema-input://file"));
+        assert!(message.contains("Check the path passed to --file"));
+        assert!(
+            public_error_message(&message).contains("input_ref: schema-input://file"),
+            "public error pass should preserve schema input refs: {message}"
+        );
+        for forbidden in ["/Users/alice", "private/input", "raw-file-token"] {
+            assert!(
+                !message.contains(forbidden),
+                "schema input read error leaked forbidden text {forbidden}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_validation_json_parse_errors_use_public_refs() {
+        let root = temp_dir("schema_validation_parse_public");
+        fs::create_dir_all(&root).expect("test root");
+        let input = root.join("private token=raw-file-token.json");
+        fs::write(&input, "{not json").expect("invalid json");
+
+        let message = read_schema_validation_input(&input)
+            .expect_err("invalid JSON should fail")
+            .to_string();
+
+        assert!(message.contains("failed to parse schema input as JSON"));
+        assert!(message.contains("input_ref: schema-input://file"));
+        assert!(message.contains("error:"));
+        assert!(
+            public_error_message(&message).contains("input_ref: schema-input://file"),
+            "public error pass should preserve schema input refs: {message}"
+        );
+        let root_display = root.display().to_string();
+        for forbidden in [root_display.as_str(), "private token", "raw-file-token"] {
+            assert!(
+                !message.contains(forbidden),
+                "schema input parse error leaked forbidden text {forbidden}: {message}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn preflight_json_messages_are_public_boundary_safe() {
+        let report = lab_runner::PreflightReport {
+            passed: false,
+            checks: vec![lab_runner::PreflightCheck {
+                name: "agent_runtime_reachable",
+                passed: false,
+                severity: lab_runner::PreflightSeverity::Error,
+                message: "failed to read /Users/alice/work/.env: permission denied\nmirror https://mirror-user:mirror-secret@mirror.example/releases?token=raw-query#frag\nagent token=raw-preflight-token\ncache file:///private/tmp/bucephalus/preflight.json".to_string(),
+            }],
+        };
+        let payload = preflight_report_to_json(&report);
+        let encoded = serde_json::to_string(&payload).unwrap();
+        let message = payload["checks"][0]["message"].as_str().unwrap();
+
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["checks"][0]["name"], "agent_runtime_reachable");
+        assert_eq!(payload["checks"][0]["severity"], "error");
+        assert!(message.contains("failed to read"));
+        assert!(message.contains("permission denied"));
+        assert!(message.contains("https://mirror.example/releases"));
+        assert!(message.contains("[redacted URL credentials/query]"));
+        assert!(message.contains("token=[REDACTED:secret-like]"));
+        assert!(message.contains("file://[REDACTED:local-path]"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "mirror-user",
+            "mirror-secret",
+            "?token=raw-query",
+            "#frag",
+            "raw-preflight-token",
+            "work/.env",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "preflight JSON leaked forbidden text: {forbidden}\n{encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_command_json_messages_are_public_boundary_safe() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let report = lab_runner::PreflightReport {
+            passed: false,
+            checks: vec![lab_runner::PreflightCheck {
+                name: "runtime_env",
+                passed: false,
+                severity: lab_runner::PreflightSeverity::Error,
+                message: "failed to load /Users/alice/private/package/.env\nmirror https://mirror-user:mirror-secret@mirror.example/releases?token=raw-query#frag\nagent token=raw-standalone-preflight-token\ncache file:///private/tmp/preflight.json".to_string(),
+            }],
+        };
+        let payload = preflight_command_report_to_json(&package_dir, &report);
+        let encoded = serde_json::to_string(&payload).unwrap();
+        let message = payload["checks"][0]["message"].as_str().unwrap();
+
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["command"], "preflight");
+        assert_eq!(payload["package_ref"], "package://.");
+        assert_eq!(payload["checks"][0]["name"], "runtime_env");
+        assert!(message.contains("failed to load"));
+        assert!(message.contains("https://mirror.example/releases"));
+        assert!(message.contains("[redacted URL credentials/query]"));
+        assert!(message.contains("token=[REDACTED:secret-like]"));
+        assert!(message.contains("file://[REDACTED:local-path]"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "private/package",
+            "mirror-user",
+            "mirror-secret",
+            "?token=raw-query",
+            "#frag",
+            "raw-standalone-preflight-token",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "preflight command JSON leaked forbidden text: {forbidden}\n{encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_display_lines_are_public_boundary_safe() {
+        let report = lab_runner::PreflightReport {
+            passed: false,
+            checks: vec![lab_runner::PreflightCheck {
+                name: "runtime_env /Users/alice/private/package/.env token=raw-name-token",
+                passed: false,
+                severity: lab_runner::PreflightSeverity::Error,
+                message: "failed to load /Users/alice/private/package/.env\nmirror https://mirror-user:mirror-secret@mirror.example/releases?token=raw-query#frag\nagent token=raw-display-token\ncache file:///private/tmp/preflight.json".to_string(),
+            }],
+        };
+
+        let rendered = preflight_report_display_lines(&report).join("\n");
+
+        assert!(rendered.contains("[FAIL] runtime_env [REDACTED:local-path]"));
+        assert!(rendered.contains("token=[REDACTED:secret-like]"));
+        assert!(rendered.contains("https://mirror.example/releases"));
+        assert!(rendered.contains("[redacted URL credentials/query]"));
+        assert!(rendered.contains("file://[REDACTED:local-path]"));
+        assert!(rendered.contains("preflight: FAILED - resolve errors above before running"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "private/package",
+            "mirror-user",
+            "mirror-secret",
+            "?token=raw-query",
+            "#frag",
+            "raw-name-token",
+            "raw-display-token",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "preflight display leaked forbidden text: {forbidden}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_check_json_report_is_public_boundary_safe() {
+        let report = json!({
+            "schema_version": "package_checks_v1",
+            "generated_at": "2026-06-09T12:00:00Z",
+            "package_digest": "sha256:abc",
+            "passed": false,
+            "summary": {"checks": 1, "failed": 1, "warnings": 0},
+            "checks": [{
+                "id": "trial_runtime.schema",
+                "scope": "package",
+                "status": "fail",
+                "reason": "failed to read /Users/alice/private/package/.env: permission denied\nmirror https://mirror-user:mirror-secret@mirror.example/releases?token=raw-query#frag\nagent token=raw-package-token\ncache file:///private/tmp/bucephalus/package_checks.json",
+                "evidence": {
+                    "path": "/Users/alice/private/package/.env",
+                    "package_ref": "package://manifest.json",
+                    "output_mount_paths": ["/bucephalus/out", "/Users/alice/private/out"],
+                    "token_hint": "raw-package-token",
+                    "OPENAI_API_KEY": "sk-live-package-secret",
+                    "env": {"SAFE_FLAG": "1"},
+                    "refresh_token_present": true
+                }
+            }]
+        });
+        let payload = package_check_report_to_json(&report);
+        let encoded = serde_json::to_string(&payload).unwrap();
+        let reason = payload["checks"][0]["reason"].as_str().unwrap();
+
+        assert_eq!(payload["schema_version"], "package_checks_v1");
+        assert_eq!(payload["package_digest"], "sha256:abc");
+        assert_eq!(
+            payload["checks"][0]["evidence"]["package_ref"],
+            "package://manifest.json"
+        );
+        assert_eq!(
+            payload["checks"][0]["evidence"]["output_mount_paths"][0],
+            "/bucephalus/out"
+        );
+        assert_eq!(
+            payload["checks"][0]["evidence"]["path"],
+            "[REDACTED:local-path]"
+        );
+        assert_eq!(
+            payload["checks"][0]["evidence"]["token_hint"],
+            "[REDACTED:secret]"
+        );
+        assert_eq!(
+            payload["checks"][0]["evidence"]["OPENAI_API_KEY"],
+            "[REDACTED:secret]"
+        );
+        assert_eq!(
+            payload["checks"][0]["evidence"]["env"],
+            "[REDACTED:environment]"
+        );
+        assert_eq!(
+            payload["checks"][0]["evidence"]["refresh_token_present"],
+            true
+        );
+        assert!(reason.contains("failed to read"));
+        assert!(reason.contains("permission denied"));
+        assert!(reason.contains("https://mirror.example/releases"));
+        assert!(reason.contains("[redacted URL credentials/query]"));
+        assert!(reason.contains("token=[REDACTED:secret-like]"));
+        assert!(reason.contains("file://[REDACTED:local-path]"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "private/package",
+            "mirror-user",
+            "mirror-secret",
+            "?token=raw-query",
+            "#frag",
+            "raw-package-token",
+            "sk-live-package-secret",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "package-check JSON leaked forbidden text: {forbidden}\n{encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_check_display_lines_are_public_boundary_safe() {
+        let report = json!({
+            "passed": false,
+            "summary": {"checks": 1, "failed": 1, "warnings": 0},
+            "checks": [{
+                "id": "trial_runtime /Users/alice/private/package token=raw-id-token",
+                "status": "/Users/alice/private/status",
+                "reason": "failed to read /Users/alice/private/package/.env\nmirror https://mirror-user:mirror-secret@mirror.example/releases?token=raw-query#frag\nagent token=raw-display-package-token\ncache file:///private/tmp/bucephalus/package_checks.json"
+            }]
+        });
+
+        let rendered = package_check_report_display_lines(&report).join("\n");
+
+        assert!(rendered.contains("package_checks: passed=false checks=1 failed=1 warnings=0"));
+        assert!(rendered.contains("[[REDACTED:local-path]] trial_runtime [REDACTED:local-path]"));
+        assert!(rendered.contains("token=[REDACTED:secret-like]"));
+        assert!(rendered.contains("https://mirror.example/releases"));
+        assert!(rendered.contains("[redacted URL credentials/query]"));
+        assert!(rendered.contains("file://[REDACTED:local-path]"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "private/package",
+            "mirror-user",
+            "mirror-secret",
+            "?token=raw-query",
+            "#frag",
+            "raw-id-token",
+            "raw-display-package-token",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "package-check display leaked forbidden text: {forbidden}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_token_refresh_transport_errors_redact_token_endpoint_url() {
+        let root = temp_dir("cloud_token_refresh_redaction");
+        let paths = cloud_token_paths(&root);
+        let err = refresh_cloud_token_cache(
+            &paths,
+            &json!({
+                "client_id": "client-1",
+                "refresh_token": "refresh-live-secret",
+                "token_endpoint": "http://user:super-secret@127.0.0.1:1/token?access_token=raw-query-token#frag"
+            }),
+        )
+        .expect_err("dead localhost token endpoint should fail");
+        let message = format!("{err:#}");
+
+        for forbidden in [
+            "super-secret",
+            "raw-query-token",
+            "refresh-live-secret",
+            "user:super-secret",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "refresh error leaked forbidden text: {forbidden}\n{message}"
+            );
+        }
+        assert!(message.contains("http://127.0.0.1:1/token"));
+        assert!(message.contains("[redacted URL credentials/query]"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cached_cloud_auth_refresh_error_is_public_and_actionable() {
+        let err = cached_cloud_auth_refresh_error(anyhow!(
+            "refresh failed at https://user:secret@issuer.example/oauth/token?refresh=raw-url-token#frag with cache=/Users/alice/private/cloud_user_token.json refresh_token=raw-refresh-token client_secret=client-secret"
+        ));
+        let message = public_cli_error(err).to_string();
+
+        assert!(message.contains("cached Cloud OAuth token could not be refreshed"));
+        assert!(message.contains("auth_ref: auth://current"));
+        assert!(message.contains("cache_ref: auth://token-cache"));
+        assert!(message.contains("https://issuer.example/oauth/token"));
+        assert!(message.contains("[redacted URL credentials/query]"));
+        assert!(message.contains("cache=[REDACTED:local-path]"));
+        assert!(message.contains("refresh_token=[REDACTED:secret-like]"));
+        assert!(message.contains("client_secret=[REDACTED:secret-like]"));
+        assert!(message.contains("bucephalus login"));
+        assert!(message.contains("bucephalus logout"));
+        for forbidden in [
+            "/Users/alice",
+            "user:secret",
+            "raw-url-token",
+            "raw-refresh-token",
+            "client-secret",
+            "#frag",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "cached refresh error leaked forbidden text: {forbidden}\n{message}"
+            );
+        }
+    }
+
+    #[test]
     fn update_dry_run_targets_current_install_contract() {
         assert_eq!(
-            install_script_url("nishiokj/Bucephalus").unwrap(),
-            "https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh"
+            installer_script_source("nishiokj/Bucephalus", "latest", None)
+                .unwrap()
+                .script_url,
+            "https://github.com/nishiokj/Bucephalus/releases/latest/download/install.sh"
         );
-        assert!(install_script_url("../bad").is_err());
+        assert_eq!(
+            installer_script_source("nishiokj/Bucephalus", "0.3.1", None)
+                .unwrap()
+                .script_url,
+            "https://github.com/nishiokj/Bucephalus/releases/download/v0.3.1/install.sh"
+        );
+        assert_eq!(
+            installer_script_source(
+                "nishiokj/Bucephalus",
+                "latest",
+                Some("https://mirror.example/releases/")
+            )
+            .unwrap()
+            .checksum_url,
+            "https://mirror.example/releases/install.sh.sha256"
+        );
+        assert!(installer_script_source("../bad", "latest", None).is_err());
+        assert!(installer_script_source("owner/repo?bad", "latest", None).is_err());
+        assert!(installer_script_source("nishiokj/Bucephalus", "../bad", None).is_err());
+        assert_eq!(
+            installer_script_source(
+                "nishiokj/Bucephalus",
+                "latest",
+                Some("file:///tmp/releases")
+            )
+            .unwrap()
+            .script_url,
+            "file:///tmp/releases/install.sh"
+        );
+        assert_eq!(
+            normalize_release_tag("0.3.1+build_5").unwrap(),
+            "v0.3.1+build_5"
+        );
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_single_sha256_record(&format!("{digest}  install.sh"), "install.sh").unwrap(),
+            digest
+        );
+        assert!(parse_single_sha256_record(&format!("{digest}  other.sh"), "install.sh").is_err());
+        assert!(parse_single_sha256_record(
+            &format!("{digest}  install.sh\n{digest}  install.sh"),
+            "install.sh"
+        )
+        .is_err());
+
+        let err = parse_single_sha256_record(
+            &format!("{digest}  /Users/alice/private/install.sh?token=raw-secret"),
+            "install.sh",
+        )
+        .expect_err("unexpected checksum name should fail");
+        let message = err.to_string();
+        assert!(message.contains("checksum record must name install.sh"));
+        assert!(message.contains("unexpected checksum filename"));
+        assert!(!message.contains("/Users/alice"));
+        assert!(!message.contains("raw-secret"));
+
         let root = temp_dir("update_install_dir");
         let result = run_update(UpdateOptions {
             version: Some("0.3.1".to_string()),
@@ -10487,11 +17373,21 @@ mod tests {
             setup: true,
             no_modify_path: true,
             dry_run: true,
+            capture_output: true,
         })
         .unwrap();
         assert_eq!(result["schema_version"], "bucephalus_update_v1");
         assert_eq!(result["version"], "0.3.1");
-        assert_eq!(result["install_dir"], root.display().to_string());
+        assert_eq!(result["install_ref"], "install://current");
+        assert_eq!(result["installer_source"], "base_url");
+        assert_eq!(
+            result["installer_url"],
+            "https://example.com/releases/install.sh"
+        );
+        assert_eq!(
+            result["installer_checksum_url"],
+            "https://example.com/releases/install.sh.sha256"
+        );
         assert_eq!(result["setup"], true);
         assert_eq!(result["no_modify_path"], true);
         assert_eq!(result["env"]["BUCEPHALUS_SETUP"], "1");
@@ -10499,6 +17395,2464 @@ mod tests {
         assert_eq!(
             result["env"]["BUCEPHALUS_BASE_URL"],
             "https://example.com/releases"
+        );
+        assert!(result.get("install_dir").is_none());
+        assert!(!result.to_string().contains(&root.display().to_string()));
+    }
+
+    #[test]
+    fn update_rejects_private_mirror_url_credentials_without_leaking_values() {
+        let root = temp_dir("update_private_mirror");
+        let err = run_update(UpdateOptions {
+            version: Some("latest".to_string()),
+            install_dir: Some(root.clone()),
+            repo: Some("nishiokj/Bucephalus".to_string()),
+            base_url: Some(
+                "https://mirror-user:sk-live-secret@mirror.example/releases".to_string(),
+            ),
+            setup: false,
+            no_modify_path: true,
+            dry_run: true,
+            capture_output: true,
+        })
+        .expect_err("credentialed update mirror should fail before planning");
+
+        let message = err.to_string();
+        assert!(message.contains("invalid BUCEPHALUS_BASE_URL value"));
+        assert!(message.contains("without credentials, query, or fragment"));
+        for forbidden in [
+            &root.display().to_string(),
+            "update_private_mirror",
+            "mirror-user",
+            "sk-live-secret",
+            "mirror.example/releases",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "credentialed update mirror error leaked forbidden text {forbidden}: {message}"
+            );
+        }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn update_rejects_ambiguous_distribution_inputs_without_leaking_values() {
+        let invalid_base_url =
+            "https://mirror-user:sk-live-secret@mirror.example/releases?token=raw-query#frag";
+        let base_err =
+            installer_script_source("nishiokj/Bucephalus", "latest", Some(invalid_base_url))
+                .expect_err("query or fragment in base URL should fail");
+        let base_message = base_err.to_string();
+        assert!(base_message.contains("invalid BUCEPHALUS_BASE_URL value"));
+        assert!(base_message.contains("without credentials, query, or fragment"));
+        for forbidden in [
+            "mirror-user",
+            "sk-live-secret",
+            "raw-query",
+            "?token=",
+            "#frag",
+        ] {
+            assert!(
+                !base_message.contains(forbidden),
+                "invalid base URL leaked forbidden text {forbidden}: {base_message}"
+            );
+        }
+
+        let plaintext_err = installer_script_source(
+            "nishiokj/Bucephalus",
+            "latest",
+            Some("http://mirror.example/raw-update-secret"),
+        )
+        .expect_err("plaintext update mirror should fail");
+        let plaintext_message = plaintext_err.to_string();
+        assert!(plaintext_message.contains("invalid BUCEPHALUS_BASE_URL value"));
+        assert!(plaintext_message.contains("https:// or file://"));
+        assert!(!plaintext_message.contains("mirror.example"));
+        assert!(!plaintext_message.contains("raw-update-secret"));
+
+        let invalid_version = "0.3.1?token=raw-version-secret#frag";
+        let version_err = installer_script_source("nishiokj/Bucephalus", invalid_version, None)
+            .expect_err("URL delimiters in release tag should fail");
+        let version_message = version_err.to_string();
+        assert!(version_message.contains("invalid BUCEPHALUS_VERSION value"));
+        assert!(version_message.contains("URL delimiters"));
+        for forbidden in ["raw-version-secret", "?token=", "#frag", invalid_version] {
+            assert!(
+                !version_message.contains(forbidden),
+                "invalid release tag leaked forbidden text {forbidden}: {version_message}"
+            );
+        }
+
+        let invalid_path_version = "/Users/alice/private-release";
+        let path_version_err =
+            installer_script_source("nishiokj/Bucephalus", invalid_path_version, None)
+                .expect_err("local path as release tag should fail");
+        let path_version_message = path_version_err.to_string();
+        assert!(path_version_message.contains("invalid BUCEPHALUS_VERSION value"));
+        assert!(!path_version_message.contains("/Users/alice"));
+        assert!(!path_version_message.contains("private-release"));
+
+        let invalid_repo = "/Users/alice/private-repo?token=raw-repo-secret";
+        let repo_err = installer_script_source(invalid_repo, "latest", None)
+            .expect_err("local path as repo should fail");
+        let repo_message = repo_err.to_string();
+        assert!(repo_message.contains("invalid BUCEPHALUS_REPO value"));
+        for forbidden in ["/Users/alice", "private-repo", "raw-repo-secret", "?token="] {
+            assert!(
+                !repo_message.contains(forbidden),
+                "invalid repo leaked forbidden text {forbidden}: {repo_message}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_json_uses_public_install_ref() {
+        let root = temp_dir("update_json_install_ref");
+        let result = run_update(UpdateOptions {
+            version: Some("0.3.1".to_string()),
+            install_dir: Some(root.clone()),
+            repo: Some("nishiokj/Bucephalus".to_string()),
+            base_url: Some("https://example.com/releases".to_string()),
+            setup: true,
+            no_modify_path: true,
+            dry_run: true,
+            capture_output: true,
+        })
+        .unwrap();
+        let payload = update_result_to_json(&result);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["schema_version"], "bucephalus_update_v1");
+        assert_eq!(payload["install_ref"], "install://current");
+        assert_eq!(
+            payload["env"]["BUCEPHALUS_INSTALL_DIR"],
+            "install://current"
+        );
+        assert_eq!(payload["env"]["BUCEPHALUS_SETUP"], "1");
+        assert_eq!(payload["env"]["BUCEPHALUS_NO_MODIFY_PATH"], "1");
+        assert!(payload.get("install_dir").is_none());
+        assert!(!encoded.contains(&root.display().to_string()));
+        assert!(!encoded.contains("update_json_install_ref"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn update_handoff_lines_use_public_install_ref() {
+        let root = temp_dir("update_handoff_install_ref");
+        let result = run_update(UpdateOptions {
+            version: Some("0.3.1".to_string()),
+            install_dir: Some(root.clone()),
+            repo: Some("nishiokj/Bucephalus".to_string()),
+            base_url: Some("https://mirror.example/releases".to_string()),
+            setup: true,
+            no_modify_path: true,
+            dry_run: true,
+            capture_output: true,
+        })
+        .unwrap();
+        let lines = update_handoff_lines(&result);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("update: planned"));
+        assert!(rendered.contains("version: 0.3.1"));
+        assert!(rendered.contains("install_ref: install://current"));
+        assert!(rendered.contains("installer_source: base_url"));
+        assert!(rendered.contains("installer_url: https://mirror.example/releases/install.sh"));
+        assert!(rendered.contains("setup: true"));
+        for forbidden in [
+            &root.display().to_string(),
+            "update_handoff_install_ref",
+            "mirror-user",
+            "sk-live-secret",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "update handoff leaked forbidden text {forbidden}: {rendered}"
+            );
+        }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn update_json_redacts_captured_installer_output() {
+        let install_dir = PathBuf::from("/Users/alice/.local/bin");
+        let raw = json!({
+            "schema_version": "bucephalus_update_v1",
+            "ok": true,
+            "dry_run": false,
+            "installer_url": "https://mirror.example/releases/install.sh",
+            "installer_checksum_url": "https://mirror.example/releases/install.sh.sha256",
+            "installer_source": "base_url",
+            "install_dir": install_dir,
+            "version": "latest",
+            "repo": "nishiokj/Bucephalus",
+            "setup": false,
+            "no_modify_path": true,
+            "updated": true,
+            "env": {
+                "BUCEPHALUS_INSTALL_DIR": "/Users/alice/.local/bin",
+                "BUCEPHALUS_BASE_URL": "https://user:token-secret@mirror.example/releases"
+            },
+            "cleanup": {
+                "temp_ref": "/private/tmp/bucephalus-update-raw-token",
+                "status": "error",
+                "error": "failed to remove /private/tmp/bucephalus-update-raw-token token=raw-cleanup-secret"
+            },
+            "installer_stdout": "Installed to /Users/alice/.local/bin\nMirror https://user:token-secret@mirror.example/releases\nNext token=raw-secret\n",
+            "installer_stderr": "warning: read /private/tmp/bucephalus/install.log\n"
+        });
+
+        let payload = update_result_to_json(&raw);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["install_ref"], "install://current");
+        assert_eq!(
+            payload["env"]["BUCEPHALUS_INSTALL_DIR"],
+            "install://current"
+        );
+        assert_eq!(
+            payload["env"]["BUCEPHALUS_BASE_URL"],
+            "https://mirror.example/releases [redacted URL credentials/query]"
+        );
+        assert!(payload["installer_stdout"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:install-dir]"));
+        assert!(payload["installer_stdout"]
+            .as_str()
+            .unwrap()
+            .contains("Mirror https://mirror.example/releases [redacted URL credentials/query]"));
+        assert!(payload["installer_stdout"]
+            .as_str()
+            .unwrap()
+            .contains("Next token=[REDACTED:secret-like]"));
+        assert!(payload["installer_stderr"]
+            .as_str()
+            .unwrap()
+            .contains("warning: read [REDACTED:local-path]"));
+        assert_eq!(payload["cleanup"]["temp_ref"], "update://temp");
+        assert_eq!(payload["cleanup"]["status"], "error");
+        assert!(payload["cleanup"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:local-path]"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "token-secret",
+            "raw-secret",
+            "raw-cleanup-secret",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "update JSON leaked forbidden text: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_temp_files_are_private_and_cleanup_is_public() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = update_temp_dir().unwrap();
+        let script_path = temp.join("install.sh");
+        write_private_update_temp_file(&script_path, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let temp_mode = fs::metadata(&temp).unwrap().permissions().mode() & 0o777;
+        let script_mode = fs::metadata(&script_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(temp_mode, 0o700);
+        assert_eq!(script_mode, 0o600);
+
+        let cleanup = cleanup_update_temp_dir(&temp);
+        assert_eq!(cleanup["temp_ref"], "update://temp");
+        assert_eq!(cleanup["status"], "removed");
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn update_temp_workspace_creation_refuses_reuse() {
+        let root = temp_dir("update_temp_workspace_reuse");
+        fs::create_dir_all(&root).unwrap();
+
+        let err = create_new_private_update_temp_dir(&root)
+            .expect_err("update temp helper must not reuse an existing directory");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_installer_script_write_refuses_existing_target_without_overwrite() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("update_installer_existing_target");
+        let temp = root.join("temp");
+        fs::create_dir_all(&root).unwrap();
+        create_private_update_temp_dir(&temp).unwrap();
+        let outside_script = root.join("outside.sh");
+        fs::write(&outside_script, "outside\n").unwrap();
+        let script_path = temp.join("install.sh");
+        symlink(&outside_script, &script_path).unwrap();
+
+        let err = write_private_update_temp_file(&script_path, b"new\n")
+            .expect_err("script write must refuse existing targets");
+        let message = err.to_string();
+
+        assert!(message.contains("File exists") || message.contains("file exists"));
+        assert!(!message.contains(&root.display().to_string()));
+        assert_eq!(fs::read_to_string(&outside_script).unwrap(), "outside\n");
+        assert!(fs::symlink_metadata(&script_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn update_cleanup_error_uses_public_temp_ref() {
+        let path = temp_dir("update_cleanup_file_not_dir");
+        fs::write(&path, "not a directory\n").unwrap();
+
+        let cleanup = cleanup_update_temp_dir(&path);
+        let rendered = serde_json::to_string(&update_cleanup_to_json(&cleanup)).unwrap();
+
+        assert_eq!(cleanup["temp_ref"], "update://temp");
+        assert_eq!(cleanup["status"], "error");
+        assert!(rendered.contains("update://temp"));
+        assert!(!rendered.contains(&path.display().to_string()));
+        assert!(!rendered.contains("update_cleanup_file_not_dir"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn update_success_reports_temp_cleanup_removed() {
+        let root = temp_dir("update_success_cleanup");
+        let mirror = root.join("mirror");
+        let install_dir = root.join("install");
+        fs::create_dir_all(&mirror).unwrap();
+        let script = r#"#!/bin/sh
+mkdir -p "$BUCEPHALUS_INSTALL_DIR"
+printf '#!/bin/sh\nprintf "bucephalus 0.0.0\n"\n' > "$BUCEPHALUS_INSTALL_DIR/bucephalus"
+printf '#!/bin/sh\nprintf "bucephalus-cloud 0.0.0\n"\n' > "$BUCEPHALUS_INSTALL_DIR/bucephalus-cloud"
+printf '#!/bin/sh\nprintf "launcher 0.0.0\n"\n' > "$BUCEPHALUS_INSTALL_DIR/bucephalus-modal-launcher"
+printf '#!/bin/sh\n' > "$BUCEPHALUS_INSTALL_DIR/bucephalus-install.sh"
+chmod +x "$BUCEPHALUS_INSTALL_DIR/bucephalus" "$BUCEPHALUS_INSTALL_DIR/bucephalus-cloud" "$BUCEPHALUS_INSTALL_DIR/bucephalus-modal-launcher" "$BUCEPHALUS_INSTALL_DIR/bucephalus-install.sh"
+printf '%s\n' "installed=$BUCEPHALUS_INSTALL_DIR"
+printf '%s\n' "mirror=$BUCEPHALUS_BASE_URL"
+printf '%s\n' "token=raw-update-success-secret"
+printf '%s\n' "stderr path /private/tmp/bucephalus/update-success.log" >&2
+exit 0
+"#;
+        let digest = sha256_bytes(script.as_bytes())
+            .strip_prefix("sha256:")
+            .unwrap()
+            .to_string();
+        fs::write(mirror.join("install.sh"), script).unwrap();
+        fs::write(
+            mirror.join("install.sh.sha256"),
+            format!("{digest}  install.sh\n"),
+        )
+        .unwrap();
+
+        let result = run_update(UpdateOptions {
+            version: Some("latest".to_string()),
+            install_dir: Some(install_dir.clone()),
+            repo: Some("nishiokj/Bucephalus".to_string()),
+            base_url: Some(format!("file://{}", mirror.display())),
+            setup: false,
+            no_modify_path: true,
+            dry_run: false,
+            capture_output: true,
+        })
+        .unwrap();
+        let payload = update_result_to_json(&result);
+        let handoff = update_handoff_lines(&result).join("\n");
+        let raw_result = result.to_string();
+
+        assert_eq!(payload["cleanup"]["temp_ref"], "update://temp");
+        assert_eq!(payload["cleanup"]["status"], "removed");
+        assert_eq!(result["install_ref"], "install://current");
+        assert!(result.get("install_dir").is_none());
+        assert!(result["installer_stdout"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:install-dir]"));
+        let result_stdout = result["installer_stdout"].as_str().unwrap();
+        assert!(
+            result_stdout.contains("file://[REDACTED:local-path]"),
+            "installer stdout did not keep the public file URL marker: {result_stdout}"
+        );
+        assert!(result["installer_stdout"]
+            .as_str()
+            .unwrap()
+            .contains("token=[REDACTED:secret-like]"));
+        assert!(result["installer_stderr"]
+            .as_str()
+            .unwrap()
+            .contains("stderr path [REDACTED:local-path]"));
+        assert!(handoff.contains("cleanup: removed"));
+        assert!(handoff.contains("cleanup_ref: update://temp"));
+        let encoded = payload.to_string();
+        assert!(!encoded.contains(&root.display().to_string()));
+        assert!(!encoded.contains("update_success_cleanup"));
+        for forbidden in [
+            root.display().to_string(),
+            install_dir.display().to_string(),
+            format!("file://{}", mirror.display()),
+            "raw-update-success-secret".to_string(),
+            "/private/tmp/bucephalus/update-success.log".to_string(),
+        ] {
+            assert!(
+                !raw_result.contains(&forbidden),
+                "raw update result leaked forbidden text: {forbidden}\n{raw_result}"
+            );
+        }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn update_json_failure_redacts_captured_installer_output() {
+        let root = temp_dir("update_failure_redaction");
+        let mirror = root.join("mirror");
+        let install_dir = root.join("install");
+        fs::create_dir_all(&mirror).unwrap();
+        let script = r#"#!/bin/sh
+printf '%s\n' "install=$BUCEPHALUS_INSTALL_DIR"
+printf '%s\n' "mirror=$BUCEPHALUS_BASE_URL"
+printf '%s\n' "token=raw-update-secret"
+printf '%s\n' "stderr path /private/tmp/bucephalus/update.log" >&2
+exit 42
+"#;
+        let digest = sha256_bytes(script.as_bytes())
+            .strip_prefix("sha256:")
+            .unwrap()
+            .to_string();
+        fs::write(mirror.join("install.sh"), script).unwrap();
+        fs::write(
+            mirror.join("install.sh.sha256"),
+            format!("{digest}  install.sh\n"),
+        )
+        .unwrap();
+
+        let base_url = format!("file://{}", mirror.display());
+        let err = run_update(UpdateOptions {
+            version: Some("latest".to_string()),
+            install_dir: Some(install_dir.clone()),
+            repo: Some("nishiokj/Bucephalus".to_string()),
+            base_url: Some(base_url.clone()),
+            setup: false,
+            no_modify_path: true,
+            dry_run: false,
+            capture_output: true,
+        })
+        .expect_err("failing fixture installer must fail");
+        let message = err.to_string();
+
+        for forbidden in [
+            root.display().to_string(),
+            install_dir.display().to_string(),
+            base_url,
+            "raw-update-secret".to_string(),
+            "/private/tmp/bucephalus/update.log".to_string(),
+        ] {
+            assert!(
+                !message.contains(&forbidden),
+                "update failure leaked forbidden text: {forbidden}\n{message}"
+            );
+        }
+        assert!(message.contains("[REDACTED:install-dir]"));
+        assert!(
+            message.contains("file://[REDACTED:local-path]"),
+            "update failure did not keep the public file URL marker: {message}"
+        );
+        assert!(message.contains("token=[REDACTED:secret-like]"));
+        assert!(message.contains("stderr path [REDACTED:local-path]"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn update_non_json_failure_redacts_installer_output() {
+        let root = temp_dir("update_non_json_failure_redaction");
+        let mirror = root.join("mirror");
+        let install_dir = root.join("install");
+        fs::create_dir_all(&mirror).unwrap();
+        let script = r#"#!/bin/sh
+printf '%s\n' "install=$BUCEPHALUS_INSTALL_DIR"
+printf '%s\n' "mirror=$BUCEPHALUS_BASE_URL"
+printf '%s\n' "token=raw-update-secret"
+printf '%s\n' "stderr path /private/tmp/bucephalus/update.log token=raw-stderr-secret" >&2
+exit 42
+"#;
+        let digest = sha256_bytes(script.as_bytes())
+            .strip_prefix("sha256:")
+            .unwrap()
+            .to_string();
+        fs::write(mirror.join("install.sh"), script).unwrap();
+        fs::write(
+            mirror.join("install.sh.sha256"),
+            format!("{digest}  install.sh\n"),
+        )
+        .unwrap();
+
+        let base_url = format!("file://{}", mirror.display());
+        let err = run_update(UpdateOptions {
+            version: Some("latest".to_string()),
+            install_dir: Some(install_dir.clone()),
+            repo: Some("nishiokj/Bucephalus".to_string()),
+            base_url: Some(base_url.clone()),
+            setup: false,
+            no_modify_path: true,
+            dry_run: false,
+            capture_output: false,
+        })
+        .expect_err("interactive update failure must still sanitize installer output");
+        let message = err.to_string();
+
+        assert!(message.contains("[REDACTED:install-dir]"));
+        assert!(message.contains("file://[REDACTED:local-path]"));
+        assert!(message.contains("token=[REDACTED:secret-like]"));
+        assert!(message.contains("stderr path [REDACTED:local-path]"));
+        for forbidden in [
+            root.display().to_string(),
+            install_dir.display().to_string(),
+            base_url,
+            "raw-update-secret".to_string(),
+            "raw-stderr-secret".to_string(),
+            "/private/tmp/bucephalus/update.log".to_string(),
+        ] {
+            assert!(
+                !message.contains(&forbidden),
+                "non-JSON update failure leaked forbidden text: {forbidden}\n{message}"
+            );
+        }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn read_tgz_text_entries(path: &Path) -> Result<BTreeMap<String, String>> {
+        let file = fs::File::open(path)?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        let mut entries = BTreeMap::new();
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let name = entry.path()?.to_string_lossy().to_string();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            entries.insert(name, String::from_utf8_lossy(&bytes).to_string());
+        }
+        Ok(entries)
+    }
+
+    #[test]
+    fn dispatch_daemon_snapshots_and_cloud_submission_results_are_redacted() {
+        let daemon = json!({
+            "job_id": "job_1",
+            "status": "completed",
+            "manifest_path": "/Users/alice/.bucephalus/dispatches/dispatch_1/manifest.json",
+            "run_root": "/private/tmp/bucephalus/runs",
+            "stdout_path": "/home/alice/.bucephalus/daemon/jobs/job_1/stdout.json",
+            "stderr_path": "/tmp/bucephalus/stderr.log",
+            "result": {
+                "run_id": "run_1",
+                "run_dir": "/Users/alice/run_1",
+                "api_token": "result-token",
+                "cases": [
+                    {
+                        "case_id": "case_1",
+                        "status": "completed",
+                        "result_path": "/tmp/result.json",
+                        "env": {"OPENAI_API_KEY": "sk-live-token"},
+                        "note": "Authorization: Bearer secret"
+                    }
+                ]
+            }
+        });
+
+        let persisted_snapshot = redacted_dispatch_value(&daemon);
+        let cloud_result = dispatch_result_for_cloud_submission(&daemon);
+        let combined = format!(
+            "{}\n{}",
+            serde_json::to_string_pretty(&persisted_snapshot).unwrap(),
+            serde_json::to_string_pretty(&cloud_result).unwrap()
+        );
+
+        assert!(combined.contains("job_1"));
+        assert!(combined.contains("run_1"));
+        assert!(combined.contains("case_1"));
+        assert!(combined.contains("completed"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "/home/alice",
+            "/tmp/result.json",
+            "result-token",
+            "sk-live-token",
+            "Authorization: Bearer secret",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "dispatch snapshot leaked forbidden text: {forbidden}"
+            );
+        }
+        assert!(combined.contains("[REDACTED:local-path]"));
+        assert!(combined.contains("[REDACTED:secret]"));
+        assert!(combined.contains("[REDACTED:environment]"));
+        assert!(combined.contains("[REDACTED:secret-like]"));
+    }
+
+    #[test]
+    fn dispatch_submission_archive_is_curated_and_redacted() {
+        let root = temp_dir("dispatch_archive");
+        let dispatch_dir = root.join("dispatch");
+        let run_root = root.join("runs");
+        let run_dir = run_root.join("run_1");
+        let case_dir = run_dir.join("cases").join("case_1");
+        fs::create_dir_all(case_dir.join("workspace")).expect("workspace dir");
+        fs::create_dir_all(case_dir.join("in")).expect("in dir");
+        fs::create_dir_all(case_dir.join("out")).expect("out dir");
+        fs::create_dir_all(case_dir.join("events")).expect("events dir");
+        fs::create_dir_all(case_dir.join("runner").join("case_materialization"))
+            .expect("runner dir");
+        let manifest_path = dispatch_dir.join("manifest.json");
+        let resolution_path = dispatch_dir.join("resolution.json");
+        fs::create_dir_all(&dispatch_dir).expect("dispatch dir");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "latch_manifest_v1",
+                "defaults": {
+                    "launch": {"argv": ["codex", "exec", "--token", "inline-secret"]},
+                    "workspace_seed": {"path": "/Users/alice/seed"}
+                }
+            }))
+            .expect("manifest json"),
+        )
+        .expect("manifest");
+        fs::write(
+            &resolution_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "latch_resolution_v1",
+                "material_path": "/private/tmp/material",
+                "resolver_token": "resolution-secret"
+            }))
+            .expect("resolution json"),
+        )
+        .expect("resolution");
+        fs::write(
+            run_dir.join("latch_manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "latch_manifest_v1",
+                "defaults": {"launch": {"argv": ["local", "secret"]}}
+            }))
+            .expect("latch manifest json"),
+        )
+        .expect("latch manifest");
+        fs::write(
+            run_dir.join("latch_result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "run_id": "run_1",
+                "run_dir": "/Users/alice/run",
+                "api_token": "run-token",
+                "cases": [{"case_id": "case_1", "status": "completed"}]
+            }))
+            .expect("latch result json"),
+        )
+        .expect("latch result");
+        fs::write(
+            case_dir.join("case_manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "case_id": "case_1",
+                "task_prompt": "solve this task",
+                "workspace_seed": {"path": "/Users/alice/case-seed"}
+            }))
+            .expect("case manifest json"),
+        )
+        .expect("case manifest");
+        fs::write(
+            case_dir.join("case_result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "case_id": "case_1",
+                "status": "completed",
+                "workspace_dir": "/Users/alice/workspace",
+                "stdout_path": "/private/tmp/stdout.log",
+                "stderr_path": "/private/tmp/stderr.log",
+                "result_path": "/private/tmp/result.json"
+            }))
+            .expect("case result json"),
+        )
+        .expect("case result");
+        fs::write(
+            case_dir.join("out").join("result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "answer": "42",
+                "api_token": "result-token",
+                "path": "/home/alice/result"
+            }))
+            .expect("result json"),
+        )
+        .expect("result");
+        fs::write(
+            case_dir.join("out").join("grader_output.json"),
+            serde_json::to_vec_pretty(&json!({
+                "score": 1,
+                "grader_path": "/Users/alice/grader"
+            }))
+            .expect("grader json"),
+        )
+        .expect("grader");
+        fs::write(
+            case_dir.join("out").join("candidate.patch"),
+            "diff --git a/answer.txt b/answer.txt\n+patch answer\n+debug_path=/Users/alice/private/project\n+token=patch-secret\n",
+        )
+        .expect("patch");
+        fs::write(case_dir.join("out").join("stdout.log"), "raw-log-secret\n").expect("stdout");
+        fs::write(
+            case_dir.join("workspace").join("secret.txt"),
+            "workspace-secret",
+        )
+        .expect("workspace secret");
+        fs::write(
+            case_dir.join("in").join("trial_input.json"),
+            "trial-input-secret",
+        )
+        .expect("trial input");
+        fs::write(
+            case_dir.join("events").join("trajectory.jsonl"),
+            "event-secret\n",
+        )
+        .expect("events");
+        fs::write(
+            case_dir
+                .join("runner")
+                .join("case_materialization")
+                .join("env.json"),
+            "runner-secret\n",
+        )
+        .expect("runner");
+
+        let record = json!({
+            "dispatch_id": "dispatch_1",
+            "paths": {
+                "dispatch_dir": dispatch_dir,
+                "run_root": run_root,
+                "manifest": manifest_path,
+                "resolution": resolution_path
+            },
+            "summary": {"case_count": 1, "run_dir": "/Users/alice/run"}
+        });
+        let daemon = json!({
+            "status": "completed",
+            "exit_code": 0,
+            "result": {
+                "run_dir": run_dir,
+                "run_id": "run_1",
+                "cases": [{"case_id": "case_1", "status": "completed"}]
+            }
+        });
+
+        let archive =
+            create_dispatch_submission_archive(&record, &daemon).expect("submission archive");
+        let entries = read_tgz_text_entries(&archive.path).expect("read archive");
+
+        for expected in [
+            "metadata.json",
+            "manifest.json",
+            "resolution.json",
+            "run/latch_manifest.json",
+            "run/latch_result.json",
+            "run/cases/case_1/case_manifest.json",
+            "run/cases/case_1/case_result.json",
+            "run/cases/case_1/out/result.json",
+            "run/cases/case_1/out/grader_output.json",
+            "run/cases/case_1/out/candidate.patch",
+            "submission-manifest.json",
+        ] {
+            assert!(entries.contains_key(expected), "missing {expected}");
+        }
+        for forbidden_entry in [
+            "run/cases/case_1/out/stdout.log",
+            "run/cases/case_1/workspace/secret.txt",
+            "run/cases/case_1/in/trial_input.json",
+            "run/cases/case_1/events/trajectory.jsonl",
+            "run/cases/case_1/runner/case_materialization/env.json",
+        ] {
+            assert!(
+                !entries.contains_key(forbidden_entry),
+                "unexpected {forbidden_entry}"
+            );
+        }
+
+        let combined = entries.values().cloned().collect::<Vec<_>>().join("\n");
+        assert!(combined.contains("\"answer\": \"42\""));
+        assert!(combined.contains("patch answer"));
+        assert!(combined.contains("curated_latch_result_upload"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "/home/alice",
+            "inline-secret",
+            "resolution-secret",
+            "run-token",
+            "result-token",
+            "patch-secret",
+            "raw-log-secret",
+            "workspace-secret",
+            "trial-input-secret",
+            "event-secret",
+            "runner-secret",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "archive leaked forbidden text: {forbidden}"
+            );
+        }
+        assert!(combined.contains("[REDACTED:local-path]"));
+        assert!(combined.contains("[REDACTED:secret]"));
+        assert!(combined.contains("token=[REDACTED:secret-like]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_submission_archive_refuses_symlinked_archive_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("dispatch_archive_target_symlink");
+        let dispatch_dir = root.join("dispatch_1");
+        let run_root = dispatch_dir.join("runs");
+        let run_dir = run_root.join("run_1");
+        let submission_dir = dispatch_dir.join("submission");
+        let outside = root.join("outside");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::create_dir_all(&submission_dir).expect("submission dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let outside_archive = outside.join("latch_result.tgz");
+        fs::write(&outside_archive, "outside\n").expect("outside archive");
+        symlink(&outside_archive, submission_dir.join("latch_result.tgz"))
+            .expect("archive symlink");
+        let record = json!({
+            "dispatch_id": "dispatch_1",
+            "paths": {
+                "dispatch_dir": dispatch_dir,
+                "run_root": run_root
+            }
+        });
+        let daemon = json!({
+            "status": "completed",
+            "result": {
+                "run_dir": run_dir,
+                "run_id": "run_1",
+                "cases": []
+            }
+        });
+
+        let err = match create_dispatch_submission_archive(&record, &daemon) {
+            Ok(_) => panic!("symlinked archive target should be refused"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+
+        assert!(message.contains("symlinked file"));
+        assert!(message.contains("archive_ref: dispatch://dispatch_1/submission/latch_result.tgz"));
+        assert_eq!(
+            fs::read_to_string(&outside_archive).expect("outside archive"),
+            "outside\n"
+        );
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "archive target error leaked root path: {message}"
+        );
+        assert!(
+            !message.contains(&outside.display().to_string()),
+            "archive target error leaked symlink target: {message}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_submission_archive_refuses_symlinked_submission_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("dispatch_archive_submission_symlink");
+        let dispatch_dir = root.join("dispatch_1");
+        let run_root = dispatch_dir.join("runs");
+        let run_dir = run_root.join("run_1");
+        let outside = root.join("outside-submission");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        symlink(&outside, dispatch_dir.join("submission")).expect("submission symlink");
+        let record = json!({
+            "dispatch_id": "dispatch_1",
+            "paths": {
+                "dispatch_dir": dispatch_dir,
+                "run_root": run_root
+            }
+        });
+        let daemon = json!({
+            "status": "completed",
+            "result": {
+                "run_dir": run_dir,
+                "run_id": "run_1",
+                "cases": []
+            }
+        });
+
+        let err = match create_dispatch_submission_archive(&record, &daemon) {
+            Ok(_) => panic!("symlinked submission directory should be refused"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+
+        assert!(message.contains("symlinked directory"));
+        assert!(message.contains("archive_ref: dispatch://dispatch_1/submission/latch_result.tgz"));
+        assert!(
+            !outside.join("latch_result.tgz").exists(),
+            "symlinked submission target should not receive archive"
+        );
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "submission directory error leaked root path: {message}"
+        );
+        assert!(
+            !message.contains(&outside.display().to_string()),
+            "submission directory error leaked symlink target: {message}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_submission_archive_skips_symlinked_evidence_without_reading_targets() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("dispatch_archive_evidence_symlink");
+        let dispatch_dir = root.join("dispatch_1");
+        let run_root = dispatch_dir.join("runs");
+        let run_dir = run_root.join("run_1");
+        let case_dir = run_dir.join("cases").join("case_1");
+        let outside = root.join("outside");
+        fs::create_dir_all(case_dir.join("out")).expect("case out dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let outside_result = outside.join("outside_latch_result.json");
+        let outside_patch = outside.join("outside.patch");
+        fs::write(
+            &outside_result,
+            serde_json::to_vec_pretty(&json!({
+                "api_token": "outside-json-secret",
+                "path": "/Users/alice/private/outside"
+            }))
+            .expect("outside json"),
+        )
+        .expect("outside result");
+        fs::write(
+            &outside_patch,
+            "+outside patch secret\n+/Users/alice/private/outside\n",
+        )
+        .expect("outside patch");
+        symlink(&outside_result, run_dir.join("latch_result.json")).expect("latch symlink");
+        symlink(&outside_patch, case_dir.join("out").join("candidate.patch"))
+            .expect("patch symlink");
+        let record = json!({
+            "dispatch_id": "dispatch_1",
+            "paths": {
+                "dispatch_dir": dispatch_dir,
+                "run_root": run_root
+            }
+        });
+        let daemon = json!({
+            "status": "completed",
+            "result": {
+                "run_dir": run_dir,
+                "run_id": "run_1",
+                "cases": [{"case_id": "case_1", "status": "completed"}]
+            }
+        });
+
+        let archive =
+            create_dispatch_submission_archive(&record, &daemon).expect("submission archive");
+        let entries = read_tgz_text_entries(&archive.path).expect("read archive");
+
+        assert!(!entries.contains_key("run/latch_result.json"));
+        assert!(!entries.contains_key("run/cases/case_1/out/candidate.patch"));
+        let manifest = entries
+            .get("submission-manifest.json")
+            .expect("submission manifest");
+        assert!(manifest.contains("\"path\": \"run/latch_result.json\""));
+        assert!(manifest.contains("\"path\": \"run/cases/case_1/out/candidate.patch\""));
+        assert!(manifest.contains("\"reason\": \"symlinked_file_excluded\""));
+        let combined = entries.values().cloned().collect::<Vec<_>>().join("\n");
+        let outside_display = outside.display().to_string();
+        for forbidden in [
+            "outside-json-secret",
+            "outside patch secret",
+            "/Users/alice/private/outside",
+            outside_display.as_str(),
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "submission archive leaked symlink target content/path: {forbidden}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_submission_archive_skips_symlinked_cases_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("dispatch_archive_cases_symlink");
+        let dispatch_dir = root.join("dispatch_1");
+        let run_root = dispatch_dir.join("runs");
+        let run_dir = run_root.join("run_1");
+        let outside = root.join("outside-cases");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::create_dir_all(outside.join("case_1").join("out")).expect("outside case dir");
+        fs::write(
+            outside.join("case_1").join("out").join("result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "api_token": "outside-case-secret",
+                "path": "/Users/alice/private/outside-case"
+            }))
+            .expect("outside result"),
+        )
+        .expect("outside result");
+        symlink(&outside, run_dir.join("cases")).expect("cases symlink");
+        let record = json!({
+            "dispatch_id": "dispatch_1",
+            "paths": {
+                "dispatch_dir": dispatch_dir,
+                "run_root": run_root
+            }
+        });
+        let daemon = json!({
+            "status": "completed",
+            "result": {
+                "run_dir": run_dir,
+                "run_id": "run_1",
+                "cases": [{"case_id": "case_1", "status": "completed"}]
+            }
+        });
+
+        let archive =
+            create_dispatch_submission_archive(&record, &daemon).expect("submission archive");
+        let entries = read_tgz_text_entries(&archive.path).expect("read archive");
+
+        assert!(!entries.contains_key("run/cases/case_1/out/result.json"));
+        let manifest = entries
+            .get("submission-manifest.json")
+            .expect("submission manifest");
+        assert!(manifest.contains("\"path\": \"run/cases\""));
+        assert!(manifest.contains("\"reason\": \"symlinked_directory_excluded\""));
+        let combined = entries.values().cloned().collect::<Vec<_>>().join("\n");
+        let root_display = root.display().to_string();
+        for forbidden in [
+            "outside-case-secret",
+            "/Users/alice/private/outside-case",
+            root_display.as_str(),
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "submission archive leaked symlinked cases content/path: {forbidden}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_submission_archive_create_errors_use_public_refs() {
+        let root = temp_dir("dispatch_archive_create_error");
+        let dispatch_dir = root.join("dispatch_1");
+        let run_root = dispatch_dir.join("runs");
+        let run_dir = run_root.join("run_1");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::create_dir_all(dispatch_dir.join("submission").join("latch_result.tgz"))
+            .expect("archive path directory");
+        let record = json!({
+            "dispatch_id": "dispatch_1",
+            "paths": {
+                "dispatch_dir": dispatch_dir,
+                "run_root": run_root
+            }
+        });
+        let daemon = json!({
+            "status": "completed",
+            "result": {
+                "run_dir": run_dir,
+                "run_id": "run_1",
+                "cases": []
+            }
+        });
+
+        let err = match create_dispatch_submission_archive(&record, &daemon) {
+            Ok(_) => panic!("expected archive create error"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+
+        assert!(message.contains("dispatch://dispatch_1/submission/latch_result.tgz"));
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "archive create error leaked root path: {message}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dispatch_submission_archive_evidence_errors_use_public_refs() {
+        let root = temp_dir("dispatch_archive_evidence_error");
+        let dispatch_dir = root.join("dispatch_1");
+        let run_root = dispatch_dir.join("runs");
+        let run_dir = run_root.join("run_1");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(run_dir.join("latch_result.json"), "{not-json").expect("bad latch result");
+        let record = json!({
+            "dispatch_id": "dispatch_1",
+            "paths": {
+                "dispatch_dir": dispatch_dir,
+                "run_root": run_root
+            }
+        });
+        let daemon = json!({
+            "status": "completed",
+            "result": {
+                "run_dir": run_dir,
+                "run_id": "run_1",
+                "cases": []
+            }
+        });
+
+        let err = match create_dispatch_submission_archive(&record, &daemon) {
+            Ok(_) => panic!("expected archive evidence parse error"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+
+        assert!(message.contains(
+            "failed to parse dispatch submission evidence dispatch-submission://run/latch_result.json"
+        ));
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "archive evidence error leaked root path: {message}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dispatch_submission_evidence_errors_redact_secret_like_entry_components() {
+        let root = temp_dir("dispatch_archive_evidence_secret_component");
+        let dispatch_dir = root.join("dispatch_1");
+        let run_root = dispatch_dir.join("runs");
+        let run_dir = run_root.join("run_1");
+        let case_dir = run_dir.join("cases").join("case_token-secret");
+        fs::create_dir_all(&case_dir).expect("case dir");
+        fs::write(run_dir.join("latch_manifest.json"), "{}").expect("latch manifest");
+        fs::write(run_dir.join("latch_result.json"), "{}").expect("latch result");
+        fs::write(case_dir.join("case_manifest.json"), "{not-json").expect("bad case manifest");
+        let record = json!({
+            "dispatch_id": "dispatch_1",
+            "paths": {
+                "dispatch_dir": dispatch_dir,
+                "run_root": run_root
+            }
+        });
+        let daemon = json!({
+            "status": "completed",
+            "result": {
+                "run_dir": run_dir,
+                "run_id": "run_1",
+                "cases": [{"case_id": "case_token-secret", "status": "completed"}]
+            }
+        });
+
+        let err = match create_dispatch_submission_archive(&record, &daemon) {
+            Ok(_) => panic!("expected archive evidence parse error"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+
+        assert!(message.contains(
+            "failed to parse dispatch submission evidence dispatch-submission://run/cases/redacted/case_manifest.json"
+        ));
+        for forbidden in ["case_token-secret", "token-secret", root.to_str().unwrap()] {
+            assert!(
+                !message.contains(forbidden),
+                "archive evidence error leaked forbidden text {forbidden}: {message}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dispatch_submission_failure_reason_is_public_before_persisting() {
+        let _lock = lock_cloud_auth_env();
+        let _env = EnvVarGuard::set(&[(BUCEPHALUS_CLOUD_API_URL_ENV, Some("https://api.example"))]);
+        let mut record = json!({
+            "dispatch_id": "dispatch_1",
+            "paths": {
+                "dispatch_dir": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1",
+                "run_root": "/Users/alice/private/missing-runs"
+            }
+        });
+        let daemon = json!({
+            "status": "completed",
+            "result": {
+                "run_id": "missing_run_1"
+            }
+        });
+
+        let submission = dispatch_submission_lifecycle(&mut record, &daemon, "local_completed");
+        let reason = submission["reason"].as_str().expect("failure reason");
+
+        assert_eq!(submission["status"], "failed");
+        assert_eq!(submission["source"], "cloud_upload");
+        assert!(reason.contains("failed to read dispatch run root [REDACTED:local-path]"));
+        for forbidden in [
+            "/Users/alice",
+            "private/missing-runs",
+            ".local/share/bucephalus",
+        ] {
+            assert!(
+                !reason.contains(forbidden),
+                "dispatch submission failure leaked forbidden text {forbidden}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_live_view_renders_public_dispatch_state() {
+        let root = temp_dir("dispatch_live_view_public");
+        let _home_lock = lock_dispatch_home_env();
+        let _guard = EnvVarGuard::set(&[("BUCEPHALUS_HOME", Some(root.to_str().unwrap()))]);
+        let dispatch_dir = root.join("dispatches").join("dispatch_1");
+        let outside = temp_dir("dispatch_live_view_public_outside");
+        let live_view = dispatch_dir.join("live.html");
+        let run_dir = dispatch_dir.join("runs").join("run_1");
+        let record = json!({
+            "schema_version": DISPATCH_SCHEMA,
+            "dispatch_id": "dispatch_1",
+            "label": "token=raw-label-token",
+            "status": "local_completed",
+            "paths": {
+                "dispatch_dir": outside.clone(),
+                "live_view": outside.join("live.html"),
+                "run_root": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/runs"
+            },
+            "benchmark": {
+                "id": "remote:bench"
+            },
+            "summary": {
+                "case_count": 1,
+                "run_id": "run_1",
+                "run_dir": run_dir.clone()
+            },
+            "lifecycle": {
+                "submission": {
+                    "status": "failed",
+                    "reason": "upload failed for /Users/alice/private/result token=raw-upload-token",
+                    "env": {
+                        "OPENAI_API_KEY": "raw-env-secret"
+                    },
+                    "argv": ["codex", "exec", "--token", "raw-argv-secret"]
+                }
+            },
+            "record_path": outside.join("dispatch.json"),
+            "internal": {
+                "job_id": "job_1"
+            }
+        });
+
+        write_dispatch_live_view(&record).expect("write live view");
+        let html = fs::read_to_string(&live_view).expect("live view html");
+
+        assert!(html.contains("dispatch://dispatch_1"));
+        assert!(html.contains("token=[REDACTED:secret-like]"));
+        assert!(html.contains("[REDACTED:environment]"));
+        assert!(html.contains("[REDACTED:arguments]"));
+        assert!(html.contains("run://run_1"));
+        for forbidden in [
+            root.display().to_string(),
+            "/Users/alice".to_string(),
+            ".local/share/bucephalus".to_string(),
+            "raw-label-token".to_string(),
+            "raw-upload-token".to_string(),
+            "raw-env-secret".to_string(),
+            "raw-argv-secret".to_string(),
+            "OPENAI_API_KEY".to_string(),
+            "record_path".to_string(),
+            "job_1".to_string(),
+        ] {
+            assert!(
+                !html.contains(&forbidden),
+                "dispatch live view leaked forbidden text {forbidden}: {html}"
+            );
+        }
+        assert!(
+            !outside.join("live.html").exists(),
+            "dispatch live view wrote through tampered live_view path"
+        );
+        assert!(
+            !outside.join("dispatch.json").exists(),
+            "dispatch live view wrote through tampered record_path"
+        );
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(outside).ok();
+    }
+
+    #[test]
+    fn dispatch_record_write_self_heals_tampered_generated_paths() {
+        let root = temp_dir("dispatch_record_self_heals_paths");
+        let outside = temp_dir("dispatch_record_self_heals_outside");
+        let _home_lock = lock_dispatch_home_env();
+        let _guard = EnvVarGuard::set(&[("BUCEPHALUS_HOME", Some(root.to_str().unwrap()))]);
+        fs::create_dir_all(&outside).expect("outside dir");
+        let record = json!({
+            "schema_version": DISPATCH_SCHEMA,
+            "dispatch_id": "dispatch_1",
+            "status": "running",
+            "paths": {
+                "dispatch_dir": outside.clone(),
+                "live_view": outside.join("live.html"),
+                "resolution": outside.join("resolution.json"),
+                "manifest": outside.join("manifest.json"),
+                "run_root": outside.join("runs")
+            },
+            "record_path": outside.join("dispatch.json"),
+            "internal": {
+                "job_id": "job_1"
+            }
+        });
+
+        write_dispatch_record(&record).expect("write dispatch record");
+        let canonical_record = root
+            .join("dispatches")
+            .join("dispatch_1")
+            .join("dispatch.json");
+        let canonical_dispatch_dir = root.join("dispatches").join("dispatch_1");
+        let canonical_record_text = canonical_record.to_string_lossy().to_string();
+        let canonical_dispatch_dir_text = canonical_dispatch_dir.to_string_lossy().to_string();
+        let canonical_live_view_text = canonical_dispatch_dir
+            .join("live.html")
+            .to_string_lossy()
+            .to_string();
+        let canonical_run_root_text = canonical_dispatch_dir
+            .join("runs")
+            .to_string_lossy()
+            .to_string();
+        let persisted: Value =
+            serde_json::from_slice(&fs::read(&canonical_record).expect("canonical record"))
+                .expect("record json");
+
+        assert!(canonical_record.is_file());
+        assert!(
+            !outside.join("dispatch.json").exists(),
+            "dispatch record wrote through tampered record_path"
+        );
+        assert_eq!(
+            persisted["record_path"].as_str(),
+            Some(canonical_record_text.as_str())
+        );
+        assert_eq!(
+            persisted["paths"]["dispatch_dir"].as_str(),
+            Some(canonical_dispatch_dir_text.as_str())
+        );
+        assert_eq!(
+            persisted["paths"]["live_view"].as_str(),
+            Some(canonical_live_view_text.as_str())
+        );
+        assert_eq!(
+            persisted["paths"]["run_root"].as_str(),
+            Some(canonical_run_root_text.as_str())
+        );
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(outside).ok();
+    }
+
+    #[test]
+    fn public_dispatch_record_uses_refs_for_local_paths() {
+        let dispatch_dir =
+            PathBuf::from("/Users/alice/.local/share/bucephalus/dispatches/dispatch_1");
+        let run_dir = dispatch_dir.join("runs").join("run_1");
+        let record = json!({
+            "schema_version": DISPATCH_SCHEMA,
+            "dispatch_id": "dispatch_1",
+            "status": "local_completed",
+            "record_path": dispatch_dir.join("dispatch.json"),
+            "paths": {
+                "dispatch_dir": dispatch_dir,
+                "live_view": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/live.html",
+                "resolution": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/resolution/resolution.json",
+                "manifest": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/resolution/manifest.json",
+                "run_root": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/runs"
+            },
+            "summary": {
+                "case_count": 1,
+                "completed_cases": 1,
+                "failed_cases": 0,
+                "run_id": "run_1",
+                "run_dir": run_dir
+            },
+            "lifecycle": {
+                "submission": {
+                    "status": "failed",
+                    "reason": "failed to read dispatch submission archive /Users/alice/.local/share/bucephalus/dispatches/dispatch_1/support.tgz via https://user:secret@example.com/upload?token=raw-url-token#frag"
+                }
+            },
+            "internal": {
+                "job_id": "job_1",
+                "daemon_job": {
+                    "stdout_path": "/Users/alice/.local/share/bucephalus/daemon/jobs/job_1/stdout.json"
+                }
+            }
+        });
+
+        let public = public_dispatch_record(&record);
+        let combined = serde_json::to_string_pretty(&public).unwrap();
+
+        assert_eq!(public["dispatch_ref"], "dispatch://dispatch_1");
+        assert_eq!(public["paths"]["dispatch_ref"], "dispatch://dispatch_1");
+        assert_eq!(
+            public["paths"]["live_view_ref"],
+            "dispatch://dispatch_1/live.html"
+        );
+        assert_eq!(
+            public["paths"]["resolution_ref"],
+            "dispatch://dispatch_1/resolution/resolution.json"
+        );
+        assert_eq!(
+            public["paths"]["manifest_ref"],
+            "dispatch://dispatch_1/resolution/manifest.json"
+        );
+        assert_eq!(
+            public["paths"]["run_root_ref"],
+            "dispatch://dispatch_1/runs"
+        );
+        assert_eq!(public["summary"]["run_ref"], "run://run_1");
+        assert_eq!(
+            public["lifecycle"]["submission"]["reason"],
+            "failed to read dispatch submission archive [REDACTED:local-path] via https://example.com/upload [redacted URL credentials/query]"
+        );
+        assert!(public.get("record_path").is_none());
+        assert!(public.get("internal").is_none());
+        assert!(public["paths"].get("live_view").is_none());
+        assert!(public["paths"].get("dispatch_dir").is_none());
+        assert!(public["summary"].get("run_dir").is_none());
+        for forbidden in [
+            "/Users/alice",
+            ".local/share/bucephalus",
+            "dispatch.json",
+            "stdout.json",
+            "raw-url-token",
+            "user:secret",
+            "#frag",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "public dispatch record leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_json_mode_accepts_parent_or_subcommand_flag() {
+        let parent = Cli::try_parse_from(["bucephalus", "setup", "--json", "status"]).unwrap();
+        assert!(command_json_mode(&parent.command));
+
+        let child = Cli::try_parse_from(["bucephalus", "setup", "status", "--json"]).unwrap();
+        assert!(command_json_mode(&child.command));
+
+        let human = Cli::try_parse_from(["bucephalus", "setup", "status"]).unwrap();
+        assert!(!command_json_mode(&human.command));
+    }
+
+    #[test]
+    fn setup_status_human_mode_does_not_return_json_payload() {
+        let home = temp_dir("setup_status_home");
+        let home_string = home.display().to_string();
+        let _home_lock = lock_dispatch_home_env();
+        let _guard = EnvVarGuard::set(&[("BUCEPHALUS_HOME", Some(home_string.as_str()))]);
+
+        let human_result = run_command(Commands::Setup {
+            command: Some(SetupCommands::Status {
+                project: None,
+                json: false,
+            }),
+            client: Vec::new(),
+            project: None,
+            no_daemon_service: false,
+            no_start: false,
+            no_mcp: false,
+            dry_run: false,
+            json: false,
+        })
+        .unwrap();
+        assert!(human_result.is_none());
+
+        let json_result = run_command(Commands::Setup {
+            command: Some(SetupCommands::Status {
+                project: None,
+                json: false,
+            }),
+            client: Vec::new(),
+            project: None,
+            no_daemon_service: false,
+            no_start: false,
+            no_mcp: false,
+            dry_run: false,
+            json: true,
+        })
+        .unwrap();
+        let json_payload = json_result.unwrap();
+        assert_eq!(json_payload["schema_version"], "bucephalus_setup_status_v1");
+        assert_eq!(json_payload["binary_ref"], "binary://current");
+        assert_eq!(json_payload["home_ref"], "state://home");
+        assert!(json_payload.get("binary").is_none());
+        assert!(json_payload.get("home").is_none());
+        let auth_payload = serde_json::to_string(&json_payload["auth"]).unwrap();
+        assert!(auth_payload.contains("auth://access-token"));
+        assert!(auth_payload.contains("auth://token-cache"));
+        assert!(
+            !auth_payload.contains(&home_string),
+            "setup auth JSON leaked home path: {auth_payload}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_private_daemon_dir_tightens_existing_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("setup_private_daemon_dir");
+        let daemon_dir = root.join("daemon");
+        fs::create_dir_all(&daemon_dir).unwrap();
+        fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_private_daemon_dir(&daemon_dir).unwrap();
+
+        let mode = fs::metadata(&daemon_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_private_daemon_dir_refuses_symlinked_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("setup_private_daemon_dir_symlink");
+        fs::create_dir_all(&root).unwrap();
+        let real_daemon = root.join("real-daemon");
+        fs::create_dir_all(&real_daemon).unwrap();
+        let daemon_link = root.join("daemon");
+        symlink(&real_daemon, &daemon_link).unwrap();
+
+        let err = ensure_private_daemon_dir(&daemon_link)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("symlinked latch daemon state directory"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn service_config_helpers_refuse_symlinked_file_without_modifying_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("setup_service_config_symlink_file");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("outside-service-target");
+        let service_path = root.join("bucephalus-latchd.service");
+        fs::write(&target, "existing service\n").unwrap();
+        symlink(&target, &service_path).unwrap();
+
+        let write_err = write_service_config_file(
+            &service_path,
+            "systemd-user",
+            "bucephalus-latchd.service",
+            b"replacement\n",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(write_err.contains("symlinked daemon service config file"));
+        assert!(write_err
+            .contains("config_ref: service://systemd-user/bucephalus-latchd.service/config"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "existing service\n");
+
+        let remove_err = remove_service_config_file_if_exists(
+            &service_path,
+            "systemd-user",
+            "bucephalus-latchd.service",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(remove_err.contains("symlinked daemon service config file"));
+        assert!(
+            service_path.exists(),
+            "service symlink should remain in place"
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "existing service\n");
+        for forbidden in [
+            root.display().to_string(),
+            "outside-service-target".to_string(),
+        ] {
+            assert!(
+                !write_err.contains(&forbidden),
+                "service config write error leaked forbidden text {forbidden}: {write_err}"
+            );
+            assert!(
+                !remove_err.contains(&forbidden),
+                "service config remove error leaked forbidden text {forbidden}: {remove_err}"
+            );
+        }
+
+        fs::remove_file(&service_path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn service_config_helpers_refuse_symlinked_parent_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("setup_service_config_symlink_parent");
+        let outside = temp_dir("setup_service_config_symlink_parent_outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let link_parent = root.join("systemd-user");
+        symlink(&outside, &link_parent).unwrap();
+        let service_path = link_parent.join("bucephalus-latchd.service");
+
+        let err = write_service_config_file(
+            &service_path,
+            "systemd-user",
+            "bucephalus-latchd.service",
+            b"service\n",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("symlinked daemon service config directory"));
+        assert!(err.contains("config_ref: service://systemd-user/bucephalus-latchd.service/config"));
+        assert!(
+            !outside.join("bucephalus-latchd.service").exists(),
+            "service config write followed a symlinked parent"
+        );
+        for forbidden in [
+            root.display().to_string(),
+            outside.display().to_string(),
+            "setup_service_config_symlink_parent".to_string(),
+        ] {
+            assert!(
+                !err.contains(&forbidden),
+                "service config symlink-parent error leaked forbidden text {forbidden}: {err}"
+            );
+        }
+
+        fs::remove_file(&link_parent).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn setup_handoff_lines_include_daemon_service_reason_publicly() {
+        let raw = json!({
+            "schema_version": "bucephalus_setup_status_v1",
+            "ok": true,
+            "binary": "/Users/alice/bin/bucephalus",
+            "home": "/Users/alice/.local/share/bucephalus",
+            "daemon_service": {
+                "status": "error",
+                "manager": "systemd-user",
+                "label": "bucephalus-latchd.service",
+                "path": "/Users/alice/.config/systemd/user/bucephalus-latchd.service",
+                "reason": "refusing to use symlinked daemon service config file\n\nconfig_ref: service://systemd-user/bucephalus-latchd.service/config\n\nRemove /Users/alice/.config/systemd/user/bucephalus-latchd.service"
+            },
+            "daemon_status": {
+                "status": "not_running"
+            },
+            "mcp": {
+                "status": "checked",
+                "clients": []
+            },
+            "auth": {
+                "status": "missing",
+                "source": "missing"
+            }
+        });
+
+        let rendered = setup_handoff_lines(&raw).join("\n");
+
+        assert!(rendered.contains("daemon_service: error"));
+        assert!(rendered.contains(
+            "daemon_service_config_ref: service://systemd-user/bucephalus-latchd.service/config"
+        ));
+        assert!(rendered.contains(
+            "daemon_service_reason: refusing to use symlinked daemon service config file"
+        ));
+        assert!(rendered.contains("[REDACTED:local-path]"));
+        for forbidden in ["/Users/alice", ".config/systemd", "LaunchAgents"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "setup handoff daemon service reason leaked forbidden text {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_json_uses_public_refs_for_daemon_and_mcp_paths() {
+        let home = PathBuf::from("/Users/alice/.local/share/bucephalus");
+        let paths = cloud_token_paths(&home);
+        let service_path =
+            PathBuf::from("/Users/alice/Library/LaunchAgents/dev.bucephalus.latchd.plist");
+        let cursor_config = PathBuf::from("/Users/alice/project/.cursor/mcp.json");
+        let raw = json!({
+            "schema_version": "bucephalus_setup_v1",
+            "ok": true,
+            "dry_run": true,
+            "binary": "/Users/alice/bin/bucephalus",
+            "home": home,
+            "daemon_service": {
+                "status": "planned",
+                "manager": "launchd",
+                "label": "dev.bucephalus.latchd",
+                "path": service_path,
+                "commands": [
+                    ["launchctl", "bootout", "gui/501", "/Users/alice/Library/LaunchAgents/dev.bucephalus.latchd.plist"],
+                    ["launchctl", "bootstrap", "gui/501", "/Users/alice/Library/LaunchAgents/dev.bucephalus.latchd.plist"]
+                ]
+            },
+            "daemon_status": {
+                "status": "ready",
+                "pid": 123,
+                "address": "/Users/alice/.local/share/bucephalus/daemon/latchd.sock",
+                "state_path": "/Users/alice/.local/share/bucephalus/daemon/latchd.json",
+                "log_path": "/Users/alice/.local/share/bucephalus/daemon/latchd.log"
+            },
+            "mcp": {
+                "status": "checked",
+                "server_name": BUCEPHALUS_MCP_SERVER_NAME,
+                "expected_server_config": {
+                    "type": "stdio",
+                    "command": "/Users/alice/bin/bucephalus",
+                    "args": ["mcp"]
+                },
+                "clients": [
+                    {
+                        "client": "cursor-project",
+                        "status": "stale",
+                        "configured": false,
+                        "path": cursor_config,
+                        "command": [
+                            "claude",
+                            "mcp",
+                            "add-json",
+                            BUCEPHALUS_MCP_SERVER_NAME,
+                            "{\"type\":\"stdio\",\"command\":\"/Users/alice/bin/bucephalus\",\"args\":[\"mcp\"]}"
+                        ],
+                        "manual_config": {
+                            "type": "stdio",
+                            "command": "/Users/alice/bin/bucephalus",
+                            "args": ["mcp"]
+                        }
+                    }
+                ]
+            },
+            "auth": {
+                "status": "ready",
+                "source": "file",
+                "path": paths.access,
+                "refresh_token_path": paths.refresh,
+                "cache": {
+                    "status": "ready",
+                    "path": paths.cache
+                }
+            }
+        });
+
+        let public = setup_result_to_json(&raw);
+        let combined = serde_json::to_string_pretty(&public).unwrap();
+
+        assert_eq!(public["binary_ref"], "binary://current");
+        assert_eq!(public["home_ref"], "state://home");
+        assert_eq!(
+            public["daemon_service"]["service_ref"],
+            "service://launchd/dev.bucephalus.latchd"
+        );
+        assert_eq!(
+            public["daemon_service"]["config_ref"],
+            "service://launchd/dev.bucephalus.latchd/config"
+        );
+        assert_eq!(
+            public["daemon_service"]["actions"][0]["operation"],
+            "bootout"
+        );
+        assert_eq!(public["daemon_status"]["address_ref"], "daemon://socket");
+        assert_eq!(public["daemon_status"]["state_ref"], "daemon://state");
+        assert_eq!(public["daemon_status"]["log_ref"], "daemon://log");
+        assert_eq!(
+            public["mcp"]["expected_server_config"]["command_ref"],
+            "binary://current"
+        );
+        assert_eq!(
+            public["mcp"]["clients"][0]["config_ref"],
+            "mcp://cursor-project/config"
+        );
+        assert_eq!(
+            public["mcp"]["clients"][0]["command_ref"],
+            "mcp://cursor-project/setup-command"
+        );
+        assert_eq!(
+            public["mcp"]["clients"][0]["manual_config"]["command_ref"],
+            "binary://current"
+        );
+        assert_eq!(public["auth"]["path_ref"], "auth://access-token");
+        for forbidden in [
+            "/Users/alice",
+            "LaunchAgents",
+            ".cursor/mcp.json",
+            "cloud_user_token",
+            "latchd.sock",
+            "latchd.json",
+            "latchd.log",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "setup JSON leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_handoff_lines_use_public_refs() {
+        let home = PathBuf::from("/Users/alice/.local/share/bucephalus");
+        let paths = cloud_token_paths(&home);
+        let raw = json!({
+            "schema_version": "bucephalus_setup_v1",
+            "ok": true,
+            "dry_run": true,
+            "binary": "/Users/alice/bin/bucephalus",
+            "home": home,
+            "daemon_service": {
+                "status": "planned",
+                "manager": "launchd",
+                "label": "dev.bucephalus.latchd",
+                "path": "/Users/alice/Library/LaunchAgents/dev.bucephalus.latchd.plist"
+            },
+            "daemon_status": {
+                "status": "ready",
+                "address": "/Users/alice/.local/share/bucephalus/daemon/latchd.sock",
+                "state_path": "/Users/alice/.local/share/bucephalus/daemon/latchd.json",
+                "log_path": "/Users/alice/.local/share/bucephalus/daemon/latchd.log"
+            },
+            "mcp": {
+                "status": "checked",
+                "clients": [{
+                    "client": "cursor-project",
+                    "status": "planned",
+                    "path": "/Users/alice/project/.cursor/mcp.json",
+                    "command": ["claude", "mcp", "add-json"]
+                }]
+            },
+            "auth": {
+                "status": "ready",
+                "source": "file",
+                "path": paths.access,
+                "refresh_token_path": paths.refresh,
+                "cache": {
+                    "status": "ready",
+                    "path": paths.cache
+                }
+            }
+        });
+        let lines = setup_handoff_lines(&raw);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("binary_ref: binary://current"));
+        assert!(rendered.contains("home_ref: state://home"));
+        assert!(rendered.contains("daemon_service_ref: service://launchd/dev.bucephalus.latchd"));
+        assert!(rendered
+            .contains("daemon_service_config_ref: service://launchd/dev.bucephalus.latchd/config"));
+        assert!(rendered.contains("daemon_address_ref: daemon://socket"));
+        assert!(rendered.contains("daemon_state_ref: daemon://state"));
+        assert!(rendered.contains("daemon_log_ref: daemon://log"));
+        assert!(rendered.contains("mcp: checked"));
+        assert!(rendered.contains("mcp_config_ref: mcp://cursor-project/config"));
+        assert!(rendered.contains("mcp_command_ref: mcp://cursor-project/setup-command"));
+        assert!(rendered.contains("auth_ref: auth://current"));
+        assert!(rendered.contains("auth_token_ref: auth://access-token"));
+        assert!(rendered.contains("auth_refresh_token_ref: auth://refresh-token"));
+        assert!(rendered.contains("auth_cache_ref: auth://token-cache"));
+        for forbidden in [
+            "/Users/alice",
+            "LaunchAgents",
+            ".cursor/mcp.json",
+            "cloud_user_token",
+            "latchd.sock",
+            "latchd.json",
+            "latchd.log",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "setup handoff leaked forbidden text {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_handoff_lines_include_mcp_recovery_actions() {
+        let raw = json!({
+            "schema_version": "bucephalus_setup_status_v1",
+            "ok": true,
+            "binary": "/Users/alice/bin/bucephalus",
+            "home": "/Users/alice/.local/share/bucephalus",
+            "daemon_service": {
+                "status": "installed",
+                "manager": "launchd",
+                "label": "dev.bucephalus.latchd",
+                "path": "/Users/alice/Library/LaunchAgents/dev.bucephalus.latchd.plist"
+            },
+            "daemon_status": {
+                "status": "not_running"
+            },
+            "mcp": {
+                "status": "checked",
+                "clients": [{
+                    "client": "cursor-project",
+                    "status": "stale",
+                    "configured": false,
+                    "path": "/Users/alice/project/.cursor/mcp.json",
+                    "reason": "registered server command differs from /Users/alice/bin/bucephalus token=raw-mcp-token",
+                    "action": "bucephalus setup --client cursor-project --project <dir>"
+                }]
+            },
+            "auth": {
+                "status": "missing",
+                "source": "missing"
+            }
+        });
+
+        let rendered = setup_handoff_lines(&raw).join("\n");
+
+        assert!(rendered.contains("mcp_client: cursor-project stale"));
+        assert!(rendered.contains(
+            "mcp_reason: cursor-project: registered server command differs from [REDACTED:local-path] token=[REDACTED:secret-like]"
+        ));
+        assert!(rendered.contains(
+            "mcp_next: cursor-project: bucephalus setup --client cursor-project --project <dir>"
+        ));
+        for forbidden in [
+            "/Users/alice",
+            ".cursor/mcp.json",
+            "raw-mcp-token",
+            "LaunchAgents",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "setup recovery handoff leaked forbidden text {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_mcp_client_names_are_public_safe() {
+        let raw = json!({
+            "schema_version": "bucephalus_setup_status_v1",
+            "ok": true,
+            "binary": "/Users/alice/bin/bucephalus",
+            "home": "/Users/alice/.local/share/bucephalus",
+            "daemon_service": {
+                "status": "installed",
+                "manager": "launchd",
+                "label": "dev.bucephalus.latchd",
+                "path": "/Users/alice/Library/LaunchAgents/dev.bucephalus.latchd.plist"
+            },
+            "daemon_status": {
+                "status": "not_running"
+            },
+            "mcp": {
+                "status": "partial_error",
+                "clients": [{
+                    "client": "cursor-project token=raw-client-token",
+                    "status": "error",
+                    "path": "/Users/alice/project/.cursor/mcp.json",
+                    "command": ["buc", "setup"],
+                    "reason": "MCP config failed for token=raw-client-token at /Users/alice/project/.cursor/mcp.json",
+                    "action": "bucephalus setup --client cursor-project --project <dir>"
+                }]
+            },
+            "auth": {
+                "status": "missing",
+                "source": "missing"
+            }
+        });
+
+        let public = setup_result_to_json(&raw);
+        let rendered = setup_handoff_lines(&raw).join("\n");
+        let combined = format!(
+            "{}\n{rendered}",
+            serde_json::to_string_pretty(&public).unwrap()
+        );
+
+        assert_eq!(public["mcp"]["clients"][0]["client"], "redacted");
+        assert_eq!(
+            public["mcp"]["clients"][0]["config_ref"],
+            "mcp://redacted/config"
+        );
+        assert_eq!(
+            public["mcp"]["clients"][0]["command_ref"],
+            "mcp://redacted/setup-command"
+        );
+        assert!(rendered.contains("mcp_client: redacted error"));
+        assert!(rendered.contains("mcp_config_ref: mcp://redacted/config"));
+        for forbidden in [
+            "raw-client-token",
+            "cursor-project token",
+            "/Users/alice",
+            ".cursor/mcp.json",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "setup MCP client output leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_uninstall_handoff_lines_include_mcp_client_actions() {
+        let raw = json!({
+            "schema_version": "bucephalus_setup_uninstall_v1",
+            "ok": true,
+            "dry_run": false,
+            "home": "/Users/alice/.local/share/bucephalus",
+            "daemon_service": {
+                "status": "removed",
+                "manager": "launchd",
+                "label": "dev.bucephalus.latchd",
+                "path": "/Users/alice/Library/LaunchAgents/dev.bucephalus.latchd.plist"
+            },
+            "mcp": {
+                "status": "partial_error",
+                "clients": [{
+                    "client": "cursor-project",
+                    "status": "invalid",
+                    "path": "/Users/alice/project/.cursor/mcp.json",
+                    "reason": "MCP config is not valid JSON in /Users/alice/project/.cursor/mcp.json",
+                    "action": "fix the MCP config JSON, then rerun bucephalus setup uninstall"
+                }]
+            },
+            "auth": {
+                "status": "missing",
+                "source": "missing"
+            }
+        });
+
+        let rendered = setup_handoff_lines(&raw).join("\n");
+
+        assert!(rendered.contains("mcp: partial_error"));
+        assert!(rendered.contains("mcp_client: cursor-project invalid"));
+        assert!(rendered.contains(
+            "mcp_reason: cursor-project: MCP config is not valid JSON in [REDACTED:local-path]"
+        ));
+        assert!(rendered.contains(
+            "mcp_next: cursor-project: fix the MCP config JSON, then rerun bucephalus setup uninstall"
+        ));
+        assert!(!rendered.contains("auth:"));
+        for forbidden in ["/Users/alice", ".cursor/mcp.json", "LaunchAgents"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "setup uninstall handoff leaked forbidden text {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_registration_status_marks_stale_cursor_project_config() {
+        let project = temp_dir("mcp_stale_cursor");
+        let config_path = project.join(".cursor").join("mcp.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&json!({
+                "mcpServers": {
+                    BUCEPHALUS_MCP_SERVER_NAME: {
+                        "type": "stdio",
+                        "command": "/old/install/bucephalus",
+                        "args": ["mcp"]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let current_exe = project.join("bin").join("bucephalus");
+        let status = mcp_registration_status(Some(&project), &current_exe);
+        let cursor = status["clients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|client| client["client"] == "cursor-project")
+            .expect("cursor status");
+        assert_eq!(cursor["status"], "stale");
+        assert_eq!(cursor["configured"], false);
+        assert_eq!(
+            cursor["reason"],
+            "registered server command differs from the current bucephalus binary"
+        );
+        assert_eq!(
+            cursor["action"],
+            "bucephalus setup --client cursor-project --project <dir>"
+        );
+
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&json!({
+                "mcpServers": {
+                    BUCEPHALUS_MCP_SERVER_NAME: mcp_server_config(&current_exe)
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let refreshed = mcp_registration_status(Some(&project), &current_exe);
+        let cursor = refreshed["clients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|client| client["client"] == "cursor-project")
+            .expect("cursor status");
+        assert_eq!(cursor["status"], "configured");
+        assert_eq!(cursor["configured"], true);
+
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn mcp_setup_reports_invalid_cursor_config_without_overwriting_it() {
+        let project = temp_dir("mcp_invalid_cursor_setup");
+        let config_path = project.join(".cursor").join("mcp.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, "{not-json").unwrap();
+
+        let current_exe = project.join("bin").join("bucephalus");
+        let result = register_mcp_client(
+            &current_exe,
+            SetupMcpClientArg::CursorProject,
+            Some(&project),
+            &mcp_server_config(&current_exe),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result["client"], "cursor-project");
+        assert_eq!(result["status"], "error");
+        assert!(result["reason"]
+            .as_str()
+            .unwrap()
+            .contains("MCP config is not valid JSON"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), "{not-json");
+
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn mcp_setup_parent_status_reports_partial_error_for_client_failures() {
+        let project = temp_dir("mcp_setup_partial_error");
+        let config_path = project.join(".cursor").join("mcp.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, "{not-json").unwrap();
+
+        let current_exe = project.join("bin").join("bucephalus");
+        let result = register_mcp_clients(
+            &current_exe,
+            vec![SetupMcpClientArg::CursorProject],
+            Some(&project),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result["status"], "partial_error");
+        assert_eq!(result["clients"][0]["status"], "error");
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), "{not-json");
+
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_setup_refuses_symlinked_cursor_config_parent_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let project = temp_dir("mcp_setup_symlink_cursor_parent");
+        let outside = temp_dir("mcp_setup_symlink_cursor_outside");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        symlink(&outside, project.join(".cursor")).expect("symlinked cursor dir");
+
+        let current_exe = project.join("bin").join("bucephalus");
+        let result = register_mcp_client(
+            &current_exe,
+            SetupMcpClientArg::CursorProject,
+            Some(&project),
+            &mcp_server_config(&current_exe),
+            false,
+        )
+        .expect("setup result");
+        let reason = result["reason"].as_str().expect("error reason");
+
+        assert_eq!(result["client"], "cursor-project");
+        assert_eq!(result["status"], "error");
+        assert!(reason.contains("symlinked MCP config directory"));
+        assert!(reason.contains("mcp://cursor-project/config"));
+        assert!(
+            !outside.join("mcp.json").exists(),
+            "setup wrote MCP config through symlinked parent"
+        );
+        assert!(
+            !reason.contains(&project.display().to_string()),
+            "setup symlink error leaked project path: {reason}"
+        );
+        assert!(
+            !reason.contains(&outside.display().to_string()),
+            "setup symlink error leaked outside path: {reason}"
+        );
+
+        let public = setup_mcp_client_to_json(&result);
+        let encoded = serde_json::to_string(&public).unwrap();
+        assert_eq!(public["config_ref"], "mcp://cursor-project/config");
+        assert!(!encoded.contains(&project.display().to_string()));
+        assert!(!encoded.contains(&outside.display().to_string()));
+
+        fs::remove_file(project.join(".cursor")).expect("remove symlink");
+        fs::remove_dir_all(project).expect("cleanup project");
+        fs::remove_dir_all(outside).expect("cleanup outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_setup_refuses_symlinked_cursor_project_root_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let project = temp_dir("mcp_setup_symlink_project_root");
+        let outside = temp_dir("mcp_setup_symlink_project_outside");
+        fs::create_dir_all(outside.join(".cursor")).expect("outside cursor dir");
+        symlink(&outside, &project).expect("symlinked project root");
+
+        let current_exe = project.join("bin").join("bucephalus");
+        let result = register_mcp_client(
+            &current_exe,
+            SetupMcpClientArg::CursorProject,
+            Some(&project),
+            &mcp_server_config(&current_exe),
+            false,
+        )
+        .expect("setup result");
+        let reason = result["reason"].as_str().expect("error reason");
+
+        assert_eq!(result["client"], "cursor-project");
+        assert_eq!(result["status"], "error");
+        assert!(reason.contains("symlinked MCP project directory"));
+        assert!(reason.contains("mcp://cursor-project/config"));
+        assert!(
+            !outside.join(".cursor").join("mcp.json").exists(),
+            "setup wrote MCP config through symlinked project root"
+        );
+
+        let public = setup_mcp_client_to_json(&result);
+        let encoded = serde_json::to_string(&public).unwrap();
+        assert_eq!(public["config_ref"], "mcp://cursor-project/config");
+        for forbidden in [
+            project.display().to_string(),
+            outside.display().to_string(),
+            "mcp_setup_symlink_project_root".to_string(),
+            "mcp_setup_symlink_project_outside".to_string(),
+        ] {
+            assert!(
+                !encoded.contains(&forbidden),
+                "setup symlink project JSON leaked forbidden text {forbidden}: {encoded}"
+            );
+            assert!(
+                !reason.contains(&forbidden),
+                "setup symlink project error leaked forbidden text {forbidden}: {reason}"
+            );
+        }
+
+        fs::remove_file(&project).expect("remove project symlink");
+        fs::remove_dir_all(outside).expect("cleanup outside");
+    }
+
+    #[test]
+    fn unregister_json_mcp_client_reports_invalid_config_without_aborting() {
+        let project = temp_dir("mcp_invalid_cursor_uninstall");
+        let config_path = project.join(".cursor").join("mcp.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, "{not-json").unwrap();
+
+        let cursor = unregister_json_mcp_client_result("cursor-project", &config_path, false);
+
+        assert_eq!(cursor["status"], "invalid");
+        assert!(cursor["reason"]
+            .as_str()
+            .unwrap()
+            .contains("MCP config is not valid JSON"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), "{not-json");
+
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_uninstall_refuses_symlinked_cursor_config_parent_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let project = temp_dir("mcp_uninstall_symlink_cursor_parent");
+        let outside = temp_dir("mcp_uninstall_symlink_cursor_outside");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let outside_config = outside.join("mcp.json");
+        fs::write(
+            &outside_config,
+            serde_json::to_vec_pretty(&json!({
+                "mcpServers": {
+                    BUCEPHALUS_MCP_SERVER_NAME: {
+                        "type": "stdio",
+                        "command": "/outside/bucephalus",
+                        "args": ["mcp"]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("outside config");
+        symlink(&outside, project.join(".cursor")).expect("symlinked cursor dir");
+
+        let config_path = project.join(".cursor").join("mcp.json");
+        let result = unregister_json_mcp_client_result("cursor-project", &config_path, false);
+        let reason = result["reason"].as_str().expect("error reason");
+        let outside_after = fs::read_to_string(&outside_config).expect("outside config remains");
+
+        assert_eq!(result["status"], "error");
+        assert!(reason.contains("symlinked MCP config directory"));
+        assert!(reason.contains("mcp://cursor-project/config"));
+        assert!(
+            outside_after.contains(BUCEPHALUS_MCP_SERVER_NAME),
+            "uninstall removed server from symlinked outside config"
+        );
+        assert!(
+            !reason.contains(&project.display().to_string()),
+            "uninstall symlink error leaked project path: {reason}"
+        );
+        assert!(
+            !reason.contains(&outside.display().to_string()),
+            "uninstall symlink error leaked outside path: {reason}"
+        );
+
+        let public = setup_mcp_client_to_json(&result);
+        let encoded = serde_json::to_string(&public).unwrap();
+        assert_eq!(public["config_ref"], "mcp://cursor-project/config");
+        assert!(!encoded.contains(&project.display().to_string()));
+        assert!(!encoded.contains(&outside.display().to_string()));
+
+        fs::remove_file(project.join(".cursor")).expect("remove symlink");
+        fs::remove_dir_all(project).expect("cleanup project");
+        fs::remove_dir_all(outside).expect("cleanup outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_uninstall_refuses_symlinked_cursor_project_root_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let project = temp_dir("mcp_uninstall_symlink_project_root");
+        let outside = temp_dir("mcp_uninstall_symlink_project_outside");
+        let outside_config = outside.join(".cursor").join("mcp.json");
+        fs::create_dir_all(outside_config.parent().unwrap()).expect("outside cursor dir");
+        fs::write(
+            &outside_config,
+            serde_json::to_vec_pretty(&json!({
+                "mcpServers": {
+                    BUCEPHALUS_MCP_SERVER_NAME: {
+                        "type": "stdio",
+                        "command": "/outside/bucephalus",
+                        "args": ["mcp"]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("outside config");
+        symlink(&outside, &project).expect("symlinked project root");
+
+        let result = unregister_cursor_project_mcp_client_result(&project, false);
+        let reason = result["reason"].as_str().expect("error reason");
+        let outside_after = fs::read_to_string(&outside_config).expect("outside config remains");
+
+        assert_eq!(result["status"], "error");
+        assert!(reason.contains("symlinked MCP project directory"));
+        assert!(reason.contains("mcp://cursor-project/config"));
+        assert!(
+            outside_after.contains(BUCEPHALUS_MCP_SERVER_NAME),
+            "uninstall removed server from symlinked outside config"
+        );
+
+        let public = setup_mcp_client_to_json(&result);
+        let encoded = serde_json::to_string(&public).unwrap();
+        assert_eq!(public["config_ref"], "mcp://cursor-project/config");
+        for forbidden in [
+            project.display().to_string(),
+            outside.display().to_string(),
+            "mcp_uninstall_symlink_project_root".to_string(),
+            "mcp_uninstall_symlink_project_outside".to_string(),
+            "/outside/bucephalus".to_string(),
+        ] {
+            assert!(
+                !encoded.contains(&forbidden),
+                "uninstall symlink project JSON leaked forbidden text {forbidden}: {encoded}"
+            );
+            assert!(
+                !reason.contains(&forbidden),
+                "uninstall symlink project error leaked forbidden text {forbidden}: {reason}"
+            );
+        }
+
+        fs::remove_file(&project).expect("remove project symlink");
+        fs::remove_dir_all(outside).expect("cleanup outside");
+    }
+
+    #[test]
+    fn mcp_uninstall_parent_status_reports_partial_error_for_invalid_client_config() {
+        let clients = vec![
+            json!({
+                "client": "cursor-project",
+                "status": "invalid",
+                "action": "fix the MCP config JSON, then rerun bucephalus setup uninstall"
+            }),
+            json!({
+                "client": "claude-code",
+                "status": "removed"
+            }),
+        ];
+
+        assert_eq!(
+            mcp_uninstall_status_from_clients(&clients, false),
+            "partial_error"
         );
     }
 
@@ -10535,6 +19889,13 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let auth_dir = paths.access.parent().unwrap();
+            let auth_dir_mode = fs::metadata(auth_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(auth_dir_mode, 0o700);
+            for path in [&paths.access, &paths.refresh, &paths.cache] {
+                let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600);
+            }
             OpenOptions::new()
                 .write(true)
                 .mode(0o644)
@@ -10542,11 +19903,1507 @@ mod tests {
                 .unwrap()
                 .set_permissions(std::fs::Permissions::from_mode(0o644))
                 .unwrap();
+            fs::set_permissions(auth_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
             write_secret_file(&paths.access, b"access-456\n").unwrap();
             let mode = fs::metadata(&paths.access).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+            let auth_dir_mode = fs::metadata(auth_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(auth_dir_mode, 0o700);
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_secret_file_refuses_symlinked_auth_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("cloud_token_symlink");
+        let paths = cloud_token_paths(&root);
+        let auth_dir = paths.access.parent().unwrap();
+        fs::create_dir_all(auth_dir).unwrap();
+        let target = root.join("target-token");
+        fs::write(&target, "original-token\n").unwrap();
+        symlink(&target, &paths.access).unwrap();
+
+        let err = write_secret_file(&paths.access, b"replacement-token\n")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("symlinked token file"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original-token\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_secret_file_refuses_symlinked_auth_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("cloud_token_dir_symlink");
+        fs::create_dir_all(&root).unwrap();
+        let real_auth = root.join("real-auth");
+        fs::create_dir_all(&real_auth).unwrap();
+        let paths = cloud_token_paths(&root);
+        symlink(&real_auth, paths.access.parent().unwrap()).unwrap();
+
+        let err = write_secret_file(&paths.access, b"access-123\n")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("symlinked auth directory"));
+        assert!(!real_auth.join("cloud_user_token").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mcp_guided_result_is_an_actionable_tool_error() {
+        let result = mcp_guided_result(GuidedError::dispatch_id_required()).unwrap();
+        assert_eq!(result["isError"], true);
+        let body = &result["structuredContent"];
+        assert_eq!(body["status"], "blocked");
+        assert_eq!(body["because"], "dispatch_id_required");
+        assert_eq!(body["docs"], LATCH_DOCS_REF);
+        let actions = body["next_actions"].as_array().unwrap();
+        assert!(!actions.is_empty(), "guided errors must carry a way out");
+        assert_eq!(actions[0]["type"], "mcp_tool");
+        assert_eq!(actions[0]["tool"], "status");
+    }
+
+    #[test]
+    fn mcp_public_payload_redacts_local_paths_without_breaking_actions() {
+        let public = mcp_public_payload(json!({
+            "home": mcp_status_home(Some(Path::new("/Users/alice/.local/share/bucephalus"))),
+            "local_runtime": {
+                "status": "error",
+                "error": "connect to /Users/alice/.local/share/bucephalus/daemon/latchd.sock failed"
+            },
+            "debug": {
+                "argv": ["bucephalus", "dispatch", "--api-key", "raw-debug-argv-token"],
+                "args": ["--token", "raw-debug-args-token"],
+                "env": {
+                    "OPENAI_API_KEY": "raw-debug-env-token",
+                    "HOME": "/Users/alice"
+                },
+                "runtime_environment": {
+                    "PATH": "/Users/alice/bin"
+                }
+            },
+            "auth": {
+                "status": "invalid",
+                "path": "/Users/alice/.local/share/bucephalus/auth/cloud_user_token",
+                "refresh_token_present": true,
+                "cache": {
+                    "path": "/private/tmp/cloud_user_token.json",
+                    "access_token": "sk-live-token"
+                },
+                "env": {
+                    "OPENAI_API_KEY": "raw-env-token",
+                    "HOME": "/Users/alice"
+                },
+                "actions": [
+                    {
+                        "type": "cli_command",
+                        "command": "bucephalus login",
+                        "description": "Refresh Cloud OAuth credentials for this user."
+                    }
+                ]
+            },
+            "recent_dispatches": [
+                {
+                    "dispatch_id": "dispatch_1",
+                    "label": "token=raw-label-token",
+                    "status": "running",
+                    "argv": ["python", "agent.py", "--api-key", "raw-argv-token"],
+                    "args": ["--token", "raw-args-token"],
+                    "detail": "failed in /Users/alice/project with callback=https://user:secret@example.com/cb?token=raw-url-token#frag"
+                }
+            ]
+        }));
+        let combined = serde_json::to_string_pretty(&public).unwrap();
+
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "sk-live-token",
+            "raw-label-token",
+            "raw-url-token",
+            "raw-env-token",
+            "raw-argv-token",
+            "raw-args-token",
+            "raw-debug-argv-token",
+            "raw-debug-args-token",
+            "raw-debug-env-token",
+            "OPENAI_API_KEY",
+            "user:secret",
+            "#frag",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "MCP public payload leaked forbidden text: {forbidden}"
+            );
+        }
+        assert_eq!(public["home"]["home_ref"], "state://home");
+        assert_eq!(public["debug"]["argv"], "[REDACTED:arguments]");
+        assert_eq!(public["debug"]["args"], "[REDACTED:arguments]");
+        assert_eq!(public["debug"]["env"], "[REDACTED:environment]");
+        assert_eq!(
+            public["debug"]["runtime_environment"],
+            "[REDACTED:environment]"
+        );
+        assert_eq!(public["auth"]["refresh_token_present"], true);
+        assert_eq!(public["auth"]["env"], "[REDACTED:environment]");
+        assert_eq!(public["auth"]["actions"][0]["command"], "bucephalus login");
+        assert_eq!(
+            public["recent_dispatches"][0]["argv"],
+            "[REDACTED:arguments]"
+        );
+        assert_eq!(
+            public["recent_dispatches"][0]["args"],
+            "[REDACTED:arguments]"
+        );
+        assert_eq!(
+            public["recent_dispatches"][0]["label"],
+            "token=[REDACTED:secret-like]"
+        );
+        assert_eq!(
+            public["recent_dispatches"][0]["detail"],
+            "failed in [REDACTED:local-path] with callback=https://example.com/cb [redacted URL credentials/query]"
+        );
+        assert!(combined.contains("[REDACTED:local-path]"));
+        assert!(combined.contains("[REDACTED:secret]"));
+        assert!(combined.contains("[REDACTED:secret-like]"));
+    }
+
+    #[test]
+    fn mcp_status_payload_uses_curated_public_refs() {
+        let home = PathBuf::from("/Users/alice/.local/share/bucephalus");
+        let paths = cloud_token_paths(&home);
+        let auth = json!({
+            "status": "ready",
+            "source": "file",
+            "path": paths.access,
+            "refresh_token_path": paths.refresh,
+            "cache": {
+                "status": "ready",
+                "path": paths.cache
+            }
+        });
+        let local_runtime = json!({
+            "status": "ready",
+            "mode": "managed_local_runtime",
+            "address": "/Users/alice/.local/share/bucephalus/daemon/latchd.sock",
+            "state_path": "/Users/alice/.local/share/bucephalus/daemon/latchd.json",
+            "log_path": "/Users/alice/.local/share/bucephalus/daemon/latchd.log"
+        });
+
+        let payload = mcp_status_payload(
+            Some(&home),
+            &local_runtime,
+            &auth,
+            json!([
+                {
+                    "dispatch_id": "dispatch_1",
+                    "status": "running",
+                    "label": "token=raw-label-token"
+                }
+            ]),
+        );
+        let combined = serde_json::to_string_pretty(&payload).unwrap();
+
+        assert_eq!(payload["binary_ref"], "binary://current");
+        assert!(payload.get("binary").is_none());
+        assert_eq!(payload["home"]["home_ref"], "state://home");
+        assert_eq!(payload["local_runtime"]["address_ref"], "daemon://socket");
+        assert_eq!(payload["local_runtime"]["state_ref"], "daemon://state");
+        assert_eq!(payload["local_runtime"]["log_ref"], "daemon://log");
+        assert_eq!(payload["auth"]["path_ref"], "auth://access-token");
+        assert_eq!(payload["auth"]["refresh_token_ref"], "auth://refresh-token");
+        assert_eq!(payload["auth"]["cache"]["path_ref"], "auth://token-cache");
+        assert_eq!(
+            payload["recent_dispatches"][0]["label"],
+            "token=[REDACTED:secret-like]"
+        );
+        for forbidden in [
+            "/Users/alice",
+            "cloud_user_token",
+            "raw-label-token",
+            "latchd.sock",
+            "latchd.json",
+            "latchd.log",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "MCP status payload leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_status_payload_reports_runtime_errors_with_next_actions() {
+        let payload = mcp_status_payload(
+            None,
+            &json!({
+                "status": "error",
+                "error": "connect to /Users/alice/.local/share/bucephalus/daemon/latchd.sock failed"
+            }),
+            &json!({
+                "status": "error",
+                "error": "Bucephalus home unavailable"
+            }),
+            json!([]),
+        );
+        let combined = serde_json::to_string_pretty(&payload).unwrap();
+
+        assert_eq!(payload["home"]["status"], "unavailable");
+        assert_eq!(
+            payload["local_runtime"]["error_code"],
+            "local_runtime_unavailable"
+        );
+        assert_eq!(
+            payload["local_runtime"]["next_actions"][0]["command"],
+            "bucephalus setup"
+        );
+        assert!(!combined.contains("/Users/alice"));
+        assert!(combined.contains("[REDACTED:local-path]"));
+    }
+
+    #[test]
+    fn mcp_latch_daemon_payload_uses_public_refs_for_job_paths() {
+        let home = PathBuf::from("/Users/alice/.local/share/bucephalus");
+        let payload = mcp_latch_daemon_payload(
+            Some(&home),
+            &json!({
+                "job_id": "job_1",
+                "status": "completed",
+                "manifest_path": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/resolution/manifest.json",
+                "run_root": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/runs",
+                "stdout_path": "/Users/alice/.local/share/bucephalus/daemon/jobs/job_1/stdout.json",
+                "stderr_path": "/Users/alice/.local/share/bucephalus/daemon/jobs/job_1/stderr.log",
+                "result": {
+                    "run_id": "run_1",
+                    "run_dir": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/runs/run_1",
+                    "cases": [
+                        {
+                            "case_id": "case_1",
+                            "stdout": "Authorization: Bearer live-token\nworkspace=/Users/alice/project"
+                        }
+                    ]
+                }
+            }),
+        );
+        let combined = serde_json::to_string_pretty(&payload).unwrap();
+
+        assert_eq!(
+            payload["manifest_ref"],
+            "dispatch://dispatch_1/resolution/manifest.json"
+        );
+        assert_eq!(payload["job_id"], "job_1");
+        assert_eq!(payload["run_root_ref"], "dispatch://dispatch_1/runs");
+        assert_eq!(payload["stdout_ref"], "daemon://jobs/job_1/stdout.json");
+        assert_eq!(payload["stderr_ref"], "daemon://jobs/job_1/stderr.log");
+        assert_eq!(payload["result"]["run_ref"], "run://run_1");
+        assert!(payload.get("manifest_path").is_none());
+        assert!(payload.get("run_root").is_none());
+        assert!(payload.get("stdout_path").is_none());
+        assert!(payload.get("stderr_path").is_none());
+        assert!(payload["result"].get("run_dir").is_none());
+        for forbidden in [
+            "/Users/alice",
+            ".local/share/bucephalus",
+            "live-token",
+            "stdout_path",
+            "stderr_path",
+            "manifest_path",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "latch daemon MCP payload leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_latch_daemon_tail_payload_uses_path_ref() {
+        let home = PathBuf::from("/Users/alice/.local/share/bucephalus");
+        let payload = mcp_latch_daemon_payload(
+            Some(&home),
+            &json!({
+                "job_id": "job_1",
+                "stream": "stderr",
+                "path": "/Users/alice/.local/share/bucephalus/daemon/jobs/job_1/stderr.log",
+                "text": "token=tail-secret\nworkspace=/Users/alice/project"
+            }),
+        );
+        let combined = serde_json::to_string_pretty(&payload).unwrap();
+
+        assert_eq!(payload["path_ref"], "daemon://jobs/job_1/stderr.log");
+        assert!(payload.get("path").is_none());
+        assert_eq!(
+            payload["text"],
+            "token=[REDACTED:secret-like]\nworkspace=[REDACTED:local-path]"
+        );
+        assert!(!combined.contains("/Users/alice"));
+        assert!(!combined.contains("tail-secret"));
+    }
+
+    #[test]
+    fn mcp_latch_daemon_path_refs_redact_untrusted_job_ids() {
+        let payload = mcp_latch_daemon_payload(
+            None,
+            &json!({
+                "job_id": "job_1-token=raw-job-token",
+                "path": "/private/tmp/bucephalus/jobs/job_1/stderr.log",
+                "text": "done"
+            }),
+        );
+        let combined = serde_json::to_string_pretty(&payload).unwrap();
+
+        assert_eq!(payload["path_ref"], "daemon://jobs/redacted/tail");
+        assert_eq!(payload["job_id"], "redacted");
+        assert!(payload.get("path").is_none());
+        for forbidden in [
+            "/private/tmp",
+            "job_1-token",
+            "raw-job-token",
+            "token=raw-job-token",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "daemon path ref leaked untrusted job id text {forbidden}: {combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_public_tool_result_redacts_debug_latch_daemon_payloads() {
+        let result = mcp_public_tool_result(json!({
+            "job_id": "job_1",
+            "status": "running",
+            "manifest_path": "/Users/alice/project/manifest.json",
+            "run_root": "/Users/alice/project/runs",
+            "stdout_path": "/private/tmp/bucephalus/jobs/job_1/stdout.json",
+            "stderr_path": "/private/tmp/bucephalus/jobs/job_1/stderr.log",
+            "result": {
+                "run_dir": "/Users/alice/project/runs/run_1",
+                "cases": [
+                    {
+                        "case_id": "case_1",
+                        "stdout": "Authorization: Bearer live-token\nfailed in /Users/alice/project"
+                    }
+                ]
+            },
+            "tail": {
+                "stream": "stderr",
+                "text": "token=raw-tail-token\nworkspace=/Users/alice/project"
+            }
+        }))
+        .unwrap();
+        let body = &result["structuredContent"];
+        let combined = serde_json::to_string_pretty(body).unwrap();
+
+        assert_eq!(body["job_id"], "job_1");
+        assert_eq!(body["status"], "running");
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "live-token",
+            "raw-tail-token",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "debug latch MCP payload leaked forbidden text: {forbidden}"
+            );
+        }
+        assert_eq!(body["manifest_path"], "[REDACTED:local-path]");
+        assert_eq!(body["run_root"], "[REDACTED:local-path]");
+        assert_eq!(body["stderr_path"], "[REDACTED:local-path]");
+        assert!(combined.contains("[REDACTED:local-path]"));
+        assert!(combined.contains("[REDACTED:secret-like]"));
+    }
+
+    #[test]
+    fn mcp_dispatch_tool_result_keeps_refs_and_scrubs_rendered_text() {
+        let dispatch_dir =
+            PathBuf::from("/Users/alice/.local/share/bucephalus/dispatches/dispatch_1");
+        let run_dir = dispatch_dir.join("runs").join("run_1");
+        let record = json!({
+            "schema_version": DISPATCH_SCHEMA,
+            "dispatch_id": "dispatch_1",
+            "label": "token=raw-label-token",
+            "status": "running",
+            "record_path": dispatch_dir.join("dispatch.json"),
+            "paths": {
+                "dispatch_dir": dispatch_dir,
+                "live_view": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/live.html",
+                "resolution": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/resolution/resolution.json",
+                "manifest": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/resolution/manifest.json",
+                "run_root": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/runs"
+            },
+            "summary": {
+                "case_count": 1,
+                "completed_cases": 0,
+                "failed_cases": 0,
+                "run_id": "run_1",
+                "run_dir": run_dir
+            },
+            "lifecycle": {
+                "submission": {
+                    "status": "failed",
+                    "reason": "upload failed for /Users/alice/private/result via https://user:secret@example.com/upload?token=raw-url-token#frag"
+                }
+            }
+        });
+
+        let public = public_dispatch_record(&record);
+        let result = mcp_public_tool_result(public).expect("mcp result");
+        let body = &result["structuredContent"];
+        let rendered = result["content"][0]["text"]
+            .as_str()
+            .expect("rendered text");
+        let combined = format!(
+            "{}\n{}",
+            serde_json::to_string_pretty(body).unwrap(),
+            rendered
+        );
+
+        assert_eq!(body["dispatch_ref"], "dispatch://dispatch_1");
+        assert_eq!(
+            body["paths"]["manifest_ref"],
+            "dispatch://dispatch_1/resolution/manifest.json"
+        );
+        assert_eq!(body["summary"]["run_ref"], "run://run_1");
+        assert_eq!(body["label"], "token=[REDACTED:secret-like]");
+        for forbidden in [
+            "/Users/alice",
+            ".local/share/bucephalus",
+            "private/result",
+            "raw-label-token",
+            "raw-url-token",
+            "user:secret",
+            "#frag",
+            "record_path",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "MCP dispatch result leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+        assert!(combined.contains("dispatch://dispatch_1"));
+        assert!(combined.contains("[REDACTED:local-path]"));
+        assert!(combined.contains("[REDACTED:secret-like]"));
+    }
+
+    #[test]
+    fn public_dispatch_record_redacts_untrusted_dispatch_ids_and_path_components() {
+        let dispatch_dir = PathBuf::from(
+            "/Users/alice/.local/share/bucephalus/dispatches/dispatch_sk-live-secret",
+        );
+        let record = json!({
+            "schema_version": DISPATCH_SCHEMA,
+            "dispatch_id": "dispatch_sk-live-secret",
+            "status": "running",
+            "paths": {
+                "dispatch_dir": dispatch_dir,
+                "live_view": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_sk-live-secret/private/customer-token.html",
+                "resolution": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_sk-live-secret/resolution/resolution.json",
+                "manifest": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_sk-live-secret/resolution/manifest.json",
+                "run_root": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_sk-live-secret/runs"
+            },
+            "summary": {}
+        });
+
+        let public = public_dispatch_record(&record);
+        let combined = serde_json::to_string_pretty(&public).unwrap();
+
+        assert_eq!(public["dispatch_id"], "redacted");
+        assert_eq!(public["dispatch_ref"], "dispatch://redacted");
+        assert_eq!(
+            public["paths"]["live_view_ref"],
+            "dispatch://redacted/redacted/redacted"
+        );
+        assert_eq!(
+            public["paths"]["manifest_ref"],
+            "dispatch://redacted/resolution/manifest.json"
+        );
+        for forbidden in [
+            "/Users/alice",
+            "dispatch_sk-live-secret",
+            "sk-live-secret",
+            "private",
+            "customer-token",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "public dispatch record leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_guided_error_details_are_public_safe() {
+        let result = mcp_guided_result(GuidedError::cloud_auth_required(
+            "remote:bench",
+            json!({
+                "status": "invalid",
+                "path": "/Users/alice/.local/share/bucephalus/auth/cloud_user_token",
+                "cache": {
+                    "path": "/private/tmp/cloud_user_token.json",
+                    "refresh_token": "refresh-secret"
+                }
+            }),
+        ))
+        .unwrap();
+        let body = &result["structuredContent"];
+        let combined = serde_json::to_string_pretty(body).unwrap();
+
+        assert_eq!(body["because"], "cloud_auth_required");
+        assert_eq!(body["next_actions"][0]["command"], "bucephalus login");
+        for forbidden in ["/Users/alice", "/private/tmp", "refresh-secret"] {
+            assert!(
+                !combined.contains(forbidden),
+                "guided MCP error leaked forbidden text: {forbidden}"
+            );
+        }
+        assert!(combined.contains("[REDACTED:local-path]"));
+        assert!(combined.contains("[REDACTED:secret]"));
+    }
+
+    #[test]
+    fn mcp_protocol_errors_are_public_boundary_safe() {
+        let response = handle_mcp_message(json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "debug /Users/alice/project token=raw-mcp-token https://user:secret@mirror.example/releases?token=query#frag file:///private/tmp/bucephalus.sock"
+        }))
+        .unwrap();
+        let encoded = serde_json::to_string(&response).unwrap();
+        let message = response["error"]["message"].as_str().unwrap();
+
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(message.contains("unsupported MCP method"));
+        assert!(message.contains("https://mirror.example/releases"));
+        assert!(message.contains("[redacted URL credentials/query]"));
+        assert!(message.contains("token=[REDACTED:secret-like]"));
+        assert!(message.contains("file://[REDACTED:local-path]"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "raw-mcp-token",
+            "user:secret",
+            "?token=query",
+            "#frag",
+            "project",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "MCP protocol error leaked forbidden text: {forbidden}\n{encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_tools_list_advertises_dispatch_case_bounds() {
+        let response = handle_mcp_message(json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/list"
+        }))
+        .expect("tools/list response");
+        let tools = response["result"]["tools"].as_array().expect("tools array");
+        let dispatch = tools
+            .iter()
+            .find(|tool| tool["name"] == "dispatch_benchmark")
+            .expect("dispatch_benchmark tool");
+        let cases = &dispatch["inputSchema"]["properties"]["cases"];
+
+        assert_eq!(cases["type"], "integer");
+        assert_eq!(cases["minimum"], MCP_DISPATCH_CASE_LIMIT_MIN);
+        assert_eq!(cases["maximum"], MCP_DISPATCH_CASE_LIMIT_MAX);
+    }
+
+    #[test]
+    fn mcp_reader_accepts_framed_messages_within_size_limit() {
+        let payload = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let framed = format!("Content-Length: {}\r\n\r\n", payload.len());
+        let mut bytes = framed.into_bytes();
+        bytes.extend_from_slice(payload);
+        let mut reader = Cursor::new(bytes);
+
+        let message = read_mcp_message(&mut reader).unwrap().unwrap();
+
+        assert_eq!(message["method"], "initialize");
+        assert_eq!(message["id"], 1);
+    }
+
+    #[test]
+    fn mcp_reader_rejects_oversized_content_length_before_allocation() {
+        let mut reader = Cursor::new(format!(
+            "Content-Length: {}\r\n\r\n",
+            MCP_MAX_CONTENT_LENGTH + 1
+        ));
+
+        let err = read_mcp_message(&mut reader).expect_err("oversized MCP frame must fail");
+        let message = err.to_string();
+
+        assert!(message.contains("MCP Content-Length"));
+        assert!(message.contains("exceeds"));
+        assert!(message.contains(&MCP_MAX_CONTENT_LENGTH.to_string()));
+    }
+
+    #[test]
+    fn dispatch_benchmark_without_argv_is_guided_not_protocol_error() {
+        let result = handle_mcp_tool_call(json!({
+            "name": "dispatch_benchmark",
+            "arguments": { "benchmark": LOCAL_LATCH_SMOKE_BENCHMARK }
+        }))
+        .unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["because"],
+            "headless_command_required"
+        );
+    }
+
+    #[test]
+    fn dispatch_benchmark_invalid_argv_is_guided_before_workspace_creation() {
+        let _lock = lock_cloud_auth_env();
+        let _home_lock = lock_dispatch_home_env();
+        let root = temp_dir("dispatch_invalid_argv");
+        let _env = EnvVarGuard::set(&[("BUCEPHALUS_HOME", Some(root.to_str().unwrap()))]);
+
+        let result = handle_mcp_tool_call(json!({
+            "name": "dispatch_benchmark",
+            "arguments": {
+                "benchmark": LOCAL_LATCH_SMOKE_BENCHMARK,
+                "headless_command": {
+                    "argv": "codex exec token=/Users/alice/private"
+                }
+            }
+        }))
+        .unwrap();
+        let body = &result["structuredContent"];
+        let combined = serde_json::to_string_pretty(&result).unwrap();
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(body["because"], "headless_command_invalid");
+        assert_eq!(body["details"]["param"], "headless_command.argv");
+        assert_eq!(body["details"]["shape"]["type"], "array");
+        assert_eq!(body["details"]["shape"]["min_items"], 1);
+        assert_eq!(body["details"]["shape"]["items"], "string");
+        assert_eq!(body["next_actions"][0]["tool"], "dispatch_benchmark");
+        assert_eq!(
+            body["next_actions"][0]["arguments"]["headless_command"]["argv"][0],
+            "codex"
+        );
+        for forbidden in ["/Users/alice", "token=", "private"] {
+            assert!(
+                !combined.contains(forbidden),
+                "invalid argv guided error leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+        assert!(
+            !root.join("dispatches").exists(),
+            "invalid argv created a dispatch workspace"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dispatch_benchmark_invalid_case_limit_is_guided_before_workspace_creation() {
+        let _lock = lock_cloud_auth_env();
+        let _home_lock = lock_dispatch_home_env();
+        let root = temp_dir("dispatch_invalid_case_limit");
+        let _env = EnvVarGuard::set(&[("BUCEPHALUS_HOME", Some(root.to_str().unwrap()))]);
+
+        let result = handle_mcp_tool_call(json!({
+            "name": "dispatch_benchmark",
+            "arguments": {
+                "benchmark": LOCAL_LATCH_SMOKE_BENCHMARK,
+                "cases": 0,
+                "headless_command": {
+                    "argv": ["sh", "-c", "true"]
+                }
+            }
+        }))
+        .unwrap();
+        let body = &result["structuredContent"];
+        let combined = serde_json::to_string_pretty(&result).unwrap();
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(body["because"], "case_limit_invalid");
+        assert_eq!(body["details"]["param"], "cases");
+        assert_eq!(body["details"]["min"], MCP_DISPATCH_CASE_LIMIT_MIN);
+        assert_eq!(body["details"]["max"], MCP_DISPATCH_CASE_LIMIT_MAX);
+        assert_eq!(body["next_actions"][0]["tool"], "dispatch_benchmark");
+        assert_eq!(
+            body["next_actions"][0]["arguments"]["cases"],
+            MCP_DISPATCH_CASE_LIMIT_MIN
+        );
+        assert!(!combined.contains(root.to_str().unwrap()));
+        assert!(
+            !root.join("dispatches").exists(),
+            "invalid cases created a dispatch workspace"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mcp_tool_call_without_name_is_guided_not_protocol_error() {
+        let result = handle_mcp_tool_call(json!({
+            "arguments": {}
+        }))
+        .unwrap();
+        let body = &result["structuredContent"];
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(body["because"], "tool_name_required");
+        assert_eq!(body["next_actions"][0]["tool"], "status");
+    }
+
+    #[test]
+    fn mcp_unknown_tool_is_guided_and_public_safe() {
+        let response = handle_mcp_message(json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "debug /Users/alice/private token=raw-tool-token",
+                "arguments": {}
+            }
+        }))
+        .unwrap();
+        let result = &response["result"];
+        let body = &result["structuredContent"];
+        let combined = serde_json::to_string_pretty(&response).unwrap();
+
+        assert!(response.get("error").is_none());
+        assert_eq!(result["isError"], true);
+        assert_eq!(body["because"], "unknown_tool");
+        assert_eq!(body["next_actions"][0]["tool"], "status");
+        assert_eq!(
+            body["details"]["requested_tool"],
+            "debug [REDACTED:local-path] token=[REDACTED:secret-like]"
+        );
+        for forbidden in ["/Users/alice", "private", "raw-tool-token"] {
+            assert!(
+                !combined.contains(forbidden),
+                "unknown MCP tool leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_low_level_latch_tool_is_guided() {
+        let _guard = EnvVarGuard::set(&[("BUCEPHALUS_MCP_DEBUG_LATCH_TOOLS", None)]);
+        let result = handle_mcp_tool_call(json!({
+            "name": "latch_tail",
+            "arguments": { "job_id": "job_1" }
+        }))
+        .unwrap();
+        let body = &result["structuredContent"];
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(body["because"], "low_level_tool_disabled");
+        assert_eq!(body["next_actions"][0]["tool"], "dispatch_benchmark");
+        assert_eq!(
+            body["details"]["debug_override"],
+            "BUCEPHALUS_MCP_DEBUG_LATCH_TOOLS=1"
+        );
+    }
+
+    #[test]
+    fn latch_tail_invalid_max_lines_is_guided_before_daemon_call() {
+        let _guard = EnvVarGuard::set(&[("BUCEPHALUS_MCP_DEBUG_LATCH_TOOLS", Some("1"))]);
+
+        let result = handle_mcp_tool_call(json!({
+            "name": "latch_tail",
+            "arguments": {
+                "job_id": "job_1",
+                "max_lines": "token=/Users/alice/private"
+            }
+        }))
+        .unwrap();
+        let body = &result["structuredContent"];
+        let combined = serde_json::to_string_pretty(&result).unwrap();
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(body["because"], "tail_limit_invalid");
+        assert_eq!(body["details"]["param"], "max_lines");
+        assert_eq!(body["details"]["min"], 1);
+        assert_eq!(body["details"]["max"], MCP_LATCH_TAIL_MAX_LINES);
+        assert_eq!(body["next_actions"][0]["tool"], "latch_tail");
+        assert_eq!(
+            body["next_actions"][0]["arguments"]["max_lines"],
+            MCP_LATCH_TAIL_DEFAULT_LINES
+        );
+        for forbidden in ["/Users/alice", "token=", "private"] {
+            assert!(
+                !combined.contains(forbidden),
+                "guided tail max_lines error leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_status_without_id_is_guided() {
+        let result = handle_mcp_tool_call(json!({
+            "name": "dispatch_status",
+            "arguments": {}
+        }))
+        .unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["because"],
+            "dispatch_id_required"
+        );
+    }
+
+    #[test]
+    fn dispatch_benchmark_cleans_pending_workspace_when_daemon_start_fails() {
+        let _lock = lock_cloud_auth_env();
+        let _home_lock = lock_dispatch_home_env();
+        let root = temp_dir("dispatch_pending_cleanup");
+        let _env = EnvVarGuard::set(&[("BUCEPHALUS_HOME", Some(root.to_str().unwrap()))]);
+
+        let result = handle_mcp_tool_call(json!({
+            "name": "dispatch_benchmark",
+            "arguments": {
+                "benchmark": LOCAL_LATCH_SMOKE_BENCHMARK,
+                "cases": 1,
+                "headless_command": {
+                    "argv": ["sh", "-c", "true"]
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["because"], "daemon_unavailable");
+        let dispatches = root.join("dispatches");
+        let orphaned = fs::read_dir(&dispatches)
+            .map(|entries| entries.filter_map(Result::ok).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(
+            orphaned.is_empty(),
+            "failed dispatch left orphaned dispatch workspaces under {}: {:?}",
+            dispatches.display(),
+            orphaned
+                .iter()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dispatch_status_unknown_id_is_guided_not_found() {
+        let _lock = lock_cloud_auth_env();
+        let _home_lock = lock_dispatch_home_env();
+        let root = temp_dir("dispatch_status_unknown");
+        let _env = EnvVarGuard::set(&[("BUCEPHALUS_HOME", Some(root.to_str().unwrap()))]);
+        let result = handle_mcp_tool_call(json!({
+            "name": "dispatch_status",
+            "arguments": { "dispatch_id": "dispatch_does_not_exist" }
+        }))
+        .unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["because"], "dispatch_not_found");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dispatch_status_unknown_untrusted_id_is_guided_public_safe() {
+        let _lock = lock_cloud_auth_env();
+        let _home_lock = lock_dispatch_home_env();
+        let root = temp_dir("dispatch_status_unknown_public_safe");
+        let _env = EnvVarGuard::set(&[("BUCEPHALUS_HOME", Some(root.to_str().unwrap()))]);
+        let result = handle_mcp_tool_call(json!({
+            "name": "dispatch_status",
+            "arguments": { "dispatch_id": "dispatch_sk-live-secret" }
+        }))
+        .unwrap();
+        let body = &result["structuredContent"];
+        let combined = serde_json::to_string_pretty(body).unwrap();
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(body["because"], "dispatch_not_found");
+        assert_eq!(body["details"]["dispatch_ref"], "dispatch://redacted");
+        for forbidden in ["dispatch_sk-live-secret", "sk-live-secret"] {
+            assert!(
+                !combined.contains(forbidden),
+                "dispatch_not_found leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn recent_dispatches_lists_written_records() {
+        let _lock = lock_cloud_auth_env();
+        let _home_lock = lock_dispatch_home_env();
+        let root = temp_dir("recent_dispatches");
+        let _env = EnvVarGuard::set(&[("BUCEPHALUS_HOME", Some(root.to_str().unwrap()))]);
+        let dir = dispatch_dir("dispatch_a").unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("dispatch.json"),
+            json!({
+                "dispatch_id": "dispatch_a",
+                "status": "running",
+                "label": "first",
+                "benchmark": { "id": "local:file-edit-smoke" },
+                "created_at": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let listed = recent_dispatches(10);
+        let items = listed.as_array().unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["dispatch_id"], "dispatch_a");
+        assert_eq!(items[0]["dispatch_ref"], "dispatch://dispatch_a");
+        assert_eq!(items[0]["status"], "running");
+        assert_eq!(items[0]["benchmark"], "local:file-edit-smoke");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn recent_dispatches_redacts_untrusted_record_ids() {
+        let _lock = lock_cloud_auth_env();
+        let _home_lock = lock_dispatch_home_env();
+        let root = temp_dir("recent_dispatches_public_ids");
+        let _env = EnvVarGuard::set(&[("BUCEPHALUS_HOME", Some(root.to_str().unwrap()))]);
+        let dispatch_id = "dispatch_sk-live-secret";
+        let dir = dispatch_dir(dispatch_id).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("dispatch.json"),
+            json!({
+                "dispatch_id": dispatch_id,
+                "status": "running",
+                "benchmark": { "id": "local:file-edit-smoke" },
+                "created_at": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let listed = recent_dispatches(10);
+        let combined = serde_json::to_string_pretty(&listed).unwrap();
+        let items = listed.as_array().unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["dispatch_id"], "redacted");
+        assert_eq!(items[0]["dispatch_ref"], "dispatch://redacted");
+        for forbidden in ["dispatch_sk-live-secret", "sk-live-secret"] {
+            assert!(
+                !combined.contains(forbidden),
+                "recent dispatches leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn auth_status_reports_ready_cache_without_legacy_access_file() {
+        let _lock = lock_cloud_auth_env();
+        let _env = EnvVarGuard::set(&[(BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None)]);
+        let root = temp_dir("auth_status_cache_only");
+        let paths = cloud_token_paths(&root);
+        write_cloud_token_cache(
+            &paths,
+            "https://issuer.example",
+            "client-1",
+            Some("audience-1"),
+            Some("https://api.example"),
+            "openid profile email",
+            "https://issuer.example/oauth/token",
+            &json!({
+                "access_token": "access-123",
+                "refresh_token": "refresh-456",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            }),
+        )
+        .unwrap();
+        fs::remove_file(&paths.access).unwrap();
+
+        let status = auth_status(&root);
+
+        assert_eq!(status["status"], "ready");
+        assert_eq!(status["source"], "cache");
+        assert_eq!(status["cache"]["status"], "ready");
+        assert!(status.get("actions").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auth_status_reports_malformed_cache_with_repair_actions() {
+        let _lock = lock_cloud_auth_env();
+        let _env = EnvVarGuard::set(&[(BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None)]);
+        let root = temp_dir("auth_status_malformed_cache");
+        let paths = cloud_token_paths(&root);
+        fs::create_dir_all(paths.cache.parent().unwrap()).unwrap();
+        fs::write(&paths.cache, "{not-json\n").unwrap();
+
+        let status = auth_status(&root);
+
+        assert_eq!(status["status"], "invalid");
+        assert_eq!(status["source"], "cache");
+        assert_eq!(status["cache"]["reason"], "malformed_json");
+        assert_eq!(first_auth_action_command(&status), Some("bucephalus login"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auth_status_payload_uses_public_refs_before_rendering() {
+        let _lock = lock_cloud_auth_env();
+        let _env = EnvVarGuard::set(&[
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+            (
+                BUCEPHALUS_CLOUD_API_URL_ENV,
+                Some("https://api-user:api-secret@example.com/cloud?token=raw-api-token#frag"),
+            ),
+        ]);
+        let root = temp_dir("auth_status_raw_public_refs");
+
+        let status = auth_status(&root);
+        let combined = serde_json::to_string_pretty(&status).unwrap();
+
+        assert_eq!(status["status"], "missing");
+        assert_eq!(status["cache"]["path_ref"], "auth://token-cache");
+        assert_eq!(
+            status["expected"],
+            json!([
+                BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
+                "auth://access-token",
+                "auth://token-cache"
+            ])
+        );
+        assert_eq!(
+            status["api_url"],
+            "https://example.com/cloud [redacted URL credentials/query]"
+        );
+        assert!(status.get("path").is_none());
+        assert!(status["cache"].get("path").is_none());
+        for forbidden in [
+            root.to_str().unwrap(),
+            "cloud_user_token",
+            "api-user",
+            "api-secret",
+            "raw-api-token",
+            "?token=",
+            "#frag",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "raw auth status leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn auth_status_json_uses_public_auth_refs() {
+        let _lock = lock_cloud_auth_env();
+        let _env = EnvVarGuard::set(&[(BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None)]);
+        let root = temp_dir("auth_status_public_refs");
+        let paths = cloud_token_paths(&root);
+        write_cloud_token_cache(
+            &paths,
+            "https://issuer.example",
+            "client-1",
+            None,
+            Some("https://api.example?token=secret"),
+            "openid profile email",
+            "https://issuer.example/oauth/token",
+            &json!({
+                "access_token": "access-123",
+                "refresh_token": "refresh-456",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            }),
+        )
+        .unwrap();
+        fs::remove_file(&paths.access).unwrap();
+
+        let status = auth_status(&root);
+        let public = auth_status_to_json(&root, &status);
+        let combined = serde_json::to_string_pretty(&public).unwrap();
+
+        assert_eq!(public["auth_ref"], "auth://current");
+        assert_eq!(public["path_ref"], "auth://token-cache");
+        assert_eq!(public["cache"]["path_ref"], "auth://token-cache");
+        assert!(
+            !combined.contains(root.to_str().unwrap()),
+            "auth status JSON leaked home path: {combined}"
+        );
+        assert!(!combined.contains("cloud_user_token.json"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn login_json_uses_public_auth_refs() {
+        let root = temp_dir("login_public_refs");
+        let paths = cloud_token_paths(&root);
+        let result = json!({
+            "schema_version": "bucephalus_login_v1",
+            "ok": true,
+            "home": root,
+            "issuer": "https://user:secret@issuer.example/oauth?debug=true",
+            "client_id": "client-1",
+            "audience": "audience-1",
+            "resource": "file:///Users/alice/private/api",
+            "scope": "openid profile email",
+            "token_path": paths.access,
+            "refresh_token_path": paths.refresh,
+            "cache_path": paths.cache
+        });
+
+        let public = login_result_to_json(&result);
+        let combined = serde_json::to_string_pretty(&public).unwrap();
+
+        assert_eq!(public["auth_ref"], "auth://current");
+        assert_eq!(public["token_ref"], "auth://access-token");
+        assert_eq!(public["refresh_token_ref"], "auth://refresh-token");
+        assert_eq!(public["cache_ref"], "auth://token-cache");
+        for forbidden in [root.to_str().unwrap(), "/Users/alice", "cloud_user_token"] {
+            assert!(
+                !combined.contains(forbidden),
+                "login JSON leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+        assert!(combined.contains("file://[REDACTED:local-path]"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn login_success_result_uses_public_refs_before_rendering() {
+        let root = temp_dir("login_source_public_refs");
+        let paths = cloud_token_paths(&root);
+        fs::create_dir_all(paths.refresh.parent().unwrap()).unwrap();
+        fs::write(&paths.refresh, "refresh\n").unwrap();
+
+        let result = login_success_result(
+            &paths,
+            "https://user:secret@issuer.example/oauth?debug=true".to_string(),
+            "client-1".to_string(),
+            Some("audience-1".to_string()),
+            Some("file:///Users/alice/private/api".to_string()),
+            "openid profile email".to_string(),
+        );
+        let combined = serde_json::to_string_pretty(&result).unwrap();
+
+        assert_eq!(result["auth_ref"], "auth://current");
+        assert_eq!(result["token_ref"], "auth://access-token");
+        assert_eq!(result["refresh_token_ref"], "auth://refresh-token");
+        assert_eq!(result["cache_ref"], "auth://token-cache");
+        assert!(result.get("home").is_none());
+        assert!(result.get("token_path").is_none());
+        assert!(result.get("refresh_token_path").is_none());
+        assert!(result.get("cache_path").is_none());
+        for forbidden in [
+            root.to_str().unwrap(),
+            "cloud_user_token",
+            "user:secret",
+            "debug=true",
+            "/Users/alice",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "login source result leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+        assert!(combined.contains("[redacted URL credentials/query]"));
+        assert!(combined.contains("file://[REDACTED:local-path]"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn login_handoff_lines_use_public_auth_refs() {
+        let root = temp_dir("login_handoff_refs");
+        let paths = cloud_token_paths(&root);
+        let result = json!({
+            "schema_version": "bucephalus_login_v1",
+            "ok": true,
+            "home": root,
+            "token_path": paths.access,
+            "refresh_token_path": paths.refresh,
+            "cache_path": paths.cache
+        });
+        let lines = login_handoff_lines(&result);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("login: ready"));
+        assert!(rendered.contains("auth_ref: auth://current"));
+        assert!(rendered.contains("token_ref: auth://access-token"));
+        assert!(rendered.contains("refresh_token_ref: auth://refresh-token"));
+        assert!(rendered.contains("cache_ref: auth://token-cache"));
+        for forbidden in [root.to_str().unwrap(), "cloud_user_token"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "login handoff leaked forbidden text {forbidden}: {rendered}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn logout_removes_cached_cloud_auth_files() {
+        let root = temp_dir("logout_auth_files");
+        let paths = cloud_token_paths(&root);
+        fs::create_dir_all(paths.access.parent().unwrap()).unwrap();
+        fs::write(&paths.access, "access\n").unwrap();
+        fs::write(&paths.refresh, "refresh\n").unwrap();
+        fs::write(&paths.cache, "{}\n").unwrap();
+
+        let result = run_logout_at_home(&root, false).unwrap();
+
+        assert_eq!(result["schema_version"], "bucephalus_logout_v1");
+        assert_eq!(result["removed"], 3);
+        assert!(!paths.access.exists());
+        assert!(!paths.refresh.exists());
+        assert!(!paths.cache.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logout_reports_partial_file_removal_errors_without_stopping() {
+        let _lock = lock_cloud_auth_env();
+        let root = temp_dir("logout_partial_error");
+        let paths = cloud_token_paths(&root);
+        fs::create_dir_all(paths.access.parent().unwrap()).unwrap();
+        fs::create_dir_all(&paths.access).unwrap();
+        fs::write(&paths.refresh, "refresh\n").unwrap();
+        fs::write(&paths.cache, "{}\n").unwrap();
+
+        let result = run_logout_at_home(&root, false).unwrap();
+        let public = logout_result_to_json(&result);
+        let lines = logout_handoff_lines(&result);
+        let rendered = lines.join("\n");
+        let combined = serde_json::to_string_pretty(&public).unwrap();
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["status"], "partial_error");
+        assert_eq!(result["removed"], 2);
+        assert_eq!(result["errors"], 1);
+        assert_eq!(public["ok"], false);
+        assert_eq!(public["files"][0]["status"], "error");
+        assert_eq!(public["files"][0]["path_ref"], "auth://access-token");
+        assert!(public["files"][0]["reason"].as_str().is_some());
+        assert!(rendered.contains("logout: partial_error"));
+        assert!(rendered.contains("auth_file_reason: access "));
+        assert!(!paths.refresh.exists());
+        assert!(!paths.cache.exists());
+        assert!(paths.access.exists());
+        for forbidden in [root.to_str().unwrap(), "cloud_user_token"] {
+            assert!(
+                !combined.contains(forbidden),
+                "logout partial JSON leaked forbidden text {forbidden}: {combined}"
+            );
+            assert!(
+                !rendered.contains(forbidden),
+                "logout partial handoff leaked forbidden text {forbidden}: {rendered}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn logout_refuses_symlinked_auth_directory_without_deleting_target_files() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = lock_cloud_auth_env();
+        let root = temp_dir("logout_symlinked_auth_dir");
+        let paths = cloud_token_paths(&root);
+        let auth_dir = paths.access.parent().unwrap();
+        let real_auth = root.join("real-auth");
+        fs::create_dir_all(&real_auth).unwrap();
+        fs::write(real_auth.join("cloud_user_token"), "access\n").unwrap();
+        fs::write(real_auth.join("cloud_refresh_token"), "refresh\n").unwrap();
+        fs::write(real_auth.join("cloud_user_token.json"), "{}\n").unwrap();
+        symlink(&real_auth, auth_dir).unwrap();
+
+        let result = run_logout_at_home(&root, false).unwrap();
+        let public = logout_result_to_json(&result);
+        let lines = logout_handoff_lines(&result);
+        let combined = serde_json::to_string_pretty(&public).unwrap();
+        let rendered = lines.join("\n");
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["status"], "blocked");
+        assert_eq!(result["removed"], 0);
+        assert_eq!(result["would_remove"], 0);
+        assert_eq!(result["errors"], 3);
+        assert_eq!(public["files"][0]["status"], "blocked");
+        assert_eq!(public["files"][1]["status"], "blocked");
+        assert_eq!(public["files"][2]["status"], "blocked");
+        assert!(rendered.contains("logout: blocked"));
+        assert!(rendered.contains("symlinked auth directory"));
+        assert_eq!(
+            fs::read_to_string(real_auth.join("cloud_user_token")).unwrap(),
+            "access\n"
+        );
+        assert_eq!(
+            fs::read_to_string(real_auth.join("cloud_refresh_token")).unwrap(),
+            "refresh\n"
+        );
+        assert_eq!(
+            fs::read_to_string(real_auth.join("cloud_user_token.json")).unwrap(),
+            "{}\n"
+        );
+        for forbidden in [
+            root.to_str().unwrap(),
+            "logout_symlinked_auth_dir",
+            "real-auth",
+            "cloud_user_token",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "logout symlink JSON leaked forbidden text {forbidden}: {combined}"
+            );
+            assert!(
+                !rendered.contains(forbidden),
+                "logout symlink handoff leaked forbidden text {forbidden}: {rendered}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn logout_dry_run_preserves_files_and_reports_env_override() {
+        let _lock = lock_cloud_auth_env();
+        let root = temp_dir("logout_dry_run");
+        let paths = cloud_token_paths(&root);
+        fs::create_dir_all(paths.access.parent().unwrap()).unwrap();
+        fs::write(&paths.access, "access\n").unwrap();
+        fs::write(&paths.refresh, "refresh\n").unwrap();
+        fs::write(&paths.cache, "{}\n").unwrap();
+        let _guard = EnvVarGuard::set(&[(BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("env-token"))]);
+
+        let result = run_logout_at_home(&root, true).unwrap();
+
+        assert_eq!(result["dry_run"], true);
+        assert_eq!(result["would_remove"], 3);
+        assert_eq!(result["removed"], 0);
+        assert_eq!(result["env"]["present"], true);
+        assert!(result["env"]["note"]
+            .as_str()
+            .unwrap()
+            .contains(BUCEPHALUS_CLOUD_USER_TOKEN_ENV));
+        assert!(paths.access.exists());
+        assert!(paths.refresh.exists());
+        assert!(paths.cache.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn logout_result_uses_public_refs_before_rendering() {
+        let _lock = lock_cloud_auth_env();
+        let root = temp_dir("logout_source_public_refs");
+        let paths = cloud_token_paths(&root);
+        fs::create_dir_all(paths.access.parent().unwrap()).unwrap();
+        fs::write(&paths.access, "access\n").unwrap();
+        fs::write(&paths.refresh, "refresh\n").unwrap();
+        fs::write(&paths.cache, "{}\n").unwrap();
+
+        let result = run_logout_at_home(&root, true).unwrap();
+        let combined = serde_json::to_string_pretty(&result).unwrap();
+
+        assert_eq!(result["auth_ref"], "auth://current");
+        assert!(result.get("home").is_none());
+        assert_eq!(result["files"][0]["path_ref"], "auth://access-token");
+        assert_eq!(result["files"][1]["path_ref"], "auth://refresh-token");
+        assert_eq!(result["files"][2]["path_ref"], "auth://token-cache");
+        for file in result["files"].as_array().unwrap() {
+            assert!(file.get("path").is_none());
+        }
+        for forbidden in [root.to_str().unwrap(), "cloud_user_token"] {
+            assert!(
+                !combined.contains(forbidden),
+                "logout source result leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+        assert!(paths.access.exists());
+        assert!(paths.refresh.exists());
+        assert!(paths.cache.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn logout_json_uses_public_auth_refs() {
+        let _lock = lock_cloud_auth_env();
+        let root = temp_dir("logout_public_refs");
+        let paths = cloud_token_paths(&root);
+        fs::create_dir_all(paths.access.parent().unwrap()).unwrap();
+        fs::write(&paths.access, "access\n").unwrap();
+        fs::write(&paths.refresh, "refresh\n").unwrap();
+        fs::write(&paths.cache, "{}\n").unwrap();
+
+        let result = run_logout_at_home(&root, true).unwrap();
+        let public = logout_result_to_json(&result);
+        let combined = serde_json::to_string_pretty(&public).unwrap();
+
+        assert_eq!(public["auth_ref"], "auth://current");
+        assert_eq!(public["files"][0]["path_ref"], "auth://access-token");
+        assert_eq!(public["files"][1]["path_ref"], "auth://refresh-token");
+        assert_eq!(public["files"][2]["path_ref"], "auth://token-cache");
+        for forbidden in [root.to_str().unwrap(), "cloud_user_token"] {
+            assert!(
+                !combined.contains(forbidden),
+                "logout JSON leaked forbidden text {forbidden}: {combined}"
+            );
+        }
+        assert!(paths.access.exists());
+        assert!(paths.refresh.exists());
+        assert!(paths.cache.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn logout_handoff_lines_use_public_auth_refs() {
+        let _lock = lock_cloud_auth_env();
+        let _env = EnvVarGuard::set(&[(BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None)]);
+        let root = temp_dir("logout_handoff_refs");
+        let paths = cloud_token_paths(&root);
+        fs::create_dir_all(paths.access.parent().unwrap()).unwrap();
+        fs::write(&paths.access, "access\n").unwrap();
+        fs::write(&paths.refresh, "refresh\n").unwrap();
+        fs::write(&paths.cache, "{}\n").unwrap();
+
+        let result = run_logout_at_home(&root, true).unwrap();
+        let lines = logout_handoff_lines(&result);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("logout: planned"));
+        assert!(rendered.contains("dry_run: true"));
+        assert!(rendered.contains("auth_ref: auth://current"));
+        assert!(rendered.contains("auth_file_ref: auth://access-token"));
+        assert!(rendered.contains("auth_file_ref: auth://refresh-token"));
+        assert!(rendered.contains("auth_file_ref: auth://token-cache"));
+        for forbidden in [root.to_str().unwrap(), "cloud_user_token"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "logout handoff leaked forbidden text {forbidden}: {rendered}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn direct_mcp_invocation_message_explains_stdio_mode() {
+        let message = direct_mcp_invocation_message();
+
+        assert!(message.contains("stdio MCP server"));
+        assert!(message.contains("bucephalus setup"));
+        assert!(message.contains("bucephalus setup status"));
+        assert!(message.contains("bucephalus mcp"));
     }
 
     fn configure_test_account_db(run_dir: &Path) -> PathBuf {
@@ -10947,7 +21804,109 @@ mod tests {
         let err = result.expect_err("stale run path should fail");
         assert!(
             err.to_string()
-                .contains("stored run path for 'run_1' is not accessible"),
+                .contains("stored run path for 'run_1' (run://missing_run_1) is not accessible"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("run://missing_run_1"),
+            "expected public run ref, got: {}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("bucephalus clean --runs --dry-run"),
+            "expected cleanup guidance, got: {}",
+            err
+        );
+        assert!(
+            !err.to_string()
+                .contains(&stale_run_dir.display().to_string()),
+            "stale run resolver error must not leak stored path: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_run_dir_arg_guides_missing_run_id() {
+        let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
+        let anchor = temp_dir("missing_run_store_anchor");
+        std::fs::create_dir_all(&anchor).expect("anchor dir");
+        configure_test_account_db(&anchor);
+
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&anchor).expect("set cwd");
+        let result = resolve_run_dir_arg("run_missing");
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        let err = result.expect_err("missing run should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("run 'run_missing' not found"));
+        assert!(message.contains("bucephalus runs"));
+        assert!(message.contains("bucephalus run <package-dir>"));
+        assert!(
+            !message.contains(&anchor.display().to_string()),
+            "missing run resolver error must not leak cwd: {message}"
+        );
+    }
+
+    #[test]
+    fn continue_and_recover_accept_run_selector_or_run_dir() {
+        let parsed = Cli::try_parse_from(["bucephalus", "continue", "run_1", "--json"]).unwrap();
+        match parsed.command {
+            Commands::Continue {
+                run, run_dir, json, ..
+            } => {
+                assert_eq!(run.as_deref(), Some("run_1"));
+                assert!(run_dir.is_none());
+                assert!(json);
+            }
+            _ => panic!("expected continue command"),
+        }
+
+        let parsed =
+            Cli::try_parse_from(["bucephalus", "recover", "run_1", "--force", "--json"]).unwrap();
+        match parsed.command {
+            Commands::Recover {
+                run,
+                run_dir,
+                force,
+                json,
+            } => {
+                assert_eq!(run.as_deref(), Some("run_1"));
+                assert!(run_dir.is_none());
+                assert!(force);
+                assert!(json);
+            }
+            _ => panic!("expected recover command"),
+        }
+
+        let parsed =
+            Cli::try_parse_from(["bucephalus", "recover", "--run-dir", "/tmp/run_1"]).unwrap();
+        match parsed.command {
+            Commands::Recover { run, run_dir, .. } => {
+                assert!(run.is_none());
+                assert_eq!(run_dir.as_deref(), Some(Path::new("/tmp/run_1")));
+            }
+            _ => panic!("expected recover command"),
+        }
+    }
+
+    #[test]
+    fn resolve_run_selector_guides_missing_or_ambiguous_input() {
+        let err = resolve_run_selector("continue", None, None)
+            .expect_err("missing run selector should fail");
+        let message = err.to_string();
+        assert!(message.contains("continue requires a run id/path"));
+        assert!(message.contains("bucephalus runs"));
+        assert!(message.contains("bucephalus continue <run_id>"));
+
+        let err = resolve_run_selector("recover", Some("run_1"), Some(Path::new("/tmp/run_1")))
+            .expect_err("ambiguous run selector should fail");
+        assert!(
+            err.to_string()
+                .contains("recover accepts either a run id/path argument or --run-dir"),
             "unexpected error: {}",
             err
         );
@@ -11021,6 +21980,28 @@ mod tests {
             table.rows[0][col("agent_result_json")].pointer("/answer"),
             Some(&json!("raw agent result"))
         );
+        assert_eq!(
+            table.rows[0][col("agent_result_path")],
+            json!("run://trials/trial_1/agent/result.json")
+        );
+        assert_eq!(
+            table.rows[0][col("agent_stdout_path")],
+            json!("run://trials/trial_1/agent/stdout.log")
+        );
+        assert_eq!(
+            table.rows[0][col("agent_stderr_path")],
+            json!("run://trials/trial_1/agent/stderr.log")
+        );
+        assert_eq!(
+            table.rows[0][col("state_path")],
+            json!("run://trials/trial_1/runner/trial_runtime_state.json")
+        );
+        assert!(
+            !serde_json::to_string(&table.rows[0])
+                .unwrap()
+                .contains(&run_dir.display().to_string()),
+            "latest_agent_output view must not leak the absolute run directory"
+        );
 
         let _ = std::fs::remove_dir_all(&run_dir);
     }
@@ -11056,7 +22037,7 @@ mod tests {
                         "timed_out": false,
                         "result_state": "missing",
                         "stdout_path": trial_dir.join("agent/stdout.log").display().to_string(),
-                        "stderr_path": trial_dir.join("agent/stderr.log").display().to_string()
+                        "stderr_path": "/Users/alice/private/stderr.log"
                     },
                     "cleanup": {"containers": []}
                 }
@@ -11076,8 +22057,342 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no agent result file"));
+        assert_eq!(
+            table.rows[0][col("agent_result_path")],
+            json!("run://trials/trial_1/agent/result.json")
+        );
+        assert_eq!(
+            table.rows[0][col("agent_stdout_path")],
+            json!("run://trials/trial_1/agent/stdout.log")
+        );
+        assert_eq!(
+            table.rows[0][col("agent_stderr_path")],
+            json!("[REDACTED:local-path]")
+        );
 
         let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn query_table_json_is_public_boundary_safe() {
+        let table = analysis::QueryTable {
+            columns: vec![
+                "trial_id".to_string(),
+                "state_path".to_string(),
+                "stdout_ref".to_string(),
+                "container_path".to_string(),
+                "api_token".to_string(),
+                "refresh_token_present".to_string(),
+                "agent_result_json".to_string(),
+                "event_json".to_string(),
+                "env".to_string(),
+            ],
+            rows: vec![vec![
+                json!("trial_1"),
+                json!("/Users/alice/private/run/trials/trial_1/state.json"),
+                json!("run://trials/trial_1/agent/stdout.log"),
+                json!("/bucephalus/out/result.json"),
+                json!("raw-table-token"),
+                json!(true),
+                json!({
+                    "answer": "ok",
+                    "OPENAI_API_KEY": "sk-live-table-secret",
+                    "path": "/private/tmp/bucephalus/result.json",
+                    "mirror": "https://mirror-user:mirror-secret@mirror.example/results?token=raw-query#frag",
+                    "container_path": "/bucephalus/out/nested.json",
+                    "notes": ["Authorization: Bearer raw-header-token", "plain note"]
+                }),
+                json!(
+                    r#"{"api_token":"raw-json-cell-token","path":"/private/tmp/event.json","mirror":"https://event-user:event-secret@event.example/payload?token=raw-event-query#frag","container_path":"/bucephalus/out/event.json"}"#
+                ),
+                json!({"SAFE_FLAG": "1"}),
+            ]],
+        };
+        let payload = query_table_to_json(&table);
+        let encoded = serde_json::to_string(&payload).unwrap();
+        let row = &payload["rows"][0];
+        let event_json: Value = serde_json::from_str(row["event_json"].as_str().unwrap()).unwrap();
+
+        assert_eq!(row["trial_id"], "trial_1");
+        assert_eq!(row["state_path"], "[REDACTED:local-path]");
+        assert_eq!(row["stdout_ref"], "run://trials/trial_1/agent/stdout.log");
+        assert_eq!(row["container_path"], "/bucephalus/out/result.json");
+        assert_eq!(row["api_token"], "[REDACTED:secret]");
+        assert_eq!(row["refresh_token_present"], true);
+        assert_eq!(row["env"], "[REDACTED:environment]");
+        assert_eq!(row["agent_result_json"]["answer"], "ok");
+        assert_eq!(
+            row["agent_result_json"]["OPENAI_API_KEY"],
+            "[REDACTED:secret]"
+        );
+        assert_eq!(row["agent_result_json"]["path"], "[REDACTED:local-path]");
+        assert_eq!(
+            row["agent_result_json"]["container_path"],
+            "/bucephalus/out/nested.json"
+        );
+        assert_eq!(
+            row["agent_result_json"]["mirror"],
+            "https://mirror.example/results [redacted URL credentials/query]"
+        );
+        assert_eq!(
+            row["agent_result_json"]["notes"][0],
+            "[REDACTED:secret-like]"
+        );
+        assert_eq!(row["agent_result_json"]["notes"][1], "plain note");
+        assert_eq!(event_json["api_token"], "[REDACTED:secret]");
+        assert_eq!(event_json["path"], "[REDACTED:local-path]");
+        assert_eq!(
+            event_json["mirror"],
+            "https://event.example/payload [redacted URL credentials/query]"
+        );
+        assert_eq!(event_json["container_path"], "/bucephalus/out/event.json");
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "private/run",
+            "raw-table-token",
+            "sk-live-table-secret",
+            "raw-json-cell-token",
+            "mirror-user",
+            "mirror-secret",
+            "?token=raw-query",
+            "#frag",
+            "raw-header-token",
+            "event-user",
+            "event-secret",
+            "raw-event-query",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "query table JSON leaked forbidden text: {forbidden}\n{encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_table_export_formats_are_public_boundary_safe() {
+        let table = analysis::QueryTable {
+            columns: vec![
+                "state_path".to_string(),
+                "api_token".to_string(),
+                "stdout_ref".to_string(),
+                "agent_result_json".to_string(),
+                "event_json".to_string(),
+            ],
+            rows: vec![vec![
+                json!("/Users/alice/private/run/state.json"),
+                json!("raw-export-token"),
+                json!("run://trials/trial_1/agent/stdout.log"),
+                json!({
+                    "OPENAI_API_KEY": "sk-live-export-secret",
+                    "path": "/private/tmp/export.json",
+                    "mirror": "https://mirror-user:mirror-secret@mirror.example/export?token=raw-query#frag",
+                    "container_path": "/bucephalus/out/export.json"
+                }),
+                json!(
+                    r#"{"api_token":"raw-export-json-token","path":"/private/tmp/export-event.json"}"#
+                ),
+            ]],
+        };
+        let csv = render_query_table_csv(&table);
+        let markdown = render_query_table_markdown(&table);
+        let html = render_query_table_html_fragment(&table);
+        let combined = format!("{csv}\n{markdown}\n{html}");
+
+        for rendered in [&csv, &markdown, &html] {
+            assert!(rendered.contains("[REDACTED:local-path]"));
+            assert!(rendered.contains("[REDACTED:secret]"));
+            assert!(rendered.contains("run://trials/trial_1/agent/stdout.log"));
+            assert!(rendered.contains("/bucephalus/out/export.json"));
+            assert!(rendered.contains("https://mirror.example/export"));
+            assert!(rendered.contains("[redacted URL credentials/query]"));
+        }
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "private/run",
+            "raw-export-token",
+            "sk-live-export-secret",
+            "raw-export-json-token",
+            "mirror-user",
+            "mirror-secret",
+            "?token=raw-query",
+            "#frag",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "query table export leaked forbidden text: {forbidden}\n{combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_metadata_and_column_names_are_public_boundary_safe() {
+        let table = analysis::QueryTable {
+            columns: vec![
+                "/Users/alice/private/run/state.json".to_string(),
+                "token=raw-column-secret".to_string(),
+                "token=second-column-secret".to_string(),
+                "api_token".to_string(),
+            ],
+            rows: vec![vec![
+                json!("state-value"),
+                json!("column-secret-value"),
+                json!("second-column-secret-value"),
+                json!("raw-cell-token"),
+            ]],
+        };
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_1");
+        let sql = "SELECT '/Users/alice/private/query.json' AS local_path, 'token=raw-sql-secret' AS token";
+
+        let payload = query_command_result_to_json(&run_dir, sql, &table);
+        let csv = render_query_table_csv(&table);
+        let markdown = render_query_table_markdown(&table);
+        let html = render_query_table_html_fragment(&table);
+        let combined = format!(
+            "{}\n{csv}\n{markdown}\n{html}",
+            serde_json::to_string_pretty(&payload).unwrap()
+        );
+
+        assert_eq!(payload["run_ref"], "run://run_1");
+        assert_eq!(
+            payload["sql"],
+            "SELECT '[REDACTED:local-path]' AS local_path, 'token=[REDACTED:secret-like]' AS token"
+        );
+        assert_eq!(payload["result"]["columns"][0], "[REDACTED:local-path]");
+        assert_eq!(
+            payload["result"]["columns"][1],
+            "token=[REDACTED:secret-like]"
+        );
+        assert_eq!(
+            payload["result"]["columns"][2],
+            "token=[REDACTED:secret-like]_2"
+        );
+        assert_eq!(payload["result"]["columns"][3], "api_token");
+        assert_eq!(
+            payload["result"]["rows"][0]["token=[REDACTED:secret-like]"],
+            "[REDACTED:secret]"
+        );
+        assert_eq!(
+            payload["result"]["rows"][0]["token=[REDACTED:secret-like]_2"],
+            "[REDACTED:secret]"
+        );
+        assert_eq!(
+            payload["result"]["rows"][0]["api_token"],
+            "[REDACTED:secret]"
+        );
+        assert!(csv.contains("[REDACTED:local-path]"));
+        assert!(markdown.contains("token=[REDACTED:secret-like]_2"));
+        assert!(html.contains("api_token"));
+        for forbidden in [
+            "/Users/alice",
+            "private/run",
+            "private/query",
+            "raw-column-secret",
+            "second-column-secret",
+            "raw-sql-secret",
+            "raw-cell-token",
+            "column-secret-value",
+            "second-column-secret-value",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "analysis metadata/export leaked forbidden text: {forbidden}\n{combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_table_text_projection_is_public_boundary_safe() {
+        let table = analysis::QueryTable {
+            columns: vec![
+                "task_id".to_string(),
+                "state_path".to_string(),
+                "api_token".to_string(),
+                "event_json".to_string(),
+            ],
+            rows: vec![
+                vec![
+                    json!("task_1"),
+                    json!("/Users/alice/private/run/state.json"),
+                    json!("raw-text-table-token"),
+                    json!(
+                        r#"{"api_token":"raw-text-json-token","path":"/private/tmp/text-event.json","mirror":"https://text-user:text-secret@text.example/payload?token=raw-text-query#frag"}"#
+                    ),
+                ],
+                vec![
+                    json!("task_2"),
+                    json!("/Users/alice/private/run/state.json"),
+                    json!("raw-text-table-token"),
+                    json!(
+                        r#"{"api_token":"raw-text-json-token","path":"/private/tmp/text-event.json","mirror":"https://text-user:text-secret@text.example/payload?token=raw-text-query#frag"}"#
+                    ),
+                ],
+            ],
+        };
+
+        let public = public_query_table(&table);
+        let (filtered, elided) = elide_constant_columns(&public);
+        let display = shorten_display_columns(&filtered);
+        let combined = format!("{elided:?}\n{:?}", display.rows);
+
+        assert!(combined.contains("[REDACTED:local-path]"));
+        assert!(combined.contains("[REDACTED:secret]"));
+        assert!(combined.contains("https://text.example/payload"));
+        assert!(combined.contains("[redacted URL credentials/query]"));
+        assert!(combined.contains("task_1"));
+        assert!(combined.contains("task_2"));
+        for forbidden in [
+            "/Users/alice",
+            "/private/tmp",
+            "private/run",
+            "raw-text-table-token",
+            "raw-text-json-token",
+            "text-user",
+            "text-secret",
+            "raw-text-query",
+            "#frag",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "query table text projection leaked forbidden text: {forbidden}\n{combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_events_stdout_is_public_boundary_safe() {
+        let table = analysis::QueryTable {
+            columns: vec!["trial_id".to_string(), "event_json".to_string()],
+            rows: vec![vec![
+                json!("trial_1"),
+                json!(
+                    r#"{"event_type":"tool_call_end","api_token":"raw-event-token","path":"/Users/alice/private/out.json","mirror":"https://event-user:event-secret@event.example/results?token=raw-query#frag","container_path":"/bucephalus/out/result.json"}"#
+                ),
+            ]],
+        };
+
+        let rendered = format_raw_events_stdout(&table).join("\n");
+
+        assert!(rendered.contains(r#""api_token": "[REDACTED:secret]""#));
+        assert!(rendered.contains(r#""path": "[REDACTED:local-path]""#));
+        assert!(rendered.contains("https://event.example/results"));
+        assert!(rendered.contains("[redacted URL credentials/query]"));
+        assert!(rendered.contains(r#""container_path": "/bucephalus/out/result.json""#));
+        for forbidden in [
+            "/Users/alice",
+            "private/out",
+            "raw-event-token",
+            "event-user",
+            "event-secret",
+            "raw-query",
+            "#frag",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "raw events stdout leaked forbidden text: {forbidden}\n{rendered}"
+            );
+        }
     }
 
     #[test]
@@ -11326,6 +22641,117 @@ mod tests {
     }
 
     #[test]
+    fn run_inventory_prioritizes_interrupted_and_surfaces_next_action() {
+        let active = RunInventoryEntry {
+            run_id: "run_active".to_string(),
+            run_dir: PathBuf::from("/tmp/run_active"),
+            experiment: "exp".to_string(),
+            started_at: "2026-03-09T17:00:00Z".to_string(),
+            started_at_display: "2026-03-09 17:00:00Z".to_string(),
+            control: RunControlSummary {
+                status: "running".to_string(),
+                status_display: "running (active_trials=1)".to_string(),
+                live_summary: "1 active".to_string(),
+                active_trials: 1,
+                is_active: true,
+            },
+        };
+        let interrupted = RunInventoryEntry {
+            run_id: "run_interrupted".to_string(),
+            run_dir: PathBuf::from("/tmp/run_interrupted"),
+            experiment: "exp".to_string(),
+            started_at: "2026-03-09T16:00:00Z".to_string(),
+            started_at_display: "2026-03-09 16:00:00Z".to_string(),
+            control: RunControlSummary {
+                status: "interrupted".to_string(),
+                status_display: "interrupted (stale running lease)".to_string(),
+                live_summary: "stale owner".to_string(),
+                active_trials: 0,
+                is_active: false,
+            },
+        };
+        let completed = RunInventoryEntry {
+            run_id: "run_completed".to_string(),
+            run_dir: PathBuf::from("/tmp/run_completed"),
+            experiment: "exp".to_string(),
+            started_at: "2026-03-09T18:00:00Z".to_string(),
+            started_at_display: "2026-03-09 18:00:00Z".to_string(),
+            control: RunControlSummary {
+                status: "completed".to_string(),
+                status_display: "completed".to_string(),
+                live_summary: "idle".to_string(),
+                active_trials: 0,
+                is_active: false,
+            },
+        };
+
+        assert_eq!(run_inventory_sort_rank(&active), 0);
+        assert_eq!(run_inventory_sort_rank(&interrupted), 1);
+        assert_eq!(run_inventory_sort_rank(&completed), 2);
+        assert_eq!(
+            run_next_action(&interrupted),
+            "recover: bucephalus recover run_interrupted"
+        );
+        assert_eq!(
+            run_next_action(&active),
+            "watch: bucephalus views-live run_active run_progress"
+        );
+        assert_eq!(
+            run_next_action(&completed),
+            "inspect: bucephalus views run_completed observability"
+        );
+    }
+
+    #[test]
+    fn runs_empty_state_surfaces_public_next_actions() {
+        let project_root = PathBuf::from("/Users/alice/private/project");
+        let table = analysis::QueryTable {
+            columns: vec![
+                "status".into(),
+                "started_at".into(),
+                "run_id".into(),
+                "experiment".into(),
+                "live".into(),
+                "variants".into(),
+                "pass_rate".into(),
+                "next_action".into(),
+            ],
+            rows: vec![],
+        };
+
+        let payload = runs_command_result_to_json(&project_root, &table);
+        let lines = runs_empty_handoff_lines(&project_root);
+        let rendered = lines.join("\n");
+        let encoded = serde_json::to_string_pretty(&payload).unwrap();
+
+        assert_eq!(payload["project_ref"], "workspace://current");
+        assert_eq!(payload["result"]["row_count"], 0);
+        assert_eq!(
+            payload["next_actions"][0]["command"],
+            "bucephalus init <workspace-dir>"
+        );
+        assert_eq!(
+            payload["next_actions"][1]["experiment_ref"],
+            "workspace://experiment.yaml"
+        );
+        assert!(rendered.contains("project_ref: workspace://current"));
+        assert!(rendered.contains("runs: none"));
+        assert!(rendered.contains("next: bucephalus init <workspace-dir> (workspace://current)"));
+        assert!(rendered
+            .contains("next: bucephalus run <experiment-yaml> (workspace://experiment.yaml)"));
+        for forbidden in ["/Users/alice", "private/project"] {
+            assert!(
+                !encoded.contains(forbidden),
+                "empty runs JSON leaked forbidden text {forbidden}: {encoded}"
+            );
+            assert!(
+                !rendered.contains(forbidden),
+                "empty runs handoff leaked forbidden text {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn summarize_run_lifecycle_keeps_fresh_running_lease_active() {
         let control = json!({
             "schema_version": "run_control_v2",
@@ -11484,6 +22910,31 @@ mod tests {
     }
 
     #[test]
+    fn state_backed_view_error_redacts_secret_like_source_names() {
+        let run_dir = temp_dir("state_view_public_error");
+        let err = query_state_backed_source_view(
+            &run_dir,
+            "/Users/alice/private/raw_events token=raw-view-token",
+        )
+        .expect_err("non-state-backed source view should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("view '[REDACTED:view-name]' requires the analysis query engine"));
+        for forbidden in [
+            "/Users/alice",
+            "private/raw_events",
+            "raw-view-token",
+            "token=",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "state-backed view error leaked forbidden text {forbidden}: {message}"
+            );
+        }
+        std::fs::remove_dir_all(run_dir).ok();
+    }
+
+    #[test]
     fn standardize_ab_column_name_rewrites_mixed_terms() {
         assert_eq!(
             standardize_ab_column_name("baseline_outcome"),
@@ -11531,9 +22982,321 @@ mod tests {
         assert!(root.join("cases.jsonl").is_file());
         assert!(root.join("agent").join("buc_agent.py").is_file());
         let experiment = fs::read_to_string(root.join("experiment.yaml")).expect("experiment yaml");
-        assert!(experiment.contains("mode: answer"));
+        let parsed: Value = serde_yaml::from_str(&experiment).expect("experiment YAML parses");
+        assert_eq!(parsed["experiment"]["mode"].as_str(), Some("answer"));
         assert!(!experiment.contains("protocol: command"));
         assert!(experiment.contains("command: [\"python3\", \"/opt/agent/buc_agent.py\"]"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn init_experiment_yaml_quotes_user_supplied_scalars() {
+        let root = unique_test_dir("init_yaml_quotes_scalars");
+        let name = "A/B: \"Smoke\"\nSecond line".to_string();
+        let mode = "answer:strict # not a comment".to_string();
+        let options = resolve_init_options(InitOptionArgs {
+            dir: Some(root.clone()),
+            client: Some(InitClientArg::Cli),
+            command: Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
+            mode: mode.clone(),
+            name: Some(name.clone()),
+            ..Default::default()
+        })
+        .expect("init options");
+        run_init(options).expect("run init");
+
+        let experiment = fs::read_to_string(root.join("experiment.yaml")).expect("experiment yaml");
+        let parsed: Value = serde_yaml::from_str(&experiment).expect("experiment YAML parses");
+        let expected_id = slugify(&name);
+
+        assert_eq!(
+            parsed["experiment"]["id"].as_str(),
+            Some(expected_id.as_str())
+        );
+        assert_eq!(parsed["experiment"]["name"].as_str(), Some(name.as_str()));
+        assert_eq!(parsed["experiment"]["mode"].as_str(), Some(mode.as_str()));
+        assert!(experiment.contains("name: \"A/B: \\\"Smoke\\\"\\nSecond line\""));
+        assert!(experiment.contains("mode: \"answer:strict # not a comment\""));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn init_json_uses_public_workspace_refs() {
+        let root = unique_test_dir("init_json_refs");
+        let options = resolve_init_options(InitOptionArgs {
+            dir: Some(root.clone()),
+            client: Some(InitClientArg::Cli),
+            command: Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
+            mode: "answer".to_string(),
+            name: Some("CLI Smoke".to_string()),
+            ..Default::default()
+        })
+        .expect("init options");
+        let result = run_init(options).expect("run init");
+        let payload = init_result_to_json(&result);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["workspace_ref"], "workspace://current");
+        assert_eq!(payload["experiment_ref"], "workspace://experiment.yaml");
+        assert_eq!(payload["cases_ref"], "workspace://cases.jsonl");
+        assert_eq!(payload["agent_ref"], "workspace://agent/buc_agent.py");
+        assert_eq!(
+            payload["next_actions"][1]["experiment_ref"],
+            "workspace://experiment.yaml"
+        );
+        assert!(payload.get("dir").is_none());
+        assert!(payload.get("experiment").is_none());
+        assert!(payload.get("cases").is_none());
+        assert!(payload.get("agent").is_none());
+        assert!(payload.get("next").is_none());
+        assert!(!encoded.contains(&root.display().to_string()));
+        assert!(!encoded.contains("bucephalus_cli_init_json_refs"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn init_result_uses_public_workspace_refs_before_rendering() {
+        let root = unique_test_dir("init_source_refs");
+        let options = resolve_init_options(InitOptionArgs {
+            dir: Some(root.clone()),
+            client: Some(InitClientArg::Cli),
+            command: Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
+            mode: "answer".to_string(),
+            name: Some("CLI Smoke".to_string()),
+            ..Default::default()
+        })
+        .expect("init options");
+
+        let result = run_init(options).expect("run init");
+        let encoded = serde_json::to_string_pretty(&result).unwrap();
+
+        assert_eq!(result["workspace_ref"], "workspace://current");
+        assert_eq!(result["experiment_ref"], "workspace://experiment.yaml");
+        assert_eq!(result["cases_ref"], "workspace://cases.jsonl");
+        assert_eq!(result["agent_ref"], "workspace://agent/buc_agent.py");
+        assert_eq!(
+            result["next_actions"][0]["command"],
+            "bucephalus dev <workspace-dir>"
+        );
+        assert_eq!(
+            result["next_actions"][1]["experiment_ref"],
+            "workspace://experiment.yaml"
+        );
+        for raw_key in ["dir", "experiment", "cases", "agent", "next"] {
+            assert!(
+                result.get(raw_key).is_none(),
+                "init result should not expose raw field {raw_key}: {encoded}"
+            );
+        }
+        let root_text = root.to_string_lossy().to_string();
+        for forbidden in [root_text.as_str(), "bucephalus_cli_init_source_refs"] {
+            assert!(
+                !encoded.contains(forbidden),
+                "init source result leaked forbidden text {forbidden}: {encoded}"
+            );
+        }
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn init_overwrite_error_uses_public_workspace_ref() {
+        let root = unique_test_dir("init_overwrite_ref");
+        let options = resolve_init_options(InitOptionArgs {
+            dir: Some(root.clone()),
+            client: Some(InitClientArg::Cli),
+            command: Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
+            mode: "answer".to_string(),
+            name: Some("CLI Smoke".to_string()),
+            ..Default::default()
+        })
+        .expect("init options");
+        run_init(options).expect("initial init");
+        let options = resolve_init_options(InitOptionArgs {
+            dir: Some(root.clone()),
+            client: Some(InitClientArg::Cli),
+            command: Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
+            mode: "answer".to_string(),
+            name: Some("CLI Smoke".to_string()),
+            ..Default::default()
+        })
+        .expect("init options");
+
+        let err = run_init(options).expect_err("second init should require --force");
+        let message = err.to_string();
+
+        assert!(message.contains("refusing to overwrite generated init files"));
+        assert!(message.contains("workspace://experiment.yaml"));
+        assert!(message.contains("workspace://cases.jsonl"));
+        assert!(message.contains("workspace://agent/buc_agent.py"));
+        assert!(message.contains("workspace://agent/README.md"));
+        assert!(message.contains("--force"));
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "init overwrite error leaked workspace path: {message}"
+        );
+        assert!(!message.contains("bucephalus_cli_init_overwrite_ref"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn init_preflights_all_targets_before_writing() {
+        let root = unique_test_dir("init_preflight_all_targets");
+        fs::create_dir_all(&root).expect("workspace dir");
+        fs::write(root.join("cases.jsonl"), "existing cases\n").expect("existing cases");
+        let options = resolve_init_options(InitOptionArgs {
+            dir: Some(root.clone()),
+            client: Some(InitClientArg::Cli),
+            command: Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
+            mode: "answer".to_string(),
+            name: Some("CLI Smoke".to_string()),
+            ..Default::default()
+        })
+        .expect("init options");
+
+        let err = run_init(options).expect_err("existing cases should block init");
+        let message = err.to_string();
+
+        assert!(message.contains("workspace://cases.jsonl"));
+        assert!(
+            !root.join("experiment.yaml").exists(),
+            "init wrote experiment.yaml before detecting a later conflict"
+        );
+        assert!(
+            !root.join("agent").exists(),
+            "init wrote agent directory before detecting a later conflict"
+        );
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "init preflight error leaked workspace path: {message}"
+        );
+        assert!(!message.contains("bucephalus_cli_init_preflight_all_targets"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn init_preflights_blocked_parent_before_writing() {
+        let root = unique_test_dir("init_preflight_blocked_parent");
+        fs::create_dir_all(&root).expect("workspace dir");
+        fs::write(root.join("agent"), "not a directory\n").expect("blocked agent path");
+        let options = resolve_init_options(InitOptionArgs {
+            dir: Some(root.clone()),
+            client: Some(InitClientArg::Cli),
+            command: Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
+            mode: "answer".to_string(),
+            name: Some("CLI Smoke".to_string()),
+            ..Default::default()
+        })
+        .expect("init options");
+
+        let err = run_init(options).expect_err("blocked agent path should stop init");
+        let message = err.to_string();
+
+        assert!(message.contains("refusing to write generated init files"));
+        assert!(message.contains("blocked_refs"));
+        assert!(message.contains("workspace://agent"));
+        assert!(
+            !root.join("experiment.yaml").exists(),
+            "init wrote experiment.yaml before detecting blocked agent parent"
+        );
+        assert!(
+            !root.join("cases.jsonl").exists(),
+            "init wrote cases.jsonl before detecting blocked agent parent"
+        );
+        assert!(
+            root.join("agent").is_file(),
+            "init should leave the blocked agent path untouched"
+        );
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "init blocked-parent error leaked workspace path: {message}"
+        );
+        assert!(!message.contains("bucephalus_cli_init_preflight_blocked_parent"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_force_refuses_symlinked_generated_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_test_dir("init_preflight_symlink_parent");
+        let outside = unique_test_dir("init_preflight_symlink_outside");
+        fs::create_dir_all(&root).expect("workspace dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        symlink(&outside, root.join("agent")).expect("symlinked agent dir");
+        let options = resolve_init_options(InitOptionArgs {
+            dir: Some(root.clone()),
+            client: Some(InitClientArg::Cli),
+            command: Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
+            mode: "answer".to_string(),
+            name: Some("CLI Smoke".to_string()),
+            force: true,
+            ..Default::default()
+        })
+        .expect("init options");
+
+        let err = run_init(options).expect_err("symlinked agent path should stop init");
+        let message = err.to_string();
+
+        assert!(message.contains("refusing to write generated init files"));
+        assert!(message.contains("blocked_refs"));
+        assert!(message.contains("workspace://agent"));
+        assert!(
+            !root.join("experiment.yaml").exists(),
+            "init wrote experiment.yaml before detecting symlinked agent parent"
+        );
+        assert!(
+            !outside.join("buc_agent.py").exists(),
+            "init wrote through symlinked generated parent"
+        );
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "init symlink-parent error leaked workspace path: {message}"
+        );
+        assert!(
+            !message.contains(&outside.display().to_string()),
+            "init symlink-parent error leaked outside path: {message}"
+        );
+        assert!(!message.contains("bucephalus_cli_init_preflight_symlink_parent"));
+        assert!(!message.contains("bucephalus_cli_init_preflight_symlink_outside"));
+
+        fs::remove_file(root.join("agent")).expect("remove symlink");
+        fs::remove_dir_all(root).expect("cleanup root");
+        fs::remove_dir_all(outside).expect("cleanup outside");
+    }
+
+    #[test]
+    fn init_handoff_lines_use_public_workspace_refs() {
+        let root = unique_test_dir("init_handoff_refs");
+        let options = resolve_init_options(InitOptionArgs {
+            dir: Some(root.clone()),
+            client: Some(InitClientArg::Cli),
+            command: Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
+            mode: "answer".to_string(),
+            name: Some("CLI Smoke".to_string()),
+            ..Default::default()
+        })
+        .expect("init options");
+        let result = run_init(options).expect("run init");
+        let lines = init_handoff_lines(&result);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("workspace_ref: workspace://current"));
+        assert!(rendered.contains("experiment_ref: workspace://experiment.yaml"));
+        assert!(rendered.contains("cases_ref: workspace://cases.jsonl"));
+        assert!(rendered.contains("agent_ref: workspace://agent/buc_agent.py"));
+        assert!(rendered.contains("next: bucephalus dev <workspace-dir> (workspace://current)"));
+        assert!(rendered
+            .contains("next: bucephalus run <experiment-yaml> (workspace://experiment.yaml)"));
+        assert!(!rendered.contains(&root.display().to_string()));
+        assert!(!rendered.contains("bucephalus_cli_init_handoff_refs"));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -11750,6 +23513,1278 @@ mod tests {
     }
 
     #[test]
+    fn public_run_ref_omits_local_filesystem_path() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+        let rendered = public_run_ref(&run_dir);
+
+        assert_eq!(rendered, "run://run_20260609_123456");
+        assert!(!rendered.contains("/Users/alice"));
+        assert!(!rendered.contains(".bucephalus"));
+    }
+
+    #[test]
+    fn public_run_ref_redacts_unusual_run_id() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_1 token=raw-run-token");
+        let rendered = public_run_ref(&run_dir);
+
+        assert_eq!(rendered, "run://redacted");
+        assert!(!rendered.contains("/Users/alice"));
+        assert!(!rendered.contains("raw-run-token"));
+        assert!(!rendered.contains("token="));
+    }
+
+    #[test]
+    fn public_run_path_ref_omits_local_filesystem_path() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+
+        assert_eq!(
+            public_run_path_ref(&run_dir, &run_dir.join("evaluation").join("summary.json")),
+            "run://evaluation/summary.json"
+        );
+        assert_eq!(
+            public_run_path_ref(&run_dir, &run_dir),
+            "run://run_20260609_123456"
+        );
+        assert_eq!(
+            public_run_path_ref(&run_dir, Path::new("/Users/alice/private/outside.json")),
+            "[REDACTED:local-path]"
+        );
+    }
+
+    #[test]
+    fn public_package_path_ref_omits_local_filesystem_path() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+
+        assert_eq!(
+            public_package_path_ref(&package_dir, &package_dir.join("tasks").join("tasks.jsonl")),
+            "package://tasks/tasks.jsonl"
+        );
+        assert_eq!(
+            public_package_path_ref(&package_dir, &package_dir),
+            "package://."
+        );
+        assert_eq!(
+            public_package_path_ref(&package_dir, Path::new("/Users/alice/private/raw.jsonl")),
+            "[REDACTED:local-path]"
+        );
+    }
+
+    #[test]
+    fn latch_generation_json_uses_public_refs() {
+        let root = PathBuf::from("/Users/alice/.bucephalus/latch/demo");
+        let materials = json!({
+            "status": "completed",
+            "count": 1,
+            "items": [
+                {
+                    "id": "seed",
+                    "path": "materials/seed.txt",
+                    "digest": "sha256:abc"
+                }
+            ]
+        });
+        let raw = json!({
+            "schema_version": "latch_demo_v1",
+            "resolution_path": root.join("resolution.json"),
+            "resolution": {
+                "manifest_path": root.join("manifest.json"),
+                "seed_dir": root.join("seed"),
+                "materials": materials.clone()
+            },
+            "manifest_path": root.join("manifest.json"),
+            "seed_dir": root.join("seed"),
+            "materials": materials,
+            "next": [
+                format!("bucephalus latch validate {}", root.join("manifest.json").display())
+            ]
+        });
+
+        let payload = latch_generation_result_to_json(&root, &raw);
+        let mcp_payload = mcp_public_payload(payload.clone());
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["output_ref"], "latch://.");
+        assert_eq!(payload["resolution_ref"], "latch://resolution.json");
+        assert_eq!(payload["manifest_ref"], "latch://manifest.json");
+        assert_eq!(payload["seed_ref"], "latch://seed");
+        assert_eq!(
+            payload["materials"]["items"][0]["path_ref"],
+            "latch://materials/seed.txt"
+        );
+        assert_eq!(
+            payload["resolution"]["materials"]["items"][0]["path_ref"],
+            "latch://materials/seed.txt"
+        );
+        assert_eq!(
+            mcp_payload["materials"]["items"][0]["path_ref"],
+            "latch://materials/seed.txt"
+        );
+        assert_eq!(
+            payload["resolution"]["manifest_ref"],
+            "latch://manifest.json"
+        );
+        assert_eq!(payload["resolution"]["seed_ref"], "latch://seed");
+        assert_eq!(
+            payload["next_actions"][0]["manifest_ref"],
+            "latch://manifest.json"
+        );
+        assert!(payload.get("resolution_path").is_none());
+        assert!(payload.get("manifest_path").is_none());
+        assert!(payload.get("seed_dir").is_none());
+        assert!(payload.get("next").is_none());
+        assert!(payload["materials"]["items"][0].get("path").is_none());
+        assert!(payload["resolution"].get("manifest_path").is_none());
+        assert!(payload["resolution"].get("seed_dir").is_none());
+        assert!(payload["resolution"]["materials"]["items"][0]
+            .get("path")
+            .is_none());
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains(".bucephalus/latch"));
+        assert!(!mcp_payload.to_string().contains("[REDACTED:local-path]"));
+    }
+
+    #[test]
+    fn cloud_latch_resolution_materializes_completed_output() {
+        let root = unique_test_dir("cloud_latch_resolution_complete");
+        let expected_digest = sha256_bytes(b"hello");
+        let response = json!({
+            "schema_version": "latch_resolution_v1",
+            "resolution_id": "resolution_1",
+            "manifest": {
+                "schema_version": lab_runner::LATCH_MANIFEST_SCHEMA,
+                "cases": []
+            },
+            "materials": [{
+                "id": "seed",
+                "target_path": "seed.txt",
+                "text": "hello",
+                "digest": expected_digest
+            }]
+        });
+
+        let result = materialize_cloud_latch_resolution(
+            &root,
+            "remote:bench",
+            1,
+            vec!["python3".to_string(), "agent.py".to_string()],
+            response,
+        )
+        .expect("cloud latch resolution");
+
+        assert!(root.join("resolution.json").is_file());
+        assert!(root.join("manifest.json").is_file());
+        assert_eq!(
+            fs::read_to_string(root.join("materials").join("seed.txt")).unwrap(),
+            "hello"
+        );
+        let resolution_path = root.join("resolution.json").to_string_lossy().to_string();
+        let manifest_path = root.join("manifest.json").to_string_lossy().to_string();
+        assert_eq!(
+            result["resolution_path"].as_str(),
+            Some(resolution_path.as_str())
+        );
+        assert_eq!(
+            result["manifest_path"].as_str(),
+            Some(manifest_path.as_str())
+        );
+        assert_eq!(result["materials"]["status"], "completed");
+        assert_no_latch_resolution_tmp_siblings(&root);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn cloud_latch_resolution_digest_mismatch_leaves_no_output_or_stage() {
+        let root = unique_test_dir("cloud_latch_resolution_digest_mismatch");
+        let response = json!({
+            "schema_version": "latch_resolution_v1",
+            "resolution_id": "resolution_1",
+            "manifest": {
+                "schema_version": lab_runner::LATCH_MANIFEST_SCHEMA,
+                "cases": []
+            },
+            "materials": [{
+                "id": "seed",
+                "target_path": "seed.txt",
+                "text": "hello",
+                "digest": "sha256:not-the-digest"
+            }]
+        });
+
+        let err = materialize_cloud_latch_resolution(
+            &root,
+            "remote:bench",
+            1,
+            vec!["python3".to_string(), "agent.py".to_string()],
+            response,
+        )
+        .expect_err("digest mismatch should fail resolution");
+        let message = err.to_string();
+
+        assert!(message.contains("digest mismatch"));
+        assert!(
+            !root.exists(),
+            "failed cloud latch resolution published partial output"
+        );
+        assert_no_latch_resolution_tmp_siblings(&root);
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "cloud latch resolution error leaked output path: {message}"
+        );
+        assert!(!message.contains("cloud_latch_resolution_digest_mismatch"));
+    }
+
+    fn assert_no_latch_resolution_tmp_siblings(out: &Path) {
+        let parent = out.parent().unwrap_or_else(|| Path::new("."));
+        let name = out
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("latch-resolution");
+        let prefix = format!(".{}.latch-resolution-tmp.", name);
+        for entry in fs::read_dir(parent).expect("read latch output parent") {
+            let entry = entry.expect("read latch output sibling");
+            let sibling = entry.file_name();
+            let sibling = sibling.to_string_lossy();
+            assert!(
+                !sibling.starts_with(&prefix),
+                "latch resolution staging directory was not cleaned up: {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    #[test]
+    fn latch_generation_handoff_lines_use_public_refs() {
+        let root = PathBuf::from("/Users/alice/.bucephalus/latch/demo");
+        let raw = json!({
+            "schema_version": "latch_demo_v1",
+            "resolution_path": root.join("resolution.json"),
+            "resolution": {
+                "manifest_path": root.join("manifest.json"),
+                "seed_dir": root.join("seed"),
+                "benchmark": {"id": "local:file-edit-smoke"},
+                "case_count": 2,
+                "launch_source": "local_fixture"
+            },
+            "manifest_path": root.join("manifest.json"),
+            "seed_dir": root.join("seed"),
+            "next": [
+                format!("bucephalus latch validate {}", root.join("manifest.json").display()),
+                format!("bucephalus latch run {} --json", root.join("manifest.json").display())
+            ]
+        });
+
+        let lines = latch_generation_handoff_lines(&root, &raw, true);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("output_ref: latch://."));
+        assert!(rendered.contains("resolution_ref: latch://resolution.json"));
+        assert!(rendered.contains("manifest_ref: latch://manifest.json"));
+        assert!(rendered.contains("seed_ref: latch://seed"));
+        assert!(rendered.contains("benchmark: local:file-edit-smoke"));
+        assert!(rendered.contains("case_count: 2"));
+        assert!(rendered.contains("launch_source: local_fixture"));
+        assert!(rendered
+            .contains("next: bucephalus latch validate <manifest-path> (latch://manifest.json)"));
+        assert!(rendered
+            .contains("next: bucephalus latch run <manifest-path> --json (latch://manifest.json)"));
+        assert!(!rendered.contains("/Users/alice"));
+        assert!(!rendered.contains(".bucephalus/latch"));
+        assert!(!rendered.contains("manifest_path"));
+        assert!(!rendered.contains("seed_dir"));
+    }
+
+    #[test]
+    fn latch_generation_handoff_lines_can_omit_next_actions() {
+        let root = PathBuf::from("/Users/alice/.bucephalus/latch/demo");
+        let raw = json!({
+            "schema_version": "latch_demo_v1",
+            "resolution_path": root.join("resolution.json"),
+            "manifest_path": root.join("manifest.json"),
+            "seed_dir": root.join("seed"),
+            "next": [
+                format!("bucephalus latch run {} --json", root.join("manifest.json").display())
+            ]
+        });
+
+        let lines = latch_generation_handoff_lines(&root, &raw, false);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("resolution_ref: latch://resolution.json"));
+        assert!(rendered.contains("manifest_ref: latch://manifest.json"));
+        assert!(rendered.contains("seed_ref: latch://seed"));
+        assert!(!rendered.contains("next:"));
+        assert!(!rendered.contains("/Users/alice"));
+        assert!(!rendered.contains(".bucephalus/latch"));
+    }
+
+    #[test]
+    fn latch_validation_json_uses_public_manifest_ref() {
+        let root = PathBuf::from("/Users/alice/.bucephalus/latch/demo");
+        let validation = lab_runner::LatchManifestValidation {
+            schema_version: lab_runner::LATCH_MANIFEST_SCHEMA.to_string(),
+            manifest_path: root.join("manifest.json"),
+            case_count: 2,
+            default_launch_present: true,
+            default_workspace_seed_present: true,
+        };
+
+        let payload = latch_manifest_validation_to_json(&validation);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["manifest_ref"], "latch://manifest.json");
+        assert!(payload.get("manifest_path").is_none());
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains(".bucephalus/latch"));
+    }
+
+    #[test]
+    fn latch_run_json_uses_public_run_refs() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+        let mut upload_headers = BTreeMap::new();
+        upload_headers.insert(
+            "Authorization".to_string(),
+            "Bearer live-secret".to_string(),
+        );
+        let result = lab_runner::LatchRunResult {
+            schema_version: lab_runner::LATCH_RESULT_SCHEMA.to_string(),
+            run_id: "run_20260609_123456".to_string(),
+            run_dir: run_dir.clone(),
+            enforcement_level: lab_runner::EnforcementLevel::Guarded,
+            started_at: "2026-06-09T12:00:00Z".to_string(),
+            ended_at: "2026-06-09T12:01:00Z".to_string(),
+            cases: vec![lab_runner::LatchCaseResult {
+                case_id: "case_1".to_string(),
+                task_id: "task_1".to_string(),
+                status: lab_runner::LatchCaseStatus::Completed,
+                exit_code: Some(0),
+                enforcement_level: lab_runner::EnforcementLevel::Guarded,
+                started_at: "2026-06-09T12:00:00Z".to_string(),
+                ended_at: "2026-06-09T12:01:00Z".to_string(),
+                workspace_dir: run_dir.join("cases").join("case_1").join("workspace"),
+                stdout_path: run_dir.join("cases").join("case_1").join("stdout.log"),
+                stderr_path: run_dir.join("cases").join("case_1").join("stderr.log"),
+                result_path: Some(run_dir.join("cases").join("case_1").join("result.json")),
+                workspace_diff_path: Some(
+                    run_dir.join("cases").join("case_1").join("workspace.patch"),
+                ),
+                workspace_diff_digest: Some("sha256:abc".to_string()),
+                capture_error: Some("failed in /Users/alice/private/workspace".to_string()),
+                upload: Some(lab_runner::UploadSpec {
+                    result_url: Some("https://example.com/results?token=live-secret".to_string()),
+                    headers: upload_headers,
+                }),
+                grade: Some(lab_runner::LatchGradeResult {
+                    status: lab_runner::LatchGradeStatus::Passed,
+                    grader_kind: "artifact_pure".to_string(),
+                    locus: "case".to_string(),
+                    requires: vec![],
+                    reason: Some("checked /Users/alice/private/grader".to_string()),
+                    score: Some(1.0),
+                    stdout_path: Some(run_dir.join("cases").join("case_1").join("grade.out")),
+                    stderr_path: None,
+                    output_path: Some(run_dir.join("cases").join("case_1").join("grade.json")),
+                }),
+            }],
+        };
+
+        let payload = latch_run_result_to_json(&result);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["run_ref"], "run://run_20260609_123456");
+        assert_eq!(
+            payload["cases"][0]["workspace_ref"],
+            "run://cases/case_1/workspace"
+        );
+        assert_eq!(
+            payload["cases"][0]["workspace_diff_ref"],
+            "run://cases/case_1/workspace.patch"
+        );
+        assert_eq!(
+            payload["cases"][0]["grade"]["output_ref"],
+            "run://cases/case_1/grade.json"
+        );
+        assert_eq!(
+            payload["cases"][0]["capture_error"],
+            "failed in [REDACTED:local-path]"
+        );
+        assert_eq!(
+            payload["cases"][0]["grade"]["reason"],
+            "checked [REDACTED:local-path]"
+        );
+        assert_eq!(payload["cases"][0]["upload"]["headers_redacted"], true);
+        assert!(payload.get("run_dir").is_none());
+        assert!(payload["cases"][0].get("workspace_dir").is_none());
+        assert!(payload["cases"][0].get("stdout_path").is_none());
+        assert!(payload["cases"][0]["grade"].get("output_path").is_none());
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains(".bucephalus/runs"));
+        assert!(!encoded.contains("live-secret"));
+    }
+
+    #[test]
+    fn latch_run_handoff_lines_use_public_refs_and_redacted_capture_errors() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+        let result = lab_runner::LatchRunResult {
+            schema_version: lab_runner::LATCH_RESULT_SCHEMA.to_string(),
+            run_id: "run_20260609_123456".to_string(),
+            run_dir: run_dir.clone(),
+            enforcement_level: lab_runner::EnforcementLevel::Guarded,
+            started_at: "2026-06-09T12:00:00Z".to_string(),
+            ended_at: "2026-06-09T12:01:00Z".to_string(),
+            cases: vec![
+                lab_runner::LatchCaseResult {
+                    case_id: "case_1".to_string(),
+                    task_id: "task_1".to_string(),
+                    status: lab_runner::LatchCaseStatus::Completed,
+                    exit_code: Some(0),
+                    enforcement_level: lab_runner::EnforcementLevel::Guarded,
+                    started_at: "2026-06-09T12:00:00Z".to_string(),
+                    ended_at: "2026-06-09T12:01:00Z".to_string(),
+                    workspace_dir: run_dir.join("cases").join("case_1").join("workspace"),
+                    stdout_path: run_dir.join("cases").join("case_1").join("stdout.log"),
+                    stderr_path: run_dir.join("cases").join("case_1").join("stderr.log"),
+                    result_path: Some(run_dir.join("cases").join("case_1").join("result.json")),
+                    workspace_diff_path: Some(
+                        run_dir.join("cases").join("case_1").join("workspace.patch"),
+                    ),
+                    workspace_diff_digest: Some("sha256:abc".to_string()),
+                    capture_error: Some(
+                        "failed in /Users/alice/private/workspace token=raw-token".to_string(),
+                    ),
+                    upload: None,
+                    grade: None,
+                },
+                lab_runner::LatchCaseResult {
+                    case_id: "case_2".to_string(),
+                    task_id: "task_2".to_string(),
+                    status: lab_runner::LatchCaseStatus::Errored,
+                    exit_code: Some(1),
+                    enforcement_level: lab_runner::EnforcementLevel::Guarded,
+                    started_at: "2026-06-09T12:00:00Z".to_string(),
+                    ended_at: "2026-06-09T12:01:00Z".to_string(),
+                    workspace_dir: run_dir.join("cases").join("case_2").join("workspace"),
+                    stdout_path: run_dir.join("cases").join("case_2").join("stdout.log"),
+                    stderr_path: run_dir.join("cases").join("case_2").join("stderr.log"),
+                    result_path: None,
+                    workspace_diff_path: Some(PathBuf::from("/Users/alice/private/outside.patch")),
+                    workspace_diff_digest: None,
+                    capture_error: None,
+                    upload: None,
+                    grade: None,
+                },
+            ],
+        };
+
+        let lines = latch_run_handoff_lines(&result, true);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("latch_run_id: run_20260609_123456"));
+        assert!(rendered.contains("run_ref: run://run_20260609_123456"));
+        assert!(rendered.contains(
+            "case case_1: Completed exit=Some(0) patch=run://cases/case_1/workspace.patch"
+        ));
+        assert!(rendered.contains("case case_2: Errored exit=Some(1) patch=[REDACTED:local-path]"));
+        assert!(rendered
+            .contains("capture: failed in [REDACTED:local-path] token=[REDACTED:secret-like]"));
+        assert!(!rendered.contains("/Users/alice"));
+        assert!(!rendered.contains(".bucephalus/runs"));
+        assert!(!rendered.contains("raw-token"));
+        assert!(!rendered.contains("outside.patch"));
+
+        let smoke_lines = latch_run_handoff_lines(&result, false).join("\n");
+        assert!(!smoke_lines.contains("patch="));
+        assert!(smoke_lines.contains("capture: failed in [REDACTED:local-path]"));
+    }
+
+    #[test]
+    fn build_result_json_uses_public_refs() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let build = lab_runner::BuildResult {
+            package_dir: package_dir.clone(),
+            manifest_path: package_dir.join("manifest.json"),
+            checksums_path: package_dir.join("checksums.json"),
+            package_checks_path: package_dir.join("package_checks.json"),
+        };
+        let payload = with_build_refs(json!({"ok": true}), &build);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["package_ref"], "package://.");
+        assert_eq!(payload["manifest_ref"], "package://manifest.json");
+        assert_eq!(payload["checksums_ref"], "package://checksums.json");
+        assert_eq!(
+            payload["package_checks_ref"],
+            "package://package_checks.json"
+        );
+        assert!(payload.get("package_dir").is_none());
+        assert!(payload.get("manifest_path").is_none());
+        assert!(payload.get("checksums_path").is_none());
+        assert!(payload.get("package_checks_path").is_none());
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains("private/package"));
+    }
+
+    #[test]
+    fn build_handoff_fields_use_public_refs() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let build = lab_runner::BuildResult {
+            package_dir: package_dir.clone(),
+            manifest_path: package_dir.join("manifest.json"),
+            checksums_path: package_dir.join("checksums.json"),
+            package_checks_path: package_dir.join("package_checks.json"),
+        };
+        let fields = build_handoff_fields(&build);
+        let encoded = format!("{fields:?}");
+
+        assert_eq!(
+            fields,
+            vec![
+                ("package_ref".to_string(), "package://.".to_string()),
+                (
+                    "manifest_ref".to_string(),
+                    "package://manifest.json".to_string()
+                ),
+                (
+                    "checksums_ref".to_string(),
+                    "package://checksums.json".to_string()
+                ),
+                (
+                    "package_checks_ref".to_string(),
+                    "package://package_checks.json".to_string()
+                )
+            ]
+        );
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains("private/package"));
+    }
+
+    #[test]
+    fn package_progress_lines_use_public_refs() {
+        let experiment = PathBuf::from("/Users/alice/private/project/experiment.yaml");
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let lines = [
+            build_package_progress_line(&experiment),
+            checking_package_progress_line(&package_dir),
+            loading_package_progress_line(&package_dir),
+            preparing_runtime_images_progress_line(&package_dir),
+            running_preflight_progress_line(&package_dir),
+        ];
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("building package from: workspace://experiment.yaml"));
+        assert!(rendered.contains("checking package: package://."));
+        assert!(rendered.contains("loading package: package://."));
+        assert!(rendered.contains("preparing runtime images from package: package://."));
+        assert!(rendered.contains("running preflight: package://."));
+        assert!(!rendered.contains("/Users/alice"));
+        assert!(!rendered.contains("private/project"));
+        assert!(!rendered.contains("private/package"));
+    }
+
+    #[test]
+    fn package_target_error_uses_public_target_ref() {
+        let target = PathBuf::from("/Users/alice/private/project/experiment.yaml");
+        let message =
+            package_command_target_error("preflight", &target, "target is an experiment YAML")
+                .to_string();
+
+        assert!(message.contains("target_ref: workspace://experiment.yaml"));
+        assert!(message.contains("bucephalus build experiment.yaml --out <package-dir>"));
+        assert!(!message.contains("/Users/alice"));
+        assert!(!message.contains("private/project"));
+    }
+
+    #[test]
+    fn package_ref_json_uses_public_ref() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let payload = with_package_ref(json!({"ok": true}), &package_dir);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["package_ref"], "package://.");
+        assert!(payload.get("package_dir").is_none());
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains("private/package"));
+    }
+
+    #[test]
+    fn validation_json_uses_public_package_ref() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let validation = lab_runner::ExperimentBundleValidation {
+            package_digest: "sha256:abc".to_string(),
+            experiment_id: Some("exp-1".to_string()),
+            package_dir,
+            smoke_tested: true,
+            smoke_run_id: Some("run_20260609_123456".to_string()),
+            smoke_tested_at_ms: Some(1_781_023_456_000),
+        };
+        let payload = experiment_bundle_validation_to_json(&validation);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["package_ref"], "package://.");
+        assert!(payload.get("package_dir").is_none());
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains("private/package"));
+    }
+
+    #[test]
+    fn run_validation_prompt_uses_public_package_ref() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let validation = lab_runner::ExperimentBundleValidation {
+            package_digest: "sha256:abc".to_string(),
+            experiment_id: Some("exp-1".to_string()),
+            package_dir: package_dir.clone(),
+            smoke_tested: false,
+            smoke_run_id: None,
+            smoke_tested_at_ms: None,
+        };
+
+        let prompt = run_validation_action_prompt(&package_dir, &validation);
+
+        assert!(prompt.contains("This experiment bundle has not been smoke tested."));
+        assert!(prompt.contains("package_ref: package://."));
+        assert!(prompt.contains("1. Run smoke test now"));
+        assert!(!prompt.contains("package_dir"));
+        assert!(!prompt.contains("/Users/alice"));
+        assert!(!prompt.contains("private/package"));
+    }
+
+    #[test]
+    fn run_validation_json_error_uses_public_package_ref() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let validation = lab_runner::ExperimentBundleValidation {
+            package_digest: "sha256:abc".to_string(),
+            experiment_id: Some("exp-1".to_string()),
+            package_dir: package_dir.clone(),
+            smoke_tested: false,
+            smoke_run_id: None,
+            smoke_tested_at_ms: None,
+        };
+
+        let err = resolve_run_validation_action(&package_dir, &validation, false, false, true)
+            .expect_err("JSON validation boundary should reject unsmoked package");
+        let message = err.to_string();
+
+        assert!(message.contains("experiment bundle sha256:abc is not smoke tested"));
+        assert!(message.contains("package_ref: package://."));
+        assert!(message.contains("bucephalus run <package-dir> --smoke-test"));
+        assert!(message.contains("bucephalus run <package-dir> --run-dangerously"));
+        assert!(!message.contains("/Users/alice"));
+        assert!(!message.contains("private/package"));
+    }
+
+    #[test]
+    fn run_result_json_uses_public_refs() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+        let result = lab_runner::RunResult {
+            run_dir: run_dir.clone(),
+            run_id: "run_20260609_123456".to_string(),
+            account_db_path: run_dir.join(".bucephalus").join("bucephalus.sqlite"),
+        };
+        let payload = run_result_to_json(&result);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["run_id"], "run_20260609_123456");
+        assert_eq!(payload["run_ref"], "run://run_20260609_123456");
+        assert_eq!(
+            payload["run_store_ref"],
+            "run://.bucephalus/bucephalus.sqlite"
+        );
+        assert!(payload.get("run_dir").is_none());
+        assert!(payload.get("run_store_location").is_none());
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains(".bucephalus/runs"));
+    }
+
+    #[test]
+    fn run_artifacts_json_uses_run_relative_refs() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+        let result = lab_runner::RunResult {
+            run_dir: run_dir.clone(),
+            run_id: "run_20260609_123456".to_string(),
+            account_db_path: PathBuf::from("/Users/alice/outside/bucephalus.sqlite"),
+        };
+        let payload = run_artifacts_to_json(&result);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["run_store_ref"], "[REDACTED:local-path]");
+        assert_eq!(payload["objects_ref"], "run://objects");
+        assert_eq!(payload["evaluation_summary_ref"], "run://evaluation");
+        assert!(payload.get("objects_dir").is_none());
+        assert!(payload.get("evaluation_summary_path").is_none());
+        assert!(!encoded.contains("/Users/alice"));
+    }
+
+    #[test]
+    fn publish_report_json_uses_public_refs() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+        let report = provenance::DebugBundleReport {
+            bundle_path: run_dir
+                .join("debug_bundles")
+                .join("support-bundle-20260609.zip"),
+            included: vec![provenance::DebugBundleIncluded {
+                path: "manifest.json".to_string(),
+                kind: "json".to_string(),
+                redacted: true,
+            }],
+            skipped: vec![provenance::DebugBundleSkipped {
+                path: "trials/trial_1/raw.log".to_string(),
+                reason: "unsupported_artifact".to_string(),
+            }],
+        };
+
+        let payload = publish_report_to_json(&run_dir, &report, true);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["run_ref"], "run://run_20260609_123456");
+        assert_eq!(
+            payload["bundle_ref"],
+            "run://debug_bundles/support-bundle-20260609.zip"
+        );
+        assert_eq!(payload["default_output"], true);
+        assert_eq!(payload["included_files"], 1);
+        assert_eq!(payload["redacted_files"], 1);
+        assert_eq!(payload["skipped_files"], 1);
+        assert_eq!(payload["included"][0]["path"], "manifest.json");
+        assert!(payload.get("run_dir").is_none());
+        assert!(payload.get("bundle").is_none());
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains(".bucephalus/runs"));
+    }
+
+    #[test]
+    fn publish_report_json_redacts_external_bundle_path() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+        let report = provenance::DebugBundleReport {
+            bundle_path: PathBuf::from("/Users/alice/Desktop/support.zip"),
+            included: vec![],
+            skipped: vec![],
+        };
+
+        let payload = publish_report_to_json(&run_dir, &report, false);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["run_ref"], "run://run_20260609_123456");
+        assert_eq!(payload["bundle_ref"], "[REDACTED:local-path]");
+        assert_eq!(payload["default_output"], false);
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains("Desktop/support.zip"));
+    }
+
+    #[test]
+    fn publish_report_json_publicizes_entry_paths_and_reasons() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+        let report = provenance::DebugBundleReport {
+            bundle_path: run_dir
+                .join("debug_bundles")
+                .join("support-bundle-20260609.zip"),
+            included: vec![
+                provenance::DebugBundleIncluded {
+                    path: run_dir
+                        .join("trials")
+                        .join("trial_1")
+                        .join("state.json")
+                        .display()
+                        .to_string(),
+                    kind: "json".to_string(),
+                    redacted: true,
+                },
+                provenance::DebugBundleIncluded {
+                    path: "manifest.json".to_string(),
+                    kind: "json".to_string(),
+                    redacted: true,
+                },
+            ],
+            skipped: vec![provenance::DebugBundleSkipped {
+                path: "/Users/alice/Desktop/raw.log".to_string(),
+                reason: "failed to read /Users/alice/Desktop/raw.log token=raw-publish-secret"
+                    .to_string(),
+            }],
+        };
+
+        let payload = publish_report_to_json(&run_dir, &report, true);
+        let encoded = serde_json::to_string_pretty(&payload).unwrap();
+
+        assert_eq!(
+            payload["included"][0]["path"],
+            "run://trials/trial_1/state.json"
+        );
+        assert_eq!(payload["included"][1]["path"], "manifest.json");
+        assert_eq!(payload["skipped"][0]["path"], "[REDACTED:local-path]");
+        assert_eq!(
+            payload["skipped"][0]["reason"],
+            "failed to read [REDACTED:local-path] token=[REDACTED:secret-like]"
+        );
+        for forbidden in [
+            "/Users/alice",
+            "Desktop/raw.log",
+            "raw-publish-secret",
+            ".bucephalus/runs",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "publish report leaked forbidden text {forbidden}: {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_management_json_uses_public_refs() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+        let kill = lab_runner::KillResult {
+            run_id: "run_20260609_123456".to_string(),
+            run_dir: run_dir.clone(),
+            previous_status: "running".to_string(),
+            killed_trials: vec!["trial_1".to_string()],
+        };
+        let replay = lab_runner::ReplayResult {
+            replay_dir: run_dir.join("replays").join("replay_20260609_123456"),
+            replay_id: "replay_20260609_123456".to_string(),
+            parent_trial_id: "trial_1".to_string(),
+            strict: false,
+            replay_grade: "not_run".to_string(),
+            harness_status: "not_run".to_string(),
+        };
+        let fork = lab_runner::ForkResult {
+            fork_dir: run_dir.join("forks").join("fork_20260609_123456"),
+            fork_id: "fork_20260609_123456".to_string(),
+            parent_trial_id: "trial_1".to_string(),
+            selector: "checkpoint:cp1".to_string(),
+            strict: true,
+            replay_grade: "not_run".to_string(),
+            harness_status: "not_run".to_string(),
+            source_checkpoint: Some("cp1".to_string()),
+        };
+        let resume = lab_runner::ResumeResult {
+            trial_id: "trial_1".to_string(),
+            mode: lab_runner::ResumeMode::Fork,
+            selector: Some("checkpoint:cp1".to_string()),
+            fork: Some(lab_runner::ForkResult {
+                fork_dir: run_dir.join("forks").join("fork_20260609_123456"),
+                fork_id: "fork_20260609_123456".to_string(),
+                parent_trial_id: "trial_1".to_string(),
+                selector: "checkpoint:cp1".to_string(),
+                strict: true,
+                replay_grade: "not_run".to_string(),
+                harness_status: "not_run".to_string(),
+                source_checkpoint: Some("cp1".to_string()),
+            }),
+        };
+
+        let payload = json!({
+            "kill": kill_result_to_json(&kill),
+            "replay": replay_result_to_json(&replay),
+            "fork": fork_result_to_json(&fork),
+            "resume": resume_result_to_json(&resume),
+        });
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["kill"]["run_ref"], "run://run_20260609_123456");
+        assert_eq!(
+            payload["replay"]["replay_ref"],
+            "run://replays/replay_20260609_123456"
+        );
+        assert_eq!(
+            payload["fork"]["fork_ref"],
+            "run://forks/fork_20260609_123456"
+        );
+        assert_eq!(
+            payload["resume"]["fork"]["fork_ref"],
+            "run://forks/fork_20260609_123456"
+        );
+        assert!(payload["kill"].get("run_dir").is_none());
+        assert!(payload["replay"].get("replay_dir").is_none());
+        assert!(payload["fork"].get("fork_dir").is_none());
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains(".bucephalus/runs"));
+    }
+
+    #[test]
+    fn run_handoff_fields_use_public_refs() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+
+        let normal = run_handoff_fields(None, "run_20260609_123456", &run_dir);
+        let smoke = run_handoff_fields(Some("smoke"), "run_20260609_123456", &run_dir);
+        let encoded = format!("{normal:?}\n{smoke:?}");
+
+        assert_eq!(
+            normal,
+            vec![
+                ("run_id".to_string(), "run_20260609_123456".to_string()),
+                (
+                    "run_ref".to_string(),
+                    "run://run_20260609_123456".to_string()
+                )
+            ]
+        );
+        assert_eq!(
+            smoke,
+            vec![
+                (
+                    "smoke_run_id".to_string(),
+                    "run_20260609_123456".to_string()
+                ),
+                (
+                    "smoke_run_ref".to_string(),
+                    "run://run_20260609_123456".to_string()
+                )
+            ]
+        );
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains(".bucephalus/runs"));
+    }
+
+    #[test]
+    fn child_run_path_ref_redacts_unrecognized_path() {
+        let rendered = public_child_run_path_ref(Path::new(
+            "/Users/alice/.bucephalus/runs/run_20260609_123456/artifacts/output.json",
+        ));
+
+        assert_eq!(rendered, "[REDACTED:local-path]");
+    }
+
+    #[test]
+    fn summary_json_uses_package_relative_dataset_ref() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let summary = lab_runner::ExperimentSummary {
+            exp_id: "experiment-1".to_string(),
+            workload_type: "cases".to_string(),
+            dataset_path: package_dir.join("tasks").join("tasks.jsonl"),
+            task_count: 2,
+            replications: 1,
+            variant_count: 2,
+            total_trials: 4,
+            agent_runtime_command: vec![
+                "/Users/alice/private/bin/agent".to_string(),
+                "--config=/Users/alice/private/config.json".to_string(),
+                "--token".to_string(),
+                "raw-agent-token".to_string(),
+                "OPENAI_API_KEY=sk-live-summary".to_string(),
+                "run".to_string(),
+            ],
+            image: Some(
+                "https://registry-user:registry-secret@registry.example/image?token=raw-image-token#frag"
+                    .to_string(),
+            ),
+            network_mode: "none".to_string(),
+            trajectory_path: Some("/Users/alice/private/trajectory.jsonl".to_string()),
+            causal_extraction: Some("token=raw-causal-token".to_string()),
+            scheduling: "paired_interleaved".to_string(),
+            state_policy: "isolate_per_trial".to_string(),
+            comparison: "paired".to_string(),
+            retry_max_attempts: 0,
+            preflight_warnings: vec![
+                "grader warning from /Users/alice/private/grader token=raw-warning-token"
+                    .to_string(),
+            ],
+        };
+
+        let payload = summary_to_json(&package_dir, &summary);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["dataset_ref"], "package://tasks/tasks.jsonl");
+        assert_eq!(payload["agent_runtime"][0], "[REDACTED:local-path]");
+        assert_eq!(
+            payload["agent_runtime"][1],
+            "--config=[REDACTED:local-path]"
+        );
+        assert_eq!(payload["agent_runtime"][2], "--token");
+        assert_eq!(payload["agent_runtime"][3], "[REDACTED:secret-like]");
+        assert_eq!(
+            payload["agent_runtime"][4],
+            "OPENAI_API_KEY=[REDACTED:secret-like]"
+        );
+        assert_eq!(payload["agent_runtime"][5], "run");
+        assert_eq!(
+            payload["image"],
+            "https://registry.example/image [redacted URL credentials/query]"
+        );
+        assert_eq!(payload["trajectory_path"], "[REDACTED:local-path]");
+        assert_eq!(payload["causal_extraction"], "token=[REDACTED:secret-like]");
+        assert_eq!(
+            payload["preflight_warnings"][0],
+            "grader warning from [REDACTED:local-path] token=[REDACTED:secret-like]"
+        );
+        assert!(payload.get("dataset").is_none());
+        for forbidden in [
+            "/Users/alice",
+            "private/package",
+            "private/bin",
+            "raw-agent-token",
+            "sk-live-summary",
+            "registry-user",
+            "registry-secret",
+            "raw-image-token",
+            "#frag",
+            "raw-causal-token",
+            "raw-warning-token",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "summary JSON leaked forbidden text: {forbidden}\n{encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn summary_display_lines_are_public_boundary_safe() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let summary = lab_runner::ExperimentSummary {
+            exp_id: "experiment-1".to_string(),
+            workload_type: "cases".to_string(),
+            dataset_path: package_dir.join("tasks").join("tasks.jsonl"),
+            task_count: 2,
+            replications: 1,
+            variant_count: 2,
+            total_trials: 4,
+            agent_runtime_command: vec![
+                "/Users/alice/private/bin/agent".to_string(),
+                "--token".to_string(),
+                "raw-agent-token".to_string(),
+                "OPENAI_API_KEY=sk-live-summary".to_string(),
+            ],
+            image: Some(
+                "https://registry-user:registry-secret@registry.example/image?token=raw-image-token#frag"
+                    .to_string(),
+            ),
+            network_mode: "none".to_string(),
+            trajectory_path: Some("/Users/alice/private/trajectory.jsonl".to_string()),
+            causal_extraction: Some("token=raw-causal-token".to_string()),
+            scheduling: "paired_interleaved".to_string(),
+            state_policy: "isolate_per_trial".to_string(),
+            comparison: "paired".to_string(),
+            retry_max_attempts: 0,
+            preflight_warnings: vec![
+                "grader warning from /Users/alice/private/grader token=raw-warning-token"
+                    .to_string(),
+            ],
+        };
+        let lines = summary_display_lines(&package_dir, &summary);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("dataset_ref: package://tasks/tasks.jsonl"));
+        assert!(rendered.contains("\"[REDACTED:local-path]\""));
+        assert!(rendered.contains("\"[REDACTED:secret-like]\""));
+        assert!(rendered.contains("https://registry.example/image"));
+        assert!(rendered.contains("[redacted URL credentials/query]"));
+        assert!(rendered.contains("trajectory_path: [REDACTED:local-path]"));
+        assert!(rendered.contains("causal_extraction: token=[REDACTED:secret-like]"));
+        assert!(rendered.contains(
+            "  - grader warning from [REDACTED:local-path] token=[REDACTED:secret-like]"
+        ));
+        for forbidden in [
+            "/Users/alice",
+            "private/package",
+            "raw-agent-token",
+            "sk-live-summary",
+            "registry-user",
+            "registry-secret",
+            "raw-image-token",
+            "#frag",
+            "raw-causal-token",
+            "raw-warning-token",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "summary display leaked forbidden text: {forbidden}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_runtime_image_json_uses_package_relative_map_ref() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let report = lab_runner::PreparedRuntimeImageReport {
+            map_path: package_dir
+                .join("runner")
+                .join("prepared_runtime_images.json"),
+            entries: vec![],
+            built: 0,
+            skipped: 2,
+            dry_run: true,
+        };
+
+        let payload = prepared_runtime_image_report_to_json(&package_dir, &report);
+        let encoded = payload.to_string();
+
+        assert_eq!(
+            payload["map_ref"],
+            "package://runner/prepared_runtime_images.json"
+        );
+        assert!(payload.get("map_path").is_none());
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains("private/package"));
+    }
+
+    #[test]
+    fn prepared_runtime_image_json_redacts_external_map_path() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let report = lab_runner::PreparedRuntimeImageReport {
+            map_path: PathBuf::from("/Users/alice/private/prepared-runtime-images.json"),
+            entries: vec![],
+            built: 1,
+            skipped: 0,
+            dry_run: false,
+        };
+
+        let payload = prepared_runtime_image_report_to_json(&package_dir, &report);
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["map_ref"], "[REDACTED:local-path]");
+        assert!(payload.get("map_path").is_none());
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains("prepared-runtime-images.json"));
+    }
+
+    #[test]
+    fn prepared_runtime_image_json_publicizes_entries() {
+        let package_dir = PathBuf::from("/Users/alice/private/package");
+        let report = lab_runner::PreparedRuntimeImageReport {
+            map_path: package_dir
+                .join("runner")
+                .join("prepared_runtime_images.json"),
+            entries: vec![lab_runner::PreparedRuntimeImageMapEntry {
+                base_image:
+                    "https://image-user:image-secret@registry.example/base?token=raw-query#frag"
+                        .to_string(),
+                agent_artifact_digest: "sha256:abc".to_string(),
+                agent_artifact_mount_path: "/Users/alice/private/agent".to_string(),
+                runner_contract_version:
+                    "bucephalus_prepared_runtime_image_v1 token=raw-contract-token".to_string(),
+                platform: Some("linux/amd64 token=raw-platform-token".to_string()),
+                prepared_image: "registry.example/repo:token=raw-image-token".to_string(),
+            }],
+            built: 1,
+            skipped: 0,
+            dry_run: false,
+        };
+
+        let payload = prepared_runtime_image_report_to_json(&package_dir, &report);
+        let encoded = payload.to_string();
+        let entry = &payload["entries"][0];
+
+        assert_eq!(
+            entry["base_image"],
+            "https://registry.example/base [redacted URL credentials/query]"
+        );
+        assert_eq!(entry["agent_artifact_mount_path"], "[REDACTED:local-path]");
+        assert_eq!(
+            entry["runner_contract_version"],
+            "bucephalus_prepared_runtime_image_v1 token=[REDACTED:secret-like]"
+        );
+        assert_eq!(
+            entry["platform"],
+            "linux/amd64 token=[REDACTED:secret-like]"
+        );
+        assert_eq!(
+            entry["prepared_image"],
+            "registry.example/repo:token=[REDACTED:secret-like]"
+        );
+        for forbidden in [
+            "/Users/alice",
+            "private/agent",
+            "image-user",
+            "image-secret",
+            "?token=raw-query",
+            "#frag",
+            "raw-contract-token",
+            "raw-platform-token",
+            "raw-image-token",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "prepared runtime image JSON leaked forbidden text: {forbidden}\n{encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_run_stats_json_uses_public_evaluation_summary_ref() {
+        let run_dir = temp_dir("post_run_stats_public_refs");
+        std::fs::create_dir_all(run_dir.join("evaluation")).expect("evaluation dir");
+        std::fs::write(run_dir.join("evaluation").join("summary.json"), "{}\n").expect("summary");
+
+        let payload = try_post_run_stats_json(&run_dir);
+        let encoded = payload.to_string();
+
+        assert_eq!(
+            payload["evaluation_summary_ref"],
+            "run://evaluation/summary.json"
+        );
+        assert!(payload.get("evaluation_summary_path").is_none());
+        assert!(!encoded.contains(&run_dir.display().to_string()));
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn public_project_ref_omits_local_filesystem_path() {
+        let project_root = PathBuf::from("/Users/alice/private/project");
+        let rendered = public_project_ref(&project_root);
+
+        assert_eq!(rendered, "workspace://current");
+        assert!(!rendered.contains("/Users/alice"));
+        assert!(!rendered.contains("private/project"));
+    }
+
+    #[test]
+    fn public_workspace_path_ref_omits_local_filesystem_path() {
+        let project_root = PathBuf::from("/Users/alice/private/project");
+
+        assert_eq!(
+            public_workspace_path_ref(&project_root, &project_root.join("agent").join("run.py")),
+            "workspace://agent/run.py"
+        );
+        assert_eq!(
+            public_workspace_path_ref(&project_root, &project_root),
+            "workspace://current"
+        );
+        assert_eq!(
+            public_workspace_path_ref(&project_root, Path::new("/Users/alice/private/raw.jsonl")),
+            "[REDACTED:local-path]"
+        );
+    }
+
+    #[test]
+    fn public_auth_path_ref_omits_local_filesystem_path() {
+        let home = PathBuf::from("/Users/alice/.local/share/bucephalus");
+        let paths = cloud_token_paths(&home);
+
+        assert_eq!(
+            public_auth_path_ref(&home, &paths.access),
+            "auth://access-token"
+        );
+        assert_eq!(
+            public_auth_path_ref(&home, &paths.refresh),
+            "auth://refresh-token"
+        );
+        assert_eq!(
+            public_auth_path_ref(&home, &paths.cache),
+            "auth://token-cache"
+        );
+        assert_eq!(
+            public_auth_path_ref(&home, Path::new("/Users/alice/private/token")),
+            "[REDACTED:local-path]"
+        );
+    }
+
+    #[test]
+    fn analysis_json_metadata_uses_public_refs() {
+        let run_dir = PathBuf::from("/Users/alice/.bucephalus/runs/run_20260609_123456");
+        let project_root = PathBuf::from("/Users/alice/private/project");
+        let payload = json!({
+            "run_ref": public_run_ref(&run_dir),
+            "project_ref": public_project_ref(&project_root),
+        });
+        let encoded = payload.to_string();
+
+        assert_eq!(payload["run_ref"], "run://run_20260609_123456");
+        assert_eq!(payload["project_ref"], "workspace://current");
+        assert!(!encoded.contains("/Users/alice"));
+        assert!(!encoded.contains(".bucephalus"));
+        assert!(!encoded.contains("private/project"));
+    }
+
+    #[test]
     fn choose_query_table_anchor_indices_prefers_task_context_columns() {
         let columns = vec![
             "delta_tokens_in".to_string(),
@@ -11907,6 +24942,39 @@ mod tests {
     }
 
     #[test]
+    fn resolve_experiment_target_missing_file_uses_public_ref() {
+        let target = PathBuf::from("/Users/alice/private/project/experiment.yaml");
+
+        let err = resolve_experiment_target(Some(&target)).expect_err("missing experiment");
+        let message = err.to_string();
+
+        assert!(message.contains("expected an experiment YAML target"));
+        assert!(message.contains("experiment file not found"));
+        assert!(message.contains("target_ref: workspace://experiment.yaml"));
+        assert!(message.contains("bucephalus init <workspace-dir>"));
+        assert!(message.contains("bucephalus build <experiment-yaml> --out <package-dir>"));
+        assert!(!message.contains("/Users/alice"));
+        assert!(!message.contains("private/project"));
+    }
+
+    #[test]
+    fn resolve_experiment_target_empty_directory_uses_public_ref() {
+        let root = unique_test_dir("resolve_experiment_empty_directory");
+        fs::create_dir_all(&root).expect("test dir");
+
+        let err = resolve_experiment_target(Some(&root)).expect_err("missing experiment");
+        let message = err.to_string();
+
+        assert!(message.contains("target directory does not contain experiment.yaml"));
+        assert!(message.contains("target_ref: workspace://current"));
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "experiment target error leaked directory: {message}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn experiment_input_path_distinguishes_package_directory() {
         let root = unique_test_dir("experiment_input_package");
         let package = root.join("package");
@@ -11934,6 +25002,59 @@ mod tests {
         let resolved = experiment_input_path(&experiment).expect("input classification");
 
         assert_eq!(resolved, Some(experiment));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn package_command_target_accepts_package_dir_and_manifest_file() {
+        let root = unique_test_dir("package_command_target");
+        let package = root.join("package");
+        fs::create_dir_all(&package).expect("package dir");
+        let manifest = package.join("manifest.json");
+        fs::write(&manifest, "{}\n").expect("manifest");
+
+        assert_eq!(
+            resolve_package_command_target("preflight", &package).unwrap(),
+            package
+        );
+        assert_eq!(
+            resolve_package_command_target("preflight", &manifest).unwrap(),
+            manifest.parent().unwrap()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn package_command_target_rejects_yaml_with_guided_next_steps() {
+        let root = unique_test_dir("package_command_yaml");
+        fs::create_dir_all(&root).expect("test dir");
+        let experiment = root.join("experiment.yaml");
+        fs::write(&experiment, "experiment:\n  id: smoke\n").expect("experiment yaml");
+
+        let err = resolve_package_command_target("check-package", &experiment)
+            .expect_err("yaml should not be accepted as package");
+        let message = err.to_string();
+        assert!(message.contains("check-package expected a sealed package directory"));
+        assert!(message.contains("target is an experiment YAML"));
+        assert!(message.contains("bucephalus build experiment.yaml --out <package-dir>"));
+        assert!(message.contains("bucephalus check-package <package-dir>"));
+        assert!(message.contains("bucephalus doctor experiment.yaml"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn package_command_target_rejects_experiment_directory_with_guided_next_steps() {
+        let root = unique_test_dir("package_command_experiment_dir");
+        fs::create_dir_all(&root).expect("test dir");
+        fs::write(root.join("experiment.yaml"), "experiment:\n  id: smoke\n")
+            .expect("experiment yaml");
+
+        let err = resolve_package_command_target("preflight", &root)
+            .expect_err("experiment dir should not be accepted as package");
+        let message = err.to_string();
+        assert!(message.contains("preflight expected a sealed package directory"));
+        assert!(message.contains("target is an experiment directory"));
+        assert!(message.contains("bucephalus preflight <package-dir>"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -11970,6 +25091,501 @@ mod tests {
         match resolved {
             DoctorTarget::Experiment(path) => assert_eq!(path, experiment),
             DoctorTarget::Package(path) => panic!("expected experiment, got {}", path.display()),
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn resolve_doctor_target_empty_directory_uses_public_ref() {
+        let root = unique_test_dir("doctor_target_empty_directory");
+        fs::create_dir_all(&root).expect("test dir");
+
+        let err = resolve_doctor_target(Some(&root)).expect_err("doctor target");
+        let message = err.to_string();
+
+        assert!(message.contains("doctor expected an experiment YAML"));
+        assert!(message.contains("target directory is neither an experiment workspace"));
+        assert!(message.contains("target_ref: workspace://current"));
+        assert!(message.contains("bucephalus doctor <experiment-yaml>"));
+        assert!(message.contains("bucephalus doctor <package-dir>"));
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "doctor target error leaked directory: {message}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn resolve_doctor_target_missing_yaml_uses_public_ref() {
+        let target = PathBuf::from("/Users/alice/private/project/experiment.yaml");
+
+        let err = resolve_doctor_target(Some(&target)).expect_err("doctor target");
+        let message = err.to_string();
+
+        assert!(message.contains("target does not exist"));
+        assert!(message.contains("target_ref: workspace://experiment.yaml"));
+        assert!(!message.contains("/Users/alice"));
+        assert!(!message.contains("private/project"));
+    }
+
+    #[test]
+    fn clean_runs_preflight_requires_force_before_delete() {
+        let runs_dir = unique_test_dir("clean_runs_force");
+        fs::create_dir_all(&runs_dir).expect("runs dir");
+
+        let err = clean_runs_preflight(&runs_dir, &[], false, false, false, false, false)
+            .expect_err("clean should require force");
+        let message = err.to_string();
+        assert!(message.contains("clean --runs removes local run directories"));
+        assert!(message.contains("runs://local"));
+        assert!(message.contains("--dry-run"));
+        assert!(message.contains("--force"));
+        assert!(
+            !message.contains(&runs_dir.display().to_string()),
+            "clean force error must not leak runs dir: {message}"
+        );
+        fs::remove_dir_all(runs_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn clean_runs_preflight_allows_dry_run_without_force() {
+        let runs_dir = unique_test_dir("clean_runs_dry_run");
+        fs::create_dir_all(&runs_dir).expect("runs dir");
+
+        let report = clean_runs_preflight(&runs_dir, &[], false, false, false, false, true)
+            .expect("dry run report");
+
+        assert!(report.exists);
+        assert!(report.dry_run);
+        assert!(report.will_remove);
+        let payload = clean_runs_report_to_json(&report);
+        assert!(!payload["removed"].as_bool().unwrap());
+        assert_eq!(payload["runs_ref"], "runs://local");
+        assert!(payload.get("runs_dir").is_none());
+        assert!(!payload
+            .to_string()
+            .contains(&runs_dir.display().to_string()));
+        assert!(runs_dir.exists(), "dry-run must not remove the runs dir");
+        fs::remove_dir_all(runs_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn clean_runs_preflight_blocks_active_runs_without_override() {
+        let runs_dir = unique_test_dir("clean_runs_active");
+        let run_dir = runs_dir.join("run_1");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        let active = RunInventoryEntry {
+            run_id: "run_1".to_string(),
+            run_dir: run_dir.clone(),
+            experiment: "experiment".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            started_at_display: "2026-01-01 00:00:00Z".to_string(),
+            control: RunControlSummary {
+                status: "running".to_string(),
+                status_display: "running (active_trials=1)".to_string(),
+                live_summary: "1 active".to_string(),
+                active_trials: 1,
+                is_active: true,
+            },
+        };
+
+        let err = clean_runs_preflight(
+            &runs_dir,
+            &[active.clone()],
+            true,
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect_err("active run should block clean");
+        let message = err.to_string();
+        assert!(message.contains("found 1 active run"));
+        assert!(message.contains("runs://local"));
+        assert!(message.contains("--include-active --force"));
+        assert!(
+            !message.contains(&runs_dir.display().to_string()),
+            "active clean error must not leak runs dir: {message}"
+        );
+
+        let dry_run_report = clean_runs_preflight(
+            &runs_dir,
+            &[active.clone()],
+            false,
+            false,
+            false,
+            false,
+            true,
+        )
+        .expect("dry-run should preview active runs without include override");
+        assert_eq!(dry_run_report.active_run_count, 1);
+        assert!(dry_run_report.will_remove);
+        let dry_run_payload = clean_runs_report_to_json(&dry_run_report);
+        assert!(!dry_run_payload["removed"].as_bool().unwrap());
+        assert_eq!(dry_run_payload["active_runs"][0]["run_ref"], "run://run_1");
+        assert!(
+            dry_run_payload["active_runs"][0].get("run_dir").is_none(),
+            "clean JSON must not expose active run_dir"
+        );
+        assert!(!dry_run_payload
+            .to_string()
+            .contains(&runs_dir.display().to_string()));
+
+        let report = clean_runs_preflight(&runs_dir, &[active], true, true, false, false, false)
+            .expect("explicit active override");
+        assert_eq!(report.active_run_count, 1);
+        assert!(report.will_remove);
+        fs::remove_dir_all(runs_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn clean_runs_report_publicizes_run_ids_and_statuses() {
+        let runs_dir = unique_test_dir("clean_runs_public_run_values");
+        let run_id = "run_1 token=raw-run-token";
+        let run_dir = runs_dir.join(run_id);
+        fs::create_dir_all(&run_dir).expect("run dir");
+        let active = RunInventoryEntry {
+            run_id: run_id.to_string(),
+            run_dir: run_dir.clone(),
+            experiment: "experiment".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            started_at_display: "2026-01-01 00:00:00Z".to_string(),
+            control: RunControlSummary {
+                status: "running".to_string(),
+                status_display: "running from /Users/alice/private/project token=raw-status-token"
+                    .to_string(),
+                live_summary: "1 active".to_string(),
+                active_trials: 1,
+                is_active: true,
+            },
+        };
+
+        let report = clean_runs_preflight(
+            &runs_dir,
+            &[active.clone()],
+            false,
+            false,
+            false,
+            false,
+            true,
+        )
+        .expect("dry-run should report active runs");
+        let payload = clean_runs_report_to_json(&report);
+        let encoded = payload.to_string();
+        let rendered = clean_runs_report_display_lines(&report).join("\n");
+
+        assert_eq!(payload["active_runs"][0]["run_ref"], "run://redacted");
+        assert_eq!(
+            payload["active_runs"][0]["run_id"],
+            "run_1 token=[REDACTED:secret-like]"
+        );
+        assert!(encoded.contains("[REDACTED:local-path]"));
+        assert!(rendered.contains("active_run: run_1 token=[REDACTED:secret-like]"));
+        assert!(rendered.contains("running from [REDACTED:local-path]"));
+        for forbidden in [
+            "/Users/alice",
+            "private/project",
+            "raw-run-token",
+            "raw-status-token",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "clean JSON leaked forbidden text: {forbidden}\n{encoded}"
+            );
+            assert!(
+                !rendered.contains(forbidden),
+                "clean display leaked forbidden text: {forbidden}\n{rendered}"
+            );
+        }
+        fs::remove_dir_all(runs_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn clean_runs_preflight_blocks_interrupted_runs_without_override() {
+        let runs_dir = unique_test_dir("clean_runs_interrupted");
+        let run_dir = runs_dir.join("run_1");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        let interrupted = RunInventoryEntry {
+            run_id: "run_1".to_string(),
+            run_dir: run_dir.clone(),
+            experiment: "experiment".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            started_at_display: "2026-01-01 00:00:00Z".to_string(),
+            control: RunControlSummary {
+                status: "interrupted".to_string(),
+                status_display: "interrupted (stale running lease)".to_string(),
+                live_summary: "stale owner".to_string(),
+                active_trials: 0,
+                is_active: false,
+            },
+        };
+
+        let err = clean_runs_preflight(
+            &runs_dir,
+            &[interrupted.clone()],
+            true,
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect_err("interrupted run should block clean");
+        let message = err.to_string();
+        assert!(message.contains("recoverable interrupted run"));
+        assert!(message.contains("runs://local"));
+        assert!(message.contains("--include-interrupted --force"));
+        assert!(message.contains("bucephalus recover run_1"));
+        assert!(message.contains("bucephalus continue run_1"));
+        assert!(
+            !message.contains(&runs_dir.display().to_string()),
+            "interrupted clean error must not leak runs dir: {message}"
+        );
+
+        let dry_run_report = clean_runs_preflight(
+            &runs_dir,
+            &[interrupted.clone()],
+            false,
+            false,
+            false,
+            false,
+            true,
+        )
+        .expect("dry-run should preview interrupted runs");
+        assert_eq!(dry_run_report.interrupted_run_count, 1);
+        let dry_run_payload = clean_runs_report_to_json(&dry_run_report);
+        assert!(!dry_run_payload["removed"].as_bool().unwrap());
+        assert_eq!(
+            dry_run_payload["interrupted_runs"][0]["run_ref"],
+            "run://run_1"
+        );
+        assert!(
+            dry_run_payload["interrupted_runs"][0]
+                .get("run_dir")
+                .is_none(),
+            "clean JSON must not expose interrupted run_dir"
+        );
+        assert!(!dry_run_payload
+            .to_string()
+            .contains(&runs_dir.display().to_string()));
+
+        let report =
+            clean_runs_preflight(&runs_dir, &[interrupted], true, false, true, false, false)
+                .expect("explicit interrupted override");
+        assert_eq!(report.interrupted_run_count, 1);
+        assert!(report.will_remove);
+        fs::remove_dir_all(runs_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn clean_runs_interrupted_guidance_uses_placeholder_for_unusual_run_id() {
+        let runs_dir = unique_test_dir("clean_runs_interrupted_public_guidance");
+        let run_id = "run_1 token=raw-run-token";
+        let run_dir = runs_dir.join(run_id);
+        fs::create_dir_all(&run_dir).expect("run dir");
+        let interrupted = RunInventoryEntry {
+            run_id: run_id.to_string(),
+            run_dir,
+            experiment: "experiment".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            started_at_display: "2026-01-01 00:00:00Z".to_string(),
+            control: RunControlSummary {
+                status: "interrupted".to_string(),
+                status_display: "interrupted token=raw-status-token".to_string(),
+                live_summary: "stale owner".to_string(),
+                active_trials: 0,
+                is_active: false,
+            },
+        };
+
+        let err = clean_runs_preflight(&runs_dir, &[interrupted], true, false, false, false, false)
+            .expect_err("interrupted run should block clean");
+        let message = err.to_string();
+
+        assert!(message.contains("bucephalus recover <run-id>"));
+        assert!(message.contains("bucephalus continue <run-id>"));
+        assert!(!message.contains("raw-run-token"));
+        assert!(!message.contains("raw-status-token"));
+        assert!(
+            !message.contains(&runs_dir.display().to_string()),
+            "interrupted guidance leaked runs dir: {message}"
+        );
+        fs::remove_dir_all(runs_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn clean_runs_preflight_blocks_untracked_entries_without_override() {
+        let runs_dir = unique_test_dir("clean_runs_untracked");
+        fs::create_dir_all(runs_dir.join("partial-run")).expect("partial run dir");
+        fs::write(runs_dir.join("scratch.txt"), "not a run").expect("scratch file");
+
+        let err = clean_runs_preflight(&runs_dir, &[], true, false, false, false, false)
+            .expect_err("untracked entries should block destructive clean");
+        let message = err.to_string();
+        assert!(message.contains("found 2 untracked entries"));
+        assert!(message.contains("runs://local"));
+        assert!(message.contains("--include-untracked --force"));
+        assert!(
+            !message.contains(&runs_dir.display().to_string()),
+            "untracked clean error must not leak runs dir: {message}"
+        );
+        assert!(
+            !message.contains("partial-run") && !message.contains("scratch.txt"),
+            "untracked clean error must not leak local entry names: {message}"
+        );
+
+        let dry_run_report = clean_runs_preflight(&runs_dir, &[], false, false, false, false, true)
+            .expect("dry-run should preview untracked entries");
+        assert_eq!(dry_run_report.untracked_entry_count, 2);
+        let dry_run_payload = clean_runs_report_to_json(&dry_run_report);
+        assert_eq!(dry_run_payload["untracked_entry_count"], 2);
+        assert_eq!(
+            dry_run_payload["untracked_entries"][0]["entry_ref"],
+            "runs://local/untracked/1"
+        );
+        assert!(!dry_run_payload
+            .to_string()
+            .contains(&runs_dir.display().to_string()));
+        assert!(!dry_run_payload.to_string().contains("partial-run"));
+        assert!(!dry_run_payload.to_string().contains("scratch.txt"));
+
+        let report = clean_runs_preflight(&runs_dir, &[], true, false, false, true, false)
+            .expect("explicit untracked override");
+        assert_eq!(report.untracked_entry_count, 2);
+        assert!(report.will_remove);
+        fs::remove_dir_all(runs_dir).expect("cleanup");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn clean_runs_treats_symlinked_run_store_entry_as_untracked() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_test_dir("clean_runs_run_symlink_entry");
+        let runs_dir = root.join("runs");
+        let outside = root.join("outside");
+        let outside_run = outside.join("run_1");
+        let run_link = runs_dir.join("run_1");
+        fs::create_dir_all(&runs_dir).expect("runs dir");
+        fs::create_dir_all(&outside_run).expect("outside run dir");
+        fs::write(outside_run.join("keep.txt"), "keep\n").expect("outside payload");
+        symlink(&outside_run, &run_link).expect("run symlink");
+        let active = RunInventoryEntry {
+            run_id: "run_1".to_string(),
+            run_dir: run_link,
+            experiment: "experiment".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            started_at_display: "2026-01-01 00:00:00Z".to_string(),
+            control: RunControlSummary {
+                status: "running".to_string(),
+                status_display: "running (active_trials=1)".to_string(),
+                live_summary: "1 active".to_string(),
+                active_trials: 1,
+                is_active: true,
+            },
+        };
+
+        let err = clean_runs_preflight(
+            &runs_dir,
+            &[active.clone()],
+            true,
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect_err("symlinked run entry should be treated as untracked");
+        let message = err.to_string();
+        assert!(message.contains("found 1 untracked entry"));
+        assert!(!message.contains("active run"));
+        assert!(!message.contains(&root.display().to_string()));
+        assert!(!message.contains("run_1"));
+
+        let report = clean_runs_preflight(&runs_dir, &[active], false, false, false, false, true)
+            .expect("dry-run should report symlink as untracked");
+        assert_eq!(report.active_run_count, 0);
+        assert_eq!(report.untracked_entry_count, 1);
+        assert_eq!(report.untracked_entries[0].entry_type, "symlink");
+        let encoded = clean_runs_report_to_json(&report).to_string();
+        assert!(!encoded.contains(&root.display().to_string()));
+        assert!(!encoded.contains("keep.txt"));
+        assert_eq!(
+            fs::read_to_string(outside_run.join("keep.txt")).expect("outside target survived"),
+            "keep\n"
+        );
+
+        fs::remove_file(runs_dir.join("run_1")).expect("remove run symlink");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn clean_runs_ignores_parent_dir_inventory_escape() {
+        let root = unique_test_dir("clean_runs_parent_escape_entry");
+        let runs_dir = root.join("runs");
+        let outside_run = root.join("outside").join("run_1");
+        fs::create_dir_all(&runs_dir).expect("runs dir");
+        fs::create_dir_all(&outside_run).expect("outside run dir");
+        let active = RunInventoryEntry {
+            run_id: "run_1".to_string(),
+            run_dir: runs_dir.join("..").join("outside").join("run_1"),
+            experiment: "experiment".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            started_at_display: "2026-01-01 00:00:00Z".to_string(),
+            control: RunControlSummary {
+                status: "running".to_string(),
+                status_display: "running (active_trials=1)".to_string(),
+                live_summary: "1 active".to_string(),
+                active_trials: 1,
+                is_active: true,
+            },
+        };
+
+        let report = clean_runs_preflight(&runs_dir, &[active], false, false, false, false, true)
+            .expect("dry-run should ignore escaped run-store row");
+
+        assert_eq!(report.active_run_count, 0);
+        assert_eq!(report.run_count, 0);
+        assert_eq!(report.untracked_entry_count, 0);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn clean_runs_refuses_symlinked_runs_root_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_test_dir("clean_runs_symlink_root");
+        let real_runs = root.join("real-runs");
+        let runs_link = root.join("runs");
+        fs::create_dir_all(&real_runs).expect("real runs dir");
+        fs::write(real_runs.join("scratch.txt"), "keep\n").expect("target file");
+        symlink(&real_runs, &runs_link).expect("runs symlink");
+
+        let preflight_err = clean_runs_preflight(&runs_link, &[], true, true, true, true, true)
+            .expect_err("symlinked runs root should not be inspected");
+        let delete_err =
+            remove_clean_runs_root(&runs_link).expect_err("symlinked runs root should not delete");
+        let combined = format!("{preflight_err}\n{delete_err}");
+
+        assert!(combined.contains("symlinked runs root"));
+        assert!(combined.contains("runs://local"));
+        assert_eq!(
+            fs::read_to_string(real_runs.join("scratch.txt")).expect("target survived"),
+            "keep\n"
+        );
+        assert!(
+            runs_link.exists(),
+            "refusing cleanup should leave the symlink for manual inspection"
+        );
+        for forbidden in [
+            root.to_str().unwrap(),
+            "clean_runs_symlink_root",
+            "real-runs",
+            "scratch.txt",
+        ] {
+            assert!(
+                !combined.contains(forbidden),
+                "clean symlink error leaked forbidden text {forbidden}: {combined}"
+            );
         }
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -12184,6 +25800,77 @@ mod tests {
             "unexpected error: {}",
             err
         );
+        assert!(err
+            .to_string()
+            .contains("output_ref: build-output://target"));
+        assert!(
+            !err.to_string().contains(&root.display().to_string()),
+            "build-run publish error leaked root path: {}",
+            err
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn build_run_publish_refuses_file_output_with_public_ref() {
+        let root = unique_test_dir("build_run_refuse_file_output");
+        let final_out = root.join("package");
+        let temp_out = root.join("temp_package");
+        fs::create_dir_all(&root).expect("root dir");
+        fs::write(&final_out, "not a directory\n").expect("file output");
+        fs::create_dir_all(&temp_out).expect("temp package dir");
+        fs::write(temp_out.join("manifest.json"), "{}\n").expect("new manifest");
+
+        let err = publish_build_run_package(fake_build_result(temp_out), &final_out)
+            .expect_err("file output must be refused");
+        let message = err.to_string();
+
+        assert!(message.contains("exists and is not a directory"));
+        assert!(message.contains("output_ref: build-output://target"));
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "build-run file output error leaked root path: {message}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_run_publish_refuses_symlink_output_with_public_ref() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_test_dir("build_run_refuse_symlink_output");
+        let final_out = root.join("package");
+        let outside = root.join("outside-package-target");
+        let temp_out = root.join("temp_package");
+        fs::create_dir_all(&outside).expect("outside target");
+        symlink(&outside, &final_out).expect("symlink output");
+        fs::create_dir_all(&temp_out).expect("temp package dir");
+        fs::write(temp_out.join("manifest.json"), "{}\n").expect("new manifest");
+
+        let err = publish_build_run_package(fake_build_result(temp_out.clone()), &final_out)
+            .expect_err("symlink output must be refused");
+        let message = err.to_string();
+
+        assert!(message.contains("build-run output target is a symlink"));
+        assert!(message.contains("output_ref: build-output://target"));
+        assert!(
+            temp_out.join("manifest.json").exists(),
+            "build-run publish moved package despite symlink output refusal"
+        );
+        assert!(
+            !outside.join("manifest.json").exists(),
+            "build-run publish wrote through symlinked output"
+        );
+        assert!(
+            !message.contains(&root.display().to_string()),
+            "build-run symlink output error leaked root path: {message}"
+        );
+        assert!(
+            !message.contains(&outside.display().to_string()),
+            "build-run symlink output error leaked outside path: {message}"
+        );
+        fs::remove_file(final_out).expect("remove symlink");
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

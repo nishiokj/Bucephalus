@@ -39,6 +39,8 @@ const RUNTIME_SNAPSHOT_MAX_EVIDENCE_RECORDS = 500;
 const RUNTIME_SNAPSHOT_MAX_JSON_BYTES = 2 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_PAYLOAD_ENVELOPE_BYTES = 128 * 1024;
+const REDACTED_PROCESS_TAIL_MAX_BYTES = 16_000;
+const REDACTED_FAILURE_MESSAGE_MAX_BYTES = 1_000;
 const REDACTED_VALUE = "[redacted]";
 const DOCKER_SOCKET_PATH = "/var/run/docker.sock";
 const DOCKER_API_VERSION = "v1.41";
@@ -64,7 +66,7 @@ async function main(): Promise<void> {
     await cleanupStartupResidue(config);
   } catch (error) {
     await poisonRunnerInstance(config, "startup_cleanup_failed", {
-      error: errorMessage(error),
+      error: redactedHostErrorMessage(error, config),
     }).catch((poisonError) => {
       console.error(`failed to mark runner unhealthy: ${errorMessage(poisonError)}`);
     });
@@ -149,6 +151,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
   let materialized: MaterializedPackage | null = null;
   let coreError: unknown = null;
   let cleanupError: unknown = null;
+  const redactionContext = () => materialized ?? materializedRedactionContext(workspaceDir);
 
   try {
     try {
@@ -158,13 +161,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         secret_ref_names: Object.keys(claim.run.secret_refs),
       });
       materialized = await materializePackage(config, claim);
-      await appendEvent(config, claim, "worker.materialized", {
-        workspace_dir: materialized.workspaceDir,
-        package_archive_path: materialized.packageArchivePath,
-        extracted_dir: materialized.extractedDir,
-        run_root_dir: materialized.runRootDir,
-        manifest_experiment_id: stringAt(materialized.manifestJson, "/resolved_experiment/experiment/id"),
-      });
+      await appendEvent(config, claim, "worker.materialized", materializedPackageEventPayload(materialized));
       await applyRuntimeNetworkPolicy(config, claim, materialized);
       await executeCoreRun(config, claim, materialized);
     } catch (error) {
@@ -176,7 +173,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         await uploadRuntimeSnapshots(config, claim, materialized);
       } catch (error) {
         await appendEvent(config, claim, "worker.runtime.snapshot_failed", {
-          error: errorMessage(error),
+          error: redactedWorkerErrorMessage(error, materialized, claim),
         }).catch((eventError) => {
           console.error(`worker ${config.workerId} failed to append runtime snapshot failure event: ${errorMessage(eventError)}`);
         });
@@ -189,33 +186,26 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
     }
 
     try {
-      await cleanupClaimWorkspace(config, claim, materialized ?? {
-        workspaceDir,
-        packageArchivePath: join(workspaceDir, "package.tgz"),
-        extractedDir: join(workspaceDir, "package"),
-        runRootDir: join(workspaceDir, "run-root"),
-        manifestJson: {},
-        secretFiles: {},
-      });
+      await cleanupClaimWorkspace(config, claim, materialized ?? materializedRedactionContext(workspaceDir));
     } catch (error) {
       cleanupError = error;
     }
 
     if (cleanupError) {
-      const message = `runner cleanup failed after run ${runId} attempt ${attemptId}: ${errorMessage(cleanupError)}`;
+      const message = `runner cleanup failed after run ${runId} attempt ${attemptId}: ${redactedWorkerErrorMessage(cleanupError, redactionContext(), claim)}`;
       await fail(config, claim, message).catch((failError) => {
         console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
       });
       await poisonRunnerInstance(config, "attempt_cleanup_failed", {
         run_id: runId,
         attempt_id: attemptId,
-        error: errorMessage(cleanupError),
+        error: redactedWorkerErrorMessage(cleanupError, redactionContext(), claim),
       }).catch((poisonError) => {
         console.error(`failed to mark runner unhealthy: ${errorMessage(poisonError)}`);
       });
       shuttingDown = true;
     } else if (coreError) {
-      await fail(config, claim, errorMessage(coreError)).catch((failError) => {
+      await fail(config, claim, redactedWorkerErrorMessage(coreError, redactionContext(), claim)).catch((failError) => {
         console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
       });
     } else {
@@ -236,8 +226,8 @@ async function executeCoreRun(
   const command = coreRunnerCommand(config, claim, materialized);
   await appendEvent(config, claim, "worker.core.starting", {
     command: command.redactedArgs,
-    workspace_dir: materialized.workspaceDir,
-    run_root_dir: materialized.runRootDir,
+    workspace: "attempt_workspace",
+    run_root: "run-root",
   });
   const result = await runProcess(command.executable, command.args, {
     cwd: materialized.workspaceDir,
@@ -245,14 +235,12 @@ async function executeCoreRun(
   });
   const eventPayload = {
     exit_code: result.exitCode,
-    stdout_tail: tail(result.stdout, 16_000),
-    stderr_tail: tail(result.stderr, 16_000),
+    stdout_tail: redactedProcessTail(result.stdout, materialized, claim),
+    stderr_tail: redactedProcessTail(result.stderr, materialized, claim),
   };
   if (result.exitCode !== 0) {
     await appendEvent(config, claim, "worker.core.failed", eventPayload);
-    throw new WorkerError(
-      `Core runner exited with ${result.exitCode}: ${tail(result.stderr || result.stdout, 1000)}`,
-    );
+    throw new WorkerError(coreRunnerFailureMessage(result.exitCode, result.stdout, result.stderr, materialized, claim));
   }
   await appendEvent(config, claim, "worker.core.completed", eventPayload);
 }
@@ -474,8 +462,8 @@ async function readBoundedJsonLines(path: string, maxLines: number): Promise<
     } catch (error) {
       return {
         event_type: "trajectory_parse_error",
-        error: errorMessage(error),
-        raw_line: line,
+        error: "event line is not valid JSON",
+        raw_line_omitted: true,
       };
     }
   });
@@ -503,7 +491,12 @@ async function readBoundedJsonObject(path: string): Promise<
   if (!fileStat.isFile() || fileStat.size > RUNTIME_SNAPSHOT_MAX_JSON_BYTES) {
     return { status: "omitted" };
   }
-  const parsed = JSON.parse(await readFile(path, "utf8"));
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    return { status: "omitted" };
+  }
   if (!isRecord(parsed)) {
     return { status: "omitted" };
   }
@@ -549,12 +542,35 @@ function sensitiveJsonKey(key: string): boolean {
     || normalized.includes("apikey")
     || normalized.includes("credential")
     || normalized.includes("authorization")
-    || normalized.includes("bearer");
+    || normalized.includes("bearer")
+    || normalized === "path"
+    || normalized.endsWith("path")
+    || normalized.includes("filepath")
+    || normalized.includes("localpath")
+    || normalized.includes("projectroot")
+    || normalized.includes("workspace")
+    || normalized.includes("workdir")
+    || normalized.includes("runroot")
+    || normalized.includes("datadir")
+    || normalized.includes("mount");
 }
 
 function sensitiveStringValue(value: string): boolean {
+  const trimmed = value.trim();
+  const lower = trimmed.toLowerCase();
   return value.includes("gcp-secret-manager://")
     || value.includes("aws-secrets-manager://")
+    || lower.startsWith("file://")
+    || trimmed.startsWith("/Users/")
+    || trimmed.startsWith("/home/")
+    || trimmed.startsWith("/private/")
+    || trimmed.startsWith("/tmp/")
+    || trimmed.startsWith("/var/folders/")
+    || lower.includes(" /users/")
+    || lower.includes(" /home/")
+    || lower.includes(" /private/")
+    || lower.includes(" /tmp/")
+    || lower.includes(" /var/folders/")
     || /\bAKIA[0-9A-Z]{16}\b/.test(value)
     || /\bASIA[0-9A-Z]{16}\b/.test(value)
     || /\bsk-[A-Za-z0-9_-]{20,}\b/.test(value)
@@ -590,7 +606,7 @@ export function coreRunnerEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function coreRunnerCommand(
+export function coreRunnerCommand(
   config: WorkerConfig,
   claim: RunClaim,
   materialized: MaterializedPackage,
@@ -602,34 +618,50 @@ function coreRunnerCommand(
     "--run-root",
     materialized.runRootDir,
   ];
-  const runtimeOptions = claim.run.runtime_options;
+  const redactedArgs = [
+    "run",
+    "package",
+    "--json",
+    "--run-root",
+    "run-root",
+  ];
+  const runtimeOptions = runtimeOptionsObject(claim.run.runtime_options);
   const smokeTest = runtimeOptions.smoke_test === true;
   if (smokeTest) {
     args.push("--smoke-test");
+    redactedArgs.push("--smoke-test");
   } else {
     args.push("--run-dangerously");
+    redactedArgs.push("--run-dangerously");
   }
 
-  const executor = optionalRuntimeString(runtimeOptions.executor);
+  const executor = normalizeCoreExecutorRuntimeOptions(runtimeOptions);
   const cloudExecutor = claim.run.run_requirements.executor;
-  const coreExecutor = executor ?? coreExecutorForCloudExecutor(cloudExecutor);
+  const queuedCoreExecutor = coreExecutorForCloudExecutor(cloudExecutor);
+  if (executor && executor !== queuedCoreExecutor) {
+    throw new WorkerError("runtime_options executor does not match the queued Cloud runner executor");
+  }
+  const coreExecutor = executor ?? queuedCoreExecutor;
   if (coreExecutor) {
     args.push("--executor", coreExecutor);
+    redactedArgs.push("--executor", coreExecutor);
   }
-  const materialize = optionalRuntimeString(runtimeOptions.materialize);
+  const materialize = normalizeMaterializeRuntimeOption(runtimeOptions.materialize);
   if (materialize) {
     args.push("--materialize", materialize);
+    redactedArgs.push("--materialize", materialize);
   }
 
-  for (const [key, value] of Object.entries(claim.run.env)) {
+  const env = stringMapObject(claim.run.env, "/env");
+  for (const [key, value] of Object.entries(env)) {
     assertRuntimeEnvKey(key);
     args.push("--env", `${key}=${value}`);
+    redactedArgs.push("--env", `${key}=<env>`);
   }
 
-  const redactedArgs = [...args];
   for (const [id, secretPath] of Object.entries(materialized.secretFiles)) {
     args.push("--secret-file", `${id}=${secretPath}`);
-    redactedArgs.push("--secret-file", `${id}=<secret:${claim.run.secret_refs[id] ?? "redacted"}>`);
+    redactedArgs.push("--secret-file", `${id}=<secret-file>`);
   }
 
   return {
@@ -642,6 +674,9 @@ function coreRunnerCommand(
 function coreExecutorForCloudExecutor(executor: string): string | null {
   switch (executor) {
     case "runner-docker":
+    case "runner_docker":
+    case "local-docker":
+    case "local_docker":
       return "local_docker";
     case "modal":
       return "modal";
@@ -650,8 +685,77 @@ function coreExecutorForCloudExecutor(executor: string): string | null {
   }
 }
 
+function normalizeCoreExecutorRuntimeOption(value: unknown): string | null {
+  const raw = optionalRuntimeString(value);
+  if (!raw) {
+    return null;
+  }
+  switch (raw.trim()) {
+    case "runner-docker":
+    case "runner_docker":
+    case "local-docker":
+    case "local_docker":
+      return "local_docker";
+    case "modal":
+      return "modal";
+    default:
+      throw new WorkerError(`Unsupported Cloud/Core runner executor '${raw}'`);
+  }
+}
+
+function normalizeCoreExecutorRuntimeOptions(runtimeOptions: Record<string, unknown>): string | null {
+  const backend = normalizeCoreExecutorRuntimeOption(runtimeOptions.backend);
+  const executor = normalizeCoreExecutorRuntimeOption(runtimeOptions.executor);
+  if (backend && executor && backend !== executor) {
+    throw new WorkerError("runtime_options.backend and runtime_options.executor select different Core executors");
+  }
+  return backend ?? executor;
+}
+
+function runtimeOptionsObject(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new WorkerError("/runtime_options must be an object");
+  }
+  return value;
+}
+
+function stringMapObject(value: unknown, pointer: string): Record<string, string> {
+  if (!isRecord(value)) {
+    throw new WorkerError(`${pointer} must be an object`);
+  }
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== "string") {
+      throw new WorkerError(`${pointer}/${key} must be a string`);
+    }
+    out[key] = item;
+  }
+  return out;
+}
+
+function normalizeMaterializeRuntimeOption(value: unknown): string | null {
+  const raw = optionalRuntimeString(value);
+  if (!raw) {
+    return null;
+  }
+  switch (raw.trim()) {
+    case "none":
+      return "none";
+    case "metadata-only":
+    case "metadata_only":
+      return "metadata_only";
+    case "outputs-only":
+    case "outputs_only":
+      return "outputs_only";
+    case "full":
+      return "full";
+    default:
+      throw new WorkerError(`Unsupported Core materialize mode '${raw}'`);
+  }
+}
+
 function optionalRuntimeString(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 ? value : null;
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
 function assertRuntimeEnvKey(key: string): void {
@@ -823,7 +927,8 @@ export async function materializeAttemptSecrets(
   claim: Pick<RunClaim, "run" | "attempt">,
   workspaceDir: string,
 ): Promise<Record<string, string>> {
-  const secretEntries = Object.entries(claim.run.secret_refs);
+  const secretRefs = stringMapObject(claim.run.secret_refs, "/secret_refs");
+  const secretEntries = Object.entries(secretRefs);
   if (secretEntries.length === 0) {
     return {};
   }
@@ -857,7 +962,7 @@ export async function materializeAttemptSecrets(
     if (typeof value !== "string" || value.trim().length === 0) {
       throw new WorkerError(`Secret resolver returned an invalid file for '${id}'`);
     }
-    if (!Object.prototype.hasOwnProperty.call(claim.run.secret_refs, id)) {
+    if (!Object.prototype.hasOwnProperty.call(secretRefs, id)) {
       throw new WorkerError(`Secret resolver returned undeclared secret id '${id}'`);
     }
     const outputPath = resolvedSecretOutputPath(secretDir, value);
@@ -905,7 +1010,11 @@ export async function applyRuntimeNetworkPolicy(
 
 function runtimeNetworkPerimeter(requirements: RunRequirements): RuntimeNetworkPerimeter {
   const raw = requirements.network_perimeter;
-  if (!isRecord(raw)) {
+  const requiresNetworkPerimeter = requirements.requires.includes("network_perimeter");
+  if (raw === undefined) {
+    if (requiresNetworkPerimeter) {
+      throw new WorkerError("/run_requirements/network_perimeter is required when run requires network_perimeter");
+    }
     return {
       default: "none",
       task_sandbox: "none",
@@ -913,19 +1022,50 @@ function runtimeNetworkPerimeter(requirements: RunRequirements): RuntimeNetworkP
       egress_hosts: [],
     };
   }
-  const defaultMode = runtimeNetworkMode(raw.default);
+  if (!isRecord(raw)) {
+    throw new WorkerError("/run_requirements/network_perimeter must be an object");
+  }
+  const defaultMode = runtimeNetworkMode(raw.default, "/run_requirements/network_perimeter/default");
+  const taskSandboxMode = runtimeNetworkMode(
+    raw.task_sandbox ?? defaultMode,
+    "/run_requirements/network_perimeter/task_sandbox",
+  );
+  const agentMode = runtimeNetworkMode(raw.agent ?? defaultMode, "/run_requirements/network_perimeter/agent");
+  const egressHosts = runtimeNetworkEgressHosts(raw.egress_hosts);
+  if ([defaultMode, taskSandboxMode, agentMode].includes("allowlist_enforced") && egressHosts.length === 0) {
+    throw new WorkerError("allowlist_enforced network modes require egress hosts");
+  }
   return {
     default: defaultMode,
-    task_sandbox: runtimeNetworkMode(raw.task_sandbox ?? defaultMode),
-    agent: runtimeNetworkMode(raw.agent ?? defaultMode),
-    egress_hosts: Array.isArray(raw.egress_hosts)
-      ? raw.egress_hosts.filter((item): item is string => typeof item === "string")
-      : [],
+    task_sandbox: taskSandboxMode,
+    agent: agentMode,
+    egress_hosts: egressHosts,
   };
 }
 
-function runtimeNetworkMode(value: unknown): RuntimeNetworkMode {
-  return value === "allowlist_enforced" ? "allowlist_enforced" : "none";
+function runtimeNetworkMode(value: unknown, pointer: string): RuntimeNetworkMode {
+  if (value === undefined || value === null) {
+    return "none";
+  }
+  if (value === "none" || value === "allowlist_enforced") {
+    return value;
+  }
+  throw new WorkerError(`${pointer} must be 'none' or 'allowlist_enforced'`);
+}
+
+function runtimeNetworkEgressHosts(value: unknown): string[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new WorkerError("/run_requirements/network_perimeter/egress_hosts must be an array");
+  }
+  return value.map((item, idx) => {
+    if (typeof item !== "string" || item.trim().length === 0) {
+      throw new WorkerError(`/run_requirements/network_perimeter/egress_hosts/${idx} must be a non-empty string`);
+    }
+    return item.trim();
+  });
 }
 
 function assertSecretRef(ref: string): void {
@@ -959,8 +1099,8 @@ async function cleanupClaimWorkspace(
   materialized: MaterializedPackage,
 ): Promise<void> {
   await appendEvent(config, claim, "worker.cleanup.starting", {
-    workspace_dir: materialized.workspaceDir,
-    run_root_dir: materialized.runRootDir,
+    workspace: "attempt_workspace",
+    run_root: "run-root",
     retain_attempt_workspace: config.retainAttemptWorkspaces,
   }).catch((error) => {
     console.error(`worker ${config.workerId} failed to append cleanup start event: ${errorMessage(error)}`);
@@ -969,13 +1109,125 @@ async function cleanupClaimWorkspace(
   const cleanup = await cleanupAttemptWorkspace(config, materialized);
 
   await appendEvent(config, claim, "worker.cleanup.completed", {
-    workspace_dir: materialized.workspaceDir,
     core_run_ids: cleanup.coreRunIds,
+    core_run_count: cleanup.coreRunIds.length,
     docker_resources_removed: cleanup.dockerResourcesRemoved,
     workspace_removed: cleanup.workspaceRemoved,
   }).catch((error) => {
     console.error(`worker ${config.workerId} failed to append cleanup completed event: ${errorMessage(error)}`);
   });
+}
+
+export function materializedPackageEventPayload(materialized: Pick<MaterializedPackage, "manifestJson" | "secretFiles">): JsonObject {
+  return {
+    workspace: "attempt_workspace",
+    package_archive: "package.tgz",
+    extracted_package: "package",
+    run_root: "run-root",
+    manifest_experiment_id: stringAt(materialized.manifestJson, "/resolved_experiment/experiment/id"),
+    secret_file_count: Object.keys(materialized.secretFiles).length,
+  };
+}
+
+type MaterializedRedactionContext = Pick<
+  MaterializedPackage,
+  "workspaceDir" | "packageArchivePath" | "extractedDir" | "runRootDir" | "secretFiles"
+>;
+
+type RunRedactionContext = Pick<RunClaim, "run"> & {
+  attempt?: Pick<RunClaim["attempt"], "attempt_token">;
+};
+
+function materializedRedactionContext(workspaceDir: string): MaterializedPackage {
+  return {
+    workspaceDir,
+    packageArchivePath: join(workspaceDir, "package.tgz"),
+    extractedDir: join(workspaceDir, "package"),
+    runRootDir: join(workspaceDir, "run-root"),
+    manifestJson: {},
+    secretFiles: {},
+  };
+}
+
+export function coreRunnerFailureMessage(
+  exitCode: number,
+  stdout: string,
+  stderr: string,
+  materialized: MaterializedRedactionContext,
+  claim: RunRedactionContext,
+): string {
+  return `Core runner exited with ${exitCode}: ${redactedProcessTail(
+    stderr || stdout,
+    materialized,
+    claim,
+    REDACTED_FAILURE_MESSAGE_MAX_BYTES,
+  )}`;
+}
+
+export function redactedWorkerErrorMessage(
+  error: unknown,
+  materialized: MaterializedRedactionContext,
+  claim: RunRedactionContext,
+): string {
+  return redactedProcessTail(errorMessage(error), materialized, claim, REDACTED_FAILURE_MESSAGE_MAX_BYTES);
+}
+
+export function redactedProcessTail(
+  value: string,
+  materialized: MaterializedRedactionContext,
+  claim: RunRedactionContext,
+  maxBytes = REDACTED_PROCESS_TAIL_MAX_BYTES,
+): string {
+  let out = value;
+  const replacements = new Map<string, string>([
+    [materialized.workspaceDir, "<attempt-workspace>"],
+    [materialized.packageArchivePath, "<package-archive>"],
+    [materialized.extractedDir, "<package-dir>"],
+    [materialized.runRootDir, "<run-root>"],
+  ]);
+  for (const [id, path] of Object.entries(materialized.secretFiles)) {
+    replacements.set(path, `<secret-file:${id}>`);
+  }
+  for (const [id, ref] of Object.entries(claim.run.secret_refs)) {
+    replacements.set(ref, `<secret-ref:${id}>`);
+  }
+  if (claim.attempt?.attempt_token) {
+    replacements.set(claim.attempt.attempt_token, "<attempt-token>");
+  }
+  for (const [key, envValue] of Object.entries(claim.run.env)) {
+    if (envValue.length >= 8) {
+      replacements.set(envValue, `<env:${key}>`);
+    }
+  }
+  for (const [needle, replacement] of [...replacements.entries()].sort((a, b) => b[0].length - a[0].length)) {
+    if (needle.trim().length > 0) {
+      out = out.split(needle).join(replacement);
+    }
+  }
+  out = out
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, REDACTED_VALUE)
+    .replace(/\bASIA[0-9A-Z]{16}\b/g, REDACTED_VALUE)
+    .replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, REDACTED_VALUE)
+    .replace(/\bya29\.[A-Za-z0-9_-]{20,}\b/g, REDACTED_VALUE);
+  return tail(out, maxBytes);
+}
+
+function redactedHostErrorMessage(error: unknown, config: Pick<WorkerConfig, "dataDir" | "workerToken">): string {
+  let out = errorMessage(error);
+  for (const [needle, replacement] of [
+    [config.dataDir, "<worker-data-dir>"],
+    [config.workerToken, "<worker-token>"],
+  ] as const) {
+    if (needle.trim().length > 0) {
+      out = out.split(needle).join(replacement);
+    }
+  }
+  out = out
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, REDACTED_VALUE)
+    .replace(/\bASIA[0-9A-Z]{16}\b/g, REDACTED_VALUE)
+    .replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, REDACTED_VALUE)
+    .replace(/\bya29\.[A-Za-z0-9_-]{20,}\b/g, REDACTED_VALUE);
+  return tail(out, REDACTED_FAILURE_MESSAGE_MAX_BYTES);
 }
 
 async function cleanupAttemptWorkspace(
@@ -1161,9 +1413,9 @@ async function validateWorkerHost(config: WorkerConfig): Promise<void> {
   }
 }
 
-async function runnerMetadata(config: WorkerConfig): Promise<JsonObject> {
+export async function runnerMetadata(config: WorkerConfig): Promise<JsonObject> {
   const resources = await workerResourceSnapshot(config).catch((error) => ({
-    error: errorMessage(error),
+    error: redactedHostErrorMessage(error, config),
   }));
   return {
     daemon: "bucephalus-cloud-worker",
@@ -1185,7 +1437,7 @@ async function workerResourceSnapshot(config: WorkerConfig): Promise<JsonObject 
     cpu_count: os.cpus().length,
     total_memory_bytes: os.totalmem(),
     free_memory_bytes: os.freemem(),
-    data_dir: config.dataDir,
+    data_dir: "worker_data_dir",
     data_dir_free_bytes: freeBytes,
     min_free_bytes: config.minFreeBytes,
   };
@@ -1366,7 +1618,7 @@ async function runJsonCommand(command: string[], input: JsonObject): Promise<unk
     child.stdin.end(`${JSON.stringify(input)}\n`);
   });
   if (result.exitCode !== 0) {
-    throw new WorkerError(`${executable} exited ${result.exitCode}: ${tail(result.stderr || result.stdout, 1000)}`);
+    throw new WorkerError(`configured worker helper command exited ${result.exitCode}; stdout/stderr omitted`);
   }
   try {
     return JSON.parse(result.stdout);
@@ -1424,7 +1676,7 @@ function workerCapabilities(env: NodeJS.ProcessEnv): WorkerCapabilities {
     resources.push("network_perimeter");
   }
   return {
-    executors: csvEnv(env.BUCEPHALUS_WORKER_EXECUTORS, ["runner-docker"]),
+    executors: workerExecutors(csvEnv(env.BUCEPHALUS_WORKER_EXECUTORS, ["runner-docker"])),
     resources,
     arch: normalizeArch(env.BUCEPHALUS_WORKER_ARCH ?? os.arch()),
     cpu_count: numberEnv(env.BUCEPHALUS_WORKER_CPU_COUNT, os.cpus().length),
@@ -1432,6 +1684,23 @@ function workerCapabilities(env: NodeJS.ProcessEnv): WorkerCapabilities {
     disk_mb: numberEnv(env.BUCEPHALUS_WORKER_DISK_MB, Math.floor(numberEnv(env.BUCEPHALUS_WORKER_MIN_FREE_BYTES ?? env.BUCEPHALUS_MIN_FREE_BYTES, 20 * 1024 * 1024 * 1024) / 1024 / 1024)),
     isolation: csvEnv(env.BUCEPHALUS_WORKER_ISOLATION, ["reusable_vm"]),
   };
+}
+
+function workerExecutors(values: string[]): string[] {
+  const executors = values.map((value) => {
+    switch (value.trim().toLowerCase()) {
+      case "runner-docker":
+      case "runner_docker":
+      case "local-docker":
+      case "local_docker":
+        return "runner-docker";
+      case "modal":
+        return "modal";
+      default:
+        throw new WorkerError(`Unsupported runner executor '${value}'`);
+    }
+  });
+  return [...new Set(executors)].sort();
 }
 
 function normalizeArch(value: string): string {

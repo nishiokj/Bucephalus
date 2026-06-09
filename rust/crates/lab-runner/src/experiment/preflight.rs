@@ -264,6 +264,7 @@ pub fn preflight_experiment_with_options(
         variants: &variants,
         variant_runtime_profiles: &variant_runtime_profiles,
         executor_kind: resolved_executor_kind(&execution)?,
+        preflight_probe_parent: execution.run_root.as_deref(),
     });
 
     let passed = checks
@@ -414,6 +415,7 @@ pub(crate) fn check_grader_reachable_for_variants(
     per_task_scan: Option<&PerTaskImageScanResult>,
     package_root: &Path,
     project_root: &Path,
+    preflight_probe_parent: Option<&Path>,
 ) -> Vec<PreflightCheck> {
     if variants.len() != variant_runtime_profiles.len() {
         return variant_profile_count_mismatch("grader_reachable");
@@ -431,6 +433,7 @@ pub(crate) fn check_grader_reachable_for_variants(
                     per_task_scan,
                     package_root,
                     project_root,
+                    preflight_probe_parent,
                 ),
                 variant,
             )
@@ -1059,6 +1062,7 @@ pub(crate) struct ExecutorPreflightInput<'a> {
     pub(crate) variants: &'a [Variant],
     pub(crate) variant_runtime_profiles: &'a [VariantRuntimeProfile],
     pub(crate) executor_kind: ExecutorKind,
+    pub(crate) preflight_probe_parent: Option<&'a Path>,
 }
 
 pub(crate) fn collect_preflight_checks_for_executor(
@@ -1074,6 +1078,7 @@ pub(crate) fn collect_preflight_checks_for_executor(
         variants,
         variant_runtime_profiles,
         executor_kind,
+        preflight_probe_parent,
     } = input;
     let mut checks = Vec::new();
     let trial_runtime = match parse_trial_runtime_config(json_value) {
@@ -1320,6 +1325,7 @@ pub(crate) fn collect_preflight_checks_for_executor(
                     per_task_scan.as_ref(),
                     package_root,
                     project_root,
+                    preflight_probe_parent,
                 ))
             );
         }
@@ -1352,6 +1358,7 @@ pub(crate) fn collect_preflight_checks_for_executor(
                     per_task_scan.as_ref(),
                     package_root,
                     project_root,
+                    preflight_probe_parent,
                 ))
             );
         } else {
@@ -1482,6 +1489,7 @@ pub(crate) fn check_grader_reachable(
         None,
         project_root,
         project_root,
+        None,
     )
 }
 
@@ -1492,6 +1500,7 @@ pub(crate) fn check_agent_runtime_reachable_for_variants(
     per_task_scan: Option<&PerTaskImageScanResult>,
     package_root: &Path,
     project_root: &Path,
+    preflight_probe_parent: Option<&Path>,
 ) -> Vec<PreflightCheck> {
     if variants.len() != variant_runtime_profiles.len() {
         return variant_profile_count_mismatch("agent_runtime_reachable");
@@ -1507,6 +1516,7 @@ pub(crate) fn check_agent_runtime_reachable_for_variants(
                 per_task_scan,
                 package_root,
                 project_root,
+                preflight_probe_parent,
             ),
             variant,
         );
@@ -1569,6 +1579,7 @@ pub(crate) fn check_agent_runtime_reachable_with_scan(
     per_task_scan: Option<&PerTaskImageScanResult>,
     package_root: &Path,
     project_root: &Path,
+    preflight_probe_parent: Option<&Path>,
 ) -> PreflightCheck {
     let name = "agent_runtime_reachable";
     if let Err(err) = ensure_required_runtime_env_present(
@@ -1607,6 +1618,7 @@ pub(crate) fn check_agent_runtime_reachable_with_scan(
                 image,
                 package_root,
                 project_root,
+                preflight_probe_parent,
             ) {
                 Ok(context) => context,
                 Err(err) => return Some(format!("{} ({})", image, err)),
@@ -1674,6 +1686,7 @@ pub(crate) fn check_grader_reachable_with_scan(
     per_task_scan: Option<&PerTaskImageScanResult>,
     package_root: &Path,
     project_root: &Path,
+    preflight_probe_parent: Option<&Path>,
 ) -> PreflightCheck {
     let name = "grader_reachable";
 
@@ -1752,6 +1765,7 @@ pub(crate) fn check_grader_reachable_with_scan(
             image,
             package_root,
             project_root,
+            preflight_probe_parent,
         ) {
             Ok(context) => context,
             Err(err) => return Some(format!("{} ({})", image, err)),
@@ -2054,6 +2068,12 @@ pub(crate) struct PreflightProbeRoot {
     path: PathBuf,
 }
 
+impl PreflightProbeRoot {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl Drop for PreflightProbeRoot {
     fn drop(&mut self) {
         if std::env::var("BUCEPHALUS_KEEP_PREFLIGHT_PROBES")
@@ -2089,8 +2109,16 @@ pub(crate) struct PreflightProbeContext {
     task_materialization_kind: TaskMaterializationKind,
 }
 
-pub(crate) fn create_preflight_probe_root(label: &str) -> Result<PreflightProbeRoot> {
-    let root = std::env::temp_dir().join(format!(
+pub(crate) fn create_preflight_probe_root(
+    label: &str,
+    parent: Option<&Path>,
+) -> Result<PreflightProbeRoot> {
+    let parent = match parent {
+        Some(parent) => parent.join(".preflight-probes"),
+        None => std::env::temp_dir(),
+    };
+    ensure_dir(&parent)?;
+    let root = parent.join(format!(
         "bucephalus_preflight_probe_{}_{}_{}",
         sanitize_for_fs(label),
         std::process::id(),
@@ -2136,6 +2164,7 @@ pub(crate) fn build_preflight_probe_context(
     image: &str,
     package_root: &Path,
     _project_root: &Path,
+    preflight_probe_parent: Option<&Path>,
 ) -> Result<PreflightProbeContext> {
     let (task_idx, task_boundary) = match select_preflight_probe_task(tasks, image) {
         Ok(selected) => selected,
@@ -2180,8 +2209,9 @@ pub(crate) fn build_preflight_probe_context(
         ),
         Err(err) => return Err(err),
     };
-    let probe_root = create_preflight_probe_root(&format!("{}_{}", variant.id, image))?;
-    let trial_dir = probe_root.path.join("trial_preflight");
+    let probe_root =
+        create_preflight_probe_root(&format!("{}_{}", variant.id, image), preflight_probe_parent)?;
+    let trial_dir = probe_root.path().join("trial_preflight");
     ensure_dir(&trial_dir)?;
     let prepared = prepare_task_environment(
         package_root,

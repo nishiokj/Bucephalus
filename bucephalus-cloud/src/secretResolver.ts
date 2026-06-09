@@ -6,6 +6,7 @@ import {
   allowsControlPlaneSecretRefs,
   controlPlaneSecretRefViolation,
 } from "./secrets/policy";
+import { publicBoundaryText } from "./publicBoundary";
 
 type JsonObject = Record<string, unknown>;
 
@@ -49,7 +50,7 @@ export async function resolveSecrets(
     const value = await fetchSecretValue(secret.ref, { env, runCommand });
     const relativePath = `${secret.id}.secret`;
     const outputPath = resolvedOutputPath(request.output_dir, relativePath);
-    await writeSecretFile(outputPath, value);
+    await writeSecretFile(outputPath, value, relativePath);
     files[secret.id] = relativePath;
   }
   return { files };
@@ -67,8 +68,17 @@ export async function fetchSecretValue(
     }
     return value;
   }
-  const result = await options.runCommand(plan.executable, plan.args);
-  return stripOneTrailingNewline(result.stdout);
+  try {
+    const result = await options.runCommand(plan.executable, plan.args);
+    return stripOneTrailingNewline(result.stdout);
+  } catch (error) {
+    if (error instanceof SecretResolverError) {
+      throw error;
+    }
+    throw new SecretResolverError(
+      `${providerCommandSubject(plan.executable)} failed: ${publicBoundaryText(errorMessage(error))}`,
+    );
+  }
 }
 
 export function secretFetchPlan(ref: string, env: NodeJS.ProcessEnv = process.env):
@@ -206,13 +216,15 @@ function resolvedOutputPath(outputDir: string, relativePath: string): string {
   return outputPath;
 }
 
-async function writeSecretFile(outputPath: string, value: string): Promise<void> {
+async function writeSecretFile(outputPath: string, value: string, relativePath: string): Promise<void> {
   let file;
   try {
     file = await open(outputPath, "wx", 0o600);
   } catch (error) {
     if (isRecord(error) && error.code === "EEXIST") {
-      throw new SecretResolverError(`Secret output file already exists: ${outputPath}`);
+      throw new SecretResolverError(
+        `Secret output file already exists\n\noutput_ref: ${secretOutputRef(relativePath)}\n\nRemove the existing file or retry with a fresh attempt workspace.`,
+      );
     }
     throw error;
   }
@@ -243,7 +255,11 @@ async function runProviderCommand(executable: string, args: string[]): Promise<{
     });
   });
   if (result.exitCode !== 0) {
-    throw new SecretResolverError(`${executable} exited ${result.exitCode}: ${tail(result.stderr, 1000)}`);
+    const stderr = publicBoundaryText(tail(result.stderr, 1000).trim());
+    throw new SecretResolverError(
+      `${providerCommandSubject(executable)} exited ${result.exitCode}`
+        + (stderr.length === 0 ? "" : `: ${stderr}`),
+    );
   }
   return {
     stdout: result.stdout,
@@ -307,6 +323,22 @@ function tail(value: string, maxBytes: number): string {
   return buffer.subarray(buffer.byteLength - maxBytes).toString("utf8");
 }
 
+function providerCommandSubject(executable: string): string {
+  const publicExecutable = publicBoundaryText(executable);
+  if (publicExecutable !== executable || /[\\/]/.test(executable)) {
+    return "Secret provider command";
+  }
+  return `Secret provider command '${publicExecutable}'`;
+}
+
+function secretOutputRef(relativePath: string): string {
+  return `secret-output://${publicBoundaryText(relativePath)}`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function truthy(value: string | undefined): boolean {
   return value !== undefined && ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
 }
@@ -331,7 +363,7 @@ if (import.meta.main) {
       process.stdout.write(`${JSON.stringify(output)}\n`);
     })
     .catch((error) => {
-      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      process.stderr.write(`${publicBoundaryText(errorMessage(error))}\n`);
       process.exit(1);
     });
 }
