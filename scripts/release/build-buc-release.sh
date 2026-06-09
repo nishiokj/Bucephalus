@@ -290,7 +290,8 @@ else
       src/worker.ts \
       src/db/migrate.ts \
       src/poolController.ts \
-      src/secretResolver.ts
+      src/secretResolver.ts \
+      src/networkPolicyClient.ts
   )
   rm -rf "${RUNTIME_BUILD_DIR}"
   RUNTIME_BUILD_DIR=""

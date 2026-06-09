@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "bin": {
-    "bucephalus-cloud-secret-resolver": "./src/secretResolver.ts"
+    "bucephalus-cloud-secret-resolver": "./src/secretResolver.ts",
+    "bucephalus-cloud-network-policy": "./src/networkPolicyClient.ts"
   },
   "scripts": {
     "api": "bun run src/server.ts",

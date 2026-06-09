@@ -252,49 +252,6 @@ ensure_host_dependencies() {
 ensure_host_dependencies
 
 install -d -m 0755 /var/lib/bucephalus/bin
-cat >/var/lib/bucephalus/bin/network-policy-client <<'BUN'
-#!/usr/bin/env bun
-const input = JSON.parse(await new Response(Bun.stdin.stream()).text());
-const attemptId = String(input.attempt_id ?? "");
-if (!/^[A-Za-z0-9_.-]+$/.test(attemptId)) {
-  console.error("attempt_id contains unsupported characters");
-  process.exit(2);
-}
-const hosts = Array.isArray(input.egress_hosts) ? input.egress_hosts : [];
-const cleaned = [...new Set(hosts.map((host) => String(host).trim().toLowerCase()).filter(Boolean))];
-if (cleaned.length === 0) {
-  process.stdout.write(JSON.stringify({ ok: true, applied: false }) + "\\n");
-  process.exit(0);
-}
-for (const host of cleaned) {
-  if (!/^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(host) && !/^[0-9]{1,3}(?:\\.[0-9]{1,3}){3}$/.test(host)) {
-    console.error(\`unsupported egress host '\${host}'\`);
-    process.exit(2);
-  }
-}
-const root = "/var/lib/bucephalus/network-policy";
-const requestPath = \`\${root}/requests/\${attemptId}.hosts\`;
-const ackPath = \`\${root}/acks/\${attemptId}.ack\`;
-await Bun.write(requestPath, cleaned.join("\\n") + "\\n");
-const deadline = Date.now() + 45_000;
-while (Date.now() < deadline) {
-  const ack = Bun.file(ackPath);
-  if (await ack.exists()) {
-    const text = await ack.text();
-    if (text.startsWith("ok\\n") || text.trim() === "ok") {
-      process.stdout.write(JSON.stringify({ ok: true, applied: true, egress_hosts: cleaned }) + "\\n");
-      process.exit(0);
-    }
-    console.error(text.trim() || "network policy enforcer failed");
-    process.exit(1);
-  }
-  await Bun.sleep(250);
-}
-console.error("timed out waiting for host network policy enforcer");
-process.exit(1);
-BUN
-chmod 0755 /var/lib/bucephalus/bin/network-policy-client
-
 cat >/var/lib/bucephalus/bin/network-policy-daemon <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -418,7 +375,6 @@ docker run -d \\
   --group-add "$(stat -c '%g' /var/run/docker.sock)" \\
   -v /var/run/docker.sock:/var/run/docker.sock \\
   -v /var/lib/bucephalus:/var/lib/bucephalus \\
-  -v /var/lib/bucephalus/bin/network-policy-client:/usr/local/bin/bucephalus-cloud-network-policy:ro \\
   "\${WORKER_IMAGE}"
 `;
 }
