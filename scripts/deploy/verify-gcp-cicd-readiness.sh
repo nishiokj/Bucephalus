@@ -478,6 +478,7 @@ deploy_roles=(
   roles/secretmanager.admin
   roles/servicenetworking.networksAdmin
   roles/serviceusage.serviceUsageAdmin
+  roles/storage.admin
   roles/storage.objectAdmin
 )
 for role in "${deploy_roles[@]}"; do
