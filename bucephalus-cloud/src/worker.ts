@@ -1161,14 +1161,14 @@ async function dockerPullImage(imageRef: string): Promise<void> {
   }
 }
 
-async function dockerRegistryAuthHeaders(imageRef: string): Promise<Record<string, string>> {
+export async function dockerRegistryAuthHeaders(imageRef: string): Promise<Record<string, string>> {
   const registry = registryHostFromImageRef(imageRef);
   const auth = await dockerRegistryAuth(registry);
   if (!auth) {
     return {};
   }
   return {
-    "X-Registry-Auth": Buffer.from(JSON.stringify(auth)).toString("base64"),
+    "X-Registry-Auth": Buffer.from(JSON.stringify(auth)).toString("base64url"),
   };
 }
 
@@ -1189,10 +1189,12 @@ async function dockerRegistryAuth(registry: string): Promise<JsonObject | null> 
     if (!entry) {
       return null;
     }
+    const decodedAuth = dockerAuthCredential(entry);
+    const username = typeof entry.username === "string" ? entry.username : decodedAuth?.username;
+    const password = typeof entry.password === "string" ? entry.password : decodedAuth?.password;
     return {
-      username: typeof entry.username === "string" ? entry.username : undefined,
-      password: typeof entry.password === "string" ? entry.password : undefined,
-      auth: typeof entry.auth === "string" ? entry.auth : undefined,
+      username,
+      password,
       serveraddress: registry,
     };
   } catch (error) {
@@ -1201,6 +1203,26 @@ async function dockerRegistryAuth(registry: string): Promise<JsonObject | null> 
     }
     throw error;
   }
+}
+
+function dockerAuthCredential(entry: JsonObject): { username: string; password: string } | null {
+  if (typeof entry.auth !== "string" || entry.auth.trim().length === 0) {
+    return null;
+  }
+  let decoded: string;
+  try {
+    decoded = Buffer.from(entry.auth, "base64").toString("utf8");
+  } catch {
+    return null;
+  }
+  const separator = decoded.indexOf(":");
+  if (separator <= 0) {
+    return null;
+  }
+  return {
+    username: decoded.slice(0, separator),
+    password: decoded.slice(separator + 1),
+  };
 }
 
 function registryHostFromImageRef(imageRef: string): string {
