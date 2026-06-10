@@ -49,6 +49,6 @@ tar = "0.4"
 thiserror = "1"
 tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "time"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 walkdir = "2"
 zip = "0.6"

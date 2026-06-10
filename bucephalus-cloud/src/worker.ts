@@ -8,6 +8,14 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import { inspectSealedPackageArchive } from "./imports/sealedPackage";
+import {
+  childTraceContext,
+  initTelemetry,
+  logError,
+  logInfo,
+  newTraceContext,
+  type TraceContext,
+} from "./logging";
 
 interface WorkerConfig {
   apiUrl: string;
@@ -53,12 +61,18 @@ class WorkerError extends Error {
 let shuttingDown = false;
 let activeChild: ChildProcess | null = null;
 let runnerInstancePoisoned = false;
+let workerContext: TraceContext = newTraceContext({ component: "worker" });
 
 async function main(): Promise<void> {
+  await initTelemetry();
   const config = loadWorkerConfig();
+  workerContext = newTraceContext({ component: "worker", requestId: `worker-${config.workerId}` });
   const instance = await registerRunnerInstance(config);
   config.runnerInstanceId = instance.runner_instance_id;
-  console.log(`runner instance registered: ${config.runnerInstanceId}`);
+  logInfo("worker.instance_registered", workerContext, {
+    runner_instance_id: config.runnerInstanceId,
+    worker_id: config.workerId,
+  });
   try {
     await validateWorkerHost(config);
     await cleanupStartupResidue(config);
@@ -66,7 +80,7 @@ async function main(): Promise<void> {
     await poisonRunnerInstance(config, "startup_cleanup_failed", {
       error: errorMessage(error),
     }).catch((poisonError) => {
-      console.error(`failed to mark runner unhealthy: ${errorMessage(poisonError)}`);
+      logError("worker.poison_failed", workerContext, { error: errorMessage(poisonError) });
     });
     throw error;
   }
@@ -74,11 +88,11 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => requestShutdown("SIGTERM"));
 
   const sweeper = runSweeper(config).catch((error) => {
-    console.error(`worker sweeper stopped: ${errorMessage(error)}`);
+    logError("worker.sweeper_stopped", workerContext, { error: errorMessage(error) });
     shuttingDown = true;
   });
   const instanceHeartbeat = runInstanceHeartbeat(config).catch((error) => {
-    console.error(`runner instance heartbeat stopped: ${errorMessage(error)}`);
+    logError("worker.instance_heartbeat_stopped", workerContext, { error: errorMessage(error) });
     shuttingDown = true;
   });
 
@@ -97,7 +111,7 @@ async function main(): Promise<void> {
     await instanceHeartbeat.catch(() => undefined);
     if (config.runnerInstanceId && !runnerInstancePoisoned) {
       await markRunnerInstanceOffline(config, "worker_shutdown").catch((error) => {
-        console.error(`failed to mark runner offline: ${errorMessage(error)}`);
+        logError("worker.offline_failed", workerContext, { error: errorMessage(error) });
       });
     }
   }
@@ -114,7 +128,7 @@ async function runSweeper(config: WorkerConfig): Promise<void> {
       body: {},
     });
     if (isRecord(result) && Array.isArray(result.expired) && result.expired.length > 0) {
-      console.log(`worker sweeper expired ${result.expired.length} attempt(s)`);
+      logInfo("worker.sweeper_expired", workerContext, { expired_count: result.expired.length });
     }
   }
 }
@@ -133,7 +147,12 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
   const attemptId = claim.attempt.attempt_id;
   const runId = claim.run.run_id;
   const workspaceDir = attemptWorkspaceDir(config, claim);
-  console.log(`worker ${config.workerId} claimed run ${runId} attempt ${attemptId}`);
+  const runContext = newTraceContext({ component: "worker-run", runId, attemptId });
+  logInfo("worker.claimed_run", runContext, {
+    run_id: runId,
+    attempt_id: attemptId,
+    worker_id: config.workerId,
+  });
 
   let heartbeatStop = false;
   const heartbeatLoop = (async () => {
@@ -167,7 +186,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
       });
       await prePullRunImages(config, claim);
       await applyRuntimeNetworkPolicy(config, claim, materialized);
-      await executeCoreRun(config, claim, materialized);
+      await executeCoreRun(config, claim, materialized, runContext);
     } catch (error) {
       coreError = error;
     }
@@ -179,12 +198,12 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         await appendEvent(config, claim, "worker.runtime.snapshot_failed", {
           error: errorMessage(error),
         }).catch((eventError) => {
-          console.error(`worker ${config.workerId} failed to append runtime snapshot failure event: ${errorMessage(eventError)}`);
+          logError("worker.snapshot_failure_event_failed", runContext, { error: errorMessage(eventError) });
         });
         if (!coreError) {
           coreError = error;
         } else {
-          console.error(`worker ${config.workerId} failed to upload runtime snapshot: ${errorMessage(error)}`);
+          logError("worker.snapshot_upload_failed", runContext, { error: errorMessage(error) });
         }
       }
     }
@@ -205,23 +224,23 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
     if (cleanupError) {
       const message = `runner cleanup failed after run ${runId} attempt ${attemptId}: ${errorMessage(cleanupError)}`;
       await fail(config, claim, message).catch((failError) => {
-        console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
+        logError("worker.fail_run_failed", runContext, { error: errorMessage(failError) });
       });
       await poisonRunnerInstance(config, "attempt_cleanup_failed", {
         run_id: runId,
         attempt_id: attemptId,
         error: errorMessage(cleanupError),
       }).catch((poisonError) => {
-        console.error(`failed to mark runner unhealthy: ${errorMessage(poisonError)}`);
+        logError("worker.poison_failed", runContext, { error: errorMessage(poisonError) });
       });
       shuttingDown = true;
     } else if (coreError) {
       await fail(config, claim, errorMessage(coreError)).catch((failError) => {
-        console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
+        logError("worker.fail_run_failed", runContext, { error: errorMessage(failError) });
       });
     } else {
       await complete(config, claim);
-      console.log(`worker ${config.workerId} completed run ${runId}`);
+      logInfo("worker.run_completed", runContext, { run_id: runId, worker_id: config.workerId });
     }
   } finally {
     heartbeatStop = true;
@@ -233,6 +252,7 @@ async function executeCoreRun(
   config: WorkerConfig,
   claim: RunClaim,
   materialized: MaterializedPackage,
+  context: TraceContext,
 ): Promise<void> {
   const command = coreRunnerCommand(config, claim, materialized);
   await appendEvent(config, claim, "worker.core.starting", {
@@ -240,9 +260,19 @@ async function executeCoreRun(
     workspace_dir: materialized.workspaceDir,
     run_root_dir: materialized.runRootDir,
   });
+  // Hand the Rust core runner the trace identity so its structured logs join
+  // this run's trace, and request JSON logs so the GCE Ops Agent parses
+  // severity + trace fields. Project id flows through from the worker env.
+  const runnerContext = childTraceContext(context, { component: "core-runner" });
+  const env = coreRunnerEnv();
+  env.BUCEPHALUS_LOG_FORMAT = "json";
+  env.BUCEPHALUS_TRACE_ID = runnerContext.traceId;
+  env.BUCEPHALUS_SPAN_ID = runnerContext.spanId;
+  env.BUCEPHALUS_RUN_ID = claim.run.run_id;
+  env.BUCEPHALUS_ATTEMPT_ID = claim.attempt.attempt_id;
   const result = await runProcess(command.executable, command.args, {
     cwd: materialized.workspaceDir,
-    env: coreRunnerEnv(),
+    env,
   });
   const eventPayload = {
     exit_code: result.exitCode,
@@ -684,7 +714,15 @@ async function runProcess(
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    // The core runner emits its structured JSON logs on stderr (stdout carries
+    // the --json result payload). Tee stderr through to the worker's own stderr
+    // so the lines reach the container stream → Ops Agent → Cloud Logging,
+    // while still buffering for the redacted failure-event tail. Stdout is not
+    // forwarded: it is the result protocol, not logs.
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr.push(chunk);
+      process.stderr.write(chunk);
+    });
     child.on("error", (error) => {
       if (activeChild === child) {
         activeChild = null;
@@ -981,7 +1019,7 @@ async function cleanupClaimWorkspace(
     run_root_dir: materialized.runRootDir,
     retain_attempt_workspace: config.retainAttemptWorkspaces,
   }).catch((error) => {
-    console.error(`worker ${config.workerId} failed to append cleanup start event: ${errorMessage(error)}`);
+    logError("worker.cleanup_start_event_failed", workerContext, { error: errorMessage(error) });
   });
 
   const cleanup = await cleanupAttemptWorkspace(config, materialized);
@@ -992,7 +1030,7 @@ async function cleanupClaimWorkspace(
     docker_resources_removed: cleanup.dockerResourcesRemoved,
     workspace_removed: cleanup.workspaceRemoved,
   }).catch((error) => {
-    console.error(`worker ${config.workerId} failed to append cleanup completed event: ${errorMessage(error)}`);
+    logError("worker.cleanup_completed_event_failed", workerContext, { error: errorMessage(error) });
   });
 }
 
@@ -1740,7 +1778,7 @@ function stringAt(root: JsonObject, pointer: string): string | null {
 
 if (import.meta.main) {
   main().catch((error) => {
-    console.error(errorMessage(error));
+    logError("worker.fatal", workerContext, { error: errorMessage(error) });
     process.exit(1);
   });
 }

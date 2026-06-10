@@ -8,6 +8,7 @@ mod model;
 mod package;
 mod perf;
 mod persistence;
+pub mod telemetry;
 mod trial;
 mod util;
 

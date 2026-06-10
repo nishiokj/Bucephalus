@@ -14,6 +14,9 @@ import { handleLatchRoute } from "./routes/latch";
 import { handleRegistryRoute } from "./routes/registry";
 import { handleRunnerRoute } from "./routes/runners";
 import { handleRunRoute } from "./routes/runs";
+import { initTelemetry, logInfo, newTraceContext } from "./logging";
+
+await initTelemetry();
 
 const config = loadConfig();
 const workerToken = config.workerToken;
@@ -94,15 +97,21 @@ const server = Bun.serve({
   },
 });
 
-console.log(`bucephalus-cloud api listening on http://${config.host}:${server.port}`);
-console.log("user_oauth=required");
+const serviceContext = newTraceContext({ component: "api" });
+logInfo("api.startup", serviceContext, {
+  host: config.host,
+  port: server.port,
+  user_oauth_required: true,
+});
 
 process.on("SIGINT", async () => {
+  logInfo("api.shutdown_requested", serviceContext, { signal: "SIGINT" });
   await sql.end({ timeout: 1 });
   process.exit(0);
 });
 
 process.on("SIGTERM", async () => {
+  logInfo("api.shutdown_requested", serviceContext, { signal: "SIGTERM" });
   await sql.end({ timeout: 1 });
   process.exit(0);
 });

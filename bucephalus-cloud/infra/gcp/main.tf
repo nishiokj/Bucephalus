@@ -480,6 +480,11 @@ resource "google_cloud_run_v2_service" "api" {
       }
 
       env {
+        name  = "BUCEPHALUS_GCP_PROJECT_ID"
+        value = var.project_id
+      }
+
+      env {
         name  = "BUCEPHALUS_CLOUD_DATA_DIR"
         value = "/tmp/bucephalus-cloud"
       }
