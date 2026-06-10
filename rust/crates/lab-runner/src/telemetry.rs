@@ -159,7 +159,10 @@ impl TraceContext {
 
         let mut entry = Map::new();
         entry.insert("time".into(), Value::String(time));
-        entry.insert("severity".into(), Value::String(severity(level).to_string()));
+        entry.insert(
+            "severity".into(),
+            Value::String(severity(level).to_string()),
+        );
         entry.insert("message".into(), Value::String(message));
         entry.insert("component".into(), Value::String(self.component.clone()));
         entry.insert("target".into(), Value::String(target.to_string()));
@@ -211,8 +214,10 @@ struct JsonVisitor<'a>(&'a mut Map<String, Value>);
 
 impl Visit for JsonVisitor<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.0
-            .insert(field.name().to_string(), Value::String(format!("{value:?}")));
+        self.0.insert(
+            field.name().to_string(),
+            Value::String(format!("{value:?}")),
+        );
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
@@ -275,10 +280,7 @@ mod tests {
             Level::WARN,
             "lab_runner::experiment",
             "2026-06-09T00:00:00+00:00".into(),
-            fields(&[
-                ("message", json!("disk pressure")),
-                ("free_mb", json!(128)),
-            ]),
+            fields(&[("message", json!("disk pressure")), ("free_mb", json!(128))]),
         );
 
         assert_eq!(entry["severity"], json!("WARNING"));
