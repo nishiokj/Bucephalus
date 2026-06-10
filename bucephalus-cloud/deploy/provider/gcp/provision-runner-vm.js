@@ -76,6 +76,11 @@ async function main() {
     metadata: {
       items: [
         { key: "startup-script", value: startupScript },
+        // COS's native logging agent ships the worker container's
+        // stdout/stderr and the system journal to Cloud Logging. Without it
+        // the VM is a black box: attempt failures leave no logs and the
+        // reaper destroys the evidence minutes later.
+        { key: "google-logging-enabled", value: "true" },
         { key: "bucephalus-runner-pool-id", value: runnerPoolId },
         { key: "bucephalus-provision-request-id", value: provisionRequestId },
         { key: "bucephalus-run-id", value: runId },
@@ -182,7 +187,6 @@ function renderStartupScript(config) {
   return `#!/usr/bin/env bash
 set -euo pipefail
 
-export DEBIAN_FRONTEND=noninteractive
 PROJECT_ID=${shellQuote(config.projectId)}
 API_URL=${shellQuote(config.apiUrl)}
 RUNNER_POOL_ID=${shellQuote(config.runnerPoolId)}
@@ -213,88 +217,25 @@ secret_access() {
     | base64 -d
 }
 
+# The boot image must already provide the runner host contract; the startup
+# script asserts capabilities instead of installing distro packages. COS
+# satisfies all of these out of the box. Failing fast here surfaces a wrong
+# boot image as a provision failure instead of a downstream mystery.
 ensure_host_dependencies() {
-  local apt_updated="false"
-  if ! command -v curl >/dev/null 2>&1; then
-    if ! command -v apt-get >/dev/null 2>&1; then
-      echo "curl is required on runner boot image and apt-get is unavailable" >&2
-      exit 1
-    fi
-    apt-get update
-    apt_updated="true"
-    apt-get install -y --no-install-recommends ca-certificates curl
-  fi
-  if ! command -v docker >/dev/null 2>&1; then
-    if ! command -v apt-get >/dev/null 2>&1; then
-      echo "docker is required on runner boot image and apt-get is unavailable" >&2
-      exit 1
-    fi
-    if [[ "\${apt_updated}" != "true" ]]; then
-      apt-get update
-    fi
-    apt-get install -y --no-install-recommends docker.io
-  fi
-  if ! command -v iptables >/dev/null 2>&1; then
-    if ! command -v apt-get >/dev/null 2>&1; then
-      echo "iptables is required on runner boot image and apt-get is unavailable" >&2
-      exit 1
-    fi
-    if [[ "\${apt_updated}" != "true" ]]; then
-      apt-get update
-    fi
-    apt-get install -y --no-install-recommends iptables
+  local missing=()
+  for cmd in curl docker iptables; do
+    command -v "\${cmd}" >/dev/null 2>&1 || missing+=("\${cmd}")
+  done
+  if [[ "\${#missing[@]}" -gt 0 ]]; then
+    echo "runner boot image is missing required commands: \${missing[*]} (expected a COS image)" >&2
+    exit 1
   fi
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl enable --now docker || systemctl start docker
+    systemctl start docker || true
   fi
-}
-
-# Cheapest structured-log egress: the Ops Agent tails the worker container's
-# json-file logs and parses our per-line JSON, preserving severity and the
-# logging.googleapis.com/{trace,spanId} correlation fields. The runner SA
-# already carries roles/logging.logWriter + roles/monitoring.metricWriter.
-# Best-effort: a logging install failure must never block the worker boot.
-ensure_ops_agent() {
-  if ! command -v apt-get >/dev/null 2>&1; then
-    echo "skipping Ops Agent install: apt-get unavailable" >&2
-    return 0
-  fi
-  if ! systemctl is-active --quiet google-cloud-ops-agent 2>/dev/null; then
-    if curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh \\
-      && bash add-google-cloud-ops-agent-repo.sh --also-install; then
-      :
-    else
-      echo "Ops Agent install failed; container logs will not reach Cloud Logging" >&2
-      return 0
-    fi
-  fi
-  install -d -m 0755 /etc/google-cloud-ops-agent
-  cat >/etc/google-cloud-ops-agent/config.yaml <<'YAML'
-logging:
-  receivers:
-    bucephalus_containers:
-      type: files
-      include_paths:
-        - /var/lib/docker/containers/*/*-json.log
-  processors:
-    # Each line is Docker's envelope ({"log": "<app line>", "stream": ...});
-    # unwrap it, then parse the application JSON carried in the log field.
-    docker_envelope:
-      type: parse_json
-    app_payload:
-      type: parse_json
-      field: log
-  service:
-    pipelines:
-      bucephalus:
-        receivers: [bucephalus_containers]
-        processors: [docker_envelope, app_payload]
-YAML
-  systemctl restart google-cloud-ops-agent || true
 }
 
 ensure_host_dependencies
-ensure_ops_agent
 
 install -d -m 0755 /var/lib/bucephalus/bin
 cat >/var/lib/bucephalus/bin/network-policy-daemon <<'BASH'

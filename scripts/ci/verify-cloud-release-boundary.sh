@@ -1367,8 +1367,21 @@ for (const dockerfile of listFiles("bucephalus-cloud/images")) {
   if (!text.includes("FROM ${BUCEPHALUS_BUN_BASE_IMAGE}")) {
     fail(`${dockerfile} must use the digest-pinned base image build arg`);
   }
-  if (/^ENV\s+/m.test(text)) {
-    fail(`${dockerfile} must not bake runtime configuration with ENV`);
+  // Release identity is build provenance, not runtime configuration: every
+  // component must self-report its release so version skew is observable.
+  const allowedEnvLines = new Set([
+    'ENV BUCEPHALUS_RELEASE_VERSION="${BUCEPHALUS_RELEASE_VERSION}"',
+    'ENV BUCEPHALUS_RELEASE_GIT_SHA="${BUCEPHALUS_RELEASE_GIT_SHA}"',
+  ]);
+  for (const line of text.split("\n")) {
+    if (/^ENV\s+/.test(line) && !allowedEnvLines.has(line.trim())) {
+      fail(`${dockerfile} must not bake runtime configuration with ENV (got: ${line.trim()})`);
+    }
+  }
+  for (const required of allowedEnvLines) {
+    if (!text.includes(required)) {
+      fail(`${dockerfile} must bake release identity for skew detection: ${required}`);
+    }
   }
   for (const forbidden of [
     /DATABASE_URL/,
@@ -1447,11 +1460,14 @@ if (!provisionRunnerVmText.includes("projects/cos-cloud/global/images/family/cos
 if (/python3/.test(provisionRunnerVmText)) {
   fail("GCE runner startup must not require python3 on the host boot image");
 }
-if (!provisionRunnerVmText.includes("ensure_host_dependencies") || !provisionRunnerVmText.includes("command -v docker")) {
-  fail("GCE runner startup must check for preinstalled Docker before falling back to package installation");
+if (!provisionRunnerVmText.includes("ensure_host_dependencies")) {
+  fail("GCE runner startup must assert the boot image provides curl, docker, and iptables");
 }
-if (/apt-get install -y --no-install-recommends ca-certificates curl docker\.io/.test(provisionRunnerVmText)) {
-  fail("GCE runner startup must not unconditionally apt-install Docker on every VM boot");
+if (/apt-get/.test(provisionRunnerVmText)) {
+  fail("GCE runner startup must not install distro packages; the boot image provides the host contract");
+}
+if (!provisionRunnerVmText.includes('"google-logging-enabled"')) {
+  fail("GCE runner provisioning must enable COS logging so worker container logs reach Cloud Logging");
 }
 if (!/const workerImage = requiredEnv\("BUCEPHALUS_GCP_RUNNER_IMAGE"\);[\s\S]*return \{[\s\S]*\bworkerImage,\s*[\s\S]*\};/.test(provisionRunnerVmText)) {
   fail("GCE runner provisioning must return the validated worker image from loadConfig");

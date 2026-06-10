@@ -8,6 +8,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import { inspectSealedPackageArchive } from "./imports/sealedPackage";
+import { releaseIdentity } from "./release";
 import {
   childTraceContext,
   initTelemetry,
@@ -261,8 +262,9 @@ async function executeCoreRun(
     run_root_dir: materialized.runRootDir,
   });
   // Hand the Rust core runner the trace identity so its structured logs join
-  // this run's trace, and request JSON logs so the GCE Ops Agent parses
-  // severity + trace fields. Project id flows through from the worker env.
+  // this run's trace, and request JSON logs so log pipelines that parse
+  // container output can recover severity + trace fields. Project id flows
+  // through from the worker env.
   const runnerContext = childTraceContext(context, { component: "core-runner" });
   const env = coreRunnerEnv();
   env.BUCEPHALUS_LOG_FORMAT = "json";
@@ -716,9 +718,9 @@ async function runProcess(
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     // The core runner emits its structured JSON logs on stderr (stdout carries
     // the --json result payload). Tee stderr through to the worker's own stderr
-    // so the lines reach the container stream → Ops Agent → Cloud Logging,
-    // while still buffering for the redacted failure-event tail. Stdout is not
-    // forwarded: it is the result protocol, not logs.
+    // so the lines reach the container stream and the host's Cloud Logging
+    // agent, while still buffering for the redacted failure-event tail. Stdout
+    // is not forwarded: it is the result protocol, not logs.
     child.stderr.on("data", (chunk: Buffer) => {
       stderr.push(chunk);
       process.stderr.write(chunk);
@@ -1333,6 +1335,7 @@ async function runnerMetadata(config: WorkerConfig): Promise<JsonObject> {
   }));
   return {
     daemon: "bucephalus-cloud-worker",
+    release: releaseIdentity(),
     ...(config.provisionRequestId ? { provision_request_id: config.provisionRequestId } : {}),
     ...(config.providerInstanceId ? { provider_instance_id: config.providerInstanceId } : {}),
     cleanup_policy: {

@@ -527,6 +527,16 @@ export class RunRepository {
     });
   }
 
+  async listAttempts(runId: string): Promise<RunAttemptRecord[]> {
+    const rows = await this.sql`
+      select *
+      from cloud.run_attempts
+      where run_id = ${runId}
+      order by started_at
+    `;
+    return rows as unknown as RunAttemptRecord[];
+  }
+
   async expireLeases(): Promise<Array<{ run: CloudRunRecord; attempt: RunAttemptRecord }>> {
     return await this.sql.begin(async (tx) => {
       const attempts = await tx`
