@@ -848,6 +848,13 @@ components:
       properties:
         package_digest:
           $ref: './common.yaml#/components/schemas/Digest'
+        name:
+          type:
+            - string
+            - 'null'
+          description: >
+            Human-readable package identity, taken from the resolved
+            experiment's name sealed inside the package.
         upload_id:
           type:
             - string

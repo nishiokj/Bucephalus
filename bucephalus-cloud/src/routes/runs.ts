@@ -798,6 +798,7 @@ function isRecord(value: unknown): value is JsonObject {
 function packageToWire(artifact: PackageArtifactRecord) {
   return {
     package_digest: artifact.package_digest,
+    name: packageName(artifact),
     upload_id: artifact.upload_id,
     byte_size: nullableNumber(artifact.byte_size),
     media_type: artifact.media_type,
@@ -811,6 +812,21 @@ function packageToWire(artifact: PackageArtifactRecord) {
     created_at: artifact.created_at,
     updated_at: artifact.updated_at,
   };
+}
+
+// Packages need a human-readable identity wherever they are listed; without
+// one, consumers fall back to stringifying structures. The authoritative name
+// is the resolved experiment's name sealed inside the package.
+function packageName(artifact: PackageArtifactRecord): string | null {
+  for (const candidate of [
+    jsonPointerValue(artifact.resolved_experiment_json, "/experiment/name"),
+    jsonPointerValue(artifact.manifest_json, "/resolved_experiment/experiment/name"),
+  ]) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+  return null;
 }
 
 function validatePackageSecretRefs(

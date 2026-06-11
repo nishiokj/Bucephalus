@@ -359,6 +359,36 @@ describe("Cloud run routes", () => {
     expect(observed.runOwnerKey).toBe("issuer:user-b");
   });
 
+  test("package responses carry the resolved experiment name", async () => {
+    const packages = {
+      async getArtifact() {
+        const record = packageRecordWithSecrets();
+        return {
+          ...record,
+          resolved_experiment_json: {
+            ...record.resolved_experiment_json,
+            experiment: { name: "Peter Gregory v2 State-Only Cloud Demo (pg_024)" },
+          },
+        };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/packages/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+      new URL("https://cloud.example/v1/packages/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+      packages as unknown as PackageRepository,
+      {} as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(response).not.toBeNull();
+    const body = await response!.json();
+    expect(body.name).toBe("Peter Gregory v2 State-Only Cloud Demo (pg_024)");
+  });
+
   test("package responses expose declared secret requirements without values", async () => {
     const packages = {
       async getArtifact() {
