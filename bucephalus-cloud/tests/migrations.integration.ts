@@ -114,6 +114,7 @@ describe("cloud SQL migrations", () => {
           "cloud.runs",
           "cloud.run_attempts",
           "cloud.runner_pools",
+          "cloud.runner_worker_images",
           "cloud.runner_instances",
           "cloud.runner_provision_requests",
           "cloud.latch_submissions",

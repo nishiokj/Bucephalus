@@ -63,7 +63,7 @@ variable "migration_image_digest" {
 }
 
 variable "worker_image_digest" {
-  description = "Digest-addressed worker image used by GCE runner VMs. Required when the pool controller is deployed."
+  description = "Optional digest-addressed worker image fallback for GCE runner VMs. Active worker image state is promoted per runner pool in Postgres."
   type        = string
   default     = null
 

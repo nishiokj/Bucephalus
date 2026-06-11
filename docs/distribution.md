@@ -187,9 +187,9 @@ are built by separate core-only matrix entries so x86 Cloud image publication
 does not wait for unrelated macOS artifacts.
 
 Product release runs always build the full public core target set. The manual
-workflow form has the same contract as a `v*` tag push: pick the version, then
-publish installable release assets, Cloud images, and deploy promotion evidence
-from the same run.
+workflow form has the same contract as a `v*` tag push: the version comes from
+the workspace `Cargo.toml`, then the run publishes installable release assets,
+Cloud images, and deploy promotion evidence.
 
 The matching archive is:
 
@@ -290,15 +290,25 @@ manifest evidence. Future base refreshes require a policy update and verifier
 pass before pushed publication can use the new digest.
 
 In the GitHub release workflow, installer-visible product releases are created
-only by full product release runs:
+only by full product release runs. The primary path is automatic: bump
+`[workspace.package] version` in the root `Cargo.toml` and land it on `main`.
+The auto-release workflow (`bucephalus-auto-release.yml`) detects that the
+version on `main` has no matching `v<version>` tag, creates the tag at that
+commit, and dispatches the release workflow on it. The version is stated once,
+in `Cargo.toml`; the tag is derived from it, never typed by hand.
 
-- Push a `v*` tag, for example `git push origin v0.3.6`. The tag push builds
-  Linux and macOS release assets, publishes the GitHub Release, and pushes the
-  Cloud images plus promotion evidence.
-- Or run the workflow manually with the single `version_override=<version>`
-  input. This creates or updates `v<version>` from the selected commit, publishes
-  the GitHub Release assets that the installer downloads, and pushes the Cloud
-  images plus promotion evidence.
+Two manual escape hatches remain:
+
+- Push a `v*` tag directly, for example `git push origin v0.3.6`. The tag must
+  match the workspace `Cargo.toml` version at the tagged commit; the release
+  gates fail immediately on a mismatch so binaries never self-report a version
+  other than the one they were published as.
+- Or run the release workflow manually. The optional `version_override` input
+  defaults to the workspace `Cargo.toml` version; if supplied it must match.
+  This creates or updates `v<version>` from the selected commit.
+
+All paths build Linux and macOS release assets, publish the GitHub Release that
+the installer downloads, and push the Cloud images plus promotion evidence.
 
 Branch pushes do not run the release workflow and do not create installer-visible
 release assets. This keeps `/releases/latest/download/...` aligned with actual

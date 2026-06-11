@@ -9,10 +9,12 @@ OUT_DIR=""
 PUSH="false"
 WORK_DIR=""
 RELEASE_ARCHIVE_SHA=""
+CACHE_MODE="${BUCEPHALUS_CLOUD_IMAGE_CACHE_MODE:-required}"
+COMPONENTS_CSV=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/release/build-cloud-images.sh --release <release-dir-or-tar.gz> --repository <repo> --base-image <image@sha256:digest> [--out <dir>] [--push]
+Usage: scripts/release/build-cloud-images.sh --release <release-dir-or-tar.gz> --repository <repo> --base-image <image@sha256:digest> [--out <dir>] [--push] [--components <csv>] [--cache-mode required|best-effort|off]
 
 Builds Bucephalus Cloud images from a verified release bundle:
   - api
@@ -24,6 +26,13 @@ The base image must be digest-addressed. Without --push, images are loaded into
 the local Docker daemon and are not valid deploy inputs. With --push, the output
 manifest records the registry digest returned by docker buildx metadata after a
 local image-boundary inspection pass.
+
+--components defaults to api,pool-controller,migrations,worker. Use
+--components worker for a worker-only promotion lane.
+
+--cache-mode controls registry BuildKit cache for pushed builds. required keeps
+the CI release default. best-effort reads existing cache but does not write it.
+off omits registry cache arguments.
 USAGE
 }
 
@@ -48,6 +57,14 @@ while [[ $# -gt 0 ]]; do
     --push)
       PUSH="true"
       shift
+      ;;
+    --components)
+      COMPONENTS_CSV="${2:-}"
+      shift 2
+      ;;
+    --cache-mode)
+      CACHE_MODE="${2:-}"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -184,6 +201,14 @@ if [[ -z "${RELEASE_INPUT}" || -z "${REPOSITORY}" || -z "${BASE_IMAGE}" ]]; then
   usage >&2
   exit 2
 fi
+case "${CACHE_MODE}" in
+  required|best-effort|off)
+    ;;
+  *)
+    echo "cache mode must be required, best-effort, or off" >&2
+    exit 2
+    ;;
+esac
 
 publish_input_args=(
   --repository "${REPOSITORY}"
@@ -264,7 +289,30 @@ TAG_SUFFIX="$(printf "%s-%s-%s" "${VERSION}" "${TARGET}" "${GIT_SHA:0:12}" | tr 
 OUT_DIR="${OUT_DIR:-${RELEASE_DIR}/image-build}"
 mkdir -p "${OUT_DIR}"
 
-COMPONENTS=(api pool-controller migrations worker)
+ALL_COMPONENTS=(api pool-controller migrations worker)
+if [[ -n "${COMPONENTS_CSV}" ]]; then
+  IFS=',' read -r -a COMPONENTS <<< "${COMPONENTS_CSV}"
+else
+  COMPONENTS=("${ALL_COMPONENTS[@]}")
+fi
+if [[ "${#COMPONENTS[@]}" -eq 0 ]]; then
+  echo "--components must name at least one component" >&2
+  exit 2
+fi
+for component in "${COMPONENTS[@]}"; do
+  case "${component}" in
+    api|pool-controller|migrations|worker)
+      ;;
+    *)
+      echo "unsupported image component: ${component}" >&2
+      exit 2
+      ;;
+  esac
+done
+ALLOW_PARTIAL_MANIFEST="false"
+if [[ "${#COMPONENTS[@]}" -ne "${#ALL_COMPONENTS[@]}" ]]; then
+  ALLOW_PARTIAL_MANIFEST="true"
+fi
 ENTRIES_JSONL="${OUT_DIR}/image-entries.jsonl"
 : > "${ENTRIES_JSONL}"
 
@@ -313,9 +361,25 @@ for component in "${COMPONENTS[@]}"; do
   if [[ "${PUSH}" == "true" ]]; then
     inspected_ref="${boundary_ref}"
     step_started_at="${SECONDS}"
+    cache_args=()
+    case "${CACHE_MODE}" in
+      required)
+        cache_args=(
+          --cache-from "type=registry,ref=${cache_ref}"
+          --cache-to "type=registry,ref=${cache_ref},mode=max"
+        )
+        ;;
+      best-effort)
+        cache_args=(
+          --cache-from "type=registry,ref=${cache_ref}"
+        )
+        ;;
+      off)
+        cache_args=()
+        ;;
+    esac
     docker "${common_build_args[@]}" \
-      --cache-from "type=registry,ref=${cache_ref}" \
-      --cache-to "type=registry,ref=${cache_ref},mode=max" \
+      "${cache_args[@]}" \
       --tag "${boundary_ref}" \
       --iidfile "${boundary_iid_file}" \
       --metadata-file "${boundary_metadata_file}" \
@@ -416,6 +480,7 @@ await Bun.write(process.env.MANIFEST_PATH, `${JSON.stringify({
     sha256: process.env.DOCKERIGNORE_SHA,
   },
   base_image: process.env.BASE_IMAGE,
+  cache_mode: process.env.CACHE_MODE,
   builder: {
     kind: isGithubActions ? "github_actions" : "local",
     github_server_url: isGithubActions ? process.env.GITHUB_SERVER_URL || null : null,
@@ -430,7 +495,11 @@ await Bun.write(process.env.MANIFEST_PATH, `${JSON.stringify({
   images: entries,
 }, null, 2)}\n`);
 JS
-ENTRIES_JSONL="${ENTRIES_JSONL}" MANIFEST_PATH="${MANIFEST_PATH}" RELEASE_MANIFEST_SHA="${RELEASE_MANIFEST_SHA}" DOCKERIGNORE_SHA="${DOCKERIGNORE_SHA}" RELEASE_ARCHIVE_SHA="${RELEASE_ARCHIVE_SHA}" RELEASE_DIR="${RELEASE_DIR}" BASE_IMAGE="${BASE_IMAGE}" PUSH="${PUSH}" BUCEPHALUS_SOURCE_RELEASE_RUN_ID="${BUCEPHALUS_SOURCE_RELEASE_RUN_ID:-}" BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME="${BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME:-}" bun "${WRITE_MANIFEST_JS}"
+ENTRIES_JSONL="${ENTRIES_JSONL}" MANIFEST_PATH="${MANIFEST_PATH}" RELEASE_MANIFEST_SHA="${RELEASE_MANIFEST_SHA}" DOCKERIGNORE_SHA="${DOCKERIGNORE_SHA}" RELEASE_ARCHIVE_SHA="${RELEASE_ARCHIVE_SHA}" RELEASE_DIR="${RELEASE_DIR}" BASE_IMAGE="${BASE_IMAGE}" CACHE_MODE="${CACHE_MODE}" PUSH="${PUSH}" BUCEPHALUS_SOURCE_RELEASE_RUN_ID="${BUCEPHALUS_SOURCE_RELEASE_RUN_ID:-}" BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME="${BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME:-}" bun "${WRITE_MANIFEST_JS}"
 
-"${ROOT_DIR}/scripts/release/verify-cloud-image-build-manifest.sh" "${MANIFEST_PATH}" --release "${RELEASE_INPUT}"
+verify_manifest_args=("${MANIFEST_PATH}" --release "${RELEASE_INPUT}")
+if [[ "${ALLOW_PARTIAL_MANIFEST}" == "true" ]]; then
+  verify_manifest_args+=(--allow-partial)
+fi
+"${ROOT_DIR}/scripts/release/verify-cloud-image-build-manifest.sh" "${verify_manifest_args[@]}"
 echo "image_manifest=${MANIFEST_PATH}"

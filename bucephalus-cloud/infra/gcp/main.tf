@@ -200,10 +200,6 @@ resource "terraform_data" "deploy_input_preflight" {
       error_message = "pool_controller_image_digest is required when the pool controller is deployed."
     }
     precondition {
-      condition     = !local.deploy_pool_controller || var.worker_image_digest != null
-      error_message = "worker_image_digest is required when the pool controller is deployed."
-    }
-    precondition {
       condition     = !local.deploy_pool_controller || var.pool_controller_runner_pool_id != null
       error_message = "pool_controller_runner_pool_id is required when the pool controller is deployed."
     }
@@ -809,9 +805,12 @@ resource "google_cloud_run_v2_service" "pool_controller" {
         value = google_service_account.runner.email
       }
 
-      env {
-        name  = "BUCEPHALUS_GCP_RUNNER_IMAGE"
-        value = var.worker_image_digest
+      dynamic "env" {
+        for_each = var.worker_image_digest == null ? [] : [var.worker_image_digest]
+        content {
+          name  = "BUCEPHALUS_GCP_RUNNER_IMAGE"
+          value = env.value
+        }
       }
 
       env {

@@ -4,9 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       version_override:
-        description: "Release version to publish, for example 0.3.6. Tag pushes derive this from the v* tag."
+        description: "Required manual release version, for example 0.3.6. Tag pushes derive it from the v* tag."
         required: true
-        default: ""
         type: string
   push:
     tags:
@@ -45,6 +44,11 @@ jobs:
       DATABASE_URL: postgres://bucephalus:bucephalus_dev@localhost:55432/bucephalus_cloud
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve release version
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: scripts/release/resolve-release-version.sh --override "${VERSION_OVERRIDE}"
 
       - uses: dtolnay/rust-toolchain@stable
         with:

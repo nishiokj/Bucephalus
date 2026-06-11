@@ -177,6 +177,7 @@ function poolToWire(pool: RunnerPoolRecord): JsonObject {
     runner_pool_id: pool.runner_pool_id,
     name: pool.name,
     status: pool.status,
+    active_worker_image_id: pool.active_worker_image_id,
     capabilities: pool.capabilities as unknown as JsonObject,
     metadata: pool.metadata,
     created_at: pool.created_at,

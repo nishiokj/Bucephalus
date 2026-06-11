@@ -26,6 +26,7 @@ async function main() {
   const provisionRequestId = requiredString(input.provision_request_id, "/provision_request_id");
   const runnerPoolId = requiredString(input.runner_pool_id, "/runner_pool_id");
   const runId = requiredString(input.run_id, "/run_id");
+  const workerImage = workerImageForRequest(input, config);
   const instanceName = `${config.namePrefix}-${shortId(provisionRequestId)}`;
   assertGcpName(instanceName, "generated instance name");
 
@@ -38,11 +39,11 @@ async function main() {
     instanceName,
     runnerIsolation: runnerIsolation(input),
     networkPolicyEnabled: runRequiresNetworkPolicy(input) ? "true" : "false",
-    workerImage: config.workerImage,
+    workerImage,
     workerTokenSecret: config.workerTokenSecret,
     workerTokenSecretVersion: config.workerTokenSecretVersion,
     projectId: config.projectId,
-    registryHost: registryHost(config.workerImage),
+    registryHost: registryHost(workerImage),
     modal: config.modal,
   });
 
@@ -85,7 +86,7 @@ async function main() {
         { key: "bucephalus-runner-pool-id", value: runnerPoolId },
         { key: "bucephalus-provision-request-id", value: provisionRequestId },
         { key: "bucephalus-run-id", value: runId },
-        { key: "bucephalus-worker-image", value: config.workerImage },
+        { key: "bucephalus-worker-image", value: workerImage },
       ],
     },
     scheduling: {
@@ -117,7 +118,7 @@ async function main() {
       project_id: config.projectId,
       zone: config.zone,
       machine_type: config.machineType,
-      runner_image: config.workerImage,
+      runner_image: workerImage,
       no_external_ip: true,
     },
   }));
@@ -129,8 +130,10 @@ export function loadConfig() {
   const zone = requiredEnv("BUCEPHALUS_GCP_ZONE");
   const environment = optionalEnv("BUCEPHALUS_GCP_ENVIRONMENT", optionalEnv("BUCEPHALUS_ENVIRONMENT", "bucephalus"));
   const resourcePrefix = optionalEnv("BUCEPHALUS_GCP_RESOURCE_PREFIX", "buc");
-  const workerImage = requiredEnv("BUCEPHALUS_GCP_RUNNER_IMAGE");
-  assertDigestRef(workerImage, "BUCEPHALUS_GCP_RUNNER_IMAGE");
+  const workerImageFallback = optionalEnv("BUCEPHALUS_GCP_RUNNER_IMAGE", "");
+  if (workerImageFallback) {
+    assertDigestRef(workerImageFallback, "BUCEPHALUS_GCP_RUNNER_IMAGE");
+  }
 
   return {
     projectId,
@@ -138,7 +141,7 @@ export function loadConfig() {
     zone,
     environment,
     namePrefix: `${resourcePrefix}-${environment}-runner`,
-    workerImage,
+    workerImageFallback,
     subnet: requiredEnv("BUCEPHALUS_GCP_SUBNET"),
     machineType: optionalEnv("BUCEPHALUS_GCP_RUNNER_MACHINE_TYPE", "e2-standard-2"),
     bootDiskSizeGb: integerEnv("BUCEPHALUS_GCP_RUNNER_BOOT_DISK_SIZE_GB", 100),
@@ -150,6 +153,17 @@ export function loadConfig() {
     operationTimeoutMs: integerEnv("BUCEPHALUS_GCP_OPERATION_TIMEOUT_MS", 600) * 1000,
     modal: modalConfig(),
   };
+}
+
+export function workerImageForRequest(input, config = loadConfig()) {
+  const workerImage = typeof input.worker_image === "string" && input.worker_image.trim() !== ""
+    ? input.worker_image.trim()
+    : config.workerImageFallback;
+  if (!workerImage) {
+    throw new ProviderError("provision request requires /worker_image or BUCEPHALUS_GCP_RUNNER_IMAGE");
+  }
+  assertDigestRef(workerImage, "/worker_image");
+  return workerImage;
 }
 
 export function validateRequest(input, config = loadConfig()) {

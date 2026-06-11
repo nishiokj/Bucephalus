@@ -6,10 +6,11 @@ RELEASE_INPUT=""
 WORK_DIR=""
 RELEASE_DIR=""
 RELEASE_ARCHIVE_SHA=""
+ALLOW_PARTIAL="false"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/release/verify-cloud-image-build-manifest.sh <cloud-image-build-manifest.json> [--release <release-dir-or-tar.gz>]
+Usage: scripts/release/verify-cloud-image-build-manifest.sh <cloud-image-build-manifest.json> [--release <release-dir-or-tar.gz>] [--allow-partial]
 
 Validates the image build manifest emitted by build-cloud-images.sh. Local
 non-pushed manifests are allowed for image inspection evidence. Pushed manifests
@@ -24,6 +25,10 @@ while [[ $# -gt 0 ]]; do
     --release)
       RELEASE_INPUT="${2:-}"
       shift 2
+      ;;
+    --allow-partial)
+      ALLOW_PARTIAL="true"
+      shift
       ;;
     -h|--help)
       usage
@@ -102,7 +107,7 @@ if [[ -n "${RELEASE_INPUT}" ]]; then
   fi
 fi
 
-RELEASE_DIR="${RELEASE_DIR}" RELEASE_ARCHIVE_SHA="${RELEASE_ARCHIVE_SHA}" bun -e '
+RELEASE_DIR="${RELEASE_DIR}" RELEASE_ARCHIVE_SHA="${RELEASE_ARCHIVE_SHA}" ALLOW_PARTIAL="${ALLOW_PARTIAL}" bun -e '
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -119,6 +124,7 @@ const digestRef = /^.+@sha256:[a-f0-9]{64}$/;
 const zeroDigest = /^sha256:0{64}$/;
 const zeroDigestRef = /^.+@sha256:0{64}$/;
 const components = new Set(["api", "pool-controller", "migrations", "worker"]);
+const allowPartial = process.env.ALLOW_PARTIAL === "true";
 const garComponentRepo = /^[a-z0-9-]+-docker\.pkg\.dev\/[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*\/(api|pool-controller|migrations|worker)$/;
 
 function fail(message) {
@@ -251,7 +257,11 @@ checkBuilder(manifest.builder, manifest.release, sourceRelease);
 if (!Array.isArray(manifest.images)) {
   fail("images must be an array");
 }
-if (manifest.images.length !== components.size) {
+if (allowPartial) {
+  if (manifest.images.length < 1 || manifest.images.length > components.size) {
+    fail(`images must contain between 1 and ${components.size} entries`);
+  }
+} else if (manifest.images.length !== components.size) {
   fail(`images must contain exactly ${components.size} entries`);
 }
 const seen = new Set();
@@ -435,9 +445,11 @@ for (const image of manifest.images) {
     fail(`${image.component}.boundary.iid does not match manifest boundary_image_id`);
   }
 }
-for (const component of components) {
-  if (!seen.has(component)) {
-    fail(`missing component: ${component}`);
+if (!allowPartial) {
+  for (const component of components) {
+    if (!seen.has(component)) {
+      fail(`missing component: ${component}`);
+    }
   }
 }
 if (releaseDir) {
