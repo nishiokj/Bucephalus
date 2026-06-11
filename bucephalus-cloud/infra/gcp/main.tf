@@ -30,16 +30,21 @@ locals {
   ])
 
   secret_ids = {
-    api_database_url                   = "${local.name_prefix}-api-database-url"
-    migrator_database_url              = "${local.name_prefix}-migrator-database-url"
-    worker_token                       = "${local.name_prefix}-worker-token"
-    r2_access_key_id                   = "${local.name_prefix}-r2-access-key-id"
-    r2_secret_access_key               = "${local.name_prefix}-r2-secret-access-key"
-    pool_controller_provision_cmd_json = "${local.name_prefix}-pool-provision-cmd-json"
-    pool_controller_reap_cmd_json      = "${local.name_prefix}-pool-reap-cmd-json"
+    api_database_url                    = "${local.name_prefix}-api-database-url"
+    migrator_database_url               = "${local.name_prefix}-migrator-database-url"
+    worker_token                        = "${local.name_prefix}-worker-token"
+    r2_access_key_id                    = "${local.name_prefix}-r2-access-key-id"
+    r2_secret_access_key                = "${local.name_prefix}-r2-secret-access-key"
+    modal_token_id                      = "${local.name_prefix}-modal-token-id"
+    modal_token_secret                  = "${local.name_prefix}-modal-token-secret"
+    modal_s3_access_key_id              = "${local.name_prefix}-modal-s3-access-key-id"
+    modal_s3_secret_access_key          = "${local.name_prefix}-modal-s3-secret-access-key"
+    modal_gcp_artifact_registry_sa_json = "${local.name_prefix}-modal-gcp-artifact-registry-sa-json"
+    pool_controller_provision_cmd_json  = "${local.name_prefix}-pool-provision-cmd-json"
+    pool_controller_reap_cmd_json       = "${local.name_prefix}-pool-reap-cmd-json"
   }
 
-  secret_access_bindings = {
+  secret_access_bindings_base = {
     api_database_url_api = {
       secret_key = "api_database_url"
       member     = "serviceAccount:${google_service_account.api.email}"
@@ -77,6 +82,32 @@ locals {
       member     = "serviceAccount:${google_service_account.migrator.email}"
     }
   }
+
+  modal_secret_access_bindings = var.modal_backend_enabled ? merge({
+    modal_token_id_runner = {
+      secret_key = "modal_token_id"
+      member     = "serviceAccount:${google_service_account.runner.email}"
+    }
+    modal_token_secret_runner = {
+      secret_key = "modal_token_secret"
+      member     = "serviceAccount:${google_service_account.runner.email}"
+    }
+    modal_s3_access_key_id_runner = {
+      secret_key = "modal_s3_access_key_id"
+      member     = "serviceAccount:${google_service_account.runner.email}"
+    }
+    modal_s3_secret_access_key_runner = {
+      secret_key = "modal_s3_secret_access_key"
+      member     = "serviceAccount:${google_service_account.runner.email}"
+    }
+    }, var.modal_gcp_artifact_registry_service_account_json_secret_version != null ? {
+    modal_gcp_artifact_registry_sa_json_runner = {
+      secret_key = "modal_gcp_artifact_registry_sa_json"
+      member     = "serviceAccount:${google_service_account.runner.email}"
+    }
+  } : {}) : {}
+
+  secret_access_bindings = merge(local.secret_access_bindings_base, local.modal_secret_access_bindings)
 }
 
 resource "terraform_data" "deploy_input_preflight" {
@@ -100,6 +131,18 @@ resource "terraform_data" "deploy_input_preflight" {
     r2_bucket                = var.cloud_r2_bucket
     r2_access_key_secret     = var.cloud_r2_access_key_id_secret_version
     r2_secret_key_secret     = var.cloud_r2_secret_access_key_secret_version
+    modal_backend_enabled    = var.modal_backend_enabled
+    modal_app_name           = var.modal_app_name
+    modal_token_id_secret    = var.modal_token_id_secret_version
+    modal_token_secret       = var.modal_token_secret_secret_version
+    modal_s3_bucket          = var.modal_s3_bucket
+    modal_s3_prefix          = var.modal_s3_prefix
+    modal_s3_secret_name     = var.modal_s3_secret_name
+    modal_s3_key_id_secret   = var.modal_s3_access_key_id_secret_version
+    modal_s3_key_secret      = var.modal_s3_secret_access_key_secret_version
+    modal_s3_force_path      = var.modal_s3_force_path_style
+    modal_gcp_ar_secret_name = var.modal_gcp_artifact_registry_secret_name
+    modal_gcp_ar_sa_json     = var.modal_gcp_artifact_registry_service_account_json_secret_version
     provision_cmd_secret     = var.pool_controller_provision_cmd_json_secret_version
     reap_cmd_secret          = var.pool_controller_reap_cmd_json_secret_version
   }
@@ -164,6 +207,38 @@ resource "terraform_data" "deploy_input_preflight" {
     precondition {
       condition     = !local.deploy_pool_controller || var.pool_controller_reap_cmd_json_secret_version != null
       error_message = "pool_controller_reap_cmd_json_secret_version is required when the pool controller is deployed."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || !var.modal_backend_enabled || var.modal_app_name != null
+      error_message = "modal_app_name is required when modal_backend_enabled is true."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || !var.modal_backend_enabled || var.modal_token_id_secret_version != null
+      error_message = "modal_token_id_secret_version is required when modal_backend_enabled is true."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || !var.modal_backend_enabled || var.modal_token_secret_secret_version != null
+      error_message = "modal_token_secret_secret_version is required when modal_backend_enabled is true."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || !var.modal_backend_enabled || var.modal_s3_bucket != null
+      error_message = "modal_s3_bucket is required when modal_backend_enabled is true."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || !var.modal_backend_enabled || length(trim(var.modal_s3_prefix, "/")) > 0
+      error_message = "modal_s3_prefix must be non-empty when modal_backend_enabled is true."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || !var.modal_backend_enabled || var.modal_s3_secret_name != null || var.modal_s3_access_key_id_secret_version != null
+      error_message = "modal_s3_access_key_id_secret_version is required when modal_backend_enabled is true and modal_s3_secret_name is unset."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || !var.modal_backend_enabled || var.modal_s3_secret_name != null || var.modal_s3_secret_access_key_secret_version != null
+      error_message = "modal_s3_secret_access_key_secret_version is required when modal_backend_enabled is true and modal_s3_secret_name is unset."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || !var.modal_backend_enabled || !var.modal_s3_force_path_style
+      error_message = "modal_s3_force_path_style must remain false because Modal CloudBucketMount does not support path-style S3 mounts."
     }
   }
 }
@@ -680,14 +755,14 @@ resource "google_cloud_run_v2_service" "pool_controller" {
         name = "BUCEPHALUS_POOL_CONTROLLER_CAPABILITIES_JSON"
         value = jsonencode({
           arch      = "x86_64"
-          executors = ["runner-docker"]
-          resources = [
+          executors = concat(["runner-docker"], var.modal_backend_enabled ? ["modal"] : [])
+          resources = concat([
             "core_runner",
             "docker_daemon",
             "registry_pull",
             "secret_resolver",
             "network_perimeter",
-          ]
+          ], var.modal_backend_enabled ? ["modal"] : [])
           isolation = ["reusable_vm", "single_use_vm"]
         })
       }
@@ -755,6 +830,160 @@ resource "google_cloud_run_v2_service" "pool_controller" {
       env {
         name  = "BUCEPHALUS_GCP_WORKER_TOKEN_SECRET_VERSION"
         value = var.worker_token_secret_version
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_MODAL_ENABLED"
+        value = tostring(var.modal_backend_enabled)
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_APP_NAME"
+          value = var.modal_app_name
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled && var.modal_environment != null ? [var.modal_environment] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_ENVIRONMENT"
+          value = env.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_TOKEN_ID_SECRET"
+          value = google_secret_manager_secret.control_plane["modal_token_id"].secret_id
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_TOKEN_ID_SECRET_VERSION"
+          value = var.modal_token_id_secret_version
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_TOKEN_SECRET_SECRET"
+          value = google_secret_manager_secret.control_plane["modal_token_secret"].secret_id
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_TOKEN_SECRET_SECRET_VERSION"
+          value = var.modal_token_secret_secret_version
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_S3_BUCKET"
+          value = var.modal_s3_bucket
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_S3_PREFIX"
+          value = trim(var.modal_s3_prefix, "/")
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled && var.modal_s3_endpoint_url != null ? [var.modal_s3_endpoint_url] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_S3_ENDPOINT_URL"
+          value = env.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled && var.modal_s3_region != null ? [var.modal_s3_region] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_S3_REGION"
+          value = env.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled && var.modal_s3_secret_name != null ? [var.modal_s3_secret_name] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_S3_SECRET_NAME"
+          value = env.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled && var.modal_s3_secret_name == null ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_S3_ACCESS_KEY_ID_SECRET"
+          value = google_secret_manager_secret.control_plane["modal_s3_access_key_id"].secret_id
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled && var.modal_s3_secret_name == null ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION"
+          value = var.modal_s3_access_key_id_secret_version
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled && var.modal_s3_secret_name == null ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_S3_SECRET_ACCESS_KEY_SECRET"
+          value = google_secret_manager_secret.control_plane["modal_s3_secret_access_key"].secret_id
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled && var.modal_s3_secret_name == null ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION"
+          value = var.modal_s3_secret_access_key_secret_version
+        }
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_MODAL_S3_FORCE_PATH_STYLE"
+        value = tostring(var.modal_s3_force_path_style)
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled && var.modal_gcp_artifact_registry_secret_name != null ? [var.modal_gcp_artifact_registry_secret_name] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME"
+          value = env.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled && var.modal_gcp_artifact_registry_service_account_json_secret_version != null ? [1] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET"
+          value = google_secret_manager_secret.control_plane["modal_gcp_artifact_registry_sa_json"].secret_id
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.modal_backend_enabled && var.modal_gcp_artifact_registry_service_account_json_secret_version != null ? [var.modal_gcp_artifact_registry_service_account_json_secret_version] : []
+        content {
+          name  = "BUCEPHALUS_GCP_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION"
+          value = env.value
+        }
       }
 
       env {

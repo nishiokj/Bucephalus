@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Result};
-use lab_schemas::compile_schema;
+use lab_schemas::{compile_schema, format_validation_error};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Component, Path};
+use std::path::Path;
 
-use crate::config::{declared_extra_outputs, value_matches_type, value_type_name};
+use crate::config::{
+    parse_metric_definitions, parse_string_array_field, value_matches_type, value_type_name,
+};
 use crate::model::{ExperimentOverrides, KnobDef, KnobManifest};
 use crate::package::authoring::{normalize_authoring_vocabulary, reject_legacy_authoring_surface};
 use crate::trial::plan::parse_trial_runtime_config;
@@ -23,6 +25,34 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     } else {
         json_value
     };
+    if !authoring_surface && json_value.pointer("/runtime/network/default").is_some() {
+        return Err(anyhow!(
+            "/runtime/network/default is authoring-only shorthand; resolved packages must declare /runtime/network/task_sandbox and /runtime/network/agent explicitly"
+        ));
+    }
+    if !authoring_surface && json_value.pointer("/runtime/registry").is_some() {
+        return Err(anyhow!(
+            "/runtime/registry is authoring-only package-build input; resolved packages must carry rewritten case images directly"
+        ));
+    }
+    if !authoring_surface && json_value.pointer("/experiment/mode").is_some() {
+        return Err(anyhow!(
+            "/experiment/mode is authoring-only evaluation intent; resolved packages must carry explicit metrics and grader contracts instead"
+        ));
+    }
+    if !authoring_surface && json_value.pointer("/scheduling/comparison").is_some() {
+        return Err(anyhow!(
+            "/scheduling/comparison is authoring-only design intent; resolved packages must carry the concrete run order under /policy/policies/scheduling"
+        ));
+    }
+    for pointer in ["/runtime/storage", "/runtime/traces"] {
+        if json_value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "{} is not part of the experiment contract; storage and trace sinks are runner-owned today, so remove this no-op backend declaration",
+                pointer
+            ));
+        }
+    }
     if json_value
         .pointer("/version")
         .and_then(|value| value.as_str())
@@ -43,6 +73,10 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             "/trial_runtime/grader/conclusion",
             "declare grader outputs and metrics instead of grader-owned trial_conclusion_v1 mapping",
         ),
+        (
+            "/trial_runtime/agent/protocol",
+            "command invocation is implied by /trial_runtime/agent/command",
+        ),
     ] {
         if json_value.pointer(pointer).is_some() {
             return Err(anyhow!("{} is not supported; {}", pointer, message));
@@ -52,109 +86,52 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         .map_err(|err| public_authoring_error(err, authoring_surface))?;
     reject_unknown_top_level_sections(json_value)
         .map_err(|err| public_authoring_error(err, authoring_surface))?;
-    validate_runtime_declarations(json_value)
-        .map_err(|err| public_authoring_error(err, authoring_surface))?;
     validate_sidecars(json_value).map_err(|err| public_authoring_error(err, authoring_surface))?;
-    let required: &[&str] = &[
-        "/matrix/variants",
-        "/matrix/tasks/source",
-        "/matrix/tasks/path",
-        "/matrix/repeats",
-        "/runtime/network/task_sandbox",
-        "/runtime/network/agent",
-        "/policy/timeout_ms",
-        "/trial_runtime/task/interface",
-        "/trial_runtime/agent/command",
-        "/trial_runtime/agent/artifact_type",
-        "/trial_runtime/agent/outputs/result/capture/type",
-        "/trial_runtime/agent/outputs/result/capture/path",
-        "/trial_runtime/execution/agent_site",
-        "/trial_runtime/grader/strategy",
-    ];
-    let mut missing = Vec::new();
-    for pointer in required {
-        let value = json_value.pointer(pointer);
-        let is_missing = match value {
-            None => true,
-            Some(Value::String(s)) => s.is_empty(),
-            Some(Value::Number(n)) => {
-                n.as_u64() == Some(0)
-                    && (*pointer == "/matrix/repeats" || *pointer == "/policy/timeout_ms")
-            }
-            _ => false,
+    let mut contract_value = json_value.clone();
+    strip_packaging_only_trial_runtime_catalogs(&mut contract_value);
+    let deferred_schema_error =
+        match validate_resolved_experiment_schema(&contract_value, "experiment validation") {
+            Ok(()) => None,
+            Err(err) if err.to_string().contains("'oneOf'") => Some(err),
+            Err(err) => return Err(public_authoring_error(err, authoring_surface)),
         };
-        if is_missing {
-            missing.push(*pointer);
-        }
-    }
-    if json_value.pointer("/policy/task_sandbox").is_none() {
-        missing.push("/policy/task_sandbox");
-    }
-    let has_command = match json_value.pointer("/trial_runtime/agent/command") {
-        Some(Value::String(s)) => !s.trim().is_empty(),
-        Some(Value::Array(parts)) if !parts.is_empty() => parts
-            .iter()
-            .all(|part| part.as_str().is_some_and(|s| !s.trim().is_empty())),
-        _ => false,
-    };
-    if !has_command {
-        missing.push("/trial_runtime/agent/command");
-    }
-    if json_value
-        .pointer("/experiment/id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .is_none_or(str::is_empty)
-    {
-        missing.push("/experiment/id");
-    }
-    if !missing.is_empty() {
-        missing.sort_unstable();
-        missing.dedup();
-        let missing = display_missing_required_fields(&missing, authoring_surface);
-        return Err(anyhow!(
-            "missing required experiment fields: {}",
-            missing.join(", ")
-        ));
-    }
-    validate_sanitization_profile_network_invariants(json_value, None)
+    parse_trial_runtime_config(&contract_value)
         .map_err(|err| public_authoring_error(err, authoring_surface))?;
-    parse_trial_runtime_config(json_value)
-        .map_err(|err| public_authoring_error(err, authoring_surface))?;
-    validate_extra_outputs(json_value)
-        .map_err(|err| public_authoring_error(err, authoring_surface))?;
+    if let Some(err) = deferred_schema_error {
+        return Err(public_authoring_error(err, authoring_surface));
+    }
     Ok(())
 }
 
-fn display_missing_required_fields(missing: &[&str], authoring_surface: bool) -> Vec<String> {
-    missing
-        .iter()
-        .map(|pointer| {
-            if authoring_surface {
-                public_authoring_pointer(pointer)
-            } else {
-                (*pointer).to_string()
+pub(crate) fn strip_packaging_only_trial_runtime_catalogs(experiment: &mut Value) {
+    if let Some(trial_runtime) = experiment.pointer_mut("/trial_runtime") {
+        strip_packaging_only_trial_runtime_fields(trial_runtime);
+    }
+    if let Some(variants) = experiment
+        .pointer_mut("/matrix/variants")
+        .and_then(Value::as_array_mut)
+    {
+        for variant in variants {
+            if let Some(overrides) = variant.get_mut("overrides") {
+                strip_packaging_only_trial_runtime_fields(overrides);
             }
-        })
-        .collect()
-}
-
-fn public_authoring_pointer(pointer: &str) -> String {
-    for (internal, public) in [
-        ("/matrix/tasks", "/matrix/cases"),
-        ("/trial_runtime/task", "/stages/case"),
-        ("/trial_runtime/agent", "/stages/agent"),
-        ("/trial_runtime/execution", "/stages/execution"),
-        ("/trial_runtime/grader", "/stages/grader"),
-    ] {
-        if pointer == internal {
-            return public.to_string();
-        }
-        if let Some(rest) = pointer.strip_prefix(&format!("{internal}/")) {
-            return format!("{public}/{rest}");
         }
     }
-    pointer.to_string()
+}
+
+fn strip_packaging_only_trial_runtime_fields(trial_runtime_root: &mut Value) {
+    if let Some(grader) = trial_runtime_root
+        .pointer_mut("/grader")
+        .and_then(Value::as_object_mut)
+    {
+        grader.remove("_runtime_assets");
+    }
+    if let Some(image) = trial_runtime_root
+        .pointer_mut("/task/workspace/image")
+        .and_then(Value::as_object_mut)
+    {
+        image.remove("rewrites");
+    }
 }
 
 pub(crate) fn public_authoring_error(err: anyhow::Error, authoring_surface: bool) -> anyhow::Error {
@@ -172,6 +149,7 @@ pub(crate) fn public_authoring_error(err: anyhow::Error, authoring_surface: bool
         ("/trial_runtime/agent", "/stages/agent"),
         ("/trial_runtime/execution", "/stages/execution"),
         ("/trial_runtime/grader", "/stages/grader"),
+        ("/trial_runtime", "/stages"),
         ("/matrix/tasks", "/matrix/cases"),
         ("/sidecars", "/ephemerals"),
         ("trial_runtime.agent.sidecars", "stages.agent.ephemerals"),
@@ -180,6 +158,7 @@ pub(crate) fn public_authoring_error(err: anyhow::Error, authoring_surface: bool
         ("trial_runtime.agent", "stages.agent"),
         ("trial_runtime.execution", "stages.execution"),
         ("trial_runtime.grader", "stages.grader"),
+        ("trial_runtime", "stages"),
         ("matrix.tasks", "matrix.cases"),
         ("sidecars", "ephemerals"),
         ("sidecar", "ephemeral"),
@@ -267,7 +246,6 @@ fn reject_unknown_top_level_sections(json_value: &Value) -> Result<()> {
             "evaluation"
                 | "experiment"
                 | "extra_outputs"
-                | "knobs"
                 | "matrix"
                 | "metrics"
                 | "policy"
@@ -277,7 +255,6 @@ fn reject_unknown_top_level_sections(json_value: &Value) -> Result<()> {
                 | "stages"
                 | "traces"
                 | "trial_runtime"
-                | "version"
         ) {
             return Err(anyhow!(
                 "/{} is not supported in v1; remove it or move its fields under the v1 experiment model",
@@ -288,178 +265,11 @@ fn reject_unknown_top_level_sections(json_value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_runtime_declarations(json_value: &Value) -> Result<()> {
-    let Some(runtime) = json_value.pointer("/runtime") else {
-        return Err(anyhow!("missing /runtime"));
-    };
-    for (pointer, supported) in [
-        ("/storage/backend", "local-fs"),
-        ("/traces/backend", "local-stdout"),
-    ] {
-        if let Some(value) = runtime.pointer(pointer).and_then(Value::as_str) {
-            if value != supported {
-                return Err(anyhow!(
-                    "/runtime{} backend '{}' is declared but not implemented yet; supported backend is '{}'",
-                    pointer.trim_end_matches("/backend"),
-                    value,
-                    supported
-                ));
-            }
-        }
-    }
-    if let Some(value) = runtime.pointer("/compute/backend").and_then(Value::as_str) {
-        crate::experiment::state::executor_kind_from_compute_backend(value)?;
-    }
-    validate_network_mode_pointer(json_value, "/runtime/network/default", true)?;
-    validate_network_mode_pointer(json_value, "/runtime/network/task_sandbox", false)?;
-    validate_network_mode_pointer(json_value, "/runtime/network/agent", true)?;
-    if let Some(secrets) = json_value.pointer("/runtime/secrets") {
-        let items = secrets
-            .as_array()
-            .ok_or_else(|| anyhow!("/runtime/secrets must be an array"))?;
-        for (idx, item) in items.iter().enumerate() {
-            let context = format!("/runtime/secrets/{}", idx);
-            let obj = item
-                .as_object()
-                .ok_or_else(|| anyhow!("{} must be an object", context))?;
-            let name = obj
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow!("{}/name is required", context))?;
-            let from = obj
-                .get("from")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow!("{}/from is required", context))?;
-            if !matches!(from, "env" | "file") {
-                return Err(anyhow!(
-                    "{}/from '{}' is not supported yet; supported providers are env and file",
-                    context,
-                    from
-                ));
-            }
-            if name.contains('=') {
-                return Err(anyhow!("{}/name must not contain '='", context));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_network_mode_pointer(
-    json_value: &Value,
-    pointer: &str,
-    allow_llm_egress: bool,
-) -> Result<()> {
-    let Some(mode) = json_value
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(());
-    };
-    if matches!(mode, "none" | "full" | "allowlist_enforced")
-        || (allow_llm_egress && mode == "llm_egress")
-    {
-        Ok(())
-    } else {
-        let allowed = if allow_llm_egress {
-            "none, full, allowlist_enforced, llm_egress"
-        } else {
-            "none, full, allowlist_enforced"
-        };
-        Err(anyhow!(
-            "{} must be one of: {} (got '{}')",
-            pointer,
-            allowed,
-            mode
-        ))
-    }
-}
-
 fn validate_sidecars(json_value: &Value) -> Result<()> {
     let mut declared = BTreeSet::new();
-    if let Some(sidecars) = json_value.pointer("/sidecars").and_then(Value::as_object) {
-        for (id, config) in sidecars {
-            if id.trim().is_empty() {
-                return Err(anyhow!("/sidecars contains an empty id"));
-            }
-            if !is_portable_sidecar_id(id) {
-                return Err(anyhow!(
-                    "/sidecars/{} id must be a portable runtime alias: lowercase letters, numbers, and '-' only; it must start and end with a letter or number",
-                    id
-                ));
-            }
-            let lifecycle = config
-                .pointer("/lifecycle")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("/sidecars/{} lifecycle is required", id))?;
-            if lifecycle != "per-trial" {
-                return Err(anyhow!(
-                    "/sidecars/{} lifecycle '{}' is not supported; use per-trial",
-                    id,
-                    lifecycle
-                ));
-            }
-            if config
-                .pointer("/image")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none()
-            {
-                return Err(anyhow!("/sidecars/{} image is required", id));
-            }
-            if let Some(command) = config.pointer("/command") {
-                let items = command
-                    .as_array()
-                    .ok_or_else(|| anyhow!("/sidecars/{} command must be an argv array", id))?;
-                for (idx, item) in items.iter().enumerate() {
-                    let Some(part) = item.as_str() else {
-                        return Err(anyhow!("/sidecars/{} command/{} must be a string", id, idx));
-                    };
-                    if part.trim().is_empty() {
-                        return Err(anyhow!(
-                            "/sidecars/{} command/{} must not be empty",
-                            id,
-                            idx
-                        ));
-                    }
-                }
-            }
-            if let Some(workdir) = config.pointer("/workdir") {
-                let Some(workdir) = workdir.as_str() else {
-                    return Err(anyhow!("/sidecars/{} workdir must be a string", id));
-                };
-                if workdir.trim().is_empty() {
-                    return Err(anyhow!("/sidecars/{} workdir must not be empty", id));
-                }
-            }
-            for field in ["env", "expose"] {
-                let Some(object) = config.pointer(&format!("/{}", field)) else {
-                    continue;
-                };
-                let object = object
-                    .as_object()
-                    .ok_or_else(|| anyhow!("/sidecars/{} {} must be an object", id, field))?;
-                for (key, value) in object {
-                    if key.trim().is_empty() {
-                        return Err(anyhow!("/sidecars/{} {} contains an empty key", id, field));
-                    }
-                    if value.as_str().is_none() {
-                        return Err(anyhow!(
-                            "/sidecars/{} {}/{} must be a string",
-                            id,
-                            field,
-                            key
-                        ));
-                    }
-                }
-            }
+    let sidecars = json_value.pointer("/sidecars").and_then(Value::as_object);
+    if let Some(sidecars) = sidecars {
+        for id in sidecars.keys() {
             declared.insert(id.clone());
         }
     }
@@ -470,10 +280,17 @@ fn validate_sidecars(json_value: &Value) -> Result<()> {
         else {
             continue;
         };
+        let mut seen_refs = BTreeSet::new();
+        let mut duplicate_refs = BTreeSet::new();
+        let mut exposed_env = BTreeMap::new();
+        let mut duplicate_env = BTreeSet::new();
         for (idx, item) in items.iter().enumerate() {
-            let id = item.as_str().ok_or_else(|| {
-                anyhow!("/trial_runtime/{}/sidecars/{} must be a string", stage, idx)
-            })?;
+            let Some(id) = item.as_str() else {
+                continue;
+            };
+            if !seen_refs.insert(id.to_string()) {
+                duplicate_refs.insert(id.to_string());
+            }
             if !declared.contains(id) {
                 return Err(anyhow!(
                     "/trial_runtime/{}/sidecars/{} references unknown sidecar '{}'",
@@ -482,140 +299,36 @@ fn validate_sidecars(json_value: &Value) -> Result<()> {
                     id
                 ));
             }
-        }
-    }
-    Ok(())
-}
-
-fn is_portable_sidecar_id(id: &str) -> bool {
-    let id = id.trim();
-    if id.is_empty() || id.len() > 63 {
-        return false;
-    }
-    let Some(first) = id.chars().next() else {
-        return false;
-    };
-    let Some(last) = id.chars().next_back() else {
-        return false;
-    };
-    (first.is_ascii_lowercase() || first.is_ascii_digit())
-        && (last.is_ascii_lowercase() || last.is_ascii_digit())
-        && id
-            .chars()
-            .all(|ch| ch == '-' || ch.is_ascii_lowercase() || ch.is_ascii_digit())
-}
-
-pub(crate) fn validate_sanitization_profile_network_invariants(
-    json_value: &Value,
-    effective_task_network: Option<&str>,
-) -> Result<()> {
-    let profile = json_value
-        .pointer("/policy/sanitization_profile")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(profile) = profile {
-        if !matches!(
-            profile,
-            "replay_strict" | "hermetic_functional" | "standard_runtime"
-        ) {
-            return Err(anyhow!(
-                "policy.sanitization_profile must be one of: replay_strict, hermetic_functional, standard_runtime (got '{}')",
-                profile
-            ));
-        }
-    }
-    if profile != Some("hermetic_functional") {
-        return Ok(());
-    }
-
-    let task_network = effective_task_network.or_else(|| {
-        json_value
-            .pointer("/runtime/network/task_sandbox")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    });
-    if task_network != Some("none") {
-        return Err(anyhow!(
-            "sanitization_profile=hermetic_functional requires runtime.network.task_sandbox/effective task network 'none' (declared by {}; got {}). For provider-backed or other networked agents, omit policy.sanitization_profile or set it to standard_runtime.",
-            "policy.sanitization_profile",
-            task_network.unwrap_or("<missing>")
-        ));
-    }
-
-    if let Some(agent_network) = json_value
-        .pointer("/runtime/network/agent")
-        .or_else(|| json_value.pointer("/runtime/network/default"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if agent_network != "none" {
-            return Err(anyhow!(
-                "sanitization_profile=hermetic_functional requires runtime.network.agent 'none' when declared (got {}). For provider-backed or other networked agents, omit policy.sanitization_profile or set it to standard_runtime.",
-                agent_network
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_extra_outputs(json_value: &Value) -> Result<()> {
-    let Some(items) = declared_extra_outputs(json_value) else {
-        return Ok(());
-    };
-    for (idx, item) in items.iter().enumerate() {
-        let context = format!("extra_outputs[{}]", idx);
-        let id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("{}.id must be a non-empty string", context))?;
-        let source_path = item
-            .get("source_path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("extra output '{}' missing source_path", id))?;
-        validate_relative_extra_output_path(
-            source_path,
-            &format!("extra output '{}'.source_path", id),
-        )?;
-        let summary_path = item
-            .get("summary_path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("extra output '{}' missing summary_path", id))?;
-        validate_relative_extra_output_path(
-            summary_path,
-            &format!("extra output '{}'.summary_path", id),
-        )?;
-    }
-    Ok(())
-}
-
-fn validate_relative_extra_output_path(raw: &str, field: &str) -> Result<()> {
-    let path = Path::new(raw);
-    if path.is_absolute() {
-        return Err(anyhow!("{} must be relative", field));
-    }
-    let mut saw_component = false;
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(_) => saw_component = true,
-            Component::ParentDir => return Err(anyhow!("{} must not contain '..'", field)),
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(anyhow!("{} must be relative", field))
+            let Some(expose) = sidecars
+                .and_then(|sidecars| sidecars.get(id))
+                .and_then(|sidecar| sidecar.get("expose"))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            for env_name in expose.keys().map(String::as_str).map(str::trim) {
+                if env_name.is_empty() {
+                    continue;
+                }
+                if let Some(previous) = exposed_env.insert(env_name.to_string(), id.to_string()) {
+                    duplicate_env.insert(format!("{} ({} and {})", env_name, previous, id));
+                }
             }
         }
-    }
-    if !saw_component {
-        return Err(anyhow!("{} cannot resolve to empty", field));
+        if !duplicate_refs.is_empty() {
+            return Err(anyhow!(
+                "/trial_runtime/{}/sidecars must reference each sidecar at most once (duplicates: {})",
+                stage,
+                format_set(&duplicate_refs)
+            ));
+        }
+        if !duplicate_env.is_empty() {
+            return Err(anyhow!(
+                "/trial_runtime/{}/sidecars expose duplicate env names: {}",
+                stage,
+                format_set(&duplicate_env)
+            ));
+        }
     }
     Ok(())
 }
@@ -647,6 +360,873 @@ pub(crate) fn validate_schema_contract_value(value: &Value, context: &str) -> Re
         ));
     }
     Ok(())
+}
+
+pub(crate) fn validate_resolved_experiment_schema(value: &Value, context: &str) -> Result<()> {
+    validate_resolved_runtime_accounting_uniqueness(value, context)?;
+    let schema = compile_schema("resolved_experiment.jsonschema")?;
+    if let Some(errors) = schema.validate(value).err() {
+        let messages = errors
+            .map(|err| format_validation_error(&err))
+            .collect::<Vec<_>>();
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): {}",
+            context,
+            messages.join("; ")
+        ));
+    }
+    validate_sidecars(value)?;
+    validate_resolved_variant_contract(value, context)?;
+    validate_resolved_metric_ids(value, context)?;
+    validate_resolved_metric_primary_contract(value, context)?;
+    validate_resolved_metric_source_contract(value, context)?;
+    validate_resolved_external_accounting_contract(value, context)?;
+    validate_resolved_agent_output_mount_contract(value, context)?;
+    validate_resolved_runtime_template_bindings(value, context)?;
+    validate_resolved_event_placeholders(value, context)?;
+    validate_resolved_hidden_path_contract(value, context)
+}
+
+fn validate_resolved_runtime_accounting_uniqueness(value: &Value, context: &str) -> Result<()> {
+    reject_duplicate_string_array(
+        value.pointer("/runtime/externals/credentials"),
+        "/runtime/externals/credentials",
+        context,
+    )?;
+    reject_duplicate_string_array(
+        value.pointer("/runtime/externals/apis"),
+        "/runtime/externals/apis",
+        context,
+    )?;
+    reject_duplicate_string_array(
+        value.pointer("/runtime/network/egress"),
+        "/runtime/network/egress",
+        context,
+    )?;
+    reject_duplicate_runtime_secret_names(value, context)?;
+    reject_duplicate_credential_cache_env(value, context)?;
+    Ok(())
+}
+
+fn reject_duplicate_string_array(
+    value: Option<&Value>,
+    pointer: &str,
+    context: &str,
+) -> Result<()> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut seen = BTreeSet::new();
+    for (idx, item) in items.iter().enumerate() {
+        let Some(item) = item.as_str().map(str::trim).filter(|item| !item.is_empty()) else {
+            continue;
+        };
+        if !seen.insert(item.to_string()) {
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): {}/{} duplicates '{}'; {} values must be unique",
+                context,
+                pointer,
+                idx,
+                item,
+                pointer
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_duplicate_runtime_secret_names(value: &Value, context: &str) -> Result<()> {
+    let Some(secrets) = value.pointer("/runtime/secrets").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut seen = BTreeSet::new();
+    for (idx, secret) in secrets.iter().enumerate() {
+        let Some(name) = secret
+            .pointer("/name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        if !seen.insert(name.to_string()) {
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): /runtime/secrets/{} duplicates secret name '{}'; runtime secret names must be unique",
+                context,
+                idx,
+                name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_duplicate_credential_cache_env(value: &Value, context: &str) -> Result<()> {
+    let Some(secrets) = value.pointer("/runtime/secrets").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut seen = BTreeSet::new();
+    for (idx, secret) in secrets.iter().enumerate() {
+        let Some(env) = secret
+            .pointer("/credential_cache/env")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|env| !env.is_empty())
+        else {
+            continue;
+        };
+        if !seen.insert(env.to_string()) {
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): /runtime/secrets/{}/credential_cache/env duplicates '{}'; credential cache env names must be unique",
+                context,
+                idx,
+                env
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_resolved_variant_contract(value: &Value, context: &str) -> Result<()> {
+    let Some(variants) = value.pointer("/matrix/variants").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut seen = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    let mut baseline_count = 0usize;
+    for variant in variants {
+        if let Some(id) = variant
+            .pointer("/id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !seen.insert(id.to_string()) {
+                duplicates.insert(id.to_string());
+            }
+        }
+        if variant.pointer("/baseline").and_then(Value::as_bool) == Some(true) {
+            baseline_count += 1;
+        }
+    }
+    if !duplicates.is_empty() {
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): /matrix/variants must declare unique ids (duplicates: {})",
+            context,
+            duplicates.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if baseline_count != 1 {
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): /matrix/variants must declare exactly one baseline variant (got {})",
+            context,
+            baseline_count
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resolved_metric_ids(value: &Value, context: &str) -> Result<()> {
+    let Some(metrics) = value.pointer("/metrics").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut seen = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    for metric in metrics {
+        if let Some(id) = metric
+            .pointer("/id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !seen.insert(id.to_string()) {
+                duplicates.insert(id.to_string());
+            }
+        }
+    }
+    if !duplicates.is_empty() {
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): /metrics must declare unique ids (duplicates: {})",
+            context,
+            duplicates.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resolved_agent_output_mount_contract(value: &Value, context: &str) -> Result<()> {
+    validate_output_mount_uniqueness(
+        value.pointer("/trial_runtime/agent/output_mounts"),
+        "base agent output_mounts",
+        context,
+    )?;
+
+    if let Some(variants) = value.pointer("/matrix/variants").and_then(Value::as_array) {
+        for (idx, variant) in variants.iter().enumerate() {
+            let variant_id = variant
+                .pointer("/id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("<unknown>");
+            validate_output_mount_uniqueness(
+                variant.pointer("/overrides/agent/output_mounts"),
+                &format!("variant {variant_id} agent output_mounts at matrix.variants[{idx}]"),
+                context,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_output_mount_uniqueness(
+    value: Option<&Value>,
+    label: &str,
+    context: &str,
+) -> Result<()> {
+    let Some(mounts) = value.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut seen_ids = BTreeSet::new();
+    let mut duplicate_ids = BTreeSet::new();
+    let mut seen_paths = BTreeSet::new();
+    let mut duplicate_paths = BTreeSet::new();
+    let mut seen_envs = BTreeSet::new();
+    let mut duplicate_envs = BTreeSet::new();
+
+    for mount in mounts {
+        if let Some(id) = mount
+            .pointer("/id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !seen_ids.insert(id.to_string()) {
+                duplicate_ids.insert(id.to_string());
+            }
+        }
+        if let Some(path) = mount
+            .pointer("/path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !seen_paths.insert(path.to_string()) {
+                duplicate_paths.insert(path.to_string());
+            }
+        }
+        if let Some(env) = mount
+            .pointer("/env")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !seen_envs.insert(env.to_string()) {
+                duplicate_envs.insert(env.to_string());
+            }
+        }
+    }
+
+    if !duplicate_ids.is_empty() || !duplicate_paths.is_empty() || !duplicate_envs.is_empty() {
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): {} must declare unique ids, paths, and env names (duplicate ids: {}; duplicate paths: {}; duplicate env: {})",
+            context,
+            label,
+            format_set(&duplicate_ids),
+            format_set(&duplicate_paths),
+            format_set(&duplicate_envs)
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_resolved_metric_primary_contract(value: &Value, context: &str) -> Result<()> {
+    let Some(metrics) = value.pointer("/metrics").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let primary_count = metrics
+        .iter()
+        .filter(|metric| metric.pointer("/primary").and_then(Value::as_bool) == Some(true))
+        .count();
+    if primary_count > 1 {
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): /metrics must declare exactly one primary metric (got {})",
+            context,
+            primary_count
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resolved_metric_source_contract(value: &Value, context: &str) -> Result<()> {
+    let metrics = parse_metric_definitions(value)?;
+    let grader_outputs = object_keys_at(value, "/trial_runtime/grader/outputs");
+    let runtime_outputs = object_keys_at(value, "/trial_runtime/agent/outputs");
+
+    for metric in metrics {
+        let Some(output) = metric
+            .definition_json
+            .pointer("/source/output")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        match metric.source.source_type.as_str() {
+            "grader_output" => {
+                if !grader_outputs.contains(output) {
+                    return Err(anyhow!(
+                        "resolved experiment schema validation failed ({}): metric '{}' uses from: grader.{}... but trial_runtime.grader.outputs.{} is not declared",
+                        context,
+                        metric.id,
+                        output,
+                        output
+                    ));
+                }
+            }
+            "runtime_output" => {
+                let output_id = crate::trial::agent_output_id(output);
+                if !runtime_outputs.contains(output_id) {
+                    return Err(anyhow!(
+                        "resolved experiment schema validation failed ({}): metrics.{} references unknown runtime output '{}'",
+                        context,
+                        metric.id,
+                        output
+                    ));
+                }
+                if output_id != "result" {
+                    return Err(anyhow!(
+                        "resolved experiment schema validation failed ({}): metrics.{} references runtime output '{}', but only the canonical result output is currently persisted into metric extraction without a grader",
+                        context,
+                        metric.id,
+                        output
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_resolved_external_accounting_contract(value: &Value, context: &str) -> Result<()> {
+    let external_credentials =
+        string_set_from_array(value.pointer("/runtime/externals/credentials"));
+    let runtime_secrets = runtime_secret_names(value);
+    let missing_secret_declarations = external_credentials
+        .difference(&runtime_secrets)
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_external_credential_accounting = runtime_secrets
+        .difference(&external_credentials)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_secret_declarations.is_empty() || !missing_external_credential_accounting.is_empty()
+    {
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): /runtime/externals/credentials must match /runtime/secrets names (missing secrets: {}; missing externals: {})",
+            context,
+            format_list(&missing_secret_declarations),
+            format_list(&missing_external_credential_accounting)
+        ));
+    }
+
+    let external_apis = string_set_from_array(value.pointer("/runtime/externals/apis"));
+    let network_egress = string_set_from_array(value.pointer("/runtime/network/egress"));
+    let missing_egress_policy = external_apis
+        .difference(&network_egress)
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_external_api_accounting = network_egress
+        .difference(&external_apis)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_egress_policy.is_empty() || !missing_external_api_accounting.is_empty() {
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): /runtime/externals/apis must match /runtime/network/egress (missing egress: {}; missing externals: {})",
+            context,
+            format_list(&missing_egress_policy),
+            format_list(&missing_external_api_accounting)
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_resolved_hidden_path_contract(value: &Value, context: &str) -> Result<()> {
+    let hidden_paths = parse_string_array_field(
+        value.pointer("/trial_runtime/grader/in_task_runtime/hidden_paths"),
+        "trial_runtime.grader.in_task_runtime.hidden_paths",
+    )?;
+    if hidden_paths.is_empty() {
+        return Ok(());
+    }
+    let output_mount_paths =
+        parse_output_mount_paths(value.pointer("/trial_runtime/agent/output_mounts"))?;
+    let overlaps = hidden_paths
+        .iter()
+        .filter(|hidden| {
+            output_mount_paths
+                .iter()
+                .any(|mount| path_prefix_overlaps(hidden, mount))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !overlaps.is_empty() {
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): hidden grader paths overlap agent output mounts: {}",
+            context,
+            overlaps.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn parse_output_mount_paths(value: Option<&Value>) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("trial_runtime.agent.output_mounts must be an array"))?;
+    let mut paths = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let path = item
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "trial_runtime.agent.output_mounts[{}].path is required",
+                    idx
+                )
+            })?;
+        paths.push(path.to_string());
+    }
+    Ok(paths)
+}
+
+fn path_prefix_overlaps(a: &str, b: &str) -> bool {
+    let a = a.trim_matches('/');
+    let b = b.trim_matches('/');
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || a.starts_with(&format!("{}/", b)) || b.starts_with(&format!("{}/", a))
+}
+
+fn object_keys_at(value: &Value, pointer: &str) -> BTreeSet<String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_object)
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn runtime_secret_names(value: &Value) -> BTreeSet<String> {
+    let Some(items) = value.pointer("/runtime/secrets").and_then(Value::as_array) else {
+        return BTreeSet::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            item.pointer("/name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn string_set_from_array(value: Option<&Value>) -> BTreeSet<String> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return BTreeSet::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            item.as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn format_set(items: &BTreeSet<String>) -> String {
+    if items.is_empty() {
+        "<none>".to_string()
+    } else {
+        items.iter().cloned().collect::<Vec<_>>().join(", ")
+    }
+}
+
+fn format_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "<none>".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+fn validate_resolved_runtime_template_bindings(value: &Value, context: &str) -> Result<()> {
+    let declared_env = declared_env_secret_names(value);
+    let base_command_refs = template_refs_in_array(value.pointer("/trial_runtime/agent/command"));
+    let base_env_refs = template_refs_in_env(value.pointer("/trial_runtime/agent/env"));
+    let Some(variants) = value.pointer("/matrix/variants").and_then(Value::as_array) else {
+        return Ok(());
+    };
+
+    let mut missing_bindings = Vec::new();
+    let mut non_scalar_bindings = Vec::new();
+    let mut removed_syntax = Vec::new();
+    for (variant_idx, variant) in variants.iter().enumerate() {
+        let variant_id = variant
+            .pointer("/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("variant[{variant_idx}]"));
+        let Some(config) = variant.pointer("/config").and_then(Value::as_object) else {
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): /matrix/variants[{}].config is required and must be an object",
+                context,
+                variant_idx
+            ));
+        };
+        let override_command = variant.pointer("/overrides/agent/command");
+        let command_refs = override_command
+            .map(|value| template_refs_in_array(Some(value)))
+            .unwrap_or_else(|| base_command_refs.clone());
+        let mut env_refs = base_env_refs.clone();
+        merge_template_refs(
+            &mut env_refs,
+            template_refs_in_env(variant.pointer("/overrides/agent/env")),
+        );
+        let mut refs = command_refs.clone();
+        merge_template_refs(&mut refs, env_refs.clone());
+
+        for refs_by_field in [&command_refs, &env_refs] {
+            for (field, refs) in refs_by_field {
+                if refs.removed_syntax {
+                    removed_syntax.push(format!("{variant_id}: {field}"));
+                }
+            }
+        }
+
+        for name in unique_template_ref_names(&refs) {
+            if name == "WORKSPACE" || declared_env.contains(&name) {
+                continue;
+            }
+            match config.get(&name) {
+                Some(value) if is_runtime_binding_scalar(value) => {}
+                Some(_) => non_scalar_bindings.push(format!("{variant_id}: ${name}")),
+                None => missing_bindings.push(format!("{variant_id}: ${name}")),
+            }
+        }
+    }
+
+    if !missing_bindings.is_empty() || !non_scalar_bindings.is_empty() || !removed_syntax.is_empty()
+    {
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): /trial_runtime/agent runtime templates must resolve from variant config, declared env secrets, or built-ins (missing: {}; non-scalar: {}; removed syntax: {})",
+            context,
+            format_list(&missing_bindings),
+            format_list(&non_scalar_bindings),
+            format_list(&removed_syntax)
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_resolved_event_placeholders(value: &Value, context: &str) -> Result<()> {
+    let base_command_refs =
+        event_placeholders_in_array(value.pointer("/trial_runtime/agent/command"));
+    let base_env_refs = event_placeholders_in_env(value.pointer("/trial_runtime/agent/env"));
+    let base_event_ids = event_sink_ids(value.pointer("/trial_runtime/agent/events"));
+    let Some(variants) = value.pointer("/matrix/variants").and_then(Value::as_array) else {
+        return Ok(());
+    };
+
+    let mut removed_placeholders = Vec::new();
+    let mut unknown_events = Vec::new();
+    let mut malformed = Vec::new();
+    let mut unsupported_env = Vec::new();
+    for (variant_idx, variant) in variants.iter().enumerate() {
+        let variant_id = variant
+            .pointer("/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("variant[{variant_idx}]"));
+        let event_ids = variant
+            .pointer("/overrides/agent/events")
+            .map(|events| event_sink_ids(Some(events)))
+            .unwrap_or_else(|| base_event_ids.clone());
+        let command_refs = variant
+            .pointer("/overrides/agent/command")
+            .map(|command| event_placeholders_in_array(Some(command)))
+            .unwrap_or_else(|| base_command_refs.clone());
+        let env_refs =
+            merge_event_env_placeholders(&base_env_refs, variant.pointer("/overrides/agent/env"));
+
+        for (field, refs) in command_refs {
+            if refs.removed_trajectory_placeholder {
+                removed_placeholders.push(format!(
+                    "{variant_id}: {field}: __BUCEPHALUS_TRAJECTORY_PATH__"
+                ));
+            }
+            if refs.malformed {
+                malformed.push(format!("{variant_id}: {field}"));
+            }
+            for event_id in refs.event_ids {
+                if !event_ids.contains(&event_id) {
+                    unknown_events.push(format!("{variant_id}: {field}: {event_id}"));
+                }
+            }
+        }
+        for field in env_refs.keys() {
+            unsupported_env.push(format!("{variant_id}: {field}"));
+        }
+    }
+
+    if !removed_placeholders.is_empty()
+        || !unknown_events.is_empty()
+        || !malformed.is_empty()
+        || !unsupported_env.is_empty()
+    {
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): agent command event placeholders must use declared __BUCEPHALUS_EVENT_PATH_<id>__ sinks, and agent env values must not contain event path placeholders (removed placeholders: {}; unknown event ids: {}; malformed placeholders: {}; unsupported env placeholders: {})",
+            context,
+            format_list(&removed_placeholders),
+            format_list(&unknown_events),
+            format_list(&malformed),
+            format_list(&unsupported_env)
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct EventPlaceholders {
+    removed_trajectory_placeholder: bool,
+    event_ids: BTreeSet<String>,
+    malformed: bool,
+}
+
+fn event_sink_ids(value: Option<&Value>) -> BTreeSet<String> {
+    let Some(events) = value.and_then(Value::as_array) else {
+        return BTreeSet::new();
+    };
+    events
+        .iter()
+        .filter_map(|event| {
+            event
+                .pointer("/id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn event_placeholders_in_array(value: Option<&Value>) -> BTreeMap<String, EventPlaceholders> {
+    let mut refs = BTreeMap::new();
+    let Some(items) = value.and_then(Value::as_array) else {
+        return refs;
+    };
+    for (idx, item) in items.iter().enumerate() {
+        if let Some(raw) = item.as_str() {
+            let placeholders = event_placeholders(raw);
+            if placeholders.removed_trajectory_placeholder
+                || placeholders.malformed
+                || !placeholders.event_ids.is_empty()
+            {
+                refs.insert(format!("agent.command[{idx}]"), placeholders);
+            }
+        }
+    }
+    refs
+}
+
+fn event_placeholders_in_env(value: Option<&Value>) -> BTreeMap<String, EventPlaceholders> {
+    let mut refs = BTreeMap::new();
+    let Some(env) = value.and_then(Value::as_object) else {
+        return refs;
+    };
+    for (key, item) in env {
+        if let Some(raw) = item.as_str() {
+            let placeholders = event_placeholders(raw);
+            if placeholders.removed_trajectory_placeholder
+                || placeholders.malformed
+                || !placeholders.event_ids.is_empty()
+            {
+                refs.insert(format!("agent.env.{key}"), placeholders);
+            }
+        }
+    }
+    refs
+}
+
+fn merge_event_env_placeholders(
+    base: &BTreeMap<String, EventPlaceholders>,
+    override_env: Option<&Value>,
+) -> BTreeMap<String, EventPlaceholders> {
+    let mut refs = base.clone();
+    let Some(env) = override_env.and_then(Value::as_object) else {
+        return refs;
+    };
+    for (key, item) in env {
+        let field = format!("agent.env.{key}");
+        refs.remove(&field);
+        if let Some(raw) = item.as_str() {
+            let placeholders = event_placeholders(raw);
+            if placeholders.removed_trajectory_placeholder
+                || placeholders.malformed
+                || !placeholders.event_ids.is_empty()
+            {
+                refs.insert(field, placeholders);
+            }
+        }
+    }
+    refs
+}
+
+fn event_placeholders(raw: &str) -> EventPlaceholders {
+    let mut placeholders = EventPlaceholders {
+        removed_trajectory_placeholder: raw.contains("__BUCEPHALUS_TRAJECTORY_PATH__"),
+        event_ids: BTreeSet::new(),
+        malformed: false,
+    };
+    let marker = "__BUCEPHALUS_EVENT_PATH_";
+    let mut rest = raw;
+    while let Some(start) = rest.find(marker) {
+        let after_marker = &rest[start + marker.len()..];
+        let Some(end) = after_marker.find("__") else {
+            placeholders.malformed = true;
+            break;
+        };
+        let event_id = after_marker[..end].trim();
+        if event_id.is_empty() {
+            placeholders.malformed = true;
+        } else {
+            placeholders.event_ids.insert(event_id.to_string());
+        }
+        rest = &after_marker[end + 2..];
+    }
+    placeholders
+}
+
+#[derive(Debug, Clone, Default)]
+struct TemplateRefs {
+    names: BTreeSet<String>,
+    removed_syntax: bool,
+}
+
+fn template_refs_in_array(value: Option<&Value>) -> BTreeMap<String, TemplateRefs> {
+    let mut refs = BTreeMap::new();
+    let Some(items) = value.and_then(Value::as_array) else {
+        return refs;
+    };
+    for (idx, item) in items.iter().enumerate() {
+        if let Some(raw) = item.as_str() {
+            refs.insert(format!("agent.command[{idx}]"), runtime_template_refs(raw));
+        }
+    }
+    refs
+}
+
+fn template_refs_in_env(value: Option<&Value>) -> BTreeMap<String, TemplateRefs> {
+    let mut refs = BTreeMap::new();
+    let Some(env) = value.and_then(Value::as_object) else {
+        return refs;
+    };
+    for (key, item) in env {
+        if let Some(raw) = item.as_str() {
+            refs.insert(format!("agent.env.{key}"), runtime_template_refs(raw));
+        }
+    }
+    refs
+}
+
+fn runtime_template_refs(raw: &str) -> TemplateRefs {
+    let mut refs = TemplateRefs {
+        names: BTreeSet::new(),
+        removed_syntax: raw.contains("${"),
+    };
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        if chars[idx] != '$' {
+            idx += 1;
+            continue;
+        }
+        if idx + 1 >= chars.len() {
+            idx += 1;
+            continue;
+        }
+        let start = chars[idx + 1];
+        if !(start == '_' || start.is_ascii_alphabetic()) {
+            idx += 1;
+            continue;
+        }
+        let mut end = idx + 2;
+        while end < chars.len() {
+            let next = chars[end];
+            if next == '_' || next.is_ascii_alphanumeric() {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        refs.names
+            .insert(chars[idx + 1..end].iter().collect::<String>());
+        idx = end;
+    }
+    refs
+}
+
+fn merge_template_refs(
+    target: &mut BTreeMap<String, TemplateRefs>,
+    source: BTreeMap<String, TemplateRefs>,
+) {
+    for (field, refs) in source {
+        target.insert(field, refs);
+    }
+}
+
+fn unique_template_ref_names(refs: &BTreeMap<String, TemplateRefs>) -> BTreeSet<String> {
+    refs.values()
+        .flat_map(|item| item.names.iter().cloned())
+        .collect()
+}
+
+fn declared_env_secret_names(value: &Value) -> BTreeSet<String> {
+    let Some(secrets) = value.pointer("/runtime/secrets").and_then(Value::as_array) else {
+        return BTreeSet::new();
+    };
+    secrets
+        .iter()
+        .filter(|secret| secret.pointer("/from").and_then(Value::as_str) == Some("env"))
+        .filter_map(|secret| {
+            secret
+                .pointer("/name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn is_runtime_binding_scalar(value: &Value) -> bool {
+    matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_))
 }
 
 fn validates_payload_at_write_boundary(schema_version: &str) -> bool {

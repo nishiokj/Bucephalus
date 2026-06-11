@@ -166,7 +166,7 @@ pub fn continue_run_with_options(
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let tasks = load_tasks(&dataset_path, &json_value)?;
     let replications = matrix_repeats(&json_value)?;
-    let random_seed = experiment_random_seed(&json_value);
+    let random_seed = experiment_random_seed(&json_value)?;
 
     let reconstructed_schedule = build_trial_schedule(
         variants.len(),
@@ -312,14 +312,8 @@ pub(crate) fn trial_index_from_trial_id(trial_id: &str) -> Option<usize> {
 }
 
 fn resolved_experiment_id(json_value: &Value) -> Result<String> {
-    json_value
-        .pointer("/experiment/id")
-        .or_else(|| json_value.pointer("/id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|raw| !raw.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("missing /experiment/id for metric definition registry"))
+    required_experiment_id(json_value)
+        .context("missing /experiment/id for metric definition registry")
 }
 
 fn metric_definition_records(
@@ -2661,7 +2655,7 @@ pub(crate) fn run_experiment_with_behavior(
 
     let policy_config = parse_policies(&json_value)?;
     let max_concurrency = experiment_max_concurrency(&json_value)?;
-    let random_seed = experiment_random_seed(&json_value);
+    let random_seed = experiment_random_seed(&json_value)?;
     let schedule = if behavior.smoke_test {
         if tasks.is_empty() {
             return Err(anyhow!("smoke test requires at least one task"));
@@ -2842,11 +2836,6 @@ pub fn experiment_summary_with_options(
     let workload_type = experiment_workload_type(&json_value)?;
 
     let policy_config = parse_policies(&json_value)?;
-    let comparison = json_value
-        .pointer("/scheduling/comparison")
-        .and_then(|v| v.as_str())
-        .unwrap_or("none")
-        .to_string();
 
     let evaluation_config = parse_evaluation_config(&json_value)?;
     let tasks_for_preflight = load_tasks(&dataset_path, &json_value).with_context(|| {
@@ -2897,7 +2886,6 @@ pub fn experiment_summary_with_options(
         agent_runtime_command: runtime_agent.command_raw,
         image,
         network_mode,
-        trajectory_path: runtime_agent.trajectory_path,
         causal_extraction: runtime_agent.causal_extraction,
         scheduling: match policy_config.scheduling {
             SchedulingPolicy::PairedInterleaved => "paired_interleaved".to_string(),
@@ -2909,7 +2897,6 @@ pub fn experiment_summary_with_options(
             StatePolicy::PersistPerTask => "persist_per_task".to_string(),
             StatePolicy::Accumulate => "accumulate".to_string(),
         },
-        comparison,
         retry_max_attempts: policy_config.retry_max_attempts,
         preflight_warnings,
     })
@@ -3361,6 +3348,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         &io_paths,
         Some(replay_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
+        !agent_runtime.event_sinks.is_empty(),
     )?;
     let run_request = TrialRunRequest {
         package_root: &run_dir,
@@ -3667,6 +3655,7 @@ pub(crate) fn fork_trial_inner(
         &io_paths,
         Some(fork_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
+        !agent_runtime.event_sinks.is_empty(),
     )?;
     let run_request = TrialRunRequest {
         package_root: &run_dir,
@@ -3840,10 +3829,9 @@ pub(crate) fn resolve_resume_selector(
     }
 
     if let Some(label) = preferred_label {
-        let found = checkpoints.iter().any(|cp| {
-            cp.get("logical_name").and_then(|v| v.as_str()) == Some(label)
-                || cp.get("path").and_then(|v| v.as_str()) == Some(label)
-        });
+        let found = checkpoints
+            .iter()
+            .any(|cp| cp.get("logical_name").and_then(|v| v.as_str()) == Some(label));
         if !found {
             return Err(anyhow!(
                 "resume_checkpoint_not_found: label '{}' was not found in trial checkpoints",
@@ -3872,10 +3860,7 @@ pub(crate) fn resolve_resume_selector(
     if let Some(name) = chosen.get("logical_name").and_then(|v| v.as_str()) {
         return Ok(format!("checkpoint:{}", name));
     }
-    if let Some(path) = chosen.get("path").and_then(|v| v.as_str()) {
-        return Ok(format!("checkpoint:{}", path));
-    }
-    Err(anyhow!("resume_no_checkpoint_token"))
+    Err(anyhow!("resume checkpoint is missing logical_name"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4218,10 +4203,9 @@ pub(crate) fn resolve_selector_checkpoint(
         .unwrap_or(&[]);
 
     let selected = match selector {
-        ForkSelector::Checkpoint(name) => checkpoints.iter().find(|cp| {
-            cp.get("logical_name").and_then(|v| v.as_str()) == Some(name.as_str())
-                || cp.get("path").and_then(|v| v.as_str()) == Some(name.as_str())
-        }),
+        ForkSelector::Checkpoint(name) => checkpoints
+            .iter()
+            .find(|cp| cp.get("logical_name").and_then(|v| v.as_str()) == Some(name.as_str())),
         ForkSelector::Step(step) => checkpoints
             .iter()
             .filter_map(|cp| {

@@ -25,7 +25,7 @@ Canonical YAML sections:
 
 | Section | Responsibility |
 | --- | --- |
-| `matrix` | Variants, cases, repeats, and seeds. |
+| `matrix` | Variants, cases, and repeats. |
 | `scheduling` | Concurrency, ordering, and comparison. |
 | `stages` | Stage chain and declared I/O. |
 | `ephemerals` | Per-trial resources attached to stages. |

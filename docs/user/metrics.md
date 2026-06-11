@@ -15,21 +15,22 @@ metrics:
     unit: ms
     direction: minimize
     primary: true
-    required: true
     from: result.metrics.speed
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `id` | Canonical metric id stored in Bucephalus. This becomes `metric_name` in `metrics_long`. |
+| `id` | Unique canonical metric id stored in Bucephalus. This becomes `metric_name` in `metrics_long`. |
 | `label` | Human-readable label for views. |
 | `semantic_key` | Optional cross-experiment meaning, such as `runtime.latency`. Use this when two experiments intentionally measure the same concept. |
 | `value_type` | Optional type hint, such as `number`, `boolean`, or `string`. |
 | `unit` | Optional unit, such as `ms`, `tokens`, `usd`, or `count`. |
 | `direction` | Optional optimization direction: commonly `maximize` or `minimize`. |
-| `primary` | Marks the declared metric as the primary metric. For grader-backed runs, primary metrics should read from declared grader outputs. |
-| `required` | If true and the referenced value is missing, the run fails before the missing value is silently committed. |
+| `primary` | Marks the declared metric as the primary metric. A single declared metric defaults to `true`; with multiple metrics, mark exactly one primary. |
+| `required` | Defaults to `true`, so a missing referenced value fails before it is silently committed. Set `false` only for optional diagnostics. |
 | `from` | Public extraction reference. Use `result.<field>` for agent responses and `grader.<output>.<field>` for declared grader outputs. |
+
+Build writes explicit `primary` and `required` booleans into sealed packages.
 
 ## Canonical IDs
 
@@ -86,9 +87,9 @@ The grader writes its native output. The runner captures the declared output, ap
 
 If you need multiple custom metrics without a grader, write them into the agent response and declare each one with `from: result...`.
 
-`bucephalus check-package` validates the metric/grader relationship statically. A
-no-grader experiment may use `from: result...` metrics, but it fails package
-checks if any metric uses `from: grader...` while `stages.grader.strategy: none`.
+Schema validation checks the metric/grader relationship statically. A no-grader
+experiment may use `from: result...` metrics, but `from: grader...` requires an
+active `stages.grader.strategy`.
 
 ## Events Are Not Metrics
 

@@ -1,6 +1,21 @@
 # Troubleshooting
 
-For a YAML experiment, start with the no-run diagnostic command:
+For a YAML experiment, start with the cheap authoring schema check:
+
+```bash
+bucephalus schema-validate
+```
+
+That command defaults to the public experiment authoring schema. It catches
+misspelled fields and resolved-package internals before any package is built.
+
+For static package checks without dynamic preflight, run:
+
+```bash
+bucephalus lint
+```
+
+Then use the no-run diagnostic command:
 
 ```bash
 bucephalus doctor experiment.yaml
@@ -31,7 +46,7 @@ Common causes:
 - a `stages.*.ephemerals` entry references an unknown ephemeral id, or an ephemeral id is not a valid runtime alias.
 - `stages.grader.command` references a file that does not match the selected grader strategy.
 - `strategy: host` is pointing at a local or absolute script path instead of a declared `stages.grader.host.capability`.
-- A command or env value references `$NAME`, but no variant config value or runtime env provides it.
+- A command or env value references `$NAME`, but no variant `config` value or explicit launch-time `--env` / `--env-file` input provides it. For credentials, also declare the name in `runtime.secrets`.
 
 What to inspect:
 
@@ -49,12 +64,17 @@ bucephalus check-package <package_dir> --json
 
 Common causes:
 
-- `comparison: paired` is declared with only one resolved variant.
-- variant ids or case ids are duplicated.
-- no primary metric is declared, or multiple metrics are marked primary.
-- a no-grader experiment declares a `from: grader...` metric.
-- agent result output capture is missing a path.
-- declared hidden grader paths overlap agent output mounts.
+- packaged case rows are missing or malformed.
+- case ids are duplicated.
+- task image refs use mutable tags; this is a warning, not a hard failure.
+
+Package build and `check-package` fail before writing package checks for
+schema-owned and resolved-contract issues, such as duplicate variant ids,
+unresolved `$NAME` runtime templates, multiple metrics without exactly one
+`primary: true`, `runtime.network.egress` without a non-`none` network plane,
+`scheduling.comparison: paired` with fewer than two variants, metric `from:`
+references that target undeclared/unsupported grader or runtime outputs, or
+declared hidden grader paths overlapping agent output mounts.
 
 Fix package-check failures before running dynamic preflight.
 

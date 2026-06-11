@@ -24,8 +24,10 @@ COPY --chown=bun:bun bucephalus-cloud/runtime-dist/worker.js ./runtime-dist/work
 COPY --chown=bun:bun bucephalus-cloud/runtime-dist/secretResolver.js ./runtime-dist/secretResolver.js
 COPY --chown=bun:bun bucephalus-cloud/runtime-dist/networkPolicyClient.js ./runtime-dist/networkPolicyClient.js
 COPY --chown=root:root bin/bucephalus-worker-runner /usr/local/bin/bucephalus-worker-runner
+COPY --chown=root:root bin/bucephalus-modal-launcher /usr/local/bin/bucephalus-modal-launcher
 
 RUN chmod 0755 /usr/local/bin/bucephalus-worker-runner \
+  && chmod 0755 /usr/local/bin/bucephalus-modal-launcher \
   && ln -sf /usr/local/bin/bucephalus-worker-runner /usr/local/bin/bucephalus \
   && printf '#!/usr/bin/env sh\nexec bun /opt/bucephalus-cloud/runtime-dist/secretResolver.js "$@"\n' >/usr/local/bin/bucephalus-cloud-secret-resolver \
   && printf '#!/usr/bin/env sh\nexec bun /opt/bucephalus-cloud/runtime-dist/networkPolicyClient.js "$@"\n' >/usr/local/bin/bucephalus-cloud-network-policy \

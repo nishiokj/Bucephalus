@@ -41,6 +41,9 @@ fn parse_string_map(value: Option<&Value>, context: &str) -> Result<BTreeMap<Str
     object
         .iter()
         .map(|(key, value)| {
+            if key.trim().is_empty() {
+                return Err(anyhow!("{} contains an empty key", context));
+            }
             let value = value
                 .as_str()
                 .ok_or_else(|| anyhow!("{}.{} must be a string", context, key))?;
@@ -60,9 +63,13 @@ fn parse_string_array(value: Option<&Value>, context: &str) -> Result<Vec<String
         .iter()
         .enumerate()
         .map(|(idx, item)| {
-            item.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("{}[{}] must be a string", context, idx))
+            let part = item
+                .as_str()
+                .ok_or_else(|| anyhow!("{}[{}] must be a string", context, idx))?;
+            if part.trim().is_empty() {
+                return Err(anyhow!("{}[{}] must not be empty", context, idx));
+            }
+            Ok(part.to_string())
         })
         .collect()
 }
@@ -73,8 +80,19 @@ pub(crate) fn sidecar_plan(experiment: &Value, id: &str) -> Result<RuntimeSideca
         .and_then(Value::as_object)
         .and_then(|sidecars| sidecars.get(id))
         .ok_or_else(|| anyhow!("sidecar '{}' is referenced but not declared", id))?;
+    let config = config
+        .as_object()
+        .ok_or_else(|| anyhow!("sidecar '{}' config must be an object", id))?;
+    for key in config.keys() {
+        if !matches!(
+            key.as_str(),
+            "image" | "lifecycle" | "command" | "env" | "workdir" | "expose"
+        ) {
+            return Err(anyhow!("sidecars.{}.{} is not supported", id, key));
+        }
+    }
     let image = config
-        .pointer("/image")
+        .get("image")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -83,25 +101,19 @@ pub(crate) fn sidecar_plan(experiment: &Value, id: &str) -> Result<RuntimeSideca
         id: id.to_string(),
         image: image.to_string(),
         lifecycle: config
-            .pointer("/lifecycle")
+            .get("lifecycle")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("sidecar '{}' lifecycle is required", id))?
             .to_string(),
-        command: parse_string_array(
-            config.pointer("/command"),
-            &format!("sidecars.{}.command", id),
-        )?,
-        env: parse_string_map(config.pointer("/env"), &format!("sidecars.{}.env", id))?,
+        command: parse_string_array(config.get("command"), &format!("sidecars.{}.command", id))?,
+        env: parse_string_map(config.get("env"), &format!("sidecars.{}.env", id))?,
         workdir: config
-            .pointer("/workdir")
+            .get("workdir")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string),
-        expose: parse_string_map(
-            config.pointer("/expose"),
-            &format!("sidecars.{}.expose", id),
-        )?,
+        expose: parse_string_map(config.get("expose"), &format!("sidecars.{}.expose", id))?,
     })
 }
 

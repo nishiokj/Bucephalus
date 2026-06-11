@@ -228,6 +228,39 @@ describe("worker lifecycle cleanup helpers", () => {
     })).toThrow("BUCEPHALUS_CLOUD_API_URL is required");
   });
 
+  test("core runner env keeps Modal controls while stripping generic cloud credentials", () => {
+    const previous = {
+      BUCEPHALUS_MODAL_LAUNCHER: process.env.BUCEPHALUS_MODAL_LAUNCHER,
+      BUCEPHALUS_MODAL_APP_NAME: process.env.BUCEPHALUS_MODAL_APP_NAME,
+      BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID: process.env.BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID,
+      AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+      AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+    };
+    try {
+      process.env.BUCEPHALUS_MODAL_LAUNCHER = "/usr/local/bin/bucephalus-modal-launcher";
+      process.env.BUCEPHALUS_MODAL_APP_NAME = "bucephalus-prod";
+      process.env.BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID = "modal-sync-key";
+      process.env.AWS_ACCESS_KEY_ID = "generic-aws-key";
+      process.env.AWS_SECRET_ACCESS_KEY = "generic-aws-secret";
+
+      const env = coreRunnerEnv();
+
+      expect(env.BUCEPHALUS_MODAL_LAUNCHER).toBe("/usr/local/bin/bucephalus-modal-launcher");
+      expect(env.BUCEPHALUS_MODAL_APP_NAME).toBe("bucephalus-prod");
+      expect(env.BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID).toBe("modal-sync-key");
+      expect(env.AWS_ACCESS_KEY_ID).toBeUndefined();
+      expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
+  });
+
   test("Docker registry auth header decodes auth-only Docker config entries", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-worker-docker-auth-"));
     const previousDockerConfig = process.env.DOCKER_CONFIG;

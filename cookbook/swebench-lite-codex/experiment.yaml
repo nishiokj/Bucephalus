@@ -11,6 +11,7 @@ runtime:
   network:
     task_sandbox: full
     agent: full
+    egress: [api.openai.com]
 
 externals:
   apis: [api.openai.com]

@@ -177,11 +177,9 @@ pub struct ExperimentSummary {
     pub agent_runtime_command: Vec<String>,
     pub image: Option<String>,
     pub network_mode: String,
-    pub trajectory_path: Option<String>,
     pub causal_extraction: Option<String>,
     pub scheduling: String,
     pub state_policy: String,
-    pub comparison: String,
     pub retry_max_attempts: usize,
     pub preflight_warnings: Vec<String>,
 }
@@ -355,7 +353,6 @@ impl TaskModel {
 pub(crate) struct TaskPolicyConfig {
     pub(crate) task_model: TaskModel,
     pub(crate) scoring_lifecycle: String,
-    pub(crate) evaluator_mode: String,
     pub(crate) required_evidence_classes: Vec<String>,
     pub(crate) chain_failure_policy: String,
 }
@@ -365,7 +362,6 @@ impl Default for TaskPolicyConfig {
         Self {
             task_model: TaskModel::Independent,
             scoring_lifecycle: "predict_then_score".to_string(),
-            evaluator_mode: "custom".to_string(),
             required_evidence_classes: Vec::new(),
             chain_failure_policy: "continue_with_flag".to_string(),
         }
@@ -543,12 +539,7 @@ pub(crate) struct WorkspaceSpec {
 pub(crate) struct PreparedMountReference {
     pub(crate) host_path: String,
     pub(crate) mount_path: String,
-    #[serde(default = "default_true")]
     pub(crate) read_only: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -857,8 +848,8 @@ pub(crate) struct RuntimeOutputCaptureConfig {
     pub(crate) format: Option<String>,
     #[serde(default)]
     pub(crate) field: Option<String>,
-    #[serde(default)]
-    pub(crate) required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) required: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -898,8 +889,8 @@ pub(crate) struct RuntimeInputMaterializeConfig {
 pub(crate) struct RuntimeInputConfig {
     pub(crate) source: RuntimeTransportSourceConfig,
     pub(crate) materialize: RuntimeInputMaterializeConfig,
-    #[serde(default)]
-    pub(crate) required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) required: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

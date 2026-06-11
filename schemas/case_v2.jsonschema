@@ -15,16 +15,8 @@
     "resources": {
       "type": "object",
       "additionalProperties": true,
+      "not": { "required": ["environment"] },
       "properties": {
-        "environment": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "image": { "type": "string", "minLength": 1 },
-            "workdir": { "type": "string", "minLength": 1, "pattern": "^/" },
-            "platform": { "type": "string", "minLength": 1 }
-          }
-        },
         "workspace": {
           "type": "object",
           "additionalProperties": false,
@@ -89,15 +81,17 @@
             "type": "array",
             "items": { "type": "string", "minLength": 1 }
           },
-          "resource": { "type": "string", "minLength": 1 },
           "source": {
             "type": "object",
-            "additionalProperties": true
+            "additionalProperties": false,
+            "properties": {
+              "path": { "type": "string", "minLength": 1 }
+            }
           },
           "mount": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["path"],
+            "required": ["path", "read_only"],
             "properties": {
               "path": { "type": "string", "minLength": 1, "pattern": "^/" },
               "read_only": { "type": "boolean" }

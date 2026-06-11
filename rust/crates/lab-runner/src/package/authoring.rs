@@ -3,6 +3,7 @@ use lab_core::{
     sha256_bytes, sha256_file, BUCEPHALUS_RESULT_PATH, BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
 };
 use serde_json::{json, Map, Value};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -52,8 +53,8 @@ pub(crate) fn load_authoring_input_for_build(
         json_value
     };
     reject_legacy_authoring_surface(&json_value)?;
-    crate::package::validate::validate_required_fields(&json_value)?;
     validate_authoring_schema(&json_value)?;
+    crate::package::validate::validate_required_fields(&json_value)?;
     normalize_authoring_vocabulary(&mut json_value)
         .map_err(|err| crate::package::validate::public_authoring_error(err, true))?;
     Ok(LoadedExperimentInput {
@@ -69,14 +70,7 @@ fn validate_authoring_schema(json_value: &Value) -> Result<()> {
         return Ok(());
     };
     let messages = errors
-        .map(|err| {
-            let path = err.instance_path.to_string();
-            if path.is_empty() {
-                err.to_string()
-            } else {
-                format!("{}: {}", path, err)
-            }
-        })
+        .map(|err| lab_schemas::format_validation_error(&err))
         .collect::<Vec<_>>();
     Err(anyhow!(
         "experiment authoring schema validation failed: {}",
@@ -103,6 +97,10 @@ pub(crate) fn reject_legacy_authoring_surface(json_value: &Value) -> Result<()> 
             "/overrides",
             "first-class v1 fields under /runtime, /policy, or /matrix",
         ),
+        (
+            "/knobs",
+            "the external knob_manifest_v1 file referenced by --overrides",
+        ),
     ] {
         if json_value.pointer(pointer).is_some() {
             return Err(anyhow!(
@@ -113,7 +111,28 @@ pub(crate) fn reject_legacy_authoring_surface(json_value: &Value) -> Result<()> 
         }
     }
     reject_metric_source_authoring(json_value)?;
+    reject_mixed_network_default_authoring(json_value)?;
+    reject_scheduling_comparison_authoring_overlap(json_value)?;
+    reject_empty_grader_authoring(json_value)?;
+    reject_noop_traces_authoring(json_value)?;
+    reject_credential_cache_without_mount(json_value)?;
+    reject_duplicate_external_accounting_lists(json_value)?;
+    reject_duplicate_runtime_secret_names(json_value)?;
+    reject_invalid_runtime_secret_provider_shapes(json_value)?;
+    reject_duplicate_credential_cache_env(json_value)?;
+    reject_uninferrable_agent_site_authoring(json_value)?;
     Ok(())
+}
+
+fn reject_mixed_network_default_authoring(json_value: &Value) -> Result<()> {
+    if json_value.pointer("/runtime/network/default").is_none() {
+        return Ok(());
+    }
+    let explicit_planes = explicit_network_default_plane_overlaps(json_value);
+    if explicit_planes.is_empty() {
+        return Ok(());
+    }
+    Err(mixed_network_default_error(&explicit_planes))
 }
 
 fn reject_metric_source_authoring(json_value: &Value) -> Result<()> {
@@ -134,22 +153,264 @@ fn reject_metric_source_authoring(json_value: &Value) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<()> {
-    alias_top_level_value(json_value, "ephemerals", &["sidecars"])?;
-    alias_top_level_value(json_value, "externals", &["runtime", "externals"])?;
-    if let Some(matrix) = json_value.get_mut("matrix") {
-        alias_child_value(matrix, "cases", "tasks")?;
+fn reject_uninferrable_agent_site_authoring(json_value: &Value) -> Result<()> {
+    let Some(stages) = json_value.get("stages").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if stages
+        .get("execution")
+        .and_then(|execution| execution.get("agent_site"))
+        .is_some()
+    {
+        return Ok(());
     }
+    let Some(agent) = stages.get("agent").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if agent
+        .get("image")
+        .and_then(Value::as_str)
+        .is_some_and(|image| !image.trim().is_empty())
+    {
+        return Ok(());
+    }
+    let Some(case) = stages.get("case").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if case
+        .get("interface")
+        .and_then(Value::as_str)
+        .is_some_and(|interface| interface == "input_only")
+        && !case.contains_key("files")
+        && !case.contains_key("workspace")
+    {
+        return Ok(());
+    }
+    if case
+        .get("workspace")
+        .and_then(|workspace| workspace.get("source"))
+        .and_then(Value::as_str)
+        == Some("container_image")
+    {
+        return Ok(());
+    }
+    if case.contains_key("files")
+        || case.contains_key("workspace")
+        || case
+            .get("interface")
+            .and_then(Value::as_str)
+            .is_some_and(|interface| interface == "readonly_files")
+    {
+        return Err(uninferrable_agent_site_error());
+    }
+    Ok(())
+}
+
+fn uninferrable_agent_site_error() -> anyhow::Error {
+    anyhow!(
+        "/stages.execution.agent_site is required when the agent runtime boundary cannot be inferred; declare agent_container, task_runtime, or host"
+    )
+}
+
+fn reject_scheduling_comparison_authoring_overlap(json_value: &Value) -> Result<()> {
+    let Some(comparison) = json_value
+        .pointer("/scheduling/comparison")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    if comparison != "paired" {
+        return Err(anyhow!(
+            "/scheduling/comparison only supports paired; omit it for default scheduling or declare /policy/policies/scheduling directly"
+        ));
+    }
+    if json_value.pointer("/policy/policies/scheduling").is_some() {
+        return Err(anyhow!(
+            "/scheduling/comparison is exclusive authoring shorthand; do not combine it with /policy/policies/scheduling"
+        ));
+    }
+    Ok(())
+}
+
+fn reject_empty_grader_authoring(json_value: &Value) -> Result<()> {
+    let Some(grader) = json_value.pointer("/stages/grader") else {
+        return Ok(());
+    };
+    let grader = grader
+        .as_object()
+        .ok_or_else(|| anyhow!("/stages/grader must be an object"))?;
+    if grader.is_empty() {
+        return Err(anyhow!(
+            "/stages/grader must not be empty; omit it for the no-grader default or declare strategy: none explicitly"
+        ));
+    }
+    Ok(())
+}
+
+fn reject_noop_traces_authoring(json_value: &Value) -> Result<()> {
+    if json_value.pointer("/traces/source").and_then(Value::as_str) == Some("none") {
+        return Err(anyhow!(
+            "/traces.source=none is not accepted; omit /traces for runner lifecycle events only, or use /traces.source=protocol to ingest command-agent traces"
+        ));
+    }
+    Ok(())
+}
+
+fn reject_credential_cache_without_mount(json_value: &Value) -> Result<()> {
+    let Some(secrets) = json_value
+        .pointer("/runtime/secrets")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for (idx, secret) in secrets.iter().enumerate() {
+        if secret.pointer("/credential_cache").is_some() && secret.pointer("/mount").is_none() {
+            return Err(anyhow!(
+                "/runtime/secrets/{} declares credential_cache without mount; credential caches are attached to file secrets, so declare mount.target",
+                idx
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_duplicate_external_accounting_lists(json_value: &Value) -> Result<()> {
+    for pointer in [
+        "/externals/apis",
+        "/externals/credentials",
+        "/runtime/network/egress",
+    ] {
+        string_array_values(json_value.pointer(pointer), pointer)?;
+    }
+    Ok(())
+}
+
+fn reject_duplicate_runtime_secret_names(json_value: &Value) -> Result<()> {
+    let Some(secrets) = json_value.pointer("/runtime/secrets") else {
+        return Ok(());
+    };
+    let secrets = secrets
+        .as_array()
+        .ok_or_else(|| anyhow!("/runtime/secrets must be an array"))?;
+    let mut seen = BTreeSet::new();
+    for (idx, secret) in secrets.iter().enumerate() {
+        let name = secret
+            .pointer("/name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("/runtime/secrets/{} name must be a non-empty string", idx))?;
+        if !seen.insert(name.to_string()) {
+            return Err(anyhow!(
+                "/runtime/secrets/{} duplicates secret name '{}'; runtime secret names must be unique",
+                idx,
+                name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_invalid_runtime_secret_provider_shapes(json_value: &Value) -> Result<()> {
+    let Some(secrets) = json_value.pointer("/runtime/secrets") else {
+        return Ok(());
+    };
+    let secrets = secrets
+        .as_array()
+        .ok_or_else(|| anyhow!("/runtime/secrets must be an array"))?;
+    for (idx, secret) in secrets.iter().enumerate() {
+        let Some(from) = secret.pointer("/from").and_then(Value::as_str) else {
+            continue;
+        };
+        match from {
+            "env" => {
+                if secret.pointer("/mount").is_some() {
+                    return Err(anyhow!(
+                        "/runtime/secrets/{} declares from=env with mount; env secrets are scalar values, so remove mount or set from: file",
+                        idx
+                    ));
+                }
+                if secret.pointer("/credential_cache").is_some() {
+                    return Err(anyhow!(
+                        "/runtime/secrets/{} declares from=env with credential_cache; credential caches are only valid for mounted file secrets",
+                        idx
+                    ));
+                }
+            }
+            "file" if secret.pointer("/mount").is_none() => {
+                return Err(anyhow!(
+                    "/runtime/secrets/{} declares from=file without mount; file secrets must declare mount.target",
+                    idx
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn reject_duplicate_credential_cache_env(json_value: &Value) -> Result<()> {
+    let Some(secrets) = json_value.pointer("/runtime/secrets") else {
+        return Ok(());
+    };
+    let secrets = secrets
+        .as_array()
+        .ok_or_else(|| anyhow!("/runtime/secrets must be an array"))?;
+    let mut seen = BTreeSet::new();
+    for (idx, secret) in secrets.iter().enumerate() {
+        let Some(env) = secret
+            .pointer("/credential_cache/env")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if !seen.insert(env.to_string()) {
+            return Err(anyhow!(
+                "/runtime/secrets/{}/credential_cache/env duplicates '{}'; credential cache env names must be unique",
+                idx,
+                env
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<()> {
+    lower_top_level_value(json_value, "ephemerals", &["sidecars"])?;
+    lower_top_level_value(json_value, "externals", &["runtime", "externals"])?;
+    if let Some(matrix) = json_value.get_mut("matrix") {
+        lower_child_value(matrix, "cases", "tasks")?;
+    }
+    default_matrix_variants(json_value)?;
+    normalize_variant_baselines(json_value)?;
+    default_variant_configs(json_value)?;
+    default_case_source(json_value)?;
+    normalize_variant_overrides(json_value)?;
+    default_variant_case_override_interfaces(json_value)?;
     normalize_authoring_defaults(json_value)?;
+    default_secret_sources(json_value)?;
+    reject_duplicate_runtime_secret_names(json_value)?;
+    reject_invalid_runtime_secret_provider_shapes(json_value)?;
+    reject_duplicate_credential_cache_env(json_value)?;
+    derive_runtime_externals_from_contract(json_value)?;
 
     let Some(stages) = json_value.get("stages").cloned() else {
-        normalize_stage_ephemerals(json_value.pointer_mut("/trial_runtime"))?;
+        default_trial_case_interface(json_value)?;
+        lower_registry_image_rewrites(json_value)?;
         normalize_agent_site_default(json_value)?;
-        normalize_agent_protocol_default(json_value)?;
         normalize_grader_defaults(json_value)?;
         normalize_agent_result_output(json_value)?;
+        normalize_output_capture_required_flags(json_value)?;
+        normalize_grader_input_required_flags(json_value)?;
         normalize_metric_authoring(json_value)?;
         normalize_trace_policy(json_value)?;
+        normalize_agent_observability_contract(json_value)?;
+        normalize_agent_integration_levels(json_value)?;
+        drop_authoring_experiment_mode(json_value);
         return Ok(());
     };
     let mut trial_runtime = Map::new();
@@ -163,46 +424,59 @@ pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<(
             other => other,
         };
         let mut normalized_stage = stage_value.clone();
-        normalize_stage_ephemerals(Some(&mut normalized_stage))?;
-        insert_alias_value(&mut trial_runtime, target, normalized_stage, "/stages")?;
+        normalize_public_stage_ephemerals(stage_name, &mut normalized_stage)?;
+        insert_lowered_value(&mut trial_runtime, target, normalized_stage, "/stages")?;
     }
-    alias_object_value(json_value, &["trial_runtime"], Value::Object(trial_runtime))?;
+    lower_object_value(json_value, &["trial_runtime"], Value::Object(trial_runtime))?;
     if let Some(object) = json_value.as_object_mut() {
         object.remove("stages");
     }
-    normalize_stage_ephemerals(json_value.pointer_mut("/trial_runtime"))?;
+    default_trial_case_interface(json_value)?;
+    lower_registry_image_rewrites(json_value)?;
     normalize_agent_site_default(json_value)?;
-    normalize_agent_protocol_default(json_value)?;
     normalize_grader_defaults(json_value)?;
     normalize_agent_result_output(json_value)?;
+    normalize_output_capture_required_flags(json_value)?;
+    normalize_grader_input_required_flags(json_value)?;
     normalize_metric_authoring(json_value)?;
     normalize_trace_policy(json_value)?;
+    normalize_agent_observability_contract(json_value)?;
+    normalize_agent_integration_levels(json_value)?;
+    drop_authoring_experiment_mode(json_value);
     Ok(())
+}
+
+fn drop_authoring_experiment_mode(json_value: &mut Value) {
+    if let Some(experiment) = json_value
+        .get_mut("experiment")
+        .and_then(Value::as_object_mut)
+    {
+        experiment.remove("mode");
+    }
 }
 
 fn normalize_authoring_defaults(json_value: &mut Value) -> Result<()> {
     default_object_path(json_value, &["runtime"])?;
     default_object_path(json_value, &["runtime", "compute"])?;
-    default_object_path(json_value, &["runtime", "storage"])?;
-    default_object_path(json_value, &["runtime", "traces"])?;
     default_object_path(json_value, &["runtime", "network"])?;
     default_object_path(json_value, &["policy"])?;
+    default_object_path(json_value, &["policy", "policies"])?;
+    default_object_path(json_value, &["policy", "policies", "retry"])?;
+    default_object_path(json_value, &["policy", "policies", "pruning"])?;
+    default_object_path(json_value, &["policy", "policies", "concurrency"])?;
+    default_object_path(json_value, &["policy", "task_sandbox"])?;
+    default_object_path(json_value, &["policy", "task_sandbox", "hardening"])?;
     default_object_path(json_value, &["scheduling"])?;
+    default_object_path(json_value, &["evaluation"])?;
+    default_object_path(json_value, &["evaluation", "policy"])?;
 
+    default_network_planes_from_authoring_default(json_value)?;
+    lower_scheduling_comparison_into_policy(json_value)?;
+    default_experiment_name(json_value)?;
     insert_default_value(
         json_value,
         &["runtime", "compute", "backend"],
         json!("local-docker"),
-    )?;
-    insert_default_value(
-        json_value,
-        &["runtime", "storage", "backend"],
-        json!("local-fs"),
-    )?;
-    insert_default_value(
-        json_value,
-        &["runtime", "traces", "backend"],
-        json!("local-stdout"),
     )?;
     insert_default_value(
         json_value,
@@ -213,9 +487,498 @@ fn normalize_authoring_defaults(json_value: &mut Value) -> Result<()> {
     insert_default_value(json_value, &["matrix", "repeats"], json!(1))?;
     insert_default_value(json_value, &["scheduling", "max_concurrency"], json!(1))?;
     insert_default_value(json_value, &["scheduling", "random_seed"], json!(1))?;
-    insert_default_value(json_value, &["scheduling", "comparison"], json!("none"))?;
     insert_default_value(json_value, &["policy", "timeout_ms"], json!(600000))?;
+    insert_default_value(
+        json_value,
+        &["policy", "sanitization_profile"],
+        json!("standard_runtime"),
+    )?;
     insert_default_value(json_value, &["policy", "task_sandbox"], json!({}))?;
+    insert_default_value(
+        json_value,
+        &["policy", "task_sandbox", "hardening", "no_new_privileges"],
+        json!(true),
+    )?;
+    insert_default_value(
+        json_value,
+        &["policy", "task_sandbox", "hardening", "drop_all_caps"],
+        json!(true),
+    )?;
+    insert_default_value(
+        json_value,
+        &["policy", "policies", "scheduling"],
+        json!("variant_sequential"),
+    )?;
+    insert_default_value(
+        json_value,
+        &["policy", "policies", "state"],
+        json!("isolate_per_trial"),
+    )?;
+    insert_default_value(
+        json_value,
+        &["policy", "policies", "retry", "max_attempts"],
+        json!(1),
+    )?;
+    insert_default_value(
+        json_value,
+        &["policy", "policies", "retry", "retry_on"],
+        json!([]),
+    )?;
+    insert_default_value(
+        json_value,
+        &["policy", "policies", "pruning", "max_consecutive_failures"],
+        json!(0),
+    )?;
+    insert_default_value(
+        json_value,
+        &["policy", "policies", "concurrency", "require_chain_lease"],
+        json!(true),
+    )?;
+    insert_default_value(
+        json_value,
+        &["evaluation", "policy", "task_model"],
+        json!("independent"),
+    )?;
+    insert_default_value(
+        json_value,
+        &["evaluation", "policy", "scoring_lifecycle"],
+        json!("predict_then_score"),
+    )?;
+    insert_default_value(
+        json_value,
+        &["evaluation", "policy", "chain_failure_policy"],
+        json!("continue_with_flag"),
+    )?;
+    insert_default_value(
+        json_value,
+        &["evaluation", "policy", "required_evidence_classes"],
+        json!([]),
+    )?;
+    Ok(())
+}
+
+fn lower_scheduling_comparison_into_policy(json_value: &mut Value) -> Result<()> {
+    let comparison = json_value
+        .pointer("/scheduling/comparison")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let Some(comparison) = comparison else {
+        return Ok(());
+    };
+    if comparison != "paired" {
+        return Err(anyhow!(
+            "/scheduling/comparison only supports paired; omit it for default scheduling or declare /policy/policies/scheduling directly"
+        ));
+    }
+    if json_value.pointer("/policy/policies/scheduling").is_some() {
+        return Err(anyhow!(
+            "/scheduling/comparison is exclusive authoring shorthand; do not combine it with /policy/policies/scheduling"
+        ));
+    }
+    let variant_count = json_value
+        .pointer("/matrix/variants")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if variant_count < 2 {
+        return Err(anyhow!(
+            "/scheduling/comparison=paired requires at least two matrix variants"
+        ));
+    }
+    insert_default_value(
+        json_value,
+        &["policy", "policies", "scheduling"],
+        json!("paired_interleaved"),
+    )?;
+    if let Some(scheduling) = json_value
+        .get_mut("scheduling")
+        .and_then(Value::as_object_mut)
+    {
+        scheduling.remove("comparison");
+    }
+    Ok(())
+}
+
+fn default_network_planes_from_authoring_default(json_value: &mut Value) -> Result<()> {
+    let Some(raw_default) = json_value.pointer("/runtime/network/default") else {
+        return Ok(());
+    };
+    let explicit_planes = explicit_network_default_plane_overlaps(json_value);
+    if !explicit_planes.is_empty() {
+        return Err(mixed_network_default_error(&explicit_planes));
+    }
+    let default = raw_default
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("/runtime/network/default must be a non-empty string"))?
+        .to_string();
+    let network = ensure_object_path(json_value, &["runtime", "network"])?;
+    network.insert("task_sandbox".to_string(), json!(default.clone()));
+    network.insert("agent".to_string(), json!(default));
+    network.remove("default");
+    Ok(())
+}
+
+fn explicit_network_default_plane_overlaps(json_value: &Value) -> Vec<&'static str> {
+    let mut explicit_planes = Vec::new();
+    if json_value
+        .pointer("/runtime/network/task_sandbox")
+        .is_some()
+    {
+        explicit_planes.push("/runtime/network/task_sandbox");
+    }
+    if json_value.pointer("/runtime/network/agent").is_some() {
+        explicit_planes.push("/runtime/network/agent");
+    }
+    explicit_planes
+}
+
+fn mixed_network_default_error(explicit_planes: &[&str]) -> anyhow::Error {
+    anyhow!(
+        "/runtime/network/default is exclusive shorthand; do not combine it with {}; write explicit task_sandbox and agent values for mixed network modes",
+        explicit_planes.join(" or ")
+    )
+}
+
+fn default_case_source(json_value: &mut Value) -> Result<()> {
+    if json_value.pointer("/matrix/tasks/source").is_none()
+        && json_value.pointer("/matrix/tasks/path").is_some()
+    {
+        insert_default_value(json_value, &["matrix", "tasks", "source"], json!("file"))?;
+    }
+    Ok(())
+}
+
+fn default_matrix_variants(json_value: &mut Value) -> Result<()> {
+    let Some(matrix) = json_value.get_mut("matrix") else {
+        return Ok(());
+    };
+    let matrix = matrix
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("/matrix must be an object"))?;
+    if matrix.contains_key("variants") {
+        return Ok(());
+    }
+    matrix.insert(
+        "variants".to_string(),
+        json!([{ "id": "baseline", "baseline": true, "config": {} }]),
+    );
+    Ok(())
+}
+
+fn normalize_variant_baselines(json_value: &mut Value) -> Result<()> {
+    let Some(variants) = json_value.pointer_mut("/matrix/variants") else {
+        return Ok(());
+    };
+    let variants = variants
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("/matrix/variants must be an array"))?;
+    if variants.is_empty() {
+        return Ok(());
+    }
+
+    let explicit_baseline_count = variants
+        .iter()
+        .filter(|variant| {
+            variant
+                .get("baseline")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count();
+    if explicit_baseline_count > 1 {
+        return Err(anyhow!(
+            "exactly one /matrix/variants[].baseline=true is required"
+        ));
+    }
+    if explicit_baseline_count == 0 {
+        if variants.len() == 1 {
+            let variant = variants[0]
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("/matrix/variants/0 must be an object"))?;
+            if variant.get("baseline").is_some() {
+                return Err(anyhow!(
+                    "single-variant authoring cannot set /matrix/variants/0/baseline=false; omit baseline or set it to true"
+                ));
+            }
+            variant.insert("baseline".to_string(), json!(true));
+        } else {
+            return Err(anyhow!(
+                "multiple variants require exactly one explicit /matrix/variants[].baseline=true"
+            ));
+        }
+    }
+
+    for (idx, variant) in variants.iter_mut().enumerate() {
+        let variant = variant
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("/matrix/variants/{} must be an object", idx))?;
+        if variant.get("baseline").is_none() {
+            variant.insert("baseline".to_string(), json!(false));
+        }
+    }
+    Ok(())
+}
+
+fn default_variant_configs(json_value: &mut Value) -> Result<()> {
+    let Some(variants) = json_value.pointer_mut("/matrix/variants") else {
+        return Ok(());
+    };
+    let variants = variants
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("/matrix/variants must be an array"))?;
+    for (idx, variant) in variants.iter_mut().enumerate() {
+        let variant = variant
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("/matrix/variants/{} must be an object", idx))?;
+        variant
+            .entry("config".to_string())
+            .or_insert_with(|| json!({}));
+    }
+    Ok(())
+}
+
+fn default_secret_sources(json_value: &mut Value) -> Result<()> {
+    let Some(secrets) = json_value.pointer_mut("/runtime/secrets") else {
+        return Ok(());
+    };
+    let secrets = secrets
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("/runtime/secrets must be an array"))?;
+    for (idx, secret) in secrets.iter_mut().enumerate() {
+        let secret = secret
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("/runtime/secrets/{} must be an object", idx))?;
+        if secret.contains_key("credential_cache") && !secret.contains_key("mount") {
+            return Err(anyhow!(
+                "/runtime/secrets/{} declares credential_cache without mount; credential caches are attached to file secrets, so declare mount.target",
+                idx
+            ));
+        }
+        if secret.contains_key("from") {
+            continue;
+        }
+        let provider = if secret.contains_key("mount") || secret.contains_key("credential_cache") {
+            "file"
+        } else {
+            "env"
+        };
+        secret.insert("from".to_string(), json!(provider));
+    }
+    Ok(())
+}
+
+fn default_trial_case_interface(json_value: &mut Value) -> Result<()> {
+    let Some(task) = json_value.pointer_mut("/trial_runtime/task") else {
+        return Ok(());
+    };
+    default_case_interface_for_stage(task, "/stages.case")
+}
+
+fn default_variant_case_override_interfaces(json_value: &mut Value) -> Result<()> {
+    let Some(variants) = json_value
+        .pointer_mut("/matrix/variants")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for (idx, variant) in variants.iter_mut().enumerate() {
+        let Some(task) = variant.pointer_mut("/overrides/task") else {
+            continue;
+        };
+        default_case_interface_for_stage(
+            task,
+            &format!("/matrix/variants/{}/overrides/case", idx),
+        )?;
+    }
+    Ok(())
+}
+
+fn default_case_interface_for_stage(stage: &mut Value, context: &str) -> Result<()> {
+    let stage = stage
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must be an object", context))?;
+    reject_inconsistent_case_resources(stage, context)?;
+    if stage.contains_key("interface") {
+        return Ok(());
+    }
+    let interface = if stage.contains_key("workspace") {
+        "writable_workspace"
+    } else if stage.contains_key("files") {
+        "readonly_files"
+    } else {
+        "input_only"
+    };
+    stage.insert("interface".to_string(), json!(interface));
+    Ok(())
+}
+
+fn reject_inconsistent_case_resources(stage: &Map<String, Value>, context: &str) -> Result<()> {
+    let has_files = stage.contains_key("files");
+    let has_workspace = stage.contains_key("workspace");
+    if has_files && has_workspace {
+        return Err(anyhow!(
+            "{} cannot declare both files and workspace; choose one case resource",
+            context
+        ));
+    }
+    let Some(interface) = stage.get("interface").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    match interface {
+        "input_only" if has_files || has_workspace => Err(anyhow!(
+            "{} declares interface input_only with a case resource; remove files/workspace or choose the matching interface",
+            context
+        )),
+        "readonly_files" if has_workspace => Err(anyhow!(
+            "{} declares interface readonly_files with workspace; use files or choose writable_workspace",
+            context
+        )),
+        "writable_workspace" if has_files => Err(anyhow!(
+            "{} declares interface writable_workspace with files; use workspace or choose readonly_files",
+            context
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn derive_runtime_externals_from_contract(json_value: &mut Value) -> Result<()> {
+    let credentials = named_runtime_secret_values(json_value)?;
+    let apis = string_array_values(
+        json_value.pointer("/runtime/network/egress"),
+        "/runtime/network/egress",
+    )?;
+
+    if let Some(declared) = json_value.pointer("/runtime/externals/credentials") {
+        let declared = string_array_values(Some(declared), "/externals/credentials")?;
+        reject_external_accounting_mismatch(
+            "/externals/credentials",
+            "/runtime/secrets names",
+            &declared,
+            &credentials,
+        )?;
+    } else if !credentials.is_empty() {
+        let externals = ensure_object_path(json_value, &["runtime", "externals"])?;
+        externals.insert("credentials".to_string(), json!(credentials));
+    }
+    if let Some(declared) = json_value.pointer("/runtime/externals/apis") {
+        let declared = string_array_values(Some(declared), "/externals/apis")?;
+        reject_external_accounting_mismatch(
+            "/externals/apis",
+            "/runtime/network/egress",
+            &declared,
+            &apis,
+        )?;
+    } else if !apis.is_empty() {
+        let externals = ensure_object_path(json_value, &["runtime", "externals"])?;
+        externals.insert("apis".to_string(), json!(apis));
+    }
+    Ok(())
+}
+
+fn reject_external_accounting_mismatch(
+    external_path: &str,
+    source_path: &str,
+    declared: &[String],
+    source: &[String],
+) -> Result<()> {
+    let declared = declared.iter().cloned().collect::<BTreeSet<_>>();
+    let source = source.iter().cloned().collect::<BTreeSet<_>>();
+    let missing_source = declared.difference(&source).cloned().collect::<Vec<_>>();
+    let missing_external = source.difference(&declared).cloned().collect::<Vec<_>>();
+    if missing_source.is_empty() && missing_external.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{} must match {}; missing source declarations: {}; missing externals: {}",
+        external_path,
+        source_path,
+        format_authoring_list(&missing_source),
+        format_authoring_list(&missing_external)
+    ))
+}
+
+fn format_authoring_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "<none>".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+fn named_runtime_secret_values(json_value: &Value) -> Result<Vec<String>> {
+    let Some(secrets) = json_value.pointer("/runtime/secrets") else {
+        return Ok(Vec::new());
+    };
+    let secrets = secrets
+        .as_array()
+        .ok_or_else(|| anyhow!("/runtime/secrets must be an array"))?;
+    let mut names = BTreeSet::new();
+    for (idx, secret) in secrets.iter().enumerate() {
+        let name = secret
+            .pointer("/name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("/runtime/secrets/{}/name must be a non-empty string", idx))?;
+        names.insert(name.to_string());
+    }
+    Ok(names.into_iter().collect())
+}
+
+fn string_array_values(value: Option<&Value>, context: &str) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow!("{} must be an array", context))?;
+    let mut seen = BTreeSet::new();
+    let mut strings = Vec::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        let value = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{}/{} must be a non-empty string", context, idx))?;
+        if !seen.insert(value.to_string()) {
+            return Err(anyhow!(
+                "{}/{} duplicates '{}'; {} values must be unique",
+                context,
+                idx,
+                value,
+                context
+            ));
+        }
+        strings.push(value.to_string());
+    }
+    Ok(strings)
+}
+
+fn default_experiment_name(json_value: &mut Value) -> Result<()> {
+    let Some(experiment) = json_value.pointer_mut("/experiment") else {
+        return Ok(());
+    };
+    let experiment = experiment
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("/experiment must be an object"))?;
+    if experiment
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| !name.trim().is_empty())
+    {
+        return Ok(());
+    }
+    let id = experiment
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow!("/experiment/id is required to default /experiment/name"))?;
+    experiment.insert("name".to_string(), json!(id));
     Ok(())
 }
 
@@ -250,6 +1013,11 @@ fn normalize_agent_site_default(json_value: &mut Value) -> Result<()> {
     }
     let default = inferred_agent_site(json_value);
     let Some(default) = default else {
+        if json_value.pointer("/trial_runtime/agent").is_some()
+            && json_value.pointer("/trial_runtime/task").is_some()
+        {
+            return Err(uninferrable_agent_site_error());
+        }
         return Ok(());
     };
     let execution = ensure_object_path(json_value, &["trial_runtime", "execution"])?;
@@ -300,30 +1068,32 @@ fn ensure_object_path<'a>(
     Ok(current)
 }
 
-fn normalize_agent_protocol_default(json_value: &mut Value) -> Result<()> {
-    let Some(agent) = json_value.pointer_mut("/trial_runtime/agent") else {
-        return Ok(());
-    };
-    let agent = agent
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("/agent must be an object"))?;
-    if agent.get("protocol").is_none() && agent.get("command").is_some() {
-        agent.insert("protocol".to_string(), json!("command"));
-    }
-    Ok(())
-}
-
 fn normalize_grader_defaults(json_value: &mut Value) -> Result<()> {
+    let trial_runtime = ensure_object_path(json_value, &["trial_runtime"])?;
+    if !trial_runtime.contains_key("grader") {
+        trial_runtime.insert("grader".to_string(), json!({ "strategy": "none" }));
+        return Ok(());
+    }
     let Some(grader) = json_value.pointer_mut("/trial_runtime/grader") else {
         return Ok(());
     };
     let grader = grader
         .as_object_mut()
         .ok_or_else(|| anyhow!("/grader must be an object"))?;
+    if grader.is_empty() {
+        return Err(anyhow!(
+            "/stages/grader must not be empty; omit it for the no-grader default or declare strategy: none explicitly"
+        ));
+    }
     if grader.get("strategy").and_then(Value::as_str) == Some("in_task_runtime")
         && grader.get("in_task_runtime").is_none()
     {
         grader.insert("in_task_runtime".to_string(), json!({}));
+    }
+    if grader.get("strategy").and_then(Value::as_str) != Some("none") {
+        grader
+            .entry("inputs".to_string())
+            .or_insert_with(|| json!({}));
     }
     Ok(())
 }
@@ -338,40 +1108,12 @@ fn normalize_agent_result_output(json_value: &mut Value) -> Result<()> {
     if !agent.contains_key("artifact_type") {
         agent.insert("artifact_type".to_string(), json!("structured_json"));
     }
-    let result = agent.remove("result");
-    let Some(result) = result else {
-        ensure_default_agent_result_output(agent)?;
-        return Ok(());
-    };
-    if agent.get("outputs").is_some() {
+    if agent.remove("result").is_some() {
         return Err(anyhow!(
-            "/agent declares both 'result' and 'outputs'; use the high-level 'result' field for the canonical agent result"
+            "/stages.agent.result is not accepted; omit it because the canonical result output is added by default, and use /stages.agent.outputs only for additional captures"
         ));
     }
-    let result = match result {
-        Value::String(kind) if kind.trim() == "structured_json" => default_agent_result_outputs(),
-        Value::Object(mut obj) => {
-            let kind = obj
-                .remove("type")
-                .or_else(|| obj.remove("format"))
-                .and_then(|value| value.as_str().map(str::to_string))
-                .unwrap_or_else(|| "structured_json".to_string());
-            if kind.trim() != "structured_json" {
-                return Err(anyhow!(
-                    "/agent.result currently supports 'structured_json' only (got '{}')",
-                    kind
-                ));
-            }
-            default_agent_result_outputs()
-        }
-        other => {
-            return Err(anyhow!(
-                "/agent.result must be 'structured_json' or an object, got {}",
-                value_kind(&other)
-            ));
-        }
-    };
-    agent.insert("outputs".to_string(), result);
+    ensure_default_agent_result_output(agent)?;
     Ok(())
 }
 
@@ -382,17 +1124,20 @@ fn ensure_default_agent_result_output(agent: &mut Map<String, Value>) -> Result<
     };
     let outputs = outputs
         .as_object_mut()
-        .ok_or_else(|| anyhow!("/agent.outputs must be an object"))?;
-    if !outputs.contains_key("result") {
-        let mut defaults = default_agent_result_outputs();
-        let Some(default_result) = defaults
-            .as_object_mut()
-            .and_then(|defaults| defaults.remove("result"))
-        else {
-            return Err(anyhow!("internal default agent result output is malformed"));
-        };
-        outputs.insert("result".to_string(), default_result);
+        .ok_or_else(|| anyhow!("/stages.agent.outputs must be an object"))?;
+    if outputs.contains_key("result") {
+        return Err(anyhow!(
+            "/stages.agent.outputs.result is not accepted; omit it because the canonical result output is added by default"
+        ));
     }
+    let mut defaults = default_agent_result_outputs();
+    let Some(default_result) = defaults
+        .as_object_mut()
+        .and_then(|defaults| defaults.remove("result"))
+    else {
+        return Err(anyhow!("internal default agent result output is malformed"));
+    };
+    outputs.insert("result".to_string(), default_result);
     Ok(())
 }
 
@@ -409,6 +1154,140 @@ fn default_agent_result_outputs() -> Value {
     })
 }
 
+fn normalize_output_capture_required_flags(json_value: &mut Value) -> Result<()> {
+    normalize_output_capture_required_flags_at(json_value, "/trial_runtime/agent/outputs")?;
+    normalize_output_capture_required_flags_at(json_value, "/trial_runtime/grader/outputs")?;
+    let Some(variants) = json_value
+        .pointer_mut("/matrix/variants")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for (idx, variant) in variants.iter_mut().enumerate() {
+        normalize_output_capture_required_flags_at(variant, "/overrides/agent/outputs")
+            .with_context(|| format!("/matrix.variants[{}].overrides.agent.outputs", idx))?;
+        normalize_output_capture_required_flags_at(variant, "/overrides/grader/outputs")
+            .with_context(|| format!("/matrix.variants[{}].overrides.grader.outputs", idx))?;
+    }
+    Ok(())
+}
+
+fn normalize_output_capture_required_flags_at(root: &mut Value, pointer: &str) -> Result<()> {
+    let Some(outputs) = root.pointer_mut(pointer) else {
+        return Ok(());
+    };
+    let outputs = outputs
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must be an object", pointer))?;
+    for (id, output) in outputs {
+        let capture = output
+            .pointer_mut("/capture")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| anyhow!("{}/{} must declare capture", pointer, id))?;
+        let capture_type = capture.get("type").and_then(Value::as_str).map(str::trim);
+        if matches!(capture_type, Some("file" | "result_json")) {
+            capture
+                .entry("required".to_string())
+                .or_insert_with(|| json!(true));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_grader_input_required_flags(json_value: &mut Value) -> Result<()> {
+    normalize_grader_input_required_flags_at(json_value, "/trial_runtime/grader/inputs")?;
+    let Some(variants) = json_value
+        .pointer_mut("/matrix/variants")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for (idx, variant) in variants.iter_mut().enumerate() {
+        normalize_grader_input_required_flags_at(variant, "/overrides/grader/inputs")
+            .with_context(|| format!("/matrix.variants[{}].overrides.grader.inputs", idx))?;
+    }
+    Ok(())
+}
+
+fn normalize_grader_input_required_flags_at(root: &mut Value, pointer: &str) -> Result<()> {
+    let Some(inputs) = root.pointer_mut(pointer) else {
+        return Ok(());
+    };
+    let inputs = inputs
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must be an object", pointer))?;
+    for input in inputs.values_mut() {
+        let input = input
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("{} values must be objects", pointer))?;
+        input
+            .entry("required".to_string())
+            .or_insert_with(|| json!(true));
+    }
+    Ok(())
+}
+
+fn normalize_agent_integration_levels(json_value: &mut Value) -> Result<()> {
+    normalize_agent_integration_level_at(json_value, &["trial_runtime", "agent"])?;
+    let Some(variants) = json_value
+        .pointer_mut("/matrix/variants")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for variant in variants {
+        let Some(agent) = variant.pointer_mut("/overrides/agent") else {
+            continue;
+        };
+        normalize_agent_integration_level_for_patch(agent)?;
+    }
+    Ok(())
+}
+
+fn normalize_agent_integration_level_at(root: &mut Value, path: &[&str]) -> Result<()> {
+    let Some(value) = root.pointer_mut(&format!("/{}", path.join("/"))) else {
+        return Ok(());
+    };
+    normalize_agent_integration_level_for_object(value)
+}
+
+fn normalize_agent_integration_level_for_object(agent: &mut Value) -> Result<()> {
+    let agent = agent
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("/trial_runtime/agent must be an object"))?;
+    if agent.contains_key("integration_level") {
+        return Ok(());
+    }
+    let has_events = agent
+        .get("events")
+        .and_then(Value::as_array)
+        .is_some_and(|events| !events.is_empty());
+    let integration_level = if has_events {
+        "cli_events"
+    } else {
+        "cli_basic"
+    };
+    agent.insert("integration_level".to_string(), json!(integration_level));
+    Ok(())
+}
+
+fn normalize_agent_integration_level_for_patch(agent: &mut Value) -> Result<()> {
+    let agent = agent
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("/matrix/variants[].overrides.agent must be an object"))?;
+    if agent.contains_key("integration_level") {
+        return Ok(());
+    }
+    let has_events = agent
+        .get("events")
+        .and_then(Value::as_array)
+        .is_some_and(|events| !events.is_empty());
+    if has_events {
+        agent.insert("integration_level".to_string(), json!("cli_events"));
+    }
+    Ok(())
+}
+
 fn normalize_metric_authoring(json_value: &mut Value) -> Result<()> {
     let Some(metrics) = json_value.get_mut("metrics") else {
         return Ok(());
@@ -416,11 +1295,21 @@ fn normalize_metric_authoring(json_value: &mut Value) -> Result<()> {
     let metrics = metrics
         .as_array_mut()
         .ok_or_else(|| anyhow!("/metrics must be an array"))?;
+    let single_metric = metrics.len() == 1;
     for (idx, metric) in metrics.iter_mut().enumerate() {
         let context = format!("/metrics/{}", idx);
         let metric = metric
             .as_object_mut()
             .ok_or_else(|| anyhow!("{} must be an object", context))?;
+        if single_metric && !metric.contains_key("primary") {
+            metric.insert("primary".to_string(), json!(true));
+        }
+        metric
+            .entry("primary".to_string())
+            .or_insert_with(|| json!(false));
+        metric
+            .entry("required".to_string())
+            .or_insert_with(|| json!(true));
         let Some(from) = metric.remove("from") else {
             continue;
         };
@@ -448,16 +1337,13 @@ fn normalize_metric_authoring(json_value: &mut Value) -> Result<()> {
 }
 
 fn metric_source_from_public_ref(raw: &str, context: &str) -> Result<Value> {
-    if let Some(rest) = raw
-        .strip_prefix("result.")
-        .or_else(|| raw.strip_prefix("agent.result."))
-    {
+    if let Some(rest) = raw.strip_prefix("result.") {
         return Ok(json!({
             "type": "agent_response",
             "pointer": public_path_to_json_pointer(rest, context)?
         }));
     }
-    if raw == "result" || raw == "agent.result" {
+    if raw == "result" {
         return Ok(json!({ "type": "agent_response", "pointer": "" }));
     }
     if let Some(rest) = raw.strip_prefix("grader.") {
@@ -541,19 +1427,8 @@ fn push_json_pointer_segment(pointer: &mut String, segment: &str) {
     pointer.push_str(&segment.replace('~', "~0").replace('/', "~1"));
 }
 
-fn value_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 fn normalize_trace_policy(json_value: &mut Value) -> Result<()> {
-    let Some(traces) = json_value.get("traces") else {
+    let Some(traces) = json_value.get("traces").cloned() else {
         return Ok(());
     };
     let traces = traces
@@ -581,35 +1456,38 @@ fn normalize_trace_policy(json_value: &mut Value) -> Result<()> {
             ));
         }
     };
-    match source {
-        "none" => Ok(()),
-        "protocol" => normalize_protocol_trace_source(json_value, retain_raw),
-        other => Err(anyhow!(
-            "/traces.source must be one of: none, protocol (got '{}')",
-            other
-        )),
+    if source == "none" {
+        return Err(anyhow!(
+            "/traces.source=none is not accepted; omit /traces for runner lifecycle events only, or use /traces.source=protocol to ingest command-agent traces"
+        ));
     }
+    if source != "protocol" {
+        return Err(anyhow!(
+            "/traces.source must be protocol; omit /traces for runner lifecycle events only (got '{}')",
+            source
+        ));
+    }
+    normalize_protocol_trace_source(json_value, retain_raw)?;
+    if let Some(object) = json_value.as_object_mut() {
+        object.remove("traces");
+    }
+    Ok(())
 }
 
 fn normalize_protocol_trace_source(json_value: &mut Value, retain_raw: bool) -> Result<()> {
     let agent = json_value
         .pointer_mut("/trial_runtime/agent")
-        .ok_or_else(|| {
-            anyhow!("/traces.source=protocol requires /stages.agent or /trial_runtime.agent")
-        })?;
+        .ok_or_else(|| anyhow!("/traces.source=protocol requires /stages.agent"))?;
     let agent = agent
         .as_object_mut()
-        .ok_or_else(|| anyhow!("/trial_runtime/agent must be an object"))?;
-    let protocol = agent
-        .get("protocol")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("/traces.source=protocol requires agent.protocol"))?;
-    if protocol != "command" {
+        .ok_or_else(|| anyhow!("/stages.agent must be an object"))?;
+    let has_command = agent
+        .get("command")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| !parts.is_empty());
+    if !has_command {
         return Err(anyhow!(
-            "/traces.source=protocol is only supported for agent protocol 'command' today (got '{}')",
-            protocol
+            "/traces.source=protocol requires /stages.agent.command"
         ));
     }
     if agent.get("events").is_some() {
@@ -628,36 +1506,152 @@ fn normalize_protocol_trace_source(json_value: &mut Value, retain_raw: bool) -> 
     Ok(())
 }
 
-fn normalize_stage_ephemerals(value: Option<&mut Value>) -> Result<()> {
-    let Some(value) = value else {
+fn normalize_agent_observability_contract(json_value: &mut Value) -> Result<()> {
+    normalize_agent_observability_contract_at(json_value, "/trial_runtime/agent")?;
+    let Some(variants) = json_value
+        .pointer_mut("/matrix/variants")
+        .and_then(Value::as_array_mut)
+    else {
         return Ok(());
     };
-    let Some(object) = value.as_object_mut() else {
+    for (idx, variant) in variants.iter_mut().enumerate() {
+        normalize_agent_observability_contract_at(variant, "/overrides/agent")
+            .with_context(|| format!("/matrix.variants[{}].overrides.agent", idx))?;
+    }
+    Ok(())
+}
+
+fn normalize_agent_observability_contract_at(root: &mut Value, pointer: &str) -> Result<()> {
+    let Some(agent) = root.pointer_mut(pointer) else {
         return Ok(());
     };
-    for stage in ["agent", "grader"] {
-        let Some(stage_value) = object.get_mut(stage) else {
-            continue;
-        };
-        if stage_value.is_object() {
-            alias_child_value(stage_value, "ephemerals", "sidecars")?;
+    let agent = agent
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must be an object", pointer))?;
+    if let Some(events) = agent.get_mut("events") {
+        let events = events
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("{}.events must be an array", pointer))?;
+        for (idx, event) in events.iter_mut().enumerate() {
+            let event = event
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("{}.events[{}] must be an object", pointer, idx))?;
+            event
+                .entry("format".to_string())
+                .or_insert_with(|| json!("jsonl"));
+            event
+                .entry("mode".to_string())
+                .or_insert_with(|| json!("jsonl"));
+            event
+                .entry("ingest".to_string())
+                .or_insert_with(|| json!(true));
+            event
+                .entry("retain_raw".to_string())
+                .or_insert_with(|| json!(false));
+        }
+    }
+    if let Some(output_mounts) = agent.get_mut("output_mounts") {
+        let output_mounts = output_mounts
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("{}.output_mounts must be an array", pointer))?;
+        for (idx, mount) in output_mounts.iter_mut().enumerate() {
+            let mount = mount
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("{}.output_mounts[{}] must be an object", pointer, idx))?;
+            mount
+                .entry("kind".to_string())
+                .or_insert_with(|| json!("directory"));
+            mount
+                .entry("persist".to_string())
+                .or_insert_with(|| json!(true));
         }
     }
     Ok(())
 }
 
-fn alias_top_level_value(json_value: &mut Value, source: &str, target: &[&str]) -> Result<()> {
+fn normalize_public_stage_ephemerals(stage_name: &str, value: &mut Value) -> Result<()> {
+    if !matches!(stage_name, "agent" | "grader") {
+        return Ok(());
+    }
+    lower_child_value(value, "ephemerals", "sidecars")?;
+    Ok(())
+}
+
+fn normalize_variant_overrides(json_value: &mut Value) -> Result<()> {
+    let Some(variants) = json_value
+        .pointer_mut("/matrix/variants")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for (idx, variant) in variants.iter_mut().enumerate() {
+        let Some(overrides) = variant.get_mut("overrides") else {
+            continue;
+        };
+        let overrides = overrides
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("/matrix/variants/{}/overrides must be an object", idx))?;
+        if let Some(case) = overrides.remove("case") {
+            insert_lowered_value(
+                overrides,
+                "task",
+                case,
+                &format!("/matrix/variants/{}/overrides", idx),
+            )?;
+        }
+        for stage_name in ["agent", "grader"] {
+            if let Some(stage) = overrides.get_mut(stage_name) {
+                normalize_public_stage_ephemerals(stage_name, stage)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lower_registry_image_rewrites(json_value: &mut Value) -> Result<()> {
+    let Some(registry) = json_value
+        .pointer_mut("/runtime/registry")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    let Some(rewrites) = registry.remove("image_rewrites") else {
+        return Ok(());
+    };
+    let image = ensure_object_path(json_value, &["trial_runtime", "task", "workspace", "image"])?;
+    insert_lowered_value(
+        image,
+        "rewrites",
+        rewrites,
+        "authoring lowering for runtime.registry.image_rewrites",
+    )?;
+    if json_value
+        .pointer("/runtime/registry")
+        .and_then(Value::as_object)
+        .is_some_and(Map::is_empty)
+    {
+        if let Some(runtime) = json_value
+            .pointer_mut("/runtime")
+            .and_then(Value::as_object_mut)
+        {
+            runtime.remove("registry");
+        }
+    }
+    Ok(())
+}
+
+fn lower_top_level_value(json_value: &mut Value, source: &str, target: &[&str]) -> Result<()> {
     let Some(value) = json_value.get(source).cloned() else {
         return Ok(());
     };
-    alias_object_value(json_value, target, value)?;
+    lower_object_value(json_value, target, value)?;
     if let Some(object) = json_value.as_object_mut() {
         object.remove(source);
     }
     Ok(())
 }
 
-fn alias_object_value(root: &mut Value, target: &[&str], value: Value) -> Result<()> {
+fn lower_object_value(root: &mut Value, target: &[&str], value: Value) -> Result<()> {
     if target.is_empty() {
         return Ok(());
     }
@@ -672,41 +1666,38 @@ fn alias_object_value(root: &mut Value, target: &[&str], value: Value) -> Result
             .as_object_mut()
             .ok_or_else(|| anyhow!("/{} must be an object", segment))?;
     }
-    insert_alias_value(
+    insert_lowered_value(
         current,
         target[target.len() - 1],
         value,
-        "authoring vocabulary",
+        "authoring lowering",
     )
 }
 
-fn alias_child_value(root: &mut Value, source: &str, target: &str) -> Result<()> {
+fn lower_child_value(root: &mut Value, source: &str, target: &str) -> Result<()> {
     let Some(value) = root.get(source).cloned() else {
         return Ok(());
     };
     let object = root
         .as_object_mut()
         .ok_or_else(|| anyhow!("stage authoring input must be an object"))?;
-    insert_alias_value(object, target, value, "stage authoring vocabulary")?;
+    insert_lowered_value(object, target, value, "authoring lowering")?;
     object.remove(source);
     Ok(())
 }
 
-fn insert_alias_value(
+fn insert_lowered_value(
     object: &mut Map<String, Value>,
     key: &str,
     value: Value,
     context: &str,
 ) -> Result<()> {
-    if let Some(existing) = object.get(key) {
-        if existing != &value {
-            return Err(anyhow!(
-                "{} declares both '{}' and its alias with different values",
-                context,
-                key
-            ));
-        }
-        return Ok(());
+    if object.contains_key(key) {
+        return Err(anyhow!(
+            "{} target '{}' already exists; use the public authoring field only",
+            context,
+            key
+        ));
     }
     object.insert(key.to_string(), value);
     Ok(())
@@ -868,12 +1859,11 @@ mod tests {
     fn normalizes_case_stage_ephemeral_authoring_nouns() {
         let mut value = json!({
             "matrix": {
-                "variants": [{ "id": "base" }],
-                "cases": { "source": "file", "path": "cases.jsonl" },
+                "cases": { "path": "cases.jsonl" },
                 "repeats": 1
             },
             "stages": {
-                "case": { "interface": "input_only" },
+                "case": {},
                 "agent": {
                     "command": ["agent"],
                     "ephemerals": ["mcp"]
@@ -886,8 +1876,7 @@ mod tests {
                     "image": "ghcr.io/acme/mcp:latest",
                     "lifecycle": "per-trial"
                 }
-            },
-            "externals": { "apis": ["api.openai.com"] }
+            }
         });
 
         normalize_authoring_vocabulary(&mut value).unwrap();
@@ -896,19 +1885,453 @@ mod tests {
             value.pointer("/matrix/tasks/path"),
             Some(&json!("cases.jsonl"))
         );
+        assert_eq!(value.pointer("/matrix/tasks/source"), Some(&json!("file")));
         assert_eq!(
             value.pointer("/trial_runtime/task/interface"),
             Some(&json!("input_only"))
+        );
+        assert_eq!(
+            value.pointer("/matrix/variants/0"),
+            Some(&json!({ "id": "baseline", "baseline": true, "config": {} }))
         );
         assert_eq!(
             value.pointer("/trial_runtime/agent/sidecars"),
             Some(&json!(["mcp"]))
         );
         assert!(value.pointer("/sidecars/mcp").is_some());
+    }
+
+    #[test]
+    fn defaults_case_interface_from_resource_shape() {
+        let mut value = json!({
+            "matrix": {
+                "variants": [{
+                    "id": "base",
+                    "overrides": {
+                        "case": {
+                            "files": {
+                                "source": "files",
+                                "path": "case-files",
+                                "mount_path": "/case"
+                            }
+                        }
+                    }
+                }]
+            },
+            "stages": {
+                "case": {
+                    "workspace": {
+                        "source": "container_image",
+                        "image": { "from": "case_row" },
+                        "workdir": { "from": "case_row" }
+                    }
+                },
+                "agent": {
+                    "command": ["agent"]
+                }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/task/interface"),
+            Some(&json!("writable_workspace"))
+        );
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/task/interface"),
+            Some(&json!("readonly_files"))
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_case_interface_default() {
+        let mut value = json!({
+            "stages": {
+                "case": {
+                    "files": {
+                        "source": "files",
+                        "path": "case-files",
+                        "mount_path": "/case"
+                    },
+                    "workspace": {
+                        "source": "empty"
+                    }
+                },
+                "agent": {
+                    "command": ["agent"]
+                }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value)
+            .expect_err("ambiguous case resources should fail");
+
+        assert!(
+            err.to_string()
+                .contains("/stages.case cannot declare both files and workspace"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_case_interface_resource_mismatch() {
+        let cases = [
+            (
+                json!({
+                    "stages": {
+                        "case": {
+                            "interface": "input_only",
+                            "files": {
+                                "source": "files",
+                                "path": "case-files",
+                                "mount_path": "/case"
+                            }
+                        },
+                        "agent": { "command": ["agent"] }
+                    }
+                }),
+                "/stages.case declares interface input_only with a case resource",
+            ),
+            (
+                json!({
+                    "stages": {
+                        "case": {
+                            "interface": "readonly_files",
+                            "workspace": { "source": "empty" }
+                        },
+                        "agent": { "command": ["agent"] }
+                    }
+                }),
+                "/stages.case declares interface readonly_files with workspace",
+            ),
+            (
+                json!({
+                    "matrix": {
+                        "variants": [{
+                            "id": "base",
+                            "overrides": {
+                                "case": {
+                                    "interface": "writable_workspace",
+                                    "files": {
+                                        "source": "files",
+                                        "path": "case-files",
+                                        "mount_path": "/case"
+                                    }
+                                }
+                            }
+                        }]
+                    },
+                    "stages": {
+                        "case": { "interface": "input_only" },
+                        "agent": { "command": ["agent"] }
+                    }
+                }),
+                "/matrix/variants/0/overrides/case declares interface writable_workspace with files",
+            ),
+        ];
+
+        for (mut value, expected) in cases {
+            let err = normalize_authoring_vocabulary(&mut value)
+                .expect_err("mismatched case interface resources should fail");
+
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn derives_externals_from_runtime_contract_when_omitted() {
+        let mut value = json!({
+            "runtime": {
+                "secrets": [
+                    { "name": "CODEX_OAUTH", "from": "file", "mount": { "target": "/root/.codex/auth.json" } },
+                    { "name": "OPENAI_API_KEY", "from": "env" }
+                ],
+                "network": { "egress": ["api.openai.com"] }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/runtime/externals/credentials"),
+            Some(&json!(["CODEX_OAUTH", "OPENAI_API_KEY"]))
+        );
         assert_eq!(
             value.pointer("/runtime/externals/apis"),
             Some(&json!(["api.openai.com"]))
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_external_accounting_values() {
+        for (mut value, expected) in [
+            (
+                json!({
+                    "runtime": {
+                        "network": { "egress": ["api.openai.com", "api.openai.com"] }
+                    }
+                }),
+                "/runtime/network/egress/1 duplicates 'api.openai.com'",
+            ),
+            (
+                json!({
+                    "externals": {
+                        "apis": ["api.openai.com", "api.openai.com"]
+                    },
+                    "runtime": {
+                        "network": { "egress": ["api.openai.com"] }
+                    }
+                }),
+                "/externals/apis/1 duplicates 'api.openai.com'",
+            ),
+            (
+                json!({
+                    "externals": {
+                        "credentials": ["OPENAI_API_KEY", "OPENAI_API_KEY"]
+                    },
+                    "runtime": {
+                        "secrets": [{ "name": "OPENAI_API_KEY", "from": "env" }]
+                    }
+                }),
+                "/externals/credentials/1 duplicates 'OPENAI_API_KEY'",
+            ),
+        ] {
+            let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(expected) && msg.contains("must be unique"),
+                "expected {expected:?}, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn defaults_secret_sources_from_provider_shape() {
+        let mut value = json!({
+            "runtime": {
+                "secrets": [
+                    { "name": "OPENAI_API_KEY" },
+                    {
+                        "name": "CODEX_OAUTH",
+                        "mount": { "target": "/root/.codex/auth.json" }
+                    },
+                    {
+                        "name": "EXPLICIT_FILE",
+                        "from": "file",
+                        "mount": { "target": "/run/secrets/explicit.json" }
+                    }
+                ]
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/runtime/secrets/0/from"),
+            Some(&json!("env"))
+        );
+        assert_eq!(
+            value.pointer("/runtime/secrets/1/from"),
+            Some(&json!("file"))
+        );
+        assert_eq!(
+            value.pointer("/runtime/secrets/2/from"),
+            Some(&json!("file"))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_runtime_secret_names() {
+        let mut value = json!({
+            "runtime": {
+                "secrets": [
+                    { "name": "OPENAI_API_KEY" },
+                    { "name": "OPENAI_API_KEY", "from": "env" }
+                ]
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/runtime/secrets/1 duplicates secret name 'OPENAI_API_KEY'")
+                && msg.contains("must be unique"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_secret_provider_shapes() {
+        for (mut value, expected) in [
+            (
+                json!({
+                    "runtime": {
+                        "secrets": [{
+                            "name": "OPENAI_API_KEY",
+                            "from": "env",
+                            "mount": { "target": "/run/secrets/openai" }
+                        }]
+                    }
+                }),
+                "/runtime/secrets/0 declares from=env with mount",
+            ),
+            (
+                json!({
+                    "runtime": {
+                        "secrets": [{
+                            "name": "CODEX_AUTH",
+                            "from": "env",
+                            "mount": { "target": "/root/.codex/auth.json" },
+                            "credential_cache": {
+                                "kind": "run_scoped",
+                                "target": "/bucephalus/credentials/codex/auth.json"
+                            }
+                        }]
+                    }
+                }),
+                "/runtime/secrets/0 declares from=env with mount",
+            ),
+            (
+                json!({
+                    "runtime": {
+                        "secrets": [{
+                            "name": "CODEX_AUTH",
+                            "from": "file"
+                        }]
+                    }
+                }),
+                "/runtime/secrets/0 declares from=file without mount",
+            ),
+        ] {
+            let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+            let msg = err.to_string();
+
+            assert!(msg.contains(expected), "expected {expected:?}, got: {msg}");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_credential_cache_env_names() {
+        let mut value = json!({
+            "runtime": {
+                "secrets": [
+                    {
+                        "name": "CODEX_AUTH_A",
+                        "from": "file",
+                        "mount": { "target": "/run/secrets/codex-a.json" },
+                        "credential_cache": {
+                            "kind": "run_scoped",
+                            "target": "/bucephalus/credentials/codex-a/auth.json",
+                            "env": "CODEX_AUTH_CACHE_FILE"
+                        }
+                    },
+                    {
+                        "name": "CODEX_AUTH_B",
+                        "from": "file",
+                        "mount": { "target": "/run/secrets/codex-b.json" },
+                        "credential_cache": {
+                            "kind": "run_scoped",
+                            "target": "/bucephalus/credentials/codex-b/auth.json",
+                            "env": "CODEX_AUTH_CACHE_FILE"
+                        }
+                    }
+                ]
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains(
+                "/runtime/secrets/1/credential_cache/env duplicates 'CODEX_AUTH_CACHE_FILE'"
+            ) && msg.contains("must be unique"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_credential_cache_without_secret_mount() {
+        let mut value = json!({
+            "runtime": {
+                "secrets": [{
+                    "name": "CODEX_OAUTH",
+                    "credential_cache": {
+                        "kind": "run_scoped",
+                        "target": "/bucephalus/credentials/codex_oauth/auth.json"
+                    }
+                }]
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/runtime/secrets/0 declares credential_cache without mount")
+                && msg.contains("mount.target"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn preserves_matching_explicit_externals_when_deriving_missing_fields() {
+        let mut value = json!({
+            "externals": { "apis": ["api.openai.com"] },
+            "runtime": {
+                "secrets": [{ "name": "OPENAI_API_KEY", "from": "env" }],
+                "network": { "egress": ["api.openai.com"] }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/runtime/externals/apis"),
+            Some(&json!(["api.openai.com"]))
+        );
+        assert_eq!(
+            value.pointer("/runtime/externals/credentials"),
+            Some(&json!(["OPENAI_API_KEY"]))
+        );
+    }
+
+    #[test]
+    fn rejects_explicit_externals_that_drift_from_runtime_contract() {
+        for (mut value, expected) in [
+            (
+                json!({
+                    "externals": { "apis": ["api.anthropic.com"] },
+                    "runtime": {
+                        "network": { "egress": ["api.openai.com"] }
+                    }
+                }),
+                "/externals/apis must match /runtime/network/egress",
+            ),
+            (
+                json!({
+                    "externals": { "credentials": ["ANTHROPIC_API_KEY"] },
+                    "runtime": {
+                        "secrets": [{ "name": "OPENAI_API_KEY", "from": "env" }]
+                    }
+                }),
+                "/externals/credentials must match /runtime/secrets names",
+            ),
+        ] {
+            let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(expected) && !msg.contains("/runtime/externals"),
+                "expected public externals error {expected:?}, got: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -930,8 +2353,7 @@ mod tests {
                 },
                 "agent": {
                     "image": "python:3.11-slim",
-                    "command": ["agent"],
-                    "result": "structured_json"
+                    "command": ["agent"]
                 },
                 "grader": { "strategy": "none" }
             },
@@ -957,10 +2379,7 @@ mod tests {
             value.pointer("/trial_runtime/agent/artifact_type"),
             Some(&json!("structured_json"))
         );
-        assert_eq!(
-            value.pointer("/trial_runtime/agent/protocol"),
-            Some(&json!("command"))
-        );
+        assert!(value.pointer("/trial_runtime/agent/protocol").is_none());
         assert_eq!(
             value.pointer("/trial_runtime/execution/agent_site"),
             Some(&json!("agent_container"))
@@ -990,11 +2409,106 @@ mod tests {
     }
 
     #[test]
+    fn defaults_single_metric_to_primary_without_overriding_intent() {
+        let mut single = json!({
+            "metrics": [{
+                "id": "resolved",
+                "from": "result.metrics.resolved"
+            }]
+        });
+
+        normalize_authoring_vocabulary(&mut single).unwrap();
+
+        assert_eq!(single.pointer("/metrics/0/primary"), Some(&json!(true)));
+        assert_eq!(single.pointer("/metrics/0/required"), Some(&json!(true)));
+
+        let mut explicit_false = json!({
+            "metrics": [{
+                "id": "resolved",
+                "from": "result.metrics.resolved",
+                "primary": false
+            }]
+        });
+
+        normalize_authoring_vocabulary(&mut explicit_false).unwrap();
+
+        assert_eq!(
+            explicit_false.pointer("/metrics/0/primary"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            explicit_false.pointer("/metrics/0/required"),
+            Some(&json!(true))
+        );
+
+        let mut multiple = json!({
+            "metrics": [{
+                "id": "resolved",
+                "from": "result.metrics.resolved"
+            }, {
+                "id": "score",
+                "from": "result.metrics.score"
+            }]
+        });
+
+        normalize_authoring_vocabulary(&mut multiple).unwrap();
+
+        assert_eq!(multiple.pointer("/metrics/0/primary"), Some(&json!(false)));
+        assert_eq!(multiple.pointer("/metrics/1/primary"), Some(&json!(false)));
+        assert_eq!(multiple.pointer("/metrics/0/required"), Some(&json!(true)));
+        assert_eq!(multiple.pointer("/metrics/1/required"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn preserves_optional_metric_required_intent() {
+        let mut value = json!({
+            "metrics": [{
+                "id": "diagnostic_latency",
+                "from": "result.metrics.latency",
+                "required": false
+            }]
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(value.pointer("/metrics/0/primary"), Some(&json!(true)));
+        assert_eq!(value.pointer("/metrics/0/required"), Some(&json!(false)));
+    }
+
+    #[test]
     fn normalizes_default_result_output_with_extra_agent_outputs() {
         let mut value = json!({
             "matrix": {
                 "cases": { "source": "file", "path": "cases.jsonl" },
-                "variants": [{ "id": "base", "baseline": true, "config": {} }]
+                "variants": [{
+                    "id": "base",
+                    "baseline": true,
+                    "config": {},
+                    "overrides": {
+                        "agent": {
+                            "outputs": {
+                                "variant_answer": {
+                                    "capture": {
+                                        "type": "file",
+                                        "path": "/bucephalus/out/variant-answer.json",
+                                        "format": "json"
+                                    }
+                                }
+                            }
+                        },
+                        "grader": {
+                            "outputs": {
+                                "variant_score": {
+                                    "capture": {
+                                        "type": "result_json",
+                                        "path": "/bucephalus/out/variant-score.json",
+                                        "field": "/score"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }]
             },
             "stages": {
                 "case": { "interface": "input_only" },
@@ -1023,6 +2537,9 @@ mod tests {
             value.pointer("/trial_runtime/agent/outputs/candidate_patch/capture/type"),
             Some(&json!("workspace_diff"))
         );
+        assert!(value
+            .pointer("/trial_runtime/agent/outputs/candidate_patch/capture/required")
+            .is_none());
         assert_eq!(
             value.pointer("/trial_runtime/execution/agent_site"),
             Some(&json!("host"))
@@ -1030,7 +2547,234 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_safe_authoring_defaults() {
+    fn normalizes_file_output_required_flags_for_resolved_packages() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{
+                    "id": "base",
+                    "baseline": true,
+                    "config": {},
+                    "overrides": {
+                        "agent": {
+                            "outputs": {
+                                "variant_answer": {
+                                    "capture": {
+                                        "type": "file",
+                                        "path": "/bucephalus/out/variant-answer.txt"
+                                    }
+                                }
+                            }
+                        },
+                        "grader": {
+                            "outputs": {
+                                "variant_score": {
+                                    "capture": {
+                                        "type": "result_json",
+                                        "path": "/bucephalus/out/variant-score.json",
+                                        "field": "/score"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }]
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": {
+                    "command": ["agent"],
+                    "outputs": {
+                        "answer": {
+                            "capture": {
+                                "type": "result_json",
+                                "path": "/bucephalus/out/result.json",
+                                "field": "/answer"
+                            }
+                        }
+                    }
+                },
+                "grader": {
+                    "strategy": "in_task_runtime",
+                    "command": ["python3", "grade.py"],
+                    "outputs": {
+                        "score": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/bucephalus/out/score.json",
+                                "format": "json"
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/outputs/answer/capture/required"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/grader/outputs/score/capture/required"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer(
+                "/matrix/variants/0/overrides/agent/outputs/variant_answer/capture/required"
+            ),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer(
+                "/matrix/variants/0/overrides/grader/outputs/variant_score/capture/required"
+            ),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/grader/inputs"),
+            Some(&json!({}))
+        );
+    }
+
+    #[test]
+    fn normalizes_grader_input_required_flags_for_resolved_packages() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{
+                    "id": "base",
+                    "baseline": true,
+                    "config": {},
+                    "overrides": {
+                        "grader": {
+                            "inputs": {
+                                "variant_prompt": {
+                                    "source": { "case": "input.prompt" },
+                                    "materialize": {
+                                        "as": "json_file",
+                                        "path": "/bucephalus/out/grader_inputs/variant_prompt.json"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }]
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "command": ["agent"] },
+                "grader": {
+                    "strategy": "in_task_runtime",
+                    "command": ["python3", "grade.py"],
+                    "inputs": {
+                        "prompt": {
+                            "source": { "case": "input.prompt" },
+                            "materialize": {
+                                "as": "json_file",
+                                "path": "/bucephalus/out/grader_inputs/prompt.json"
+                            }
+                        },
+                        "notes": {
+                            "source": { "case": "metadata.notes" },
+                            "materialize": {
+                                "as": "json_file",
+                                "path": "/bucephalus/out/grader_inputs/notes.json"
+                            },
+                            "required": false
+                        }
+                    }
+                }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/grader/inputs/prompt/required"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/grader/inputs/notes/required"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/grader/inputs/variant_prompt/required"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn rejects_removed_agent_result_authoring_knob() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }]
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": {
+                    "command": ["agent"],
+                    "result": "structured_json"
+                },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/stages.agent.result is not accepted"),
+            "agent result error should use public path: {msg}"
+        );
+        assert!(
+            !msg.contains("trial_runtime"),
+            "agent result error should not leak resolved runtime paths: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_authored_canonical_agent_result_output() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }]
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": {
+                    "command": ["agent"],
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/tmp/result.json",
+                                "format": "json"
+                            }
+                        }
+                    }
+                },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/stages.agent.outputs.result is not accepted"),
+            "canonical result output should be runner-owned: {msg}"
+        );
+        assert!(
+            !msg.contains("trial_runtime"),
+            "canonical result output error should not leak resolved runtime paths: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_agent_result_metric_ref_alias() {
         let mut value = json!({
             "matrix": {
                 "cases": { "source": "file", "path": "cases.jsonl" },
@@ -1040,22 +2784,63 @@ mod tests {
                 "case": { "interface": "input_only" },
                 "agent": { "command": ["agent"] },
                 "grader": { "strategy": "none" }
+            },
+            "metrics": [{
+                "id": "score",
+                "from": "agent.result.score"
+            }]
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/metrics/0/from='agent.result.score' is not understood"),
+            "agent.result metric ref should be rejected by name: {msg}"
+        );
+        assert!(
+            msg.contains("use result.<field> or grader.<output>.<field>"),
+            "agent.result metric ref should point users at public refs: {msg}"
+        );
+    }
+
+    #[test]
+    fn normalizes_safe_authoring_defaults() {
+        let mut value = json!({
+            "experiment": { "id": "smoke_eval", "mode": "answer" },
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }]
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "command": ["agent"] }
             }
         });
 
         normalize_authoring_vocabulary(&mut value).unwrap();
 
         assert_eq!(
+            value.pointer("/experiment/name"),
+            Some(&json!("smoke_eval"))
+        );
+        assert!(
+            value.pointer("/experiment/mode").is_none(),
+            "authoring-only mode should not survive normalization"
+        );
+        assert_eq!(
             value.pointer("/runtime/compute/backend"),
             Some(&json!("local-docker"))
         );
         assert_eq!(
-            value.pointer("/runtime/storage/backend"),
-            Some(&json!("local-fs"))
+            value.pointer("/runtime/storage"),
+            None,
+            "storage is runner-owned and should not be defaulted into packages"
         );
         assert_eq!(
-            value.pointer("/runtime/traces/backend"),
-            Some(&json!("local-stdout"))
+            value.pointer("/runtime/traces"),
+            None,
+            "trace sinks are runner-owned and should not be defaulted into packages"
         );
         assert_eq!(
             value.pointer("/runtime/network/task_sandbox"),
@@ -1071,16 +2856,477 @@ mod tests {
             Some(&json!(1))
         );
         assert_eq!(value.pointer("/scheduling/random_seed"), Some(&json!(1)));
+        assert!(value.pointer("/scheduling/comparison").is_none());
         assert_eq!(
-            value.pointer("/scheduling/comparison"),
-            Some(&json!("none"))
+            value.pointer("/policy/sanitization_profile"),
+            Some(&json!("standard_runtime"))
+        );
+        assert_eq!(
+            value.pointer("/evaluation/policy/task_model"),
+            Some(&json!("independent"))
+        );
+        assert_eq!(
+            value.pointer("/evaluation/policy/scoring_lifecycle"),
+            Some(&json!("predict_then_score"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/integration_level"),
+            Some(&json!("cli_basic"))
+        );
+        assert_eq!(
+            value.pointer("/evaluation/policy/chain_failure_policy"),
+            Some(&json!("continue_with_flag"))
+        );
+        assert_eq!(
+            value.pointer("/evaluation/policy/required_evidence_classes"),
+            Some(&json!([]))
+        );
+        assert_eq!(
+            value.pointer("/policy/policies/scheduling"),
+            Some(&json!("variant_sequential"))
+        );
+        assert_eq!(
+            value.pointer("/policy/policies/state"),
+            Some(&json!("isolate_per_trial"))
+        );
+        assert_eq!(
+            value.pointer("/policy/policies/retry/max_attempts"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            value.pointer("/policy/policies/retry/retry_on"),
+            Some(&json!([]))
+        );
+        assert_eq!(
+            value.pointer("/policy/policies/pruning/max_consecutive_failures"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            value.pointer("/policy/policies/concurrency/require_chain_lease"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer("/policy/task_sandbox/hardening/no_new_privileges"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer("/policy/task_sandbox/hardening/drop_all_caps"),
+            Some(&json!(true))
         );
         assert_eq!(
             value.pointer("/trial_runtime/execution/agent_site"),
             Some(&json!("host"))
         );
+        assert_eq!(
+            value.pointer("/trial_runtime/grader/strategy"),
+            Some(&json!("none"))
+        );
         assert_eq!(value.pointer("/policy/timeout_ms"), Some(&json!(600000)));
-        assert_eq!(value.pointer("/policy/task_sandbox"), Some(&json!({})));
+        assert_eq!(
+            value.pointer("/policy/task_sandbox"),
+            Some(&json!({
+                "hardening": {
+                    "no_new_privileges": true,
+                    "drop_all_caps": true
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn normalizes_variant_baseline_flags_for_resolved_packages() {
+        let mut single = json!({
+            "matrix": {
+                "variants": [{ "id": "control" }]
+            }
+        });
+        normalize_authoring_vocabulary(&mut single).unwrap();
+        assert_eq!(
+            single.pointer("/matrix/variants/0/baseline"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            single.pointer("/matrix/variants/0/config"),
+            Some(&json!({}))
+        );
+
+        let mut explicit_multi = json!({
+            "matrix": {
+                "variants": [
+                    { "id": "baseline", "baseline": true },
+                    { "id": "treatment" }
+                ]
+            }
+        });
+        normalize_authoring_vocabulary(&mut explicit_multi).unwrap();
+        assert_eq!(
+            explicit_multi.pointer("/matrix/variants/0/baseline"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            explicit_multi.pointer("/matrix/variants/1/baseline"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            explicit_multi.pointer("/matrix/variants/0/config"),
+            Some(&json!({}))
+        );
+        assert_eq!(
+            explicit_multi.pointer("/matrix/variants/1/config"),
+            Some(&json!({}))
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_variant_baseline_authoring() {
+        for (mut value, expected) in [
+            (
+                json!({
+                    "matrix": {
+                        "variants": [
+                            { "id": "control", "config": {} },
+                            { "id": "treatment", "config": {} }
+                        ]
+                    }
+                }),
+                "multiple variants require exactly one explicit /matrix/variants[].baseline=true",
+            ),
+            (
+                json!({
+                    "matrix": {
+                        "variants": [
+                            { "id": "baseline", "config": {} },
+                            { "id": "treatment", "config": {} }
+                        ]
+                    }
+                }),
+                "multiple variants require exactly one explicit /matrix/variants[].baseline=true",
+            ),
+            (
+                json!({
+                    "matrix": {
+                        "variants": [
+                            { "id": "control", "baseline": false }
+                        ]
+                    }
+                }),
+                "single-variant authoring cannot set /matrix/variants/0/baseline=false",
+            ),
+        ] {
+            let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn lowers_paired_comparison_to_concrete_scheduling_policy() {
+        let mut value = json!({
+            "experiment": { "id": "paired_eval" },
+            "matrix": {
+                "cases": { "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true }, { "id": "treatment" }]
+            },
+            "scheduling": { "comparison": "paired" },
+            "stages": {
+                "case": {},
+                "agent": { "command": ["agent"] }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert!(value.pointer("/scheduling/comparison").is_none());
+        assert_eq!(
+            value.pointer("/policy/policies/scheduling"),
+            Some(&json!("paired_interleaved"))
+        );
+    }
+
+    #[test]
+    fn rejects_paired_comparison_with_explicit_scheduling_policy() {
+        let mut value = json!({
+            "experiment": { "id": "paired_eval" },
+            "matrix": {
+                "cases": { "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true }, { "id": "treatment" }]
+            },
+            "scheduling": { "comparison": "paired" },
+            "policy": {
+                "policies": { "scheduling": "variant_sequential" }
+            },
+            "stages": {
+                "case": {},
+                "agent": { "command": ["agent"] }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/scheduling/comparison is exclusive authoring shorthand")
+                && msg.contains("/policy/policies/scheduling"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_noop_scheduling_comparison_values() {
+        let mut value = json!({
+            "experiment": { "id": "default_eval" },
+            "matrix": {
+                "cases": { "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true }]
+            },
+            "scheduling": { "comparison": "none" },
+            "stages": {
+                "case": {},
+                "agent": { "command": ["agent"] }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/scheduling/comparison only supports paired")
+                && msg.contains("/policy/policies/scheduling"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn paired_comparison_requires_multiple_variants() {
+        let mut value = json!({
+            "experiment": { "id": "paired_eval" },
+            "matrix": {
+                "cases": { "path": "cases.jsonl" }
+            },
+            "scheduling": { "comparison": "paired" },
+            "stages": {
+                "case": {},
+                "agent": { "command": ["agent"] }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("/scheduling/comparison=paired requires at least two matrix variants"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn normalizes_lowered_authoring_without_leaking_experiment_mode() {
+        let mut value = json!({
+            "experiment": { "id": "lowered_authoring", "mode": "patch" },
+            "matrix": {
+                "cases": { "path": "cases.jsonl" }
+            },
+            "trial_runtime": {
+                "task": {},
+                "agent": { "command": ["agent"] }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert!(
+            value.pointer("/experiment/mode").is_none(),
+            "authoring-only mode should be dropped even when stages are already lowered"
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/task/interface"),
+            Some(&json!("input_only"))
+        );
+    }
+
+    #[test]
+    fn lowers_network_default_to_both_runtime_planes() {
+        let mut value = json!({
+            "experiment": { "id": "network_default" },
+            "runtime": {
+                "network": {
+                    "default": "full"
+                }
+            },
+            "matrix": {
+                "cases": { "path": "cases.jsonl" }
+            },
+            "stages": {
+                "case": {},
+                "agent": { "command": ["agent"] }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/runtime/network/task_sandbox"),
+            Some(&json!("full"))
+        );
+        assert_eq!(
+            value.pointer("/runtime/network/agent"),
+            Some(&json!("full"))
+        );
+        assert!(value.pointer("/runtime/network/default").is_none());
+    }
+
+    #[test]
+    fn rejects_network_default_mixed_with_explicit_planes() {
+        let mut value = json!({
+            "experiment": { "id": "network_default_mixed" },
+            "runtime": {
+                "network": {
+                    "default": "full",
+                    "agent": "none"
+                }
+            },
+            "matrix": {
+                "cases": { "path": "cases.jsonl" }
+            },
+            "stages": {
+                "case": {},
+                "agent": { "command": ["agent"] }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/runtime/network/default is exclusive shorthand")
+                && msg.contains("/runtime/network/agent"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn normalizes_public_variant_overrides_to_runtime_patch() {
+        let mut value = json!({
+            "experiment": { "id": "smoke_eval" },
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{
+                    "id": "base",
+                    "baseline": true,
+                    "overrides": {
+                        "case": {
+                            "workspace": {
+                                "image": { "from": "case_row" }
+                            }
+                        },
+                        "agent": {
+                            "ephemerals": ["mcp"],
+                            "env": { "MODE": "variant" },
+                            "events": [{
+                                "id": "variant_events",
+                                "format": "jsonl",
+                                "mode": "jsonl",
+                                "ingest": true,
+                                "retain_raw": false
+                            }]
+                        },
+                        "grader": {
+                            "ephemerals": ["judge"]
+                        }
+                    }
+                }]
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "command": ["agent"] }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/task/workspace/image"),
+            Some(&json!({ "from": "case_row" }))
+        );
+        assert!(value.pointer("/matrix/variants/0/overrides/case").is_none());
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/agent/sidecars"),
+            Some(&json!(["mcp"]))
+        );
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/agent/integration_level"),
+            Some(&json!("cli_events"))
+        );
+        assert!(value
+            .pointer("/matrix/variants/0/overrides/agent/ephemerals")
+            .is_none());
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/grader/sidecars"),
+            Some(&json!(["judge"]))
+        );
+    }
+
+    #[test]
+    fn variant_agent_env_override_does_not_inject_integration_level() {
+        let mut value = json!({
+            "experiment": { "id": "smoke_eval" },
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{
+                    "id": "base",
+                    "baseline": true,
+                    "overrides": {
+                        "agent": {
+                            "env": { "MODE": "variant" }
+                        }
+                    }
+                }]
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "command": ["agent"] }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/agent/env/MODE"),
+            Some(&json!("variant"))
+        );
+        assert!(
+            value
+                .pointer("/matrix/variants/0/overrides/agent/integration_level")
+                .is_none(),
+            "variant agent overrides are patches and must not receive full-object defaults"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_grader_authoring() {
+        let mut value = json!({
+            "experiment": { "id": "smoke_eval" },
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{ "id": "base" }]
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "command": ["agent"] },
+                "grader": {}
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/stages/grader must not be empty")
+                && msg.contains("declare strategy: none"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -1113,6 +3359,73 @@ mod tests {
     }
 
     #[test]
+    fn rejects_uninferrable_agent_site_authoring() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }]
+            },
+            "stages": {
+                "case": {
+                    "files": {
+                        "source": "files",
+                        "path": "case-files",
+                        "mount_path": "/case"
+                    }
+                },
+                "agent": { "command": ["agent"] },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/stages.execution.agent_site is required")
+                && msg.contains("agent runtime boundary cannot be inferred"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains("trial_runtime"),
+            "authoring error should not leak resolved runtime paths: {msg}"
+        );
+    }
+
+    #[test]
+    fn explicit_agent_site_allows_readonly_file_cases() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }]
+            },
+            "stages": {
+                "case": {
+                    "files": {
+                        "source": "files",
+                        "path": "case-files",
+                        "mount_path": "/case"
+                    }
+                },
+                "agent": { "command": ["agent"] },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/execution/agent_site"),
+            Some(&json!("host"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/task/interface"),
+            Some(&json!("readonly_files"))
+        );
+    }
+
+    #[test]
     fn rejects_removed_authoring_fallbacks_at_file_boundary() {
         for (value, expected) in [
             (
@@ -1133,6 +3446,10 @@ mod tests {
                 "/runtime/externals",
             ),
             (
+                json!({ "knobs": { "temperature": { "json_pointer": "/matrix/variants/0/config/temperature" } } }),
+                "/knobs",
+            ),
+            (
                 json!({ "metrics": [{ "id": "score", "source": { "type": "agent_response", "pointer": "/score" } }] }),
                 "/metrics/0 uses internal metric extraction field 'source'",
             ),
@@ -1141,6 +3458,118 @@ mod tests {
             assert!(
                 err.to_string().contains(expected),
                 "expected {expected}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_external_accounting_values_at_file_boundary() {
+        for (value, expected) in [
+            (
+                json!({
+                    "runtime": {
+                        "network": { "egress": ["api.openai.com", "api.openai.com"] }
+                    }
+                }),
+                "/runtime/network/egress/1 duplicates 'api.openai.com'",
+            ),
+            (
+                json!({
+                    "externals": {
+                        "apis": ["api.openai.com", "api.openai.com"]
+                    }
+                }),
+                "/externals/apis/1 duplicates 'api.openai.com'",
+            ),
+            (
+                json!({
+                    "externals": {
+                        "credentials": ["OPENAI_API_KEY", "OPENAI_API_KEY"]
+                    }
+                }),
+                "/externals/credentials/1 duplicates 'OPENAI_API_KEY'",
+            ),
+        ] {
+            let err = reject_legacy_authoring_surface(&value).unwrap_err();
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(expected) && msg.contains("must be unique"),
+                "expected {expected:?}, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn authoring_lowering_rejects_public_and_resolved_field_collisions() {
+        for (label, mut value, expected) in [
+            (
+                "ephemerals",
+                json!({
+                    "ephemerals": {
+                        "svc": {
+                            "image": "svc:latest",
+                            "lifecycle": "per-trial"
+                        }
+                    },
+                    "sidecars": {
+                        "svc": {
+                            "image": "svc:latest",
+                            "lifecycle": "per-trial"
+                        }
+                    }
+                }),
+                "target 'sidecars' already exists",
+            ),
+            (
+                "externals",
+                json!({
+                    "externals": { "apis": ["api.openai.com"] },
+                    "runtime": { "externals": { "apis": ["api.openai.com"] } }
+                }),
+                "target 'externals' already exists",
+            ),
+            (
+                "matrix cases",
+                json!({
+                    "matrix": {
+                        "cases": { "source": "file", "path": "cases.jsonl" },
+                        "tasks": { "source": "file", "path": "cases.jsonl" }
+                    }
+                }),
+                "target 'tasks' already exists",
+            ),
+            (
+                "stage ephemerals",
+                json!({
+                    "stages": {
+                        "agent": {
+                            "command": ["agent"],
+                            "ephemerals": ["svc"],
+                            "sidecars": ["svc"]
+                        }
+                    }
+                }),
+                "target 'sidecars' already exists",
+            ),
+            (
+                "stages",
+                json!({
+                    "stages": { "agent": { "command": ["agent"] } },
+                    "trial_runtime": { "agent": { "command": ["agent"] } }
+                }),
+                "target 'trial_runtime' already exists",
+            ),
+        ] {
+            let err = match normalize_authoring_vocabulary(&mut value) {
+                Ok(()) => {
+                    panic!("{label}: public and resolved fields should not be accepted together")
+                }
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains(expected),
+                "{label}: expected {expected}, got {err}"
             );
         }
     }
@@ -1156,7 +3585,7 @@ mod tests {
             },
             "stages": {
                 "case": { "interface": "input_only" },
-                "agent": { "protocol": "command", "command": ["agent"] },
+                "agent": { "command": ["agent"] },
                 "execution": { "agent_site": "host" },
                 "grader": { "strategy": "none" }
             }
@@ -1170,6 +3599,134 @@ mod tests {
         );
         assert_eq!(
             value.pointer("/trial_runtime/agent/events/0/retain_raw"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/integration_level"),
+            Some(&json!("cli_events"))
+        );
+        assert!(value.pointer("/traces").is_none());
+    }
+
+    #[test]
+    fn defaults_agent_observability_contract_for_resolved_packages() {
+        let mut value = json!({
+            "matrix": {
+                "variants": [{
+                    "id": "base",
+                    "overrides": {
+                        "agent": {
+                            "events": [{
+                                "id": "variant_events",
+                                "ingest": false,
+                                "retain_raw": true
+                            }],
+                            "output_mounts": [{
+                                "id": "variant_context",
+                                "path": "variant-context",
+                                "persist": false
+                            }]
+                        }
+                    }
+                }],
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "repeats": 1
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": {
+                    "command": ["agent"],
+                    "events": [{
+                        "id": "agent_events"
+                    }],
+                    "output_mounts": [{
+                        "id": "session_context",
+                        "path": "session-context"
+                    }]
+                },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/events/0/format"),
+            Some(&json!("jsonl"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/events/0/mode"),
+            Some(&json!("jsonl"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/events/0/ingest"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/events/0/retain_raw"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/output_mounts/0/persist"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/output_mounts/0/kind"),
+            Some(&json!("directory"))
+        );
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/agent/events/0/format"),
+            Some(&json!("jsonl"))
+        );
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/agent/events/0/mode"),
+            Some(&json!("jsonl"))
+        );
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/agent/events/0/ingest"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/agent/events/0/retain_raw"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/agent/output_mounts/0/persist"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            value.pointer("/matrix/variants/0/overrides/agent/output_mounts/0/kind"),
+            Some(&json!("directory"))
+        );
+    }
+
+    #[test]
+    fn defaults_agent_output_mount_persist() {
+        let mut value = json!({
+            "matrix": {
+                "variants": [{ "id": "base" }],
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "repeats": 1
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": {
+                    "command": ["agent"],
+                    "output_mounts": [{
+                        "id": "session_context",
+                        "path": "session-context"
+                    }]
+                },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).expect("normalize output mount");
+
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/output_mounts/0/persist"),
             Some(&json!(true))
         );
     }
@@ -1193,6 +3750,36 @@ mod tests {
         normalize_authoring_vocabulary(&mut value).unwrap();
 
         assert!(value.pointer("/trial_runtime/agent/events").is_none());
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/integration_level"),
+            Some(&json!("cli_basic"))
+        );
+    }
+
+    #[test]
+    fn trace_source_none_is_rejected_as_noop_authoring() {
+        let mut value = json!({
+            "traces": { "source": "none" },
+            "matrix": {
+                "variants": [{ "id": "base" }],
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "repeats": 1
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "command": ["agent"] },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/traces.source=none is not accepted") && msg.contains("omit /traces"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -1230,7 +3817,30 @@ mod tests {
     }
 
     #[test]
-    fn trace_source_protocol_uses_default_command_protocol() {
+    fn trace_source_protocol_missing_agent_uses_public_stage_path() {
+        let mut value = json!({
+            "traces": { "source": "protocol" },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/stages.agent"),
+            "trace error should use public stage path: {msg}"
+        );
+        assert!(
+            !msg.contains("trial_runtime"),
+            "trace error should not leak resolved runtime paths: {msg}"
+        );
+    }
+
+    #[test]
+    fn trace_source_protocol_uses_command_stage_without_protocol_field() {
         let mut value = json!({
             "traces": { "source": "protocol" },
             "stages": { "agent": { "command": ["agent"] } }
@@ -1238,18 +3848,16 @@ mod tests {
 
         normalize_authoring_vocabulary(&mut value).unwrap();
 
-        assert_eq!(
-            value.pointer("/trial_runtime/agent/protocol"),
-            Some(&json!("command"))
-        );
+        assert!(value.pointer("/trial_runtime/agent/protocol").is_none());
         assert_eq!(
             value.pointer("/trial_runtime/agent/events/0/id"),
             Some(&json!("trajectory"))
         );
+        assert!(value.pointer("/traces").is_none());
     }
 
     #[test]
-    fn trace_source_protocol_rejects_non_command_protocol_until_supported() {
+    fn trace_source_protocol_requires_command_stage() {
         let mut value = json!({
             "traces": { "source": "protocol" },
             "matrix": {
@@ -1259,7 +3867,7 @@ mod tests {
             },
             "stages": {
                 "case": { "interface": "input_only" },
-                "agent": { "protocol": "acp", "command": ["agent"] },
+                "agent": {},
                 "execution": { "agent_site": "host" },
                 "grader": { "strategy": "none" }
             }
@@ -1268,9 +3876,8 @@ mod tests {
         let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
 
         assert!(
-            err.to_string().contains(
-                "/traces.source=protocol is only supported for agent protocol 'command' today"
-            ),
+            err.to_string()
+                .contains("/traces.source=protocol requires /stages.agent.command"),
             "unexpected error: {err}"
         );
     }

@@ -224,19 +224,17 @@ fn validate_common_step(step: &CaseMaterializationStepPlan) -> Result<()> {
 
 fn resolve_step_source(manifest_dir: &Path, step: &CaseMaterializationStepPlan) -> Result<PathBuf> {
     let raw = step
-        .resource
-        .as_deref()
-        .or_else(|| string_at(&step.source, "/path"))
-        .or_else(|| string_at(&step.source, "/ref"))
-        .or_else(|| string_at(&step.source, "/uri"))
+        .source
+        .pointer("/path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             anyhow!(
-                "case materialization step '{}' requires resource or source.path",
+                "case materialization step '{}' requires source.path",
                 step.id
             )
         })?;
-    let raw = raw.strip_prefix("file://").unwrap_or(raw);
-    let raw = raw.strip_prefix("package://").unwrap_or(raw);
     let path = PathBuf::from(raw);
     Ok(if path.is_absolute() {
         path
@@ -249,24 +247,10 @@ fn step_target_path(workspace_dir: &Path, step: &CaseMaterializationStepPlan) ->
     if let Some(mount) = step.mount.as_ref() {
         return map_workspace_path(workspace_dir, &mount.path);
     }
-    if let Some(raw) = string_at(&step.source, "/target")
-        .or_else(|| string_at(&step.source, "/destination"))
-        .or_else(|| string_at(&step.source, "/dest"))
-    {
-        return map_workspace_path(workspace_dir, raw);
-    }
     Err(anyhow!(
-        "case materialization step '{}' requires mount.path or source.destination",
+        "case materialization step '{}' requires mount.path",
         step.id
     ))
-}
-
-fn string_at<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|raw| !raw.is_empty())
 }
 
 fn copy_source_to_target(source: &Path, target: &Path) -> Result<()> {
@@ -459,8 +443,7 @@ mod tests {
                 stage: CaseMaterializationStage::Case,
                 operation: CaseMaterializationOperation::Copy,
                 command: Vec::new(),
-                resource: Some("input.txt".to_string()),
-                source: json!({}),
+                source: json!({"path": "input.txt"}),
                 mount: Some(CaseMaterializationMountPlan {
                     path: "/workspace/task/copied.txt".to_string(),
                     read_only: false,
@@ -479,7 +462,6 @@ mod tests {
                     "-c".to_string(),
                     "cat copied.txt > generated.txt".to_string(),
                 ],
-                resource: None,
                 source: json!({}),
                 mount: None,
                 workdir: Some("/workspace/task".to_string()),
@@ -508,6 +490,68 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn host_executor_rejects_case_materialization_source_aliases() {
+        let root = temp_root("bucephalus_host_case_materialization_aliases");
+        let manifest_dir = root.join("manifest");
+        let workspace = root.join("workspace");
+        let logs = root.join("logs");
+        ensure_dir(&manifest_dir).expect("manifest dir");
+        ensure_dir(&workspace).expect("workspace dir");
+        fs::write(manifest_dir.join("input.txt"), "hello").expect("source");
+
+        for (label, source, expected) in [
+            ("ref", json!({"ref": "input.txt"}), "requires source.path"),
+            ("uri", json!({"uri": "input.txt"}), "requires source.path"),
+            (
+                "destination",
+                json!({"path": "input.txt", "destination": "/workspace/task/copied.txt"}),
+                "requires mount.path",
+            ),
+            (
+                "dest",
+                json!({"path": "input.txt", "dest": "/workspace/task/copied.txt"}),
+                "requires mount.path",
+            ),
+            (
+                "target",
+                json!({"path": "input.txt", "target": "/workspace/task/copied.txt"}),
+                "requires mount.path",
+            ),
+        ] {
+            let step = CaseMaterializationStepPlan {
+                id: label.to_string(),
+                stage: CaseMaterializationStage::Case,
+                operation: CaseMaterializationOperation::Copy,
+                command: Vec::new(),
+                source,
+                mount: None,
+                workdir: None,
+                network: Some("none".to_string()),
+                timeout_ms: None,
+                hidden: false,
+            };
+            let err = HostCaseMaterializationExecutor
+                .execute(
+                    HostCaseMaterializationRequest {
+                        manifest_dir: &manifest_dir,
+                        workspace_dir: &workspace,
+                        log_dir: &logs,
+                        phase: CaseMaterializationPhase::AgentVisible,
+                        default_timeout_ms: 5_000,
+                        env: BTreeMap::new(),
+                    },
+                    &[step],
+                )
+                .expect_err("source aliases should be rejected");
+            assert!(
+                err.to_string().contains(expected),
+                "{label}: expected {expected}, got {err}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn step(
         id: &str,
         stage: CaseMaterializationStage,
@@ -518,7 +562,6 @@ mod tests {
             stage,
             operation: CaseMaterializationOperation::Command,
             command: vec!["true".to_string()],
-            resource: None,
             source: json!({}),
             mount: None,
             workdir: None,

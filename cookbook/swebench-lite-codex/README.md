@@ -61,7 +61,7 @@ BUCEPHALUS="$(pwd)/target/debug/bucephalus"
 
 The run captures:
 
-- `agent.result`: the Codex wrapper's JSON summary
+- `result`: the Codex wrapper's JSON summary
 - `agent.candidate_patch`: the workspace diff after Codex edits `/testbed`
 - `grader.report`: the real SWE-bench subset grading report
 
@@ -73,4 +73,3 @@ This is deliberately heavier than the other cookbook recipes. It has real
 benchmark semantics, real container setup, provider credentials, a coding agent,
 patch capture, and test-based grading. Use the smaller cookbook recipes first if
 you only want to learn the YAML shape.
-

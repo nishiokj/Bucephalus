@@ -2215,6 +2215,7 @@ pub(crate) fn build_preflight_probe_context(
         &io_paths,
         Some(probe_task_image.as_str()),
         smoke_timeout_ms,
+        false,
     )?;
     Ok(PreflightProbeContext {
         _root: probe_root,

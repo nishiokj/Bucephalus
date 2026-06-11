@@ -176,13 +176,15 @@ fn copy_runtime_asset_file_into_package(
 }
 
 #[derive(Debug, Clone)]
-struct TaskImageRewriteRule {
+pub(crate) struct TaskImageRewriteRule {
     match_prefix: String,
     replace_prefix: String,
     platform: Option<String>,
 }
 
-fn load_task_image_rewrite_rules(json_value: &Value) -> Result<Vec<TaskImageRewriteRule>> {
+pub(crate) fn load_task_image_rewrite_rules(
+    json_value: &Value,
+) -> Result<Vec<TaskImageRewriteRule>> {
     let Some(items) = json_value
         .pointer("/trial_runtime/task/workspace/image/rewrites")
         .and_then(Value::as_array)
@@ -235,28 +237,23 @@ fn apply_task_image_rewrites(task_row: &mut TaskRow, rules: &[TaskImageRewriteRu
     }
 }
 
-fn apply_case_image_rewrites(task: &mut Value, rules: &[TaskImageRewriteRule]) {
+pub(crate) fn apply_case_image_rewrites(task: &mut Value, rules: &[TaskImageRewriteRule]) {
     let Some(workspace) = task.pointer("/resources/workspace") else {
         return;
     };
-    let is_container_workspace = workspace
-        .get("type")
-        .or_else(|| workspace.get("kind"))
-        .or_else(|| workspace.get("source"))
-        .and_then(Value::as_str)
-        == Some("container_image");
+    let workspace_kind_field = match task.get("schema_version").and_then(Value::as_str) {
+        Some("case_v1") => "type",
+        Some("case_v2") => "source",
+        _ => return,
+    };
+    let is_container_workspace =
+        workspace.get(workspace_kind_field).and_then(Value::as_str) == Some("container_image");
     if !is_container_workspace {
         return;
     }
     let workspace_platform_missing = workspace.get("platform").and_then(Value::as_str).is_none();
     let image_pointer = if workspace.get("image").and_then(Value::as_str).is_some() {
         "/resources/workspace/image"
-    } else if task
-        .pointer("/resources/environment/image")
-        .and_then(Value::as_str)
-        .is_some()
-    {
-        "/resources/environment/image"
     } else {
         return;
     };
@@ -338,15 +335,24 @@ fn stage_case_asset_into_package(
     Ok(rel_portable)
 }
 
-fn case_asset_kind(value: &Value) -> Option<&str> {
-    let kind = value
-        .get("type")
-        .or_else(|| value.get("kind"))
-        .and_then(Value::as_str)?;
+fn case_asset_kind<'a>(value: &'a Value, context: &str) -> Result<Option<&'a str>> {
+    if let Some(alias) = value.get("kind").and_then(Value::as_str) {
+        if matches!(alias, "file" | "directory") {
+            return Err(anyhow!(
+                "{} declares case asset kind='{}'; use type='{}'",
+                context,
+                alias,
+                alias
+            ));
+        }
+    }
+    let Some(kind) = value.get("type").and_then(Value::as_str) else {
+        return Ok(None);
+    };
     if matches!(kind, "file" | "directory") {
-        Some(kind)
+        Ok(Some(kind))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -371,17 +377,13 @@ fn rewrite_case_input_assets_value(
         }
         return Ok(());
     }
-    let kind = case_asset_kind(value).map(str::to_string);
+    let kind = case_asset_kind(value, context)?.map(str::to_string);
     let Some(obj) = value.as_object_mut() else {
         return Ok(());
     };
     if let Some(kind) = kind {
-        if obj.get("package_path").and_then(Value::as_str).is_some()
-            || obj
-                .get("uri")
-                .and_then(Value::as_str)
-                .is_some_and(|uri| uri.starts_with("package://"))
-        {
+        if obj.get("package_path").and_then(Value::as_str).is_some() {
+            obj.remove("uri");
             return Ok(());
         }
         let raw_path = obj
@@ -412,10 +414,7 @@ fn rewrite_case_input_assets_value(
             )
         })?;
         obj.remove("path");
-        obj.insert(
-            "uri".to_string(),
-            Value::String(format!("package://{}", packaged_rel)),
-        );
+        obj.remove("uri");
         obj.insert("package_path".to_string(), Value::String(packaged_rel));
         return Ok(());
     }
@@ -486,9 +485,10 @@ pub(crate) fn compile_tasks_for_package(
                 })?;
                 compiled.push(serde_json::to_value(task_row)?);
             }
-            Some("case_v1") | Some("case_v2") | Some("task_case_v1") => {
+            Some("case_v1") | Some("case_v2") => {
                 let mut task_case = task.clone();
                 apply_case_image_rewrites(&mut task_case, &image_rewrites);
+                normalize_packaged_case_defaults(&mut task_case)?;
                 rewrite_case_input_assets(
                     &mut task_case,
                     dataset_dir,
@@ -513,6 +513,68 @@ pub(crate) fn compile_tasks_for_package(
         }
     }
     Ok(compiled)
+}
+
+pub(crate) fn normalize_packaged_case_defaults(task_case: &mut Value) -> Result<()> {
+    if task_case.pointer("/schema_version").and_then(Value::as_str) == Some("case_v2") {
+        let obj = task_case
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("case_v2 row must be an object"))?;
+        obj.entry("inputs".to_string()).or_insert(json!({}));
+        obj.entry("resources".to_string()).or_insert(json!({}));
+        obj.entry("metadata".to_string()).or_insert(json!({}));
+        obj.entry("limits".to_string()).or_insert(json!({}));
+        obj.entry("materialization".to_string())
+            .or_insert(json!([]));
+        if let Some(resources) = task_case
+            .get_mut("resources")
+            .and_then(Value::as_object_mut)
+        {
+            resources.entry("assets".to_string()).or_insert(json!({}));
+            resources.entry("workspace".to_string()).or_insert(json!({
+                "source": "empty",
+                "mode": "scratch",
+                "overlays": [],
+                "aux_mounts": []
+            }));
+        }
+        if let Some(workspace) = task_case
+            .pointer_mut("/resources/workspace")
+            .and_then(Value::as_object_mut)
+        {
+            workspace
+                .entry("mode".to_string())
+                .or_insert(json!("scratch"));
+            workspace.entry("overlays".to_string()).or_insert(json!([]));
+            workspace
+                .entry("aux_mounts".to_string())
+                .or_insert(json!([]));
+        }
+    }
+    normalize_packaged_case_materialization_defaults(task_case)
+}
+
+fn normalize_packaged_case_materialization_defaults(task_case: &mut Value) -> Result<()> {
+    let Some(steps) = task_case
+        .get_mut("materialization")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for (idx, step) in steps.iter_mut().enumerate() {
+        let obj = step
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("case materialization[{}] must be an object", idx))?;
+        obj.entry("source".to_string()).or_insert(json!({}));
+        obj.entry("hidden".to_string()).or_insert(json!(false));
+        if let Some(mount) = obj.get_mut("mount") {
+            let mount = mount
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("case materialization[{}].mount must be an object", idx))?;
+            mount.entry("read_only".to_string()).or_insert(json!(false));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn write_packaged_tasks(path: &Path, tasks: &[Value]) -> Result<()> {
@@ -558,13 +620,14 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
             break;
         }
         let task: Value = serde_json::from_str(trimmed)?;
+        let mut task_for_validation = task.clone();
+        normalize_packaged_case_defaults(&mut task_for_validation)?;
         let case_label = task
-            .pointer("/task/id")
-            .or_else(|| task.pointer("/id"))
+            .pointer("/id")
             .and_then(Value::as_str)
             .map(|id| format!("case '{}'", id))
             .unwrap_or_else(|| format!("row {}", idx + 1));
-        if let Err(err) = parse_task_boundary_from_packaged_task(&task) {
+        if let Err(err) = parse_task_boundary_from_packaged_task(&task_for_validation) {
             return Err(anyhow!(
                 "dataset {} is not a valid case_v1 or case_v2: {}",
                 case_label,
@@ -574,45 +637,6 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
         tasks.push(task);
     }
     Ok(tasks)
-}
-
-fn strip_grader_runtime_asset_catalog(trial_runtime_root: &mut Value) {
-    if let Some(grader) = trial_runtime_root
-        .pointer_mut("/grader")
-        .and_then(Value::as_object_mut)
-    {
-        grader.remove("_runtime_assets");
-    }
-}
-
-fn strip_task_image_rewrite_catalog(trial_runtime_root: &mut Value) {
-    if let Some(image) = trial_runtime_root
-        .pointer_mut("/task/workspace/image")
-        .and_then(Value::as_object_mut)
-    {
-        image.remove("rewrites");
-    }
-}
-
-fn strip_packaging_only_trial_runtime_fields(trial_runtime_root: &mut Value) {
-    strip_grader_runtime_asset_catalog(trial_runtime_root);
-    strip_task_image_rewrite_catalog(trial_runtime_root);
-}
-
-fn strip_packaging_only_trial_runtime_catalogs(experiment: &mut Value) {
-    if let Some(trial_runtime) = experiment.pointer_mut("/trial_runtime") {
-        strip_packaging_only_trial_runtime_fields(trial_runtime);
-    }
-    if let Some(variants) = experiment
-        .pointer_mut("/matrix/variants")
-        .and_then(Value::as_array_mut)
-    {
-        for variant in variants {
-            if let Some(runtime_overrides) = variant.get_mut("overrides") {
-                strip_packaging_only_trial_runtime_fields(runtime_overrides);
-            }
-        }
-    }
 }
 
 pub fn build_experiment_package(
@@ -710,7 +734,8 @@ pub fn build_experiment_package(
         &runtime_path_rewrite.staging_manifest_entries,
     )?;
     strip_packaging_only_trial_runtime_catalogs(&mut json_value);
-    strip_public_authoring_aliases_from_resolved_package(&mut json_value);
+    strip_public_authoring_fields_from_resolved_package(&mut json_value);
+    validate_resolved_experiment_schema(&json_value, "package build")?;
     validate_packaged_runtime_artifacts(&package_dir, &json_value)
         .map_err(|err| public_authoring_error(err, true))?;
 
@@ -763,13 +788,8 @@ pub fn build_experiment_package(
             "package_digest": package_digest.clone(),
         }),
     )?;
-    write_package_checks(
-        &package_dir,
-        &resolved_for_manifest,
-        &packaged_tasks,
-        &package_digest,
-    )
-    .map_err(|err| public_authoring_error(err, true))?;
+    write_package_checks(&package_dir, &packaged_tasks, &package_digest)
+        .map_err(|err| public_authoring_error(err, true))?;
     let package_manifest = json!({
         "schema_version": "sealed_run_package_v2",
         "created_at": Utc::now().to_rfc3339(),
@@ -788,7 +808,7 @@ pub fn build_experiment_package(
     })
 }
 
-fn strip_public_authoring_aliases_from_resolved_package(json_value: &mut Value) {
+fn strip_public_authoring_fields_from_resolved_package(json_value: &mut Value) {
     if let Some(object) = json_value.as_object_mut() {
         object.remove("stages");
         object.remove("cases");

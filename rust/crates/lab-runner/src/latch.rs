@@ -1917,14 +1917,17 @@ mod tests {
                                 "stage": "case",
                                 "operation": "command",
                                 "command": ["sh", "-c", "printf visible > pre.txt"],
+                                "source": {},
                                 "workdir": "/workspace/task",
-                                "network": "none"
+                                "network": "none",
+                                "hidden": false
                             },
                             {
                                 "id": "hidden-grader",
                                 "stage": "grader",
                                 "operation": "command",
                                 "command": ["sh", "-c", "printf hidden > hidden.txt"],
+                                "source": {},
                                 "workdir": "/workspace/task",
                                 "network": "none",
                                 "hidden": true

@@ -273,13 +273,7 @@ fn registry_metadata_from_run_dir(run_dir: &Path) -> Result<(Option<String>, Opt
             .with_context(|| format!("failed to read {}", resolved_path.display()))?;
         let value: Value = serde_json::from_str(&raw)
             .with_context(|| format!("invalid JSON in {}", resolved_path.display()))?;
-        value
-            .pointer("/experiment/id")
-            .or_else(|| value.pointer("/id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
+        Some(crate::config::required_experiment_id(&value)?)
     } else {
         None
     };
@@ -484,13 +478,7 @@ fn load_experiment_bundle_identity(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("sealed package manifest missing package_digest"))?
         .to_string();
-    let experiment_id = resolved_experiment
-        .pointer("/experiment/id")
-        .or_else(|| resolved_experiment.pointer("/id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+    let experiment_id = Some(crate::config::required_experiment_id(&resolved_experiment)?);
     Ok((
         package_dir,
         package_digest,

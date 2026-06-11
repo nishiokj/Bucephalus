@@ -686,9 +686,8 @@ fn transform_task_source_value(trial_input: &Value, source: &str) -> Option<Valu
         return select_transport_field(trial_input, source);
     }
     trial_input
-        .pointer("/task")
-        .and_then(|task| select_transport_field(task, source))
-        .or_else(|| select_transport_field(trial_input, source))
+        .pointer("/case")
+        .and_then(|case| select_transport_field(case, source))
 }
 
 fn metric_transform_test_ids(
@@ -1181,7 +1180,7 @@ fn attach_local_runtime_evidence(
 
     let event_sink = request.runtime.event_sinks.first();
     let retain_raw_events = event_sink.map(|sink| sink.persist).unwrap_or(false);
-    let ingest_events = event_sink.map(|sink| sink.ingest).unwrap_or(true);
+    let ingest_events = event_sink.map(|sink| sink.ingest).unwrap_or(false);
     if retain_raw_events {
         outcome.events = local_blob_if_present(request.io_paths.events_host.clone());
     }
@@ -1268,15 +1267,17 @@ fn execute_host_agent_runtime(
             .to_string_lossy()
             .to_string(),
     );
-    env.insert(
-        BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
-        request
-            .trial_paths
-            .runtime
-            .trajectory
-            .to_string_lossy()
-            .to_string(),
-    );
+    if !request.runtime.event_sinks.is_empty() {
+        env.insert(
+            BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
+            request
+                .trial_paths
+                .runtime
+                .trajectory
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
 
     let started_at = Utc::now().to_rfc3339();
     let agent_run_started_at = Instant::now();
@@ -1797,4 +1798,103 @@ pub(crate) fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> Resu
         &ContractPathHostRoots::from_trial_paths(paths),
         ContractPathMode::ContainerMount,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_metric_transform;
+    use crate::config::parse_metric_definitions;
+    use serde_json::{json, Value};
+
+    fn metric_with_test_ids_source(source: &str) -> crate::model::MetricDefinition {
+        let spec = json!({
+            "metrics": [
+                {
+                    "id": "pass_rate",
+                    "source": {
+                        "type": "grader_output",
+                        "output": "pytest_report",
+                        "pointer": "/",
+                        "transform": {
+                            "type": "pytest_json_report_pass_rate",
+                            "test_ids": {
+                                "source": { "task": source }
+                            }
+                        }
+                    },
+                    "required": true,
+                    "primary": true
+                }
+            ]
+        });
+        parse_metric_definitions(&spec)
+            .expect("metric definition")
+            .into_iter()
+            .next()
+            .expect("metric")
+    }
+
+    fn pytest_report() -> Value {
+        json!({
+            "tests": [
+                { "nodeid": "test_passes", "outcome": "passed" },
+                { "nodeid": "test_fails", "outcome": "failed" }
+            ],
+            "summary": { "passed": 1, "total": 2 }
+        })
+    }
+
+    #[test]
+    fn metric_transform_task_source_reads_case_payload() {
+        let metric = metric_with_test_ids_source("commit0.test_ids");
+        let trial_input = json!({
+            "case": {
+                "commit0": {
+                    "test_ids": ["test_passes"]
+                }
+            }
+        });
+
+        let value =
+            apply_metric_transform(&metric, &pytest_report(), &trial_input).expect("transform");
+
+        assert_eq!(value, json!(1.0));
+    }
+
+    #[test]
+    fn metric_transform_task_source_does_not_fallback_to_trial_input_root() {
+        let metric = metric_with_test_ids_source("ids.test_ids");
+        let trial_input = json!({
+            "case": {},
+            "ids": {
+                "test_ids": ["test_fails"]
+            }
+        });
+
+        let err = apply_metric_transform(&metric, &pytest_report(), &trial_input)
+            .expect_err("relative source.task should not read trial_input root");
+
+        assert!(
+            err.to_string()
+                .contains("source.transform.test_ids.source.task resolved to null"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn metric_transform_task_source_absolute_pointer_reads_trial_input_root() {
+        let metric = metric_with_test_ids_source("/ids/test_ids");
+        let trial_input = json!({
+            "case": {},
+            "ids": {
+                "test_ids": ["test_fails"]
+            }
+        });
+
+        let value =
+            apply_metric_transform(&metric, &pytest_report(), &trial_input).expect("transform");
+
+        assert_eq!(value, json!(0.0));
+    }
 }

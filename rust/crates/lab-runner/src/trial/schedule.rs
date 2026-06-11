@@ -325,10 +325,9 @@ fn extract_checkpoint_labels(response_payload: &Value) -> Result<Vec<String>> {
             object
                 .get("logical_name")
                 .and_then(Value::as_str)
-                .or_else(|| object.get("path").and_then(Value::as_str))
                 .filter(|label| !label.is_empty())
                 .map(str::to_string)
-                .ok_or_else(|| anyhow!("trial output checkpoint {} missing label path", idx))
+                .ok_or_else(|| anyhow!("trial output checkpoint {} missing logical_name", idx))
         })
         .collect()
 }
@@ -581,7 +580,11 @@ pub(crate) fn finalize_scheduled_trial(
     let (mut metrics, declared_primary) = if request.metric_definitions.is_empty() {
         (json!({}), None)
     } else {
-        extract_declared_metrics(request.metric_definitions, response_payload)?
+        extract_declared_metrics(
+            request.metric_definitions,
+            response_payload,
+            trial_conclusion_row.as_ref(),
+        )?
     };
     if let Some(obj) = metrics.as_object_mut() {
         obj.insert("status_code".to_string(), json!(status.clone()));
@@ -951,24 +954,19 @@ fn write_trial_summary(
 fn summary_extra_outputs(experiment: &Value) -> Result<Value> {
     let mut artifacts = serde_json::Map::new();
     if let Some(items) = declared_extra_outputs(experiment) {
-        for item in items {
-            let Some(id) = item
+        for (idx, item) in items.iter().enumerate() {
+            let id = item
                 .get("id")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            let Some(path) = item
+                .ok_or_else(|| anyhow!("extra_outputs[{}].id is required", idx))?;
+            let path = item
                 .get("summary_path")
-                .or_else(|| item.get("source_path"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
+                .ok_or_else(|| anyhow!("extra output '{}' missing summary_path", id))?;
             artifacts.insert(id.to_string(), json!(path));
         }
     }
@@ -1266,4 +1264,82 @@ fn build_contract_stage_rows(
     })
     .collect::<Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_checkpoint_labels_uses_logical_name_only() {
+        let labels = extract_checkpoint_labels(&json!({
+            "checkpoints": [
+                {
+                    "logical_name": "cp1",
+                    "path": "/bucephalus/state/cp1.json",
+                    "step": 1
+                }
+            ]
+        }))
+        .expect("checkpoint labels");
+
+        assert_eq!(labels, vec!["cp1".to_string()]);
+    }
+
+    #[test]
+    fn extract_checkpoint_labels_rejects_path_fallback() {
+        let err = extract_checkpoint_labels(&json!({
+            "checkpoints": [
+                {
+                    "path": "/bucephalus/state/cp1.json",
+                    "step": 1
+                }
+            ]
+        }))
+        .expect_err("checkpoint logical_name must be explicit");
+
+        assert!(
+            err.to_string().contains("missing logical_name"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn summary_extra_outputs_uses_summary_path_only() {
+        let mapped = summary_extra_outputs(&json!({
+            "extra_outputs": [
+                {
+                    "id": "host_eval",
+                    "source_path": "host_eval",
+                    "summary_path": "grader/host_eval"
+                }
+            ]
+        }))
+        .expect("extra output summary mapping");
+
+        assert_eq!(
+            mapped.pointer("/host_eval"),
+            Some(&json!("grader/host_eval"))
+        );
+    }
+
+    #[test]
+    fn summary_extra_outputs_rejects_source_path_fallback() {
+        let err = summary_extra_outputs(&json!({
+            "extra_outputs": [
+                {
+                    "id": "host_eval",
+                    "source_path": "host_eval"
+                }
+            ]
+        }))
+        .expect_err("summary_path must be explicit");
+
+        assert!(
+            err.to_string().contains("missing summary_path"),
+            "unexpected error: {}",
+            err
+        );
+    }
 }

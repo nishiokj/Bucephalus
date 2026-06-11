@@ -162,7 +162,7 @@ pub(crate) fn normalize_execution_options(execution: &RunExecutionOptions) -> Ru
 
 pub(crate) fn executor_kind_from_compute_backend(backend: &str) -> Result<ExecutorKind> {
     match backend {
-        "local-docker" | "local_docker" => Ok(ExecutorKind::LocalDocker),
+        "local-docker" => Ok(ExecutorKind::LocalDocker),
         "modal" => Ok(ExecutorKind::Modal),
         other => Err(anyhow!(
             "runtime compute backend '{}' is declared but no executor mapping is defined",

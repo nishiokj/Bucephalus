@@ -44,6 +44,8 @@ Ephemerals count against the Local Docker active container cap. The default cap 
 If `runtime.network.task_sandbox: none`, the per-trial network is internal: attached containers can talk to each other, but the ephemeral network does not open external egress. If the trial needs external egress, configure the runtime network explicitly.
 
 `expose` values are injected only into stages that list the ephemeral. An ephemeral declared under `stages.agent.ephemerals` does not leak its env into the grader unless the grader also declares that ephemeral.
+Each stage-level `ephemerals` list is duplicate-free, and the attached
+ephemerals must not expose the same env name to that stage.
 
 Host stages cannot attach container ephemerals. `stages.execution.agent_site: host` rejects `stages.agent.ephemerals`, and `stages.grader.strategy: host` rejects `stages.grader.ephemerals`.
 

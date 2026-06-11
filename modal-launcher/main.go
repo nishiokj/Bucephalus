@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -183,15 +184,73 @@ func requiredEnv(name string) (string, error) {
 	return value, nil
 }
 
+func requiredAnyEnv(names ...string) (string, error) {
+	for _, name := range names {
+		if value := os.Getenv(name); value != "" {
+			return value, nil
+		}
+	}
+	return "", fmt.Errorf("%s is required for Modal S3-compatible sync", strings.Join(names, " or "))
+}
+
+func decodedEnvAny(names ...string) (string, bool, error) {
+	for _, name := range names {
+		if encoded := os.Getenv(name); encoded != "" {
+			decoded, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil {
+				return "", true, fmt.Errorf("decode %s: %w", name, err)
+			}
+			return string(decoded), true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func buildGcpServiceAccountSecret(ctx context.Context, mc *modal.Client, secretNameEnv string, encodedEnvNames ...string) (*modal.Secret, bool, error) {
+	if secretName := os.Getenv(secretNameEnv); secretName != "" {
+		secret, err := mc.Secrets.FromName(ctx, secretName, &modal.SecretFromNameParams{
+			RequiredKeys: []string{"SERVICE_ACCOUNT_JSON"},
+		})
+		return secret, true, err
+	}
+	serviceAccountJSON, ok, err := decodedEnvAny(encodedEnvNames...)
+	if err != nil {
+		return nil, true, err
+	}
+	if ok {
+		secret, err := mc.Secrets.FromMap(ctx, map[string]string{
+			"SERVICE_ACCOUNT_JSON": serviceAccountJSON,
+		}, nil)
+		return secret, true, err
+	}
+	return nil, false, nil
+}
+
 func buildSecret(ctx context.Context, mc *modal.Client, sync map[string]any) (*modal.Secret, error) {
 	if secretName, ok := optionalString(sync, "modal_secret_name"); ok {
 		return mc.Secrets.FromName(ctx, secretName, nil)
 	}
-	accessKey, err := requiredEnv("AWS_ACCESS_KEY_ID")
+	if endpoint, ok := optionalString(sync, "endpoint_url"); ok && strings.Contains(endpoint, "storage.googleapis.com") {
+		secret, configured, err := buildGcpServiceAccountSecret(
+			ctx,
+			mc,
+			"BUCEPHALUS_MODAL_GCS_SECRET",
+			"BUCEPHALUS_MODAL_GCP_SERVICE_ACCOUNT_JSON_B64",
+			"BUCEPHALUS_MODAL_GCS_SERVICE_ACCOUNT_JSON_B64",
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !configured {
+			return nil, errors.New("BUCEPHALUS_MODAL_GCP_SERVICE_ACCOUNT_JSON_B64 or BUCEPHALUS_MODAL_GCS_SECRET is required for Modal GCS sync")
+		}
+		return secret, nil
+	}
+	accessKey, err := requiredAnyEnv("BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
 	if err != nil {
 		return nil, err
 	}
-	secretKey, err := requiredEnv("AWS_SECRET_ACCESS_KEY")
+	secretKey, err := requiredAnyEnv("BUCEPHALUS_MODAL_S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +258,9 @@ func buildSecret(ctx context.Context, mc *modal.Client, sync map[string]any) (*m
 		"AWS_ACCESS_KEY_ID":     accessKey,
 		"AWS_SECRET_ACCESS_KEY": secretKey,
 	}
-	if token := os.Getenv("AWS_SESSION_TOKEN"); token != "" {
+	if token := os.Getenv("BUCEPHALUS_MODAL_S3_SESSION_TOKEN"); token != "" {
+		data["AWS_SESSION_TOKEN"] = token
+	} else if token := os.Getenv("AWS_SESSION_TOKEN"); token != "" {
 		data["AWS_SESSION_TOKEN"] = token
 	}
 	if region, ok := optionalString(sync, "region"); ok {
@@ -245,6 +306,47 @@ func buildAgentSecret(ctx context.Context, mc *modal.Client, spec map[string]any
 		data[name] = value
 	}
 	return mc.Secrets.FromMap(ctx, data, nil)
+}
+
+func isGcpArtifactRegistryRef(imageRef string) bool {
+	registryHost := imageRef
+	if slash := strings.Index(registryHost, "/"); slash >= 0 {
+		registryHost = registryHost[:slash]
+	}
+	return strings.HasSuffix(registryHost, ".pkg.dev")
+}
+
+func buildGcpArtifactRegistrySecret(ctx context.Context, mc *modal.Client) (*modal.Secret, bool, error) {
+	secret, configured, err := buildGcpServiceAccountSecret(
+		ctx,
+		mc,
+		"BUCEPHALUS_MODAL_GCP_ARTIFACT_REGISTRY_SECRET",
+		"BUCEPHALUS_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_B64",
+		"BUCEPHALUS_MODAL_GCP_SERVICE_ACCOUNT_JSON_B64",
+	)
+	if configured || err != nil {
+		return secret, configured, err
+	}
+	if serviceAccountJSON := os.Getenv("BUCEPHALUS_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON"); serviceAccountJSON != "" {
+		secret, err := mc.Secrets.FromMap(ctx, map[string]string{
+			"SERVICE_ACCOUNT_JSON": serviceAccountJSON,
+		}, nil)
+		return secret, true, err
+	}
+	return nil, false, nil
+}
+
+func imageFromRegistry(ctx context.Context, mc *modal.Client, imageRef string) (*modal.Image, error) {
+	if isGcpArtifactRegistryRef(imageRef) {
+		secret, configured, err := buildGcpArtifactRegistrySecret(ctx, mc)
+		if err != nil {
+			return nil, err
+		}
+		if configured {
+			return mc.Images.FromGcpArtifactRegistry(imageRef, secret), nil
+		}
+	}
+	return mc.Images.FromRegistry(imageRef, nil), nil
 }
 
 func appLookup(ctx context.Context, mc *modal.Client, appName string, environmentName string) (*modal.App, error) {
@@ -370,7 +472,10 @@ func stageLaunchMounts(ctx context.Context, mc *modal.Client, app *modal.App, sp
 	if len(items) == 0 {
 		return nil
 	}
-	image := mc.Images.FromRegistry(stringValue(spec, "image"), nil)
+	image, err := imageFromRegistry(ctx, mc, stringValue(spec, "image"))
+	if err != nil {
+		return err
+	}
 	stager, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
 		Command:           []string{"sleep", "31536000"},
 		CloudBucketMounts: map[string]*modal.CloudBucketMount{"/bucephalus/case_assets": writableAssetMount},
@@ -424,7 +529,10 @@ func createSandbox(ctx context.Context, mc *modal.Client, app *modal.App, imageR
 	if memory := intValue(spec, "memory_mb", 0); memory > 0 {
 		params.MemoryMiB = memory
 	}
-	image := mc.Images.FromRegistry(imageRef, nil)
+	image, err := imageFromRegistry(ctx, mc, imageRef)
+	if err != nil {
+		return nil, err
+	}
 	sandbox, err := mc.Sandboxes.Create(ctx, app, image, params)
 	if err != nil {
 		return nil, err
@@ -973,7 +1081,10 @@ func exportLocalFileToBucket(ctx context.Context, mc *modal.Client, app *modal.A
 	if err != nil {
 		return false, err
 	}
-	image := mc.Images.FromRegistry(stringValue(spec, "image"), nil)
+	image, err := imageFromRegistry(ctx, mc, stringValue(spec, "image"))
+	if err != nil {
+		return false, err
+	}
 	stager, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
 		Command:           []string{"sleep", "31536000"},
 		CloudBucketMounts: map[string]*modal.CloudBucketMount{"/bucephalus": writableMount},

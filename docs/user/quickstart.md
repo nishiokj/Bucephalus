@@ -61,11 +61,31 @@ Important files:
 | `cookbook/agent-eval/cases.jsonl` | Two `case_v2` rows with prompts and lightweight workspace images. |
 | `cookbook/agent-eval/agent/run.js` | Tiny agent runtime app that reads trial input and writes the result JSON. |
 
-The recipe uses `stages.grader.strategy: none`, so the metric rows come directly
-from the declared `from: result...` references. The agent reads
+The recipe uses the no-grader path, so the metric rows come directly from the
+declared `from: result...` references. Omit `stages.grader` for the no-grader
+default, or declare `stages.grader.strategy: none` explicitly. The agent reads
 `BUCEPHALUS_TRIAL_INPUT_PATH` and writes JSON to `BUCEPHALUS_RESULT_PATH`.
 
 ## 4. Validate The Experiment Locally
+
+Start with the cheap authoring check:
+
+```bash
+bucephalus schema-validate --file cookbook/agent-eval/experiment.yaml
+```
+
+`schema-validate` defaults to the public experiment authoring schema. It catches
+misspelled fields and resolved-package internals before the build step lowers
+the YAML.
+
+Then run the authoring linter:
+
+```bash
+bucephalus lint cookbook/agent-eval
+```
+
+`lint` builds a sealed package and runs static package checks without dynamic
+preflight or a smoke trial.
 
 ```bash
 bucephalus dev cookbook/agent-eval

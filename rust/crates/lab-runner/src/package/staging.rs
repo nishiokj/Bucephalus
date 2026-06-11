@@ -662,7 +662,7 @@ pub(crate) fn rewrite_grader_paths_for_package(
     Ok(())
 }
 
-pub(crate) fn stage_agent_command_env_path_refs_for_package(
+pub(crate) fn stage_agent_command_path_refs_for_package(
     agent_root: &mut Value,
     exp_dir: &Path,
     package_dir: &Path,
@@ -677,50 +677,6 @@ pub(crate) fn stage_agent_command_env_path_refs_for_package(
         public_path_copies,
         staging_manifest_entries,
     )?;
-    if let Some(items) = agent_root
-        .pointer_mut("/env")
-        .and_then(Value::as_object_mut)
-    {
-        let keys = items.keys().cloned().collect::<Vec<_>>();
-        for key in keys {
-            let raw = items
-                .get(&key)
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("trial_runtime.agent.env.{} must be a string", key))?;
-            if contains_removed_runtime_template(raw) {
-                return Err(anyhow!(
-                    "trial_runtime.agent.env.{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
-                    key
-                ));
-            }
-            if raw.trim().starts_with("/bucephalus/") {
-                return Err(anyhow!(
-                    "trial_runtime.agent.env.{} leaks runner topology; remove internal /bucephalus paths from public authoring",
-                    key
-                ));
-            }
-            if is_runner_staged_destination_path(raw) {
-                continue;
-            }
-            let Some(rel) = resolve_existing_public_path_reference(
-                raw,
-                exp_dir,
-                &format!("trial_runtime.agent.env.{}", key),
-            )?
-            else {
-                continue;
-            };
-            let contract_path = stage_public_runtime_path_reference(
-                &rel,
-                exp_dir,
-                package_dir,
-                public_path_copies,
-                staging_manifest_entries,
-                &format!("trial_runtime.agent.env.{}", key),
-            )?;
-            items.insert(key, Value::String(contract_path));
-        }
-    }
     Ok(())
 }
 
@@ -760,7 +716,7 @@ pub(crate) fn collect_command_staging_entries(
     Ok(())
 }
 
-pub(crate) fn collect_runtime_command_env_staging_entries(
+pub(crate) fn collect_runtime_command_staging_entries(
     experiment: &Value,
     catalog: &BTreeMap<String, RuntimePathStagingManifestEntry>,
 ) -> Result<Vec<RuntimePathStagingManifestEntry>> {
@@ -785,31 +741,6 @@ pub(crate) fn collect_runtime_command_env_staging_entries(
             &mut seen,
             &mut entries,
         )?;
-    }
-
-    if let Some(items) = experiment
-        .pointer("/trial_runtime/agent/env")
-        .and_then(Value::as_object)
-    {
-        for (key, value) in items {
-            let Some(runtime_path) = value.as_str().map(str::trim) else {
-                return Err(anyhow!("trial_runtime.agent.env.{} must be a string", key));
-            };
-            if strip_task_workdir_support_destination_path(runtime_path).is_none() {
-                continue;
-            }
-            if !seen.insert(runtime_path.to_string()) {
-                continue;
-            }
-            let entry = lookup_runtime_staging_entry(catalog, runtime_path).ok_or_else(|| {
-                anyhow!(
-                    "trial_runtime.agent.env.{} references packaged dependency '{}' with no staging manifest entry",
-                    key,
-                    runtime_path
-                )
-            })?;
-            entries.push(entry);
-        }
     }
 
     Ok(entries)
@@ -899,17 +830,43 @@ fn required_bool_field(
 pub(crate) fn merge_runtime_path_staging_entries(
     base: &mut Vec<RuntimePathStagingManifestEntry>,
     extra: Vec<RuntimePathStagingManifestEntry>,
-) {
+) -> Result<()> {
     for next in extra {
         if let Some(existing) = base
-            .iter_mut()
+            .iter()
             .find(|entry| entry.runtime_path == next.runtime_path)
         {
-            *existing = next;
+            if existing != &next {
+                return Err(anyhow!(
+                    "runtime staging entries define conflicting sources for runtime_path '{}' ({} vs {}); each runtime destination must resolve to one packaged source",
+                    next.runtime_path,
+                    existing.packaged_path,
+                    next.packaged_path
+                ));
+            }
+        } else if let Some(existing) = base
+            .iter()
+            .find(|entry| runtime_staging_paths_overlap(&entry.runtime_path, &next.runtime_path))
+        {
+            return Err(anyhow!(
+                "runtime staging entries define overlapping runtime destinations '{}' and '{}'; each runtime destination must be disjoint",
+                existing.runtime_path,
+                next.runtime_path
+            ));
         } else {
             base.push(next);
         }
     }
+    Ok(())
+}
+
+pub(crate) fn runtime_staging_paths_overlap(a: &str, b: &str) -> bool {
+    let a = a.trim().trim_end_matches('/');
+    let b = b.trim().trim_end_matches('/');
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || a.starts_with(&format!("{}/", b)) || b.starts_with(&format!("{}/", a))
 }
 
 pub(crate) fn write_runtime_staging_manifest(
@@ -929,15 +886,15 @@ pub(crate) fn write_runtime_staging_manifest(
                 variant_experiment.pointer("/trial_runtime/grader/_runtime_assets"),
                 "trial_runtime.grader._runtime_assets",
             )?,
-        );
+        )?;
         let variant_catalog = variant_catalog_entries
             .iter()
             .cloned()
             .map(|entry| (entry.runtime_path.clone(), entry))
             .collect::<BTreeMap<_, _>>();
         let mut variant_entries =
-            collect_runtime_command_env_staging_entries(&variant_experiment, &variant_catalog)?;
-        merge_runtime_path_staging_entries(&mut variant_entries, variant_catalog_entries);
+            collect_runtime_command_staging_entries(&variant_experiment, &variant_catalog)?;
+        merge_runtime_path_staging_entries(&mut variant_entries, variant_catalog_entries)?;
         variant_entries.sort_by(|left, right| {
             left.runtime_path
                 .cmp(&right.runtime_path)
@@ -1002,7 +959,7 @@ pub(crate) fn rewrite_trial_runtime_paths_for_package(
         set_json_pointer_value(trial_runtime_root, "/agent/mount/resolved_path", json!(rel))?;
     }
     if let Some(agent_root) = trial_runtime_root.pointer_mut("/agent") {
-        stage_agent_command_env_path_refs_for_package(
+        stage_agent_command_path_refs_for_package(
             agent_root,
             context.exp_dir,
             context.package_dir,

@@ -19,7 +19,7 @@ use crate::package::authoring::{
 };
 use crate::package::sealed::*;
 use crate::package::staging::*;
-use crate::package::validate::*;
+use crate::package::validate::validate_required_fields;
 use crate::util::remove_path_if_exists;
 
 pub(crate) const TASK_WORKDIR_TEMPLATE_PLACEHOLDER: &str = BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER;
@@ -131,7 +131,6 @@ pub(crate) struct AgentRuntimeConfig {
     pub(crate) secret_files: Vec<AgentRuntimeSecretFileSpec>,
     pub(crate) event_sinks: Vec<AgentRuntimeEventSink>,
     pub(crate) output_mounts: Vec<AgentRuntimeOutputMount>,
-    pub(crate) trajectory_path: Option<String>,
     pub(crate) causal_extraction: Option<String>,
     #[cfg(test)]
     pub(crate) sandbox_image: Option<String>,
@@ -201,11 +200,8 @@ pub(crate) fn resolve_runtime_binding_value(
     if let Some(value) = runtime_env_inputs.get(name) {
         return Ok(value.clone());
     }
-    if let Ok(value) = std::env::var(name) {
-        return Ok(value);
-    }
     Err(anyhow!(
-        "{} references missing runtime binding ${}; provide it in variant bindings or launch-time env",
+        "{} references missing runtime binding ${}; provide it in variant config or launch-time --env/--env-file",
         field_name,
         name
     ))
@@ -389,6 +385,12 @@ fn parse_agent_runtime_event_sinks(
                 id
             ));
         }
+        if obj.contains_key("persist") {
+            return Err(anyhow!(
+                "{}.persist is not supported; use retain_raw",
+                item_field
+            ));
+        }
         let path = DEFAULT_CONTAINER_TRAJECTORY_PATH;
         let mode = obj
             .get("mode")
@@ -399,12 +401,8 @@ fn parse_agent_runtime_event_sinks(
         if mode != "jsonl" {
             return Err(anyhow!("{}.mode must be 'jsonl'", item_field));
         }
-        let persist = obj
-            .get("retain_raw")
-            .or_else(|| obj.get("persist"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let ingest = obj.get("ingest").and_then(Value::as_bool).unwrap_or(true);
+        let persist = required_bool_field(obj, "retain_raw", &item_field)?;
+        let ingest = required_bool_field(obj, "ingest", &item_field)?;
         sinks.push(AgentRuntimeEventSink {
             id: id.to_string(),
             format: format.to_string(),
@@ -527,7 +525,7 @@ fn parse_agent_runtime_output_mounts(
                 return Err(anyhow!("{} contains duplicate env '{}'", field, env_name));
             }
         }
-        let persist = obj.get("persist").and_then(Value::as_bool).unwrap_or(true);
+        let persist = required_bool_field(obj, "persist", &item_field)?;
         mounts.push(AgentRuntimeOutputMount {
             id: id.to_string(),
             kind: kind.to_string(),
@@ -537,6 +535,19 @@ fn parse_agent_runtime_output_mounts(
         });
     }
     Ok(mounts)
+}
+
+fn required_bool_field(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    field: &str,
+) -> Result<bool> {
+    let Some(value) = obj.get(key) else {
+        return Err(anyhow!("{}.{} is required", field, key));
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| anyhow!("{}.{} must be a boolean", field, key))
 }
 
 pub(crate) fn resolve_agent_runtime(
@@ -857,6 +868,11 @@ fn parse_runtime_perimeter_secret_files(
         let obj = item
             .as_object()
             .ok_or_else(|| anyhow!("runtime.secrets[{}] must be an object", idx))?;
+        for key in obj.keys() {
+            if !matches!(key.as_str(), "name" | "from" | "mount" | "credential_cache") {
+                return Err(anyhow!("runtime.secrets[{}].{} is not supported", idx, key));
+            }
+        }
         let id = obj
             .get("name")
             .and_then(Value::as_str)
@@ -864,15 +880,55 @@ fn parse_runtime_perimeter_secret_files(
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("runtime.secrets[{}].name is required", idx))?
             .to_string();
+        let from = obj
+            .get("from")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("runtime.secrets[{}].from is required", idx))?;
+        if !matches!(from, "env" | "file") {
+            return Err(anyhow!(
+                "runtime.secrets[{}].from '{}' is not supported yet; supported providers are env and file",
+                idx,
+                from
+            ));
+        }
         if !ids.insert(id.clone()) {
             return Err(anyhow!("runtime.secrets contains duplicate name '{}'", id));
         }
-        let Some(mount) = obj.get("mount") else {
+        if from == "env" {
+            if obj.contains_key("mount") {
+                return Err(anyhow!(
+                    "runtime.secrets[{}].mount is only supported when from is 'file'",
+                    idx
+                ));
+            }
+            if obj.contains_key("credential_cache") {
+                return Err(anyhow!(
+                    "runtime.secrets[{}].credential_cache is only supported when from is 'file'",
+                    idx
+                ));
+            }
             continue;
+        }
+        let Some(mount) = obj.get("mount") else {
+            return Err(anyhow!(
+                "runtime.secrets[{}].mount is required when from is 'file'",
+                idx
+            ));
         };
         let mount = mount
             .as_object()
             .ok_or_else(|| anyhow!("runtime.secrets[{}].mount must be an object", idx))?;
+        for key in mount.keys() {
+            if !matches!(key.as_str(), "target" | "required_for_variants") {
+                return Err(anyhow!(
+                    "runtime.secrets[{}].mount.{} is not supported",
+                    idx,
+                    key
+                ));
+            }
+        }
         let target_path = mount
             .get("target")
             .and_then(Value::as_str)
@@ -884,10 +940,7 @@ fn parse_runtime_perimeter_secret_files(
             &target_path,
             &format!("runtime.secrets[{}].mount.target", idx),
         )?;
-        let required_for_variants = match mount
-            .get("required_for_variants")
-            .or_else(|| obj.get("required_for_variants"))
-        {
+        let required_for_variants = match mount.get("required_for_variants") {
             Some(Value::Array(values)) => values
                 .iter()
                 .enumerate()
@@ -959,10 +1012,6 @@ pub(crate) fn resolve_agent_runtime_with_context(
         }
     }
 
-    let trajectory_path = json_value
-        .pointer("/trial_runtime/agent/telemetry/trajectory_path")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
     let causal_extraction = json_value
         .pointer("/trial_runtime/agent/telemetry/causal_extraction")
         .and_then(|v| v.as_str())
@@ -1023,28 +1072,19 @@ pub(crate) fn resolve_agent_runtime_with_context(
         })
         .transpose()?;
 
-    let protocol =
-        parse_optional_nonempty_string(agent.pointer("/protocol"), "trial_runtime.agent.protocol")?
-            .unwrap_or_else(|| "command".to_string());
-    if protocol != "command" {
-        return Err(anyhow!(
-            "trial_runtime.agent.protocol '{}' is not supported yet; current supported value is 'command'",
-            protocol
-        ));
-    }
-
     let command = parse_command_field(agent.pointer("/command"), "trial_runtime.agent.command")?
         .ok_or_else(|| anyhow!("trial_runtime.agent.command is required"))?;
     let event_sinks =
         parse_agent_runtime_event_sinks(agent.pointer("/events"), "trial_runtime.agent.events")?;
-    let integration_level =
-        if let Some(level) = agent.pointer("/integration_level").and_then(|v| v.as_str()) {
-            level.to_string()
-        } else if event_sinks.is_empty() {
-            "cli_basic".to_string()
-        } else {
-            "cli_events".to_string()
-        };
+    let integration_level = parse_agent_integration_level(
+        agent.pointer("/integration_level"),
+        "trial_runtime.agent.integration_level",
+    )?;
+    if integration_level == "cli_basic" && !event_sinks.is_empty() {
+        return Err(anyhow!(
+            "trial_runtime.agent.integration_level=cli_basic is incompatible with declared agent events; use cli_events or a control integration level"
+        ));
+    }
     let env = parse_string_map_field(agent.pointer("/env"), "trial_runtime.agent.env")?;
     if agent.pointer("/secret_files").is_some() {
         return Err(anyhow!(
@@ -1097,9 +1137,11 @@ pub(crate) fn resolve_agent_runtime_with_context(
     }
     let env_from_host = Vec::new();
     let dependency_file_staging = match &context {
-        PathResolutionContext::Build { exp_dir, .. } => {
-            derive_public_path_staging_specs(&command, &env, exp_dir)?
-        }
+        PathResolutionContext::Build { exp_dir, .. } => derive_public_command_path_staging_specs(
+            &command,
+            exp_dir,
+            "trial_runtime.agent.command",
+        )?,
         PathResolutionContext::Run {
             package_dir,
             variant_id,
@@ -1124,7 +1166,6 @@ pub(crate) fn resolve_agent_runtime_with_context(
         secret_files,
         event_sinks,
         output_mounts,
-        trajectory_path,
         causal_extraction,
         #[cfg(test)]
         sandbox_image: None,
@@ -1134,6 +1175,25 @@ pub(crate) fn resolve_agent_runtime_with_context(
         execution: AgentExecutionConfig {},
         dependency_file_staging,
     })
+}
+
+fn parse_agent_integration_level(value: Option<&Value>, field: &str) -> Result<String> {
+    let level = value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .ok_or_else(|| anyhow!("{} is required", field))?;
+    if !matches!(
+        level,
+        "cli_basic" | "cli_events" | "otel" | "control_checkpoint" | "control_full"
+    ) {
+        return Err(anyhow!(
+            "{} must be one of: cli_basic, cli_events, otel, control_checkpoint, control_full (got '{}')",
+            field,
+            level
+        ));
+    }
+    Ok(level.to_string())
 }
 
 pub(crate) fn validate_runtime_env_name(name: &str, field: &str) -> Result<()> {
@@ -1185,6 +1245,14 @@ pub(crate) fn parse_runtime_env_file(path: &Path) -> Result<BTreeMap<String, Str
             key,
             &format!("env file {}:{} key", path.display(), line_no + 1),
         )?;
+        if values.contains_key(key) {
+            return Err(anyhow!(
+                "invalid env file {}:{} (duplicate key '{}')",
+                path.display(),
+                line_no + 1,
+                key
+            ));
+        }
         let mut value = raw_value.trim().to_string();
         if (value.starts_with('"') && value.ends_with('"'))
             || (value.starts_with('\'') && value.ends_with('\''))
@@ -1210,11 +1278,23 @@ pub(crate) fn resolve_runtime_env_inputs(
         };
         let file_values = parse_runtime_env_file(&path)?;
         for (key, value) in file_values {
+            if resolved.contains_key(&key) {
+                return Err(anyhow!(
+                    "runtime env binding '{}' is declared more than once across launch-time --env-file inputs and --env flags",
+                    key
+                ));
+            }
             resolved.insert(key, value);
         }
     }
     for (key, value) in &execution.runtime_env {
         validate_runtime_env_name(key, &format!("--env {}", key))?;
+        if resolved.contains_key(key) {
+            return Err(anyhow!(
+                "runtime env binding '{}' is declared more than once across launch-time --env-file inputs and --env flags",
+                key
+            ));
+        }
         resolved.insert(key.clone(), value.clone());
     }
     Ok(resolved)
@@ -1535,7 +1615,7 @@ pub(crate) fn ensure_required_runtime_env_present(
     for key in &runtime_agent.env_from_host {
         if !resolved_env.contains_key(key) {
             return Err(anyhow!(
-                "missing required runtime env var for trial_runtime.agent.env_from_host: {} (provide via host env, --env, or --env-file)",
+                "missing required runtime env var for trial_runtime.agent.env_from_host: {} (provide via --env or --env-file)",
                 key
             ));
         }
@@ -1620,7 +1700,7 @@ pub(crate) fn resolve_grader_runtime_assets(
                     exp_dir,
                     project_root,
                 )?,
-            );
+            )?;
             Ok(support_files)
         }
         "injected" => {
@@ -1731,7 +1811,7 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
         merge_dependency_file_staging(
             &mut agent_runtime.dependency_file_staging,
             resolve_grader_runtime_assets(&variant_experiment, exp_dir, project_root)?,
-        );
+        )?;
     }
     validate_agent_artifact_pin(&agent_runtime)?;
     let configured_network_mode = configured_task_network_mode(&variant_experiment)?;
@@ -1748,10 +1828,7 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
             effective_network_mode
         ));
     }
-    validate_sanitization_profile_network_invariants(
-        &variant_experiment,
-        Some(&effective_network_mode),
-    )?;
+    validate_sanitization_profile_network_invariants(&variant_experiment, &effective_network_mode)?;
 
     let runtime_env_inputs = resolve_runtime_env_inputs(execution)?;
     let credential_cache_root = credential_cache_root_for_context(&context);
@@ -1964,6 +2041,7 @@ pub(crate) fn load_staging_specs_from_package(
             manifest_path.display()
         )
     })?;
+    validate_runtime_staging_manifest_variant(variant_id, entries)?;
     let mut specs = Vec::with_capacity(entries.len());
     for (idx, entry) in entries.iter().enumerate() {
         let source_from_host = resolve_package_path_under_root(
@@ -1996,6 +2074,43 @@ pub(crate) fn load_staging_specs_from_package(
         });
     }
     Ok(specs)
+}
+
+fn validate_runtime_staging_manifest_variant(
+    variant_id: &str,
+    entries: &[RuntimePathStagingManifestEntry],
+) -> Result<()> {
+    let mut runtime_paths = BTreeMap::new();
+    let mut prior_runtime_paths: Vec<(usize, String)> = Vec::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        let runtime_path = entry.runtime_path.trim();
+        if runtime_path.is_empty() {
+            continue;
+        }
+        if let Some(previous_idx) = runtime_paths.insert(runtime_path.to_string(), idx) {
+            return Err(anyhow!(
+                "runtime staging manifest variant '{}' duplicates runtime_path '{}' at entries {} and {}; each runtime destination must be unique",
+                variant_id,
+                runtime_path,
+                previous_idx,
+                idx
+            ));
+        }
+        for (previous_idx, previous_path) in &prior_runtime_paths {
+            if runtime_staging_paths_overlap(previous_path, runtime_path) {
+                return Err(anyhow!(
+                    "runtime staging manifest variant '{}' has overlapping runtime_path '{}' and '{}' at entries {} and {}; each runtime destination must be disjoint",
+                    variant_id,
+                    previous_path,
+                    runtime_path,
+                    previous_idx,
+                    idx
+                ));
+            }
+        }
+        prior_runtime_paths.push((idx, runtime_path.to_string()));
+    }
+    Ok(())
 }
 
 pub(crate) fn derive_public_command_path_staging_specs(
@@ -2034,51 +2149,6 @@ pub(crate) fn derive_public_command_path_staging_specs(
                 field_name,
                 idx,
                 token,
-                source.display()
-            )
-        })?;
-        specs.push(DependencyFileStagingSpec {
-            source_from_host: source,
-            destination_path: task_workdir_support_destination_path(&key.replace('\\', "/")),
-            required: true,
-            read_only: true,
-        });
-    }
-    Ok(specs)
-}
-
-pub(crate) fn derive_public_path_staging_specs(
-    command: &[String],
-    env: &BTreeMap<String, String>,
-    exp_dir: &Path,
-) -> Result<Vec<DependencyFileStagingSpec>> {
-    let mut specs =
-        derive_public_command_path_staging_specs(command, exp_dir, "trial_runtime.agent.command")?;
-    let mut seen = HashSet::new();
-    for spec in &specs {
-        if let Some(rel) = strip_task_workdir_support_destination_path(&spec.destination_path) {
-            seen.insert(rel.to_string());
-        }
-    }
-    for (key_name, value) in env {
-        let Some(rel) = resolve_existing_public_path_reference(
-            value,
-            exp_dir,
-            &format!("trial_runtime.agent.env.{}", key_name),
-        )?
-        else {
-            continue;
-        };
-        let key = rel.to_string_lossy().to_string();
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-        let source = normalize_path(&exp_dir.join(&rel));
-        fs::metadata(&source).with_context(|| {
-            format!(
-                "failed to read trial_runtime.agent.env.{} public path reference '{}' resolved to '{}'",
-                key_name,
-                value,
                 source.display()
             )
         })?;
@@ -2157,11 +2227,9 @@ pub(crate) fn parse_build_runtime_asset_specs(
             .get("runtime_path")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("{}[{}].runtime_path is required", field_name, idx))?;
-        let required = obj.get("required").and_then(Value::as_bool).unwrap_or(true);
-        let read_only = obj
-            .get("read_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let item_field = format!("{}[{}]", field_name, idx);
+        let required = required_bool_field(obj, "required", &item_field)?;
+        let read_only = required_bool_field(obj, "read_only", &item_field)?;
         specs.push(DependencyFileStagingSpec {
             source_from_host: normalize_staged_support_source_path(
                 source_from_host,
@@ -2183,15 +2251,26 @@ pub(crate) fn parse_build_runtime_asset_specs(
 pub(crate) fn merge_dependency_file_staging(
     base: &mut Vec<DependencyFileStagingSpec>,
     extra: Vec<DependencyFileStagingSpec>,
-) {
+) -> Result<()> {
     for next in extra {
         if let Some(existing) = base
-            .iter_mut()
+            .iter()
             .find(|entry| entry.destination_path == next.destination_path)
         {
-            *existing = next;
+            if existing.source_from_host != next.source_from_host
+                || existing.required != next.required
+                || existing.read_only != next.read_only
+            {
+                return Err(anyhow!(
+                    "runtime asset staging destination '{}' is declared more than once with conflicting source or mount flags ({} vs {})",
+                    next.destination_path,
+                    existing.source_from_host.display(),
+                    next.source_from_host.display()
+                ));
+            }
         } else {
             base.push(next);
         }
     }
+    Ok(())
 }

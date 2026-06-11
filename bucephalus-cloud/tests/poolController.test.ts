@@ -16,6 +16,18 @@ describe("pool controller matching", () => {
     )).toBe(false);
   });
 
+  test("matches modal executor only when modal resource is advertised", () => {
+    expect(matchesCapabilities(
+      { executors: ["runner-docker", "modal"], resources: ["core_runner", "registry_pull", "modal"] },
+      { executor: "modal", requires: ["core_runner", "modal", "registry_pull"] },
+    )).toBe(true);
+
+    expect(matchesCapabilities(
+      { executors: ["runner-docker", "modal"], resources: ["core_runner", "registry_pull"] },
+      { executor: "modal", requires: ["core_runner", "modal", "registry_pull"] },
+    )).toBe(false);
+  });
+
   test("rejects missing resources", () => {
     expect(matchesCapabilities(
       { executors: ["runner-docker"], resources: ["core_runner"] },

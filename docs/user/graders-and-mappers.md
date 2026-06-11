@@ -26,6 +26,7 @@ stages:
       candidate:
         capture:
           type: workspace_diff
+          format: unified_diff
 
   grader:
     strategy: in_task_runtime
@@ -38,7 +39,6 @@ stages:
         materialize:
           as: file
           path: /patch.diff
-        required: true
     outputs:
       report:
         capture:
@@ -83,6 +83,11 @@ Container grader stages may attach top-level `ephemerals` with `stages.grader.ep
 ## Strategy Declarations
 
 Each strategy has a different packaging boundary. Declare the boundary directly instead of relying on arbitrary host paths.
+Strategy-specific config blocks are closed:
+`in_task_runtime` accepts `hidden_paths` and `revealed_paths`; `injected`
+accepts `bundle` and `copy_dest`; `separate` accepts `image` and `workdir`;
+`host` accepts `capability`. Use `stages.grader.max_concurrency` when a grader
+needs a lower concurrency limit than the run.
 
 ### None
 
@@ -92,8 +97,11 @@ Use this when the agent result is the only source of metrics.
 stages:
   grader:
     strategy: none
-    command: []
 ```
+
+You can also omit `stages.grader` entirely for this case; the authoring build
+defaults an omitted grader to `strategy: none`. Do not declare an empty
+`stages.grader: {}`.
 
 Do not declare `from: grader...` metrics when `strategy: none`.
 

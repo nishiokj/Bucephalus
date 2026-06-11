@@ -39,7 +39,6 @@ pub(crate) fn load_event_rows(
                 let event_type = payload
                     .get("event_type")
                     .and_then(Value::as_str)
-                    .or_else(|| payload.get("type").and_then(Value::as_str))
                     .map(str::trim)
                     .filter(|event_type| !event_type.is_empty())
                     .ok_or_else(|| anyhow!("event row {} missing event_type", seq + 1))?
@@ -47,9 +46,11 @@ pub(crate) fn load_event_rows(
                 let ts = payload
                     .get("ts")
                     .and_then(Value::as_str)
-                    .or_else(|| payload.get("timestamp").and_then(Value::as_str))
-                    .map(str::to_string);
-                (event_type, ts, payload)
+                    .map(str::trim)
+                    .filter(|ts| !ts.is_empty())
+                    .ok_or_else(|| anyhow!("event row {} missing ts", seq + 1))?
+                    .to_string();
+                (event_type, Some(ts), payload)
             }
             Err(err) => (
                 "trajectory_parse_error".to_string(),
@@ -254,6 +255,7 @@ pub(crate) fn build_metric_rows(
 fn declared_metric_value(
     definition: &MetricDefinition,
     agent_response_payload: &Value,
+    trial_conclusion_row: Option<&Value>,
 ) -> Option<Value> {
     match definition.source.source_type.as_str() {
         "agent_response" => {
@@ -276,6 +278,16 @@ fn declared_metric_value(
                 Some(agent_response_payload.clone())
             }
         }
+        "grader_output" => trial_conclusion_row
+            .and_then(|row| row.pointer("/payload"))
+            .and_then(|payload| {
+                definition
+                    .source
+                    .pointer
+                    .as_deref()
+                    .and_then(|pointer| payload.pointer(pointer))
+            })
+            .cloned(),
         _ => None,
     }
 }
@@ -283,12 +295,13 @@ fn declared_metric_value(
 pub(crate) fn extract_declared_metrics(
     definitions: &[MetricDefinition],
     agent_response_payload: &Value,
+    trial_conclusion_row: Option<&Value>,
 ) -> Result<(Value, Option<(String, Value)>)> {
     let mut metrics = serde_json::Map::new();
     let mut primary = None;
 
     for definition in definitions {
-        let value = declared_metric_value(definition, agent_response_payload);
+        let value = declared_metric_value(definition, agent_response_payload, trial_conclusion_row);
         ensure!(
             value.is_some() || !definition.required,
             "required metric '{}' resolved to null",

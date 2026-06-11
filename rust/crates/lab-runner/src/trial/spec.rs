@@ -112,7 +112,6 @@ pub enum CaseMaterializationOperation {
 #[serde(deny_unknown_fields)]
 pub struct CaseMaterializationMountPlan {
     pub path: String,
-    #[serde(default)]
     pub read_only: bool,
 }
 
@@ -124,9 +123,6 @@ pub struct CaseMaterializationStepPlan {
     pub operation: CaseMaterializationOperation,
     #[serde(default)]
     pub command: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource: Option<String>,
-    #[serde(default = "empty_object_value")]
     pub source: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount: Option<CaseMaterializationMountPlan>,
@@ -136,37 +132,20 @@ pub struct CaseMaterializationStepPlan {
     pub network: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
-    #[serde(default)]
     pub hidden: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct TaskCaseV2Resources {
-    #[serde(default)]
-    pub(crate) environment: Option<TaskCaseV2Environment>,
-    #[serde(default)]
-    pub(crate) workspace: Option<TaskCaseV2Workspace>,
-    #[serde(default)]
-    pub(crate) assets: Value,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TaskCaseV2Environment {
-    #[serde(default)]
-    pub(crate) image: Option<String>,
-    #[serde(default)]
-    pub(crate) workdir: Option<String>,
-    #[serde(default)]
-    pub(crate) platform: Option<String>,
+pub(crate) struct TaskCaseV2Resources {
+    pub(crate) workspace: TaskCaseV2Workspace,
+    pub(crate) assets: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TaskCaseV2Workspace {
     pub(crate) source: CaseWorkspaceSource,
-    #[serde(default)]
-    pub(crate) mode: Option<WorkspaceMode>,
+    pub(crate) mode: WorkspaceMode,
     #[serde(default)]
     pub(crate) image: Option<String>,
     #[serde(default)]
@@ -179,9 +158,7 @@ pub(crate) struct TaskCaseV2Workspace {
     pub(crate) repo: Option<String>,
     #[serde(default)]
     pub(crate) commit: Option<String>,
-    #[serde(default)]
     pub(crate) overlays: Vec<WorkspaceOverlaySpec>,
-    #[serde(default)]
     pub(crate) aux_mounts: Vec<WorkspaceAuxMountSpec>,
 }
 
@@ -190,15 +167,10 @@ pub(crate) struct TaskCaseV2Workspace {
 pub(crate) struct TaskCaseV2 {
     pub(crate) schema_version: String,
     pub(crate) id: String,
-    #[serde(default = "empty_object_value")]
     pub(crate) inputs: Value,
-    #[serde(default)]
     pub(crate) resources: TaskCaseV2Resources,
-    #[serde(default)]
     pub(crate) materialization: Vec<CaseMaterializationStepPlan>,
-    #[serde(default = "empty_object_value")]
     pub(crate) metadata: Value,
-    #[serde(default)]
     pub(crate) limits: TaskCaseLimits,
 }
 
@@ -272,7 +244,7 @@ pub(crate) fn parse_task_case(task: &Value) -> Result<TaskCaseV1> {
         .as_object()
         .ok_or_else(|| anyhow!("case row must be an object"))?;
     match obj.get("schema_version").and_then(Value::as_str) {
-        Some("case_v1") | Some("task_case_v1") => {}
+        Some("case_v1") => {}
         Some(other) => {
             return Err(anyhow!(
                 "case row schema_version '{}' is not supported; expected 'case_v1'",
@@ -309,10 +281,98 @@ pub(crate) fn parse_task_case_v2(task: &Value) -> Result<TaskCaseV2> {
             ))
         }
     }
+    validate_packaged_case_v2_sections(task)?;
+    validate_packaged_case_workspace_fields(task)?;
+    validate_packaged_case_materialization_flags(task)?;
     let task_case: TaskCaseV2 =
         serde_json::from_value(task.clone()).map_err(|err| anyhow!("invalid case row: {}", err))?;
     validate_task_case_v2(&task_case)?;
     Ok(task_case)
+}
+
+fn validate_packaged_case_v2_sections(task: &Value) -> Result<()> {
+    for key in ["inputs", "resources", "metadata", "limits"] {
+        task.get(key)
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("case_v2.{} is required in packaged rows", key))?;
+    }
+    task.get("materialization")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("case_v2.materialization is required in packaged rows"))?;
+    task.pointer("/resources/assets")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("case_v2.resources.assets is required in packaged rows"))?;
+    task.pointer("/resources/workspace")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("case_v2.resources.workspace is required in packaged rows"))?;
+    if task.pointer("/resources/environment").is_some() {
+        return Err(anyhow!(
+            "case_v2.resources.environment is not accepted; put image, workdir, and platform under resources.workspace"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_packaged_case_workspace_fields(task: &Value) -> Result<()> {
+    let Some(workspace) = task.pointer("/resources/workspace") else {
+        return Ok(());
+    };
+    let workspace = workspace
+        .as_object()
+        .ok_or_else(|| anyhow!("case resources.workspace must be an object"))?;
+    workspace
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("case resources.workspace.source is required"))?;
+    workspace
+        .get("mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("case resources.workspace.mode is required"))?;
+    workspace
+        .get("overlays")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("case resources.workspace.overlays is required"))?;
+    workspace
+        .get("aux_mounts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("case resources.workspace.aux_mounts is required"))?;
+    Ok(())
+}
+
+fn validate_packaged_case_materialization_flags(task: &Value) -> Result<()> {
+    let Some(steps) = task.get("materialization") else {
+        return Ok(());
+    };
+    let steps = steps
+        .as_array()
+        .ok_or_else(|| anyhow!("case materialization must be an array"))?;
+    for (idx, step) in steps.iter().enumerate() {
+        let obj = step
+            .as_object()
+            .ok_or_else(|| anyhow!("case materialization[{}] must be an object", idx))?;
+        if obj.get("resource").is_some() {
+            return Err(anyhow!(
+                "case materialization[{}].resource is not accepted; use source.path",
+                idx
+            ));
+        }
+        obj.get("hidden")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow!("case materialization[{}].hidden is required", idx))?;
+        obj.get("source")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("case materialization[{}].source is required", idx))?;
+        if let Some(mount) = obj.get("mount") {
+            mount
+                .as_object()
+                .and_then(|mount| mount.get("read_only"))
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    anyhow!("case materialization[{}].mount.read_only is required", idx)
+                })?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn materialize_task_row(task_row: TaskRow) -> Result<TaskBoundaryMaterialization> {
@@ -351,12 +411,12 @@ fn case_container_image(case: &TaskCaseV1) -> Result<Option<TaskRowContainerImag
     let Some(workspace) = case.resources.pointer("/workspace") else {
         return Ok(None);
     };
-    if workspace
-        .get("type")
-        .or_else(|| workspace.get("kind"))
-        .and_then(Value::as_str)
-        != Some("container_image")
-    {
+    if workspace.get("kind").is_some() {
+        return Err(anyhow!(
+            "case resources.workspace.kind is not accepted; use resources.workspace.type"
+        ));
+    }
+    if workspace.get("type").and_then(Value::as_str) != Some("container_image") {
         return Ok(None);
     }
     let image = workspace
@@ -436,26 +496,7 @@ fn require_string(value: Option<String>, context: &str) -> Result<String> {
     value.ok_or_else(|| anyhow!("{} is required", context))
 }
 
-fn workspace_mode_or_default(workspace: Option<&TaskCaseV2Workspace>) -> WorkspaceMode {
-    workspace
-        .and_then(|workspace| workspace.mode.clone())
-        .unwrap_or(WorkspaceMode::Scratch)
-}
-
-fn lower_case_v2_workspace(workspace: Option<&TaskCaseV2Workspace>) -> Result<WorkspaceSpec> {
-    let Some(workspace) = workspace else {
-        return Ok(WorkspaceSpec {
-            mode: WorkspaceMode::Scratch,
-            base: WorkspaceBaseSpec {
-                kind: WorkspaceBaseKind::Empty,
-                dataset_pack_ref: None,
-                repo: None,
-                commit: None,
-            },
-            overlays: Vec::new(),
-            aux_mounts: Vec::new(),
-        });
-    };
+fn lower_case_v2_workspace(workspace: &TaskCaseV2Workspace) -> Result<WorkspaceSpec> {
     let base = match workspace.source {
         CaseWorkspaceSource::ContainerImage | CaseWorkspaceSource::Empty => WorkspaceBaseSpec {
             kind: WorkspaceBaseKind::Empty,
@@ -489,7 +530,7 @@ fn lower_case_v2_workspace(workspace: Option<&TaskCaseV2Workspace>) -> Result<Wo
         },
     };
     Ok(WorkspaceSpec {
-        mode: workspace_mode_or_default(Some(workspace)),
+        mode: workspace.mode.clone(),
         base,
         overlays: workspace.overlays.clone(),
         aux_mounts: workspace.aux_mounts.clone(),
@@ -497,43 +538,23 @@ fn lower_case_v2_workspace(workspace: Option<&TaskCaseV2Workspace>) -> Result<Wo
 }
 
 fn case_v2_container_image(case: &TaskCaseV2) -> Result<Option<TaskRowContainerImage>> {
-    let Some(workspace) = case.resources.workspace.as_ref() else {
-        return Ok(None);
-    };
+    let workspace = &case.resources.workspace;
     if workspace.source != CaseWorkspaceSource::ContainerImage {
-        if case.resources.environment.is_some() {
-            return Err(anyhow!(
-                "case_v2 resources.environment is currently executable only with resources.workspace.source=container_image"
-            ));
-        }
         return Ok(None);
     }
-    let env = case.resources.environment.as_ref();
     let image = require_string(
-        non_empty_string(
-            workspace
-                .image
-                .as_ref()
-                .or_else(|| env.and_then(|env| env.image.as_ref())),
-            "case resources.workspace.image",
-        )?,
+        non_empty_string(workspace.image.as_ref(), "case resources.workspace.image")?,
         "case resources.workspace.image",
     )?;
     let workdir = require_string(
         non_empty_string(
-            workspace
-                .workdir
-                .as_ref()
-                .or_else(|| env.and_then(|env| env.workdir.as_ref())),
+            workspace.workdir.as_ref(),
             "case resources.workspace.workdir",
         )?,
         "case resources.workspace.workdir",
     )?;
     let platform = non_empty_string(
-        workspace
-            .platform
-            .as_ref()
-            .or_else(|| env.and_then(|env| env.platform.as_ref())),
+        workspace.platform.as_ref(),
         "case resources.workspace.platform",
     )?;
     Ok(Some(TaskRowContainerImage {
@@ -562,7 +583,7 @@ pub(crate) fn materialize_task_case_v2(
     Ok(TaskBoundaryMaterialization {
         declaration: serde_json::to_value(&task_case)?,
         task_payload,
-        workspace: lower_case_v2_workspace(task_case.resources.workspace.as_ref())?,
+        workspace: lower_case_v2_workspace(&task_case.resources.workspace)?,
         dependencies: json!({}),
         materialization,
         case_materialization: task_case.materialization.clone(),
@@ -585,7 +606,7 @@ pub(crate) fn materialize_packaged_task_boundary(
 ) -> Result<TaskBoundaryMaterialization> {
     match task.get("schema_version").and_then(Value::as_str) {
         Some("task_row_v2") => materialize_task_row(parse_task_row(task)?),
-        Some("case_v1") | Some("task_case_v1") => materialize_task_case(parse_task_case(task)?),
+        Some("case_v1") => materialize_task_case(parse_task_case(task)?),
         Some("case_v2") => materialize_task_case_v2(parse_task_case_v2(task)?),
         Some("task_row_v1") => Err(anyhow!(
             "packaged task schema_version 'task_row_v1' is not supported at runtime; expected 'case_v2' or 'case_v1'"
@@ -689,63 +710,62 @@ pub(crate) fn validate_task_case_v2(task_case: &TaskCaseV2) -> Result<()> {
     if task_case.limits.timeout_ms == Some(0) {
         return Err(anyhow!("case limits.timeout_ms must be > 0 when provided"));
     }
-    if let Some(workspace) = task_case.resources.workspace.as_ref() {
-        for (value, context) in [
-            (&workspace.image, "case resources.workspace.image"),
-            (&workspace.workdir, "case resources.workspace.workdir"),
-            (&workspace.platform, "case resources.workspace.platform"),
-            (
-                &workspace.dataset_pack_ref,
-                "case resources.workspace.dataset_pack_ref",
-            ),
-            (&workspace.repo, "case resources.workspace.repo"),
-            (&workspace.commit, "case resources.workspace.commit"),
-        ] {
-            non_empty_string(value.as_ref(), context)?;
-        }
-        if let Some(workdir) = workspace.workdir.as_deref() {
-            validate_task_container_workdir(workdir.trim()).map_err(|err| {
-                anyhow!(
-                    "{} (case resources.workspace.workdir)",
-                    err.to_string()
-                        .replace("task row runtime.container_image.workdir", "workdir")
-                )
-            })?;
-        }
-        match workspace.source {
-            CaseWorkspaceSource::ContainerImage => {
-                let container = case_v2_container_image(task_case)?;
-                if let Some(container) = container {
-                    validate_task_container_workdir(container.workdir.trim()).map_err(|err| {
-                        anyhow!(
-                            "{} (case resources.workspace.workdir)",
-                            err.to_string()
-                                .replace("task row runtime.container_image.workdir", "workdir")
-                        )
-                    })?;
-                }
+    let workspace = &task_case.resources.workspace;
+    for (value, context) in [
+        (&workspace.image, "case resources.workspace.image"),
+        (&workspace.workdir, "case resources.workspace.workdir"),
+        (&workspace.platform, "case resources.workspace.platform"),
+        (
+            &workspace.dataset_pack_ref,
+            "case resources.workspace.dataset_pack_ref",
+        ),
+        (&workspace.repo, "case resources.workspace.repo"),
+        (&workspace.commit, "case resources.workspace.commit"),
+    ] {
+        non_empty_string(value.as_ref(), context)?;
+    }
+    if let Some(workdir) = workspace.workdir.as_deref() {
+        validate_task_container_workdir(workdir.trim()).map_err(|err| {
+            anyhow!(
+                "{} (case resources.workspace.workdir)",
+                err.to_string()
+                    .replace("task row runtime.container_image.workdir", "workdir")
+            )
+        })?;
+    }
+    match workspace.source {
+        CaseWorkspaceSource::ContainerImage => {
+            let container = case_v2_container_image(task_case)?;
+            if let Some(container) = container {
+                validate_task_container_workdir(container.workdir.trim()).map_err(|err| {
+                    anyhow!(
+                        "{} (case resources.workspace.workdir)",
+                        err.to_string()
+                            .replace("task row runtime.container_image.workdir", "workdir")
+                    )
+                })?;
             }
-            CaseWorkspaceSource::DatasetPack => {
-                require_string(
-                    non_empty_string(
-                        workspace.dataset_pack_ref.as_ref(),
-                        "case resources.workspace.dataset_pack_ref",
-                    )?,
+        }
+        CaseWorkspaceSource::DatasetPack => {
+            require_string(
+                non_empty_string(
+                    workspace.dataset_pack_ref.as_ref(),
                     "case resources.workspace.dataset_pack_ref",
-                )?;
-            }
-            CaseWorkspaceSource::GitCheckout => {
-                require_string(
-                    non_empty_string(workspace.repo.as_ref(), "case resources.workspace.repo")?,
-                    "case resources.workspace.repo",
-                )?;
-                require_string(
-                    non_empty_string(workspace.commit.as_ref(), "case resources.workspace.commit")?,
-                    "case resources.workspace.commit",
-                )?;
-            }
-            CaseWorkspaceSource::Empty => {}
+                )?,
+                "case resources.workspace.dataset_pack_ref",
+            )?;
         }
+        CaseWorkspaceSource::GitCheckout => {
+            require_string(
+                non_empty_string(workspace.repo.as_ref(), "case resources.workspace.repo")?,
+                "case resources.workspace.repo",
+            )?;
+            require_string(
+                non_empty_string(workspace.commit.as_ref(), "case resources.workspace.commit")?,
+                "case resources.workspace.commit",
+            )?;
+        }
+        CaseWorkspaceSource::Empty => {}
     }
     validate_case_materialization_steps(task_case)?;
     Ok(())
@@ -755,11 +775,7 @@ fn validate_case_materialization_steps(task_case: &TaskCaseV2) -> Result<()> {
     if task_case.materialization.is_empty() {
         return Ok(());
     }
-    let workspace = task_case
-        .resources
-        .workspace
-        .as_ref()
-        .ok_or_else(|| anyhow!("case_v2 materialization requires resources.workspace"))?;
+    let workspace = &task_case.resources.workspace;
     if workspace.source != CaseWorkspaceSource::ContainerImage {
         return Err(anyhow!(
             "case_v2 materialization is currently executable only with resources.workspace.source=container_image"

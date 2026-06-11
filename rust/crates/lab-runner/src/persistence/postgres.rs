@@ -1904,13 +1904,7 @@ fn registry_metadata_from_run_dir(run_dir: &Path) -> Result<(Option<String>, Opt
             .with_context(|| format!("failed to read {}", resolved_path.display()))?;
         let value: Value = serde_json::from_str(&raw)
             .with_context(|| format!("invalid JSON in {}", resolved_path.display()))?;
-        value
-            .pointer("/experiment/id")
-            .or_else(|| value.pointer("/id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
+        Some(crate::config::required_experiment_id(&value)?)
     } else {
         None
     };
