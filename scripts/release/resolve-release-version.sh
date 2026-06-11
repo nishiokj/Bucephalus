@@ -73,6 +73,35 @@ if [[ ! "${version}" =~ ^[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
   exit 2
 fi
 
+# The workspace Cargo.toml version is the single source of truth: it is what
+# binaries self-report via CARGO_PKG_VERSION. A tag or override that disagrees
+# would ship binaries that lie about their version, making release skew
+# undiagnosable. Releasing requires bumping Cargo.toml.
+if [[ "${source}" != "Cargo.toml" ]]; then
+  cargo_version="$(
+    awk '
+      /^\[package\]$/ { in_package = 1; next }
+      /^\[workspace[.]package\]$/ { in_workspace_package = 1; next }
+      /^\[/ { in_package = 0 }
+      /^\[/ { in_workspace_package = 0 }
+      in_package && /^version[[:space:]]*=/ {
+        gsub(/"/, "", $3)
+        print $3
+        exit
+      }
+      in_workspace_package && /^version[[:space:]]*=/ {
+        gsub(/"/, "", $3)
+        print $3
+        exit
+      }
+    ' "${ROOT_DIR}/Cargo.toml"
+  )"
+  if [[ "${version}" != "${cargo_version}" ]]; then
+    echo "release version ${version} (from ${source}) does not match workspace Cargo.toml version ${cargo_version}; bump Cargo.toml so released binaries report the version they were published as" >&2
+    exit 2
+  fi
+fi
+
 emit_outputs() {
   echo "version=${version}"
   echo "version_source=${source}"

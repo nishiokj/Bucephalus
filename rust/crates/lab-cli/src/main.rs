@@ -1705,7 +1705,7 @@ fn auth_status(home: &Path) -> Value {
             "status": "ready",
             "source": "env",
             "env": BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
-            "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
+            "api_url": cloud_api_base_url()
         });
     }
     if paths.access.is_file() {
@@ -1715,7 +1715,7 @@ fn auth_status(home: &Path) -> Value {
             "path": paths.access,
             "refresh_token_path": if paths.refresh.is_file() { Some(paths.refresh.display().to_string()) } else { None },
             "cache_path": if paths.cache.is_file() { Some(paths.cache.display().to_string()) } else { None },
-            "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
+            "api_url": cloud_api_base_url()
         });
     }
     json!({
@@ -1725,7 +1725,7 @@ fn auth_status(home: &Path) -> Value {
             BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
             paths.access.display().to_string()
         ],
-        "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok(),
+        "api_url": cloud_api_base_url(),
         "note": "Local Core and latch smoke fixtures do not require Cloud auth. Cloud benchmark resolution and upload require first-party user auth.",
         "actions": [
             {
@@ -1822,9 +1822,13 @@ fn run_logout(dry_run: bool) -> Result<Value> {
 fn run_login(options: DeviceLoginOptions) -> Result<Value> {
     let home = lab_runner::bucephalus_home()?;
     let paths = cloud_token_paths(&home);
+    // Resolution order everywhere: explicit flag, then env, then the cloud
+    // profile persisted by a previous login. First login pins the deployment;
+    // later logins are zero-configuration.
     let issuer = options
         .issuer
         .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV))
+        .or_else(|| lab_runner::cloud_profile_string(&home, "/oauth/issuer"))
         .ok_or_else(|| {
             anyhow!(
                 "OAuth issuer is required; pass --issuer or set {}",
@@ -1833,11 +1837,13 @@ fn run_login(options: DeviceLoginOptions) -> Result<Value> {
         })?;
     let audience = options
         .audience
-        .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV));
+        .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV))
+        .or_else(|| lab_runner::cloud_profile_string(&home, "/oauth/audience"));
     let resource = options.resource.or_else(cloud_api_base_url);
     let scope = options
         .scope
         .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV))
+        .or_else(|| lab_runner::cloud_profile_string(&home, "/oauth/scope"))
         .unwrap_or_else(|| "openid profile email".to_string());
     let (metadata_url, metadata) = fetch_oauth_metadata(&issuer)?;
     let device_authorization_endpoint = metadata
@@ -1863,6 +1869,7 @@ fn run_login(options: DeviceLoginOptions) -> Result<Value> {
     let client_id = options
         .client_id
         .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV))
+        .or_else(|| lab_runner::cloud_profile_string(&home, "/oauth/client_id"))
         .map(Ok)
         .unwrap_or_else(|| dynamic_register_oauth_client(&metadata, &issuer, &scope))?;
 
@@ -1907,6 +1914,19 @@ fn run_login(options: DeviceLoginOptions) -> Result<Value> {
         &scope,
         &token_endpoint,
         &token,
+    )?;
+    lab_runner::write_cloud_profile(
+        &home,
+        &json!({
+            "schema_version": "bucephalus_cloud_profile_v1",
+            "api_url": resource,
+            "oauth": {
+                "issuer": issuer,
+                "client_id": client_id,
+                "audience": audience,
+                "scope": scope,
+            },
+        }),
     )?;
     Ok(json!({
         "schema_version": "bucephalus_login_v1",
@@ -2868,6 +2888,11 @@ fn cloud_api_base_url() -> Option<String> {
         .ok()
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let home = lab_runner::bucephalus_home().ok()?;
+            lab_runner::cloud_profile_string(&home, "/api_url")
+                .map(|value| value.trim_end_matches('/').to_string())
+        })
 }
 
 fn cloud_bearer_token() -> Result<Option<String>> {

@@ -34,7 +34,9 @@ pub use latch::{
     TaskInjection, UploadSpec, WorkspaceSeed, LATCH_MANIFEST_SCHEMA, LATCH_RESULT_SCHEMA,
 };
 pub use local_storage::{
-    account_sqlite_path, bucephalus_home, default_agent_root, default_build_root, default_run_root,
+    account_sqlite_path, bucephalus_home, cloud_profile_path, cloud_profile_string,
+    default_agent_root, default_build_root, default_run_root, read_cloud_profile,
+    write_cloud_profile,
 };
 pub use model::{
     BuildResult, ExecutorKind, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,
