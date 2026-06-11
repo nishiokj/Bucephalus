@@ -48,4 +48,7 @@ jobs:
         if: ${{ steps.tag.outputs.created == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run bucephalus-release.yml --ref "v${{ steps.version.outputs.version }}"
+        run: >-
+          gh workflow run bucephalus-release.yml
+          --ref "v${{ steps.version.outputs.version }}"
+          -f version_override="${{ steps.version.outputs.version }}"
