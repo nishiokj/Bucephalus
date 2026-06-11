@@ -1464,6 +1464,18 @@ fn run_init(options: InitOptions) -> Result<Value> {
     }))
 }
 
+fn read_json_or_yaml_value(path: &Path) -> Result<Value> {
+    let data = fs::read_to_string(path)
+        .with_context(|| format!("failed to read structured data file '{}'", path.display()))?;
+    if let Ok(value) = serde_json::from_str::<Value>(&data) {
+        return Ok(value);
+    }
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&data)
+        .with_context(|| format!("failed to parse '{}' as JSON or YAML", path.display()))?;
+    serde_json::to_value(yaml_value)
+        .with_context(|| format!("failed to convert YAML '{}' to JSON value", path.display()))
+}
+
 fn run_mcp_stdio() -> Result<()> {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
@@ -7026,8 +7038,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         }
         Commands::SchemaValidate { schema, file, json } => {
             let compiled = schemas::compile_schema(&schema)?;
-            let data = std::fs::read_to_string(file)?;
-            let value: serde_json::Value = serde_json::from_str(&data)?;
+            let value = read_json_or_yaml_value(&file)?;
             if let Err(errors) = compiled.validate(&value) {
                 for e in errors {
                     eprintln!("schema error: {}", e);
@@ -13011,6 +13022,35 @@ mod tests {
         assert!(!yaml.contains("comparison: none"));
         assert!(!yaml.contains("agent_site: agent_container"));
         assert!(!yaml.contains("/bucephalus/out/result.json"));
+    }
+
+    #[test]
+    fn schema_validate_accepts_generated_experiment_yaml() {
+        let root = unique_test_dir("schema_validate_generated_yaml");
+        let options = InitOptions {
+            dir: root.clone(),
+            client: InitClientArg::Cli,
+            command: Some("agent --input {input} --output {output}".to_string()),
+            url: None,
+            stream: InitStreamArg::None,
+            language: InitLanguageArg::Python,
+            mcp_role: None,
+            mcp_tool: None,
+            mode: "answer".to_string(),
+            name: "Smoke Eval".to_string(),
+            force: true,
+        };
+        run_init(options).expect("init");
+        let value = read_json_or_yaml_value(&root.join("experiment.yaml")).expect("read yaml");
+        let schema = schemas::compile_schema("experiment_authoring_v1.jsonschema").expect("schema");
+        let errors = schema
+            .validate(&value)
+            .err()
+            .map(|errors| errors.map(|err| err.to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        assert!(errors.is_empty(), "unexpected schema errors: {errors:?}");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
