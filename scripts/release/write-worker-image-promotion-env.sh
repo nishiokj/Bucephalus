@@ -5,13 +5,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFEST=""
 POOL_ID=""
 EVIDENCE_URI=""
+OUTPUT_PATH=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/release/promote-worker-image.sh --manifest <cloud-image-build-manifest.json> --pool-id <runner-pool-id> [--evidence-uri <uri>]
+Usage: scripts/release/write-worker-image-promotion-env.sh --manifest <cloud-image-build-manifest.json> --pool-id <runner-pool-id> (--out <path>|--github-env <path>) [--evidence-uri <uri>]
 
-Promotes the worker image from a pushed cloud image build manifest into the
-runner pool's active worker image state in Postgres. Requires DATABASE_URL.
+Writes BUCEPHALUS_PROMOTE_WORKER_* environment values for the Cloud Run worker
+image promotion job from a pushed, verified image build manifest.
 USAGE
 }
 
@@ -29,6 +30,10 @@ while [[ $# -gt 0 ]]; do
       EVIDENCE_URI="${2:-}"
       shift 2
       ;;
+    --out|--github-env)
+      OUTPUT_PATH="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -41,12 +46,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${MANIFEST}" || -z "${POOL_ID}" ]]; then
+if [[ -z "${MANIFEST}" || -z "${POOL_ID}" || -z "${OUTPUT_PATH}" ]]; then
   usage >&2
-  exit 2
-fi
-if [[ -z "${DATABASE_URL:-}" ]]; then
-  echo "DATABASE_URL is required to promote worker image state" >&2
   exit 2
 fi
 
@@ -59,6 +60,9 @@ elif command -v shasum >/dev/null 2>&1; then
 else
   echo "sha256sum or shasum is required" >&2
   exit 2
+fi
+if [[ -z "${EVIDENCE_URI}" ]]; then
+  EVIDENCE_URI="file://${MANIFEST}"
 fi
 
 worker_json="$(bun -e '
@@ -76,22 +80,22 @@ console.log(JSON.stringify({
   image: worker.immutable_ref,
   release_version: manifest.release.version,
   release_git_sha: manifest.release.git_sha,
+  boundary_verified_at: new Date().toISOString(),
 }));
 ' "${MANIFEST}")"
 
 image_ref="$(bun -e 'const data = JSON.parse(process.argv[1]); console.log(data.image);' "${worker_json}")"
 release_version="$(bun -e 'const data = JSON.parse(process.argv[1]); console.log(data.release_version);' "${worker_json}")"
 release_git_sha="$(bun -e 'const data = JSON.parse(process.argv[1]); console.log(data.release_git_sha);' "${worker_json}")"
-if [[ -z "${EVIDENCE_URI}" ]]; then
-  EVIDENCE_URI="file://${MANIFEST}"
-fi
+boundary_verified_at="$(bun -e 'const data = JSON.parse(process.argv[1]); console.log(data.boundary_verified_at);' "${worker_json}")"
 
-cd "${ROOT_DIR}/bucephalus-cloud"
-bun run scripts/promote-worker-image.ts \
-  --pool-id "${POOL_ID}" \
-  --image "${image_ref}" \
-  --release-version "${release_version}" \
-  --release-git-sha "${release_git_sha}" \
-  --promotion-evidence-uri "${EVIDENCE_URI}" \
-  --promotion-evidence-sha256 "sha256:${MANIFEST_SHA}" \
-  --metadata-json "{\"source\":\"cloud-image-build-manifest\"}"
+{
+  echo "BUCEPHALUS_PROMOTE_WORKER_POOL_ID=${POOL_ID}"
+  echo "BUCEPHALUS_PROMOTE_WORKER_IMAGE=${image_ref}"
+  echo "BUCEPHALUS_PROMOTE_WORKER_RELEASE_VERSION=${release_version}"
+  echo "BUCEPHALUS_PROMOTE_WORKER_RELEASE_GIT_SHA=${release_git_sha}"
+  echo "BUCEPHALUS_PROMOTE_WORKER_EVIDENCE_URI=${EVIDENCE_URI}"
+  echo "BUCEPHALUS_PROMOTE_WORKER_EVIDENCE_SHA256=sha256:${MANIFEST_SHA}"
+  echo "BUCEPHALUS_PROMOTE_WORKER_BOUNDARY_VERIFIED_AT=${boundary_verified_at}"
+  echo 'BUCEPHALUS_PROMOTE_WORKER_METADATA_JSON={"source":"cloud-image-build-manifest","trigger":"gcp-deploy-workflow"}'
+} >> "${OUTPUT_PATH}"

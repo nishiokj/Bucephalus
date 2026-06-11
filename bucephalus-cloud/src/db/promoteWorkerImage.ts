@@ -1,9 +1,8 @@
-#!/usr/bin/env bun
-import { createSql } from "../src/db/client";
-import { RunnerRepository } from "../src/runners/repository";
-import type { JsonObject } from "../src/primitives";
+import { createSql } from "./client";
+import { RunnerRepository } from "../runners/repository";
+import type { JsonObject } from "../primitives";
 
-interface Args {
+interface PromotionInput {
   poolId: string;
   imageRef: string;
   releaseVersion: string | null;
@@ -33,8 +32,8 @@ const knownArgs = new Set([
   "metadata-json",
 ]);
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
+export async function main(argv = process.argv.slice(2)): Promise<void> {
+  const args = parseArgs(argv);
   const image = parseImageRef(args.imageRef);
   const sql = createSql();
   try {
@@ -64,7 +63,10 @@ async function main() {
   }
 }
 
-function parseArgs(argv: string[]): Args {
+export function parseArgs(argv: string[]): PromotionInput {
+  if (argv.length === 0 && process.env.BUCEPHALUS_PROMOTE_WORKER_IMAGE) {
+    return parseEnv();
+  }
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index] ?? "";
@@ -86,20 +88,17 @@ function parseArgs(argv: string[]): Args {
     index += 1;
   }
 
-  const poolId = required(values, "pool-id");
-  const imageRef = required(values, "image");
   const releaseGitSha = optional(values, "release-git-sha");
   if (releaseGitSha && !gitSha.test(releaseGitSha)) {
     fail("--release-git-sha must be a 40-character lowercase git SHA");
   }
-
   const metadata = parseMetadata(optional(values, "metadata-json"));
-  metadata.promoted_by = metadata.promoted_by ?? "bucephalus-cloud-promote-worker-image";
+  metadata.promoted_by = metadata.promoted_by ?? "bucephalus-cloud-worker-image-promotion";
   metadata.promoted_at = metadata.promoted_at ?? new Date().toISOString();
 
   return {
-    poolId,
-    imageRef,
+    poolId: required(values, "pool-id"),
+    imageRef: required(values, "image"),
     releaseVersion: optional(values, "release-version"),
     releaseGitSha,
     promotionEvidenceUri: optional(values, "promotion-evidence-uri"),
@@ -107,6 +106,38 @@ function parseArgs(argv: string[]): Args {
     modalLauncherSha256: normalizeSha256(optional(values, "modal-launcher-sha256"), "--modal-launcher-sha256"),
     workerRunnerSha256: normalizeSha256(optional(values, "worker-runner-sha256"), "--worker-runner-sha256"),
     boundaryVerifiedAt: optional(values, "boundary-verified-at"),
+    metadata,
+  };
+}
+
+function parseEnv(): PromotionInput {
+  const releaseGitSha = envOptional("BUCEPHALUS_PROMOTE_WORKER_RELEASE_GIT_SHA");
+  if (releaseGitSha && !gitSha.test(releaseGitSha)) {
+    fail("BUCEPHALUS_PROMOTE_WORKER_RELEASE_GIT_SHA must be a 40-character lowercase git SHA");
+  }
+  const metadata = parseMetadata(envOptional("BUCEPHALUS_PROMOTE_WORKER_METADATA_JSON"));
+  metadata.promoted_by = metadata.promoted_by ?? "bucephalus-cloud-worker-image-promotion";
+  metadata.promoted_at = metadata.promoted_at ?? new Date().toISOString();
+
+  return {
+    poolId: envRequired("BUCEPHALUS_PROMOTE_WORKER_POOL_ID"),
+    imageRef: envRequired("BUCEPHALUS_PROMOTE_WORKER_IMAGE"),
+    releaseVersion: envOptional("BUCEPHALUS_PROMOTE_WORKER_RELEASE_VERSION"),
+    releaseGitSha,
+    promotionEvidenceUri: envOptional("BUCEPHALUS_PROMOTE_WORKER_EVIDENCE_URI"),
+    promotionEvidenceSha256: normalizeSha256(
+      envOptional("BUCEPHALUS_PROMOTE_WORKER_EVIDENCE_SHA256"),
+      "BUCEPHALUS_PROMOTE_WORKER_EVIDENCE_SHA256",
+    ),
+    modalLauncherSha256: normalizeSha256(
+      envOptional("BUCEPHALUS_PROMOTE_WORKER_MODAL_LAUNCHER_SHA256"),
+      "BUCEPHALUS_PROMOTE_WORKER_MODAL_LAUNCHER_SHA256",
+    ),
+    workerRunnerSha256: normalizeSha256(
+      envOptional("BUCEPHALUS_PROMOTE_WORKER_RUNNER_SHA256"),
+      "BUCEPHALUS_PROMOTE_WORKER_RUNNER_SHA256",
+    ),
+    boundaryVerifiedAt: envOptional("BUCEPHALUS_PROMOTE_WORKER_BOUNDARY_VERIFIED_AT"),
     metadata,
   };
 }
@@ -163,13 +194,26 @@ function optional(values: Map<string, string>, key: string): string | null {
   return value && value.trim() !== "" ? value.trim() : null;
 }
 
+function envRequired(name: string): string {
+  const value = envOptional(name);
+  if (!value) {
+    fail(`${name} is required`);
+  }
+  return value;
+}
+
+function envOptional(name: string): string | null {
+  const value = process.env[name];
+  return value && value.trim() !== "" ? value.trim() : null;
+}
+
 function fail(message: string): never {
   console.error(message);
   usage(2);
 }
 
 function usage(exitCode: number): never {
-  console.error(`Usage: bun run scripts/promote-worker-image.ts --pool-id <runner-pool-id> --image <image@sha256:digest> [options]
+  console.error(`Usage: bun run src/db/promoteWorkerImage.ts --pool-id <runner-pool-id> --image <image@sha256:digest> [options]
 
 Options:
   --release-version <version>

@@ -176,6 +176,23 @@ user OAuth client ID, and the JWKS URL is
 `https://www.googleapis.com/oauth2/v3/certs`. Setting
 `BUCEPHALUS_CLOUD_AUTH_REQUIRED=false` is rejected at startup.
 
+The API also enables a lightweight in-process rate limiter for every `/v1/*`
+request before auth, database, or route work. It keeps both a client-IP bucket
+and a presented-credential bucket, so anonymous spam, invalid bearer rotation,
+and one API key used from many clients are all constrained. Defaults are a
+60-second window, 300 requests per client IP, and 120 requests per credential.
+Tune with:
+
+```bash
+BUCEPHALUS_CLOUD_RATE_LIMIT_ENABLED=true
+BUCEPHALUS_CLOUD_RATE_LIMIT_WINDOW_MS=60000
+BUCEPHALUS_CLOUD_RATE_LIMIT_IP_MAX=300
+BUCEPHALUS_CLOUD_RATE_LIMIT_CREDENTIAL_MAX=120
+```
+
+Limited callers receive `429` with `Retry-After`, `RateLimit-Limit`,
+`RateLimit-Remaining`, and `RateLimit-Reset` headers.
+
 The identity-provider JWT is only the sign-in credential. Clients exchange it
 once via `POST /v1/auth/sessions` for a Bucephalus session token (opaque
 `buc_` bearer, hashed at rest, sliding 30-day expiry, revocation-checked on

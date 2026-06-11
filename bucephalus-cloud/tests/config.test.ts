@@ -52,6 +52,31 @@ describe("config", () => {
     expect(config.runnerAdminToken).toBe("runner-admin-token");
   });
 
+  test("loads rate limiting safety defaults", () => {
+    expect(loadConfig({}).rateLimit).toEqual({
+      enabled: true,
+      windowMs: 60_000,
+      ipMax: 300,
+      credentialMax: 120,
+    });
+  });
+
+  test("loads rate limiting overrides", () => {
+    const config = loadConfig({
+      BUCEPHALUS_CLOUD_RATE_LIMIT_ENABLED: "false",
+      BUCEPHALUS_CLOUD_RATE_LIMIT_WINDOW_MS: "5000",
+      BUCEPHALUS_CLOUD_RATE_LIMIT_IP_MAX: "25",
+      BUCEPHALUS_CLOUD_RATE_LIMIT_CREDENTIAL_MAX: "10",
+    });
+
+    expect(config.rateLimit).toEqual({
+      enabled: false,
+      windowMs: 5000,
+      ipMax: 25,
+      credentialMax: 10,
+    });
+  });
+
   test("uses filesystem object storage by default", () => {
     expect(loadConfig({}).storage).toEqual({ backend: "filesystem" });
   });

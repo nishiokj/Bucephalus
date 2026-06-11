@@ -34,7 +34,7 @@ use crate::view_spec::{
 };
 
 #[derive(Parser)]
-#[command(name = "bucephalus", version = "0.3.0", about = "Bucephalus CLI")]
+#[command(name = "bucephalus", version = env!("CARGO_PKG_VERSION"), about = "Bucephalus CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -1752,7 +1752,7 @@ fn auth_status(home: &Path) -> Value {
             paths.access.display().to_string()
         ],
         "api_url": cloud_api_base_url(),
-        "note": "Local Core and latch smoke fixtures do not require Cloud auth. Cloud benchmark resolution and upload require first-party user auth.",
+        "note": "Local Core and latch smoke fixtures do not require Cloud auth. Cloud-backed benchmark resolution and result submission require first-party user auth.",
         "actions": [
             {
                 "type": "cli_command",
@@ -2360,6 +2360,7 @@ fn run_update(options: UpdateOptions) -> Result<Value> {
     })();
     let _ = fs::remove_dir_all(&tmp_dir);
     result?;
+    let installed_version = installed_bucephalus_version(&install_dir);
 
     Ok(json!({
         "schema_version": "bucephalus_update_v1",
@@ -2371,8 +2372,21 @@ fn run_update(options: UpdateOptions) -> Result<Value> {
         "repo": plan["repo"],
         "setup": plan["setup"],
         "no_modify_path": plan["no_modify_path"],
+        "installed_version": installed_version,
         "updated": true
     }))
+}
+
+fn installed_bucephalus_version(install_dir: &Path) -> Option<String> {
+    let output = Command::new(install_dir.join("bucephalus"))
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.split_whitespace().nth(1).map(str::to_string)
 }
 
 fn default_update_install_dir() -> Result<PathBuf> {
@@ -5656,10 +5670,14 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 return Ok(Some(result));
             }
             println!("update: {}", if dry_run { "planned" } else { "complete" });
-            println!(
-                "version: {}",
-                result["version"].as_str().unwrap_or("unknown")
-            );
+            let requested_version = result["version"].as_str().unwrap_or("unknown");
+            let installed_version = result["installed_version"]
+                .as_str()
+                .unwrap_or(requested_version);
+            println!("version: {}", installed_version);
+            if installed_version != requested_version {
+                println!("requested_version: {}", requested_version);
+            }
             println!(
                 "install_dir: {}",
                 result["install_dir"].as_str().unwrap_or("unknown")

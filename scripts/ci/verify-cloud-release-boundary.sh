@@ -287,6 +287,13 @@ if (!deployWorkflowText.includes("BUCEPHALUS_TERRAFORM_BACKEND_BUCKET") || !depl
 if (!deployWorkflowText.includes("gcloud run jobs execute") || !deployWorkflowText.includes("-migrations")) {
   fail(`${deployWorkflowPath} must run the scoped Cloud Run migration job after apply`);
 }
+if (
+  !deployWorkflowText.includes("write-worker-image-promotion-env.sh")
+  || !deployWorkflowText.includes("-worker-image-promotion")
+  || !deployWorkflowText.includes("BUCEPHALUS_PROMOTE_WORKER_IMAGE")
+) {
+  fail(`${deployWorkflowPath} must promote the active worker image through the Cloud Run worker-image promotion job after apply`);
+}
 if (deployWorkflowText.includes("-target=google_cloud_run_v2_job.migrations")) {
   fail(`${deployWorkflowPath} must not use targeted Terraform applies for normal deploy flow`);
 }
@@ -731,6 +738,7 @@ if (!cloudImageBuildText.includes("bucephalus-cloud/runtime-dist")) {
 for (const requiredRuntimeEntry of [
   "runtime-dist/server.js",
   "runtime-dist/db/migrate.js",
+  "runtime-dist/db/promoteWorkerImage.js",
   "runtime-dist/poolController.js",
   "runtime-dist/worker.js",
   "runtime-dist/secretResolver.js",
@@ -779,7 +787,7 @@ for (const dockerfilePath of listFiles("bucephalus-cloud/images").filter((file) 
 }
 const componentRuntimeEntries = new Map([
   ["bucephalus-cloud/images/Dockerfile.api", ["runtime-dist/server.js"]],
-  ["bucephalus-cloud/images/Dockerfile.migrations", ["runtime-dist/db/migrate.js"]],
+  ["bucephalus-cloud/images/Dockerfile.migrations", ["runtime-dist/db/migrate.js", "runtime-dist/db/promoteWorkerImage.js"]],
   ["bucephalus-cloud/images/Dockerfile.pool-controller", ["runtime-dist/poolController.js"]],
   ["bucephalus-cloud/images/Dockerfile.worker", ["runtime-dist/worker.js", "runtime-dist/secretResolver.js", "runtime-dist/networkPolicyClient.js", "bin/bucephalus"]],
 ]);
@@ -928,6 +936,13 @@ if (!/resource\s+"google_project_iam_member"\s+"runner_artifact_registry_reader"
 }
 if (!/google_project_iam_member\.runner_artifact_registry_reader/.test(gcpInfraText)) {
   fail(`${gcpInfraPath} pool controller must depend on runner Artifact Registry reader IAM before provisioning VMs`);
+}
+if (
+  !/resource\s+"google_cloud_run_v2_job"\s+"worker_image_promotion"/.test(gcpInfraText)
+  || !gcpInfraText.includes("runtime-dist/db/promoteWorkerImage.js")
+  || !/resource\s+"google_cloud_run_v2_job"\s+"worker_image_promotion"[\s\S]*google_vpc_access_connector\.control_plane/.test(gcpInfraText)
+) {
+  fail(`${gcpInfraPath} must define an in-GCP Cloud Run worker image promotion job with DB/VPC access`);
 }
 for (const requiredService of [
   "iam.googleapis.com",

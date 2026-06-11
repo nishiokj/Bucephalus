@@ -6,6 +6,7 @@ export interface AppConfig {
   workerToken: string | null;
   runnerAdminToken: string | null;
   auth: AuthConfig;
+  rateLimit: RateLimitConfig;
   storage: StorageConfig;
   secrets: SecretsStoreConfig;
 }
@@ -26,6 +27,13 @@ export interface AuthConfig {
   issuer: string | null;
   audiences: string[] | null;
   jwksUrl: string | null;
+}
+
+export interface RateLimitConfig {
+  enabled: boolean;
+  windowMs: number;
+  ipMax: number;
+  credentialMax: number;
 }
 
 export type StorageConfig =
@@ -75,8 +83,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       audiences,
       jwksUrl,
     },
+    rateLimit: loadRateLimitConfig(env),
     storage: loadStorageConfig(env),
     secrets: loadSecretsStoreConfig(env),
+  };
+}
+
+function loadRateLimitConfig(env: NodeJS.ProcessEnv): RateLimitConfig {
+  return {
+    enabled: parseBoolean(env.BUCEPHALUS_CLOUD_RATE_LIMIT_ENABLED, true),
+    windowMs: parsePositiveInteger(env.BUCEPHALUS_CLOUD_RATE_LIMIT_WINDOW_MS, 60_000),
+    ipMax: parsePositiveInteger(env.BUCEPHALUS_CLOUD_RATE_LIMIT_IP_MAX, 300),
+    credentialMax: parsePositiveInteger(env.BUCEPHALUS_CLOUD_RATE_LIMIT_CREDENTIAL_MAX, 120),
   };
 }
 
@@ -173,4 +191,23 @@ function parseCsv(value: string | undefined): string[] | null {
     .map((part) => part.trim())
     .filter(Boolean);
   return values.length === 0 ? null : values;
+}
+
+function parsePositiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined) {
+    return fallback;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
 }

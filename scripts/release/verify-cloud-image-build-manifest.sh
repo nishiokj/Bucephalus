@@ -361,7 +361,10 @@ for (const image of manifest.images) {
     const expectedContextPayloads = {
       api: ["bucephalus-cloud/runtime-dist/server.js"],
       "pool-controller": ["bucephalus-cloud/runtime-dist/poolController.js"],
-      migrations: ["bucephalus-cloud/runtime-dist/db/migrate.js"],
+      migrations: [
+        "bucephalus-cloud/runtime-dist/db/migrate.js",
+        "bucephalus-cloud/runtime-dist/db/promoteWorkerImage.js",
+      ],
       worker: [
         "bucephalus-cloud/runtime-dist/worker.js",
         "bucephalus-cloud/runtime-dist/secretResolver.js",

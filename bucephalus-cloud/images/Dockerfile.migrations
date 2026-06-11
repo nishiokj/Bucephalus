@@ -20,6 +20,7 @@ ENV BUCEPHALUS_RELEASE_GIT_SHA="${BUCEPHALUS_RELEASE_GIT_SHA}"
 WORKDIR /opt/bucephalus-cloud
 
 COPY --chown=bun:bun bucephalus-cloud/runtime-dist/db/migrate.js ./runtime-dist/db/migrate.js
+COPY --chown=bun:bun bucephalus-cloud/runtime-dist/db/promoteWorkerImage.js ./runtime-dist/db/promoteWorkerImage.js
 COPY --chown=bun:bun bucephalus-cloud/db ./db
 
 USER bun

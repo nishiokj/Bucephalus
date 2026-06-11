@@ -35,8 +35,9 @@ bucephalus setup uninstall --client cursor-project --project <project-dir>
 
 `setup status` reports daemon service state, daemon readiness, MCP registration,
 and Cloud auth readiness. Local Core smoke fixtures do not require Cloud auth;
-Cloud benchmark resolution and upload require `BUCEPHALUS_CLOUD_USER_TOKEN` or
-a token file at `<BUCEPHALUS_HOME>/auth/cloud_user_token`. Use
+Cloud benchmark resolution and result submission require
+`BUCEPHALUS_CLOUD_USER_TOKEN` or a token file at
+`<BUCEPHALUS_HOME>/auth/cloud_user_token`. Use
 `bucephalus logout` to remove cached token files; if `BUCEPHALUS_CLOUD_USER_TOKEN`
 is set in the environment, unset that variable as well.
 

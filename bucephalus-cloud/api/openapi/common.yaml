@@ -54,6 +54,33 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: The request exceeded the configured API rate limit.
+      headers:
+        Retry-After:
+          description: Seconds until the client should retry.
+          schema:
+            type: integer
+            minimum: 1
+        RateLimit-Limit:
+          description: Maximum requests allowed in the current window.
+          schema:
+            type: integer
+            minimum: 1
+        RateLimit-Remaining:
+          description: Requests remaining in the current window.
+          schema:
+            type: integer
+            minimum: 0
+        RateLimit-Reset:
+          description: Seconds until the current window resets.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
   schemas:
     Digest:
       type: string

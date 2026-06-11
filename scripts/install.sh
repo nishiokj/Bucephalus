@@ -278,7 +278,7 @@ install -m 0755 "${tmp_dir}/bucephalus" "${install_dir}/bucephalus"
 install -m 0755 "${tmp_dir}/bucephalus-cloud" "${install_dir}/bucephalus-cloud"
 install -m 0755 "${tmp_dir}/bucephalus-modal-launcher" "${install_dir}/bucephalus-modal-launcher"
 
-printf '%s\n' "Installed bucephalus, bucephalus-cloud, and bucephalus-modal-launcher to ${install_dir}"
+printf '%s\n' "Installed bucephalus, bucephalus-cloud (operator utility), and bucephalus-modal-launcher to ${install_dir}"
 "${install_dir}/bucephalus" --version
 
 # Idempotently append an export line to a POSIX shell profile. The sentinel

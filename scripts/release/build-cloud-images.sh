@@ -168,6 +168,7 @@ prepare_image_context() {
       ;;
     migrations)
       copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/db/migrate.js" "${context_dir}/bucephalus-cloud/runtime-dist/db/migrate.js"
+      copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/db/promoteWorkerImage.js" "${context_dir}/bucephalus-cloud/runtime-dist/db/promoteWorkerImage.js"
       copy_context_path "${RELEASE_DIR}/bucephalus-cloud/db" "${context_dir}/bucephalus-cloud/db"
       ;;
     pool-controller)
