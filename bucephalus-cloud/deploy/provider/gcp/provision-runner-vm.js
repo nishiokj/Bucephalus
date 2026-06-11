@@ -388,7 +388,11 @@ fi
 if [[ "\${MODAL_ENABLED}" == "true" ]]; then
   modal_token_id="$(secret_access "\${MODAL_TOKEN_ID_SECRET}" "\${MODAL_TOKEN_ID_SECRET_VERSION}")"
   modal_token_secret="$(secret_access "\${MODAL_TOKEN_SECRET_SECRET}" "\${MODAL_TOKEN_SECRET_SECRET_VERSION}")"
-  if [[ -z "\${MODAL_S3_SECRET_NAME}" ]]; then
+  modal_uses_gcs_service_account_sync=false
+  if [[ "\${MODAL_S3_ENDPOINT_URL}" == *storage.googleapis.com* && -n "\${MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET}" ]]; then
+    modal_uses_gcs_service_account_sync=true
+  fi
+  if [[ -z "\${MODAL_S3_SECRET_NAME}" && "\${modal_uses_gcs_service_account_sync}" != "true" ]]; then
     modal_s3_access_key_id="$(secret_access "\${MODAL_S3_ACCESS_KEY_ID_SECRET}" "\${MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION}")"
     modal_s3_secret_access_key="$(secret_access "\${MODAL_S3_SECRET_ACCESS_KEY_SECRET}" "\${MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION}")"
   fi
@@ -437,7 +441,7 @@ EOF
   fi
   if [[ -n "\${MODAL_S3_SECRET_NAME}" ]]; then
     printf 'BUCEPHALUS_MODAL_S3_SECRET=%s\\n' "\${MODAL_S3_SECRET_NAME}" >>/etc/bucephalus/worker.env
-  else
+  elif [[ "\${modal_uses_gcs_service_account_sync}" != "true" ]]; then
     printf 'BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID=%s\\n' "\${modal_s3_access_key_id}" >>/etc/bucephalus/worker.env
     printf 'BUCEPHALUS_MODAL_S3_SECRET_ACCESS_KEY=%s\\n' "\${modal_s3_secret_access_key}" >>/etc/bucephalus/worker.env
   fi
@@ -519,6 +523,12 @@ function modalConfig() {
   return config;
 }
 
+function modalUsesGcsServiceAccountSync(config) {
+  return String(config.s3EndpointUrl || "").includes("storage.googleapis.com")
+    && String(config.gcpArtifactRegistryServiceAccountJsonSecret || "").trim()
+    && String(config.gcpArtifactRegistryServiceAccountJsonSecretVersion || "").trim();
+}
+
 function validateModalStartupConfig(config) {
   if (!config.enabled) {
     return;
@@ -532,7 +542,12 @@ function validateModalStartupConfig(config) {
     ["BUCEPHALUS_GCP_MODAL_S3_BUCKET", config.s3Bucket],
     ["BUCEPHALUS_GCP_MODAL_S3_PREFIX", config.s3Prefix],
   ];
-  if (!config.s3SecretName) {
+  if (!config.s3SecretName && modalUsesGcsServiceAccountSync(config)) {
+    required.push(
+      ["BUCEPHALUS_GCP_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET", config.gcpArtifactRegistryServiceAccountJsonSecret],
+      ["BUCEPHALUS_GCP_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION", config.gcpArtifactRegistryServiceAccountJsonSecretVersion],
+    );
+  } else if (!config.s3SecretName) {
     required.push(
       ["BUCEPHALUS_GCP_MODAL_S3_ACCESS_KEY_ID_SECRET", config.s3AccessKeyIdSecret],
       ["BUCEPHALUS_GCP_MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION", config.s3AccessKeyIdSecretVersion],

@@ -32,6 +32,27 @@ describe("GCE runner provider Modal bridge", () => {
     expect(script).not.toContain("actual-modal-token-secret");
   });
 
+  test("renders Modal GCS sync without requiring S3 access key secrets", () => {
+    const script = renderStartupScript({
+      ...startupConfig(),
+      modal: {
+        ...startupConfig().modal,
+        s3Bucket: "gen-lang-client-0255842044-buc-bucephalus-objects",
+        s3EndpointUrl: "https://storage.googleapis.com",
+        s3Region: "",
+        s3AccessKeyIdSecret: "",
+        s3AccessKeyIdSecretVersion: "",
+        s3SecretAccessKeySecret: "",
+        s3SecretAccessKeySecretVersion: "",
+      },
+    });
+
+    expect(script).toContain("modal_uses_gcs_service_account_sync=true");
+    expect(script).toContain("if [[ -z \"${MODAL_S3_SECRET_NAME}\" && \"${modal_uses_gcs_service_account_sync}\" != \"true\" ]]; then");
+    expect(script).toContain("elif [[ \"${modal_uses_gcs_service_account_sync}\" != \"true\" ]]; then");
+    expect(script).toContain("printf 'BUCEPHALUS_MODAL_GCP_SERVICE_ACCOUNT_JSON_B64=%s\\n' \"${modal_gcp_artifact_registry_service_account_json_b64}\"");
+  });
+
   test("fails fast for Modal path-style S3 because the Modal Go SDK cannot mount it", () => {
     expect(() => renderStartupScript({
       ...startupConfig(),

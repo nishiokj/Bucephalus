@@ -5,6 +5,12 @@ locals {
   deploy_pool_controller        = var.deploy_control_plane_services || var.deploy_pool_controller
   runner_gce_zone               = coalesce(var.runner_gce_zone, "${var.region}-a")
   cloud_gcs_bucket_name         = coalesce(var.cloud_gcs_bucket, "${var.project_id}-${local.name_prefix}-objects")
+  modal_gcs_service_account_sync = (
+    var.modal_s3_endpoint_url != null &&
+    length(regexall("storage[.]googleapis[.]com", var.modal_s3_endpoint_url)) > 0 &&
+    var.modal_gcp_artifact_registry_service_account_json_secret_version != null
+  )
+  modal_requires_s3_secret_versions = var.modal_backend_enabled && var.modal_s3_secret_name == null && !local.modal_gcs_service_account_sync
 
   labels = merge(var.labels, {
     app         = "bucephalus-cloud"
@@ -92,6 +98,7 @@ locals {
       secret_key = "modal_token_secret"
       member     = "serviceAccount:${google_service_account.runner.email}"
     }
+    }, local.modal_requires_s3_secret_versions ? {
     modal_s3_access_key_id_runner = {
       secret_key = "modal_s3_access_key_id"
       member     = "serviceAccount:${google_service_account.runner.email}"
@@ -100,7 +107,7 @@ locals {
       secret_key = "modal_s3_secret_access_key"
       member     = "serviceAccount:${google_service_account.runner.email}"
     }
-    }, var.modal_gcp_artifact_registry_service_account_json_secret_version != null ? {
+    } : {}, var.modal_gcp_artifact_registry_service_account_json_secret_version != null ? {
     modal_gcp_artifact_registry_sa_json_runner = {
       secret_key = "modal_gcp_artifact_registry_sa_json"
       member     = "serviceAccount:${google_service_account.runner.email}"
@@ -229,12 +236,12 @@ resource "terraform_data" "deploy_input_preflight" {
       error_message = "modal_s3_prefix must be non-empty when modal_backend_enabled is true."
     }
     precondition {
-      condition     = !local.deploy_pool_controller || !var.modal_backend_enabled || var.modal_s3_secret_name != null || var.modal_s3_access_key_id_secret_version != null
-      error_message = "modal_s3_access_key_id_secret_version is required when modal_backend_enabled is true and modal_s3_secret_name is unset."
+      condition     = !local.deploy_pool_controller || !local.modal_requires_s3_secret_versions || var.modal_s3_access_key_id_secret_version != null
+      error_message = "modal_s3_access_key_id_secret_version is required when modal_backend_enabled is true, modal_s3_secret_name is unset, and the sync bucket is not using the GCS service-account path."
     }
     precondition {
-      condition     = !local.deploy_pool_controller || !var.modal_backend_enabled || var.modal_s3_secret_name != null || var.modal_s3_secret_access_key_secret_version != null
-      error_message = "modal_s3_secret_access_key_secret_version is required when modal_backend_enabled is true and modal_s3_secret_name is unset."
+      condition     = !local.deploy_pool_controller || !local.modal_requires_s3_secret_versions || var.modal_s3_secret_access_key_secret_version != null
+      error_message = "modal_s3_secret_access_key_secret_version is required when modal_backend_enabled is true, modal_s3_secret_name is unset, and the sync bucket is not using the GCS service-account path."
     }
     precondition {
       condition     = !local.deploy_pool_controller || !var.modal_backend_enabled || !var.modal_s3_force_path_style
@@ -926,7 +933,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
       }
 
       dynamic "env" {
-        for_each = var.modal_backend_enabled && var.modal_s3_secret_name == null ? [1] : []
+        for_each = local.modal_requires_s3_secret_versions ? [1] : []
         content {
           name  = "BUCEPHALUS_GCP_MODAL_S3_ACCESS_KEY_ID_SECRET"
           value = google_secret_manager_secret.control_plane["modal_s3_access_key_id"].secret_id
@@ -934,7 +941,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
       }
 
       dynamic "env" {
-        for_each = var.modal_backend_enabled && var.modal_s3_secret_name == null ? [1] : []
+        for_each = local.modal_requires_s3_secret_versions ? [1] : []
         content {
           name  = "BUCEPHALUS_GCP_MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION"
           value = var.modal_s3_access_key_id_secret_version
@@ -942,7 +949,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
       }
 
       dynamic "env" {
-        for_each = var.modal_backend_enabled && var.modal_s3_secret_name == null ? [1] : []
+        for_each = local.modal_requires_s3_secret_versions ? [1] : []
         content {
           name  = "BUCEPHALUS_GCP_MODAL_S3_SECRET_ACCESS_KEY_SECRET"
           value = google_secret_manager_secret.control_plane["modal_s3_secret_access_key"].secret_id
@@ -950,7 +957,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
       }
 
       dynamic "env" {
-        for_each = var.modal_backend_enabled && var.modal_s3_secret_name == null ? [1] : []
+        for_each = local.modal_requires_s3_secret_versions ? [1] : []
         content {
           name  = "BUCEPHALUS_GCP_MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION"
           value = var.modal_s3_secret_access_key_secret_version

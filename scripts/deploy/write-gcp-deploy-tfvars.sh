@@ -373,6 +373,11 @@ const deployServices = values.deploy_control_plane_services === "true";
 const deployApi = deployServices || values.deploy_api_services === "true" || values.deploy_pool_controller === "true";
 const deployPoolController = deployServices || values.deploy_pool_controller === "true";
 const modalEnabled = values.modal_backend_enabled === "true";
+const modalUsesGcsServiceAccountSync =
+  typeof values.modal_s3_endpoint_url === "string" &&
+  values.modal_s3_endpoint_url.includes("storage.googleapis.com") &&
+  typeof values.modal_gcp_artifact_registry_service_account_json_secret_version === "string" &&
+  /^[1-9][0-9]*$/.test(values.modal_gcp_artifact_registry_service_account_json_secret_version);
 const checks = [
   ...alwaysChecks,
   ...(deployApi ? serviceChecks : []),
@@ -400,10 +405,10 @@ if (deployPoolController && modalEnabled) {
       fail(`${name} is invalid for deploy tfvars`);
     }
   }
-  if (values.modal_s3_secret_name === null) {
+  if (values.modal_s3_secret_name === null && !modalUsesGcsServiceAccountSync) {
     for (const name of ["modal_s3_access_key_id_secret_version", "modal_s3_secret_access_key_secret_version"]) {
       if (typeof values[name] !== "string" || !/^[1-9][0-9]*$/.test(values[name])) {
-        fail(`${name} is required when modal_s3_secret_name is unset`);
+        fail(`${name} is required when modal_s3_secret_name is unset and the sync bucket is not using the GCS service-account path`);
       }
     }
   }
