@@ -7,7 +7,19 @@ export interface AppConfig {
   runnerAdminToken: string | null;
   auth: AuthConfig;
   storage: StorageConfig;
+  secrets: SecretsStoreConfig;
 }
+
+export type SecretsStoreConfig =
+  | {
+      backend: "filesystem";
+      prefix: string;
+    }
+  | {
+      backend: "gcp";
+      project: string;
+      prefix: string;
+    };
 
 export interface AuthConfig {
   required: boolean;
@@ -64,7 +76,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       jwksUrl,
     },
     storage: loadStorageConfig(env),
+    secrets: loadSecretsStoreConfig(env),
   };
+}
+
+function loadSecretsStoreConfig(env: NodeJS.ProcessEnv): SecretsStoreConfig {
+  const backend = (env.BUCEPHALUS_CLOUD_SECRETS_BACKEND?.trim() || "filesystem").toLowerCase();
+  const prefix = env.BUCEPHALUS_CLOUD_SECRETS_PREFIX?.trim() || "buc";
+  if (!/^[A-Za-z0-9_-]+$/.test(prefix)) {
+    throw new Error(`Invalid BUCEPHALUS_CLOUD_SECRETS_PREFIX: ${prefix}`);
+  }
+  if (backend === "filesystem") {
+    return { backend: "filesystem", prefix };
+  }
+  if (backend !== "gcp") {
+    throw new Error(`Unsupported BUCEPHALUS_CLOUD_SECRETS_BACKEND: ${backend}`);
+  }
+  const project = env.BUCEPHALUS_CLOUD_SECRETS_GCP_PROJECT?.trim() || null;
+  if (!project) {
+    throw new Error("BUCEPHALUS_CLOUD_SECRETS_GCP_PROJECT is required for the GCP secrets backend");
+  }
+  return { backend: "gcp", project, prefix };
 }
 
 function defaultJwksUrl(issuer: string | null): string | null {

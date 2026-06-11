@@ -11,6 +11,7 @@ use crate::model::*;
 use crate::package::cas::{package_blob_path_for_digest, read_cas_pointer, PACKAGE_BLOBS_DIR};
 use crate::package::checks::{PACKAGE_CHECKS_FILE, PACKAGE_CHECKS_SCHEMA_VERSION};
 use crate::package::compile::as_portable_rel;
+use crate::package::validate::validate_schema_contract_value;
 
 struct VerifiedPackageIntegrity {
     resolved_experiment: Value,
@@ -70,6 +71,7 @@ fn require_sealed_manifest_keys(manifest: &Value) -> Result<()> {
         "created_at",
         "resolved_experiment",
         "checksums_ref",
+        "package_checks_ref",
         "package_digest",
     ] {
         if !obj.contains_key(key) {
@@ -100,6 +102,7 @@ fn verify_sealed_package_integrity_snapshot(
             "preflight_failed: manifest schema_version must be 'sealed_run_package_v2'"
         ));
     }
+    validate_schema_contract_value(manifest, "sealed package manifest")?;
     let checksums_ref = manifest
         .pointer("/checksums_ref")
         .and_then(Value::as_str)
@@ -115,6 +118,7 @@ fn verify_sealed_package_integrity_snapshot(
             "preflight_failed: checksums schema_version must be 'sealed_package_checksums_v2'"
         ));
     }
+    validate_schema_contract_value(&checksums, "sealed package checksums")?;
     let files = checksums
         .pointer("/files")
         .and_then(Value::as_object)
@@ -185,30 +189,47 @@ fn verify_sealed_package_integrity_snapshot(
             "preflight_failed: package.lock digest does not match manifest package_digest"
         ));
     }
-    if let Some(package_checks_ref) = manifest
+    let package_checks_ref_value = manifest
         .pointer("/package_checks_ref")
+        .ok_or_else(|| anyhow!("sealed package manifest missing package_checks_ref"))?;
+    let package_checks_ref = package_checks_ref_value
+        .as_str()
+        .ok_or_else(|| anyhow!("sealed package manifest package_checks_ref must be a string"))?;
+    validate_metadata_ref_outside_runtime_payload(package_checks_ref, "package_checks_ref")?;
+    let package_checks_path =
+        resolve_package_path_under_root(package_dir, package_checks_ref, "package_checks_ref")?;
+    let package_checks = load_json_file(&package_checks_path).map_err(|err| {
+        anyhow!(
+            "preflight_failed: package checks missing or unreadable at {}: {}",
+            package_checks_path.display(),
+            err
+        )
+    })?;
+    if package_checks
+        .pointer("/schema_version")
         .and_then(Value::as_str)
+        != Some(PACKAGE_CHECKS_SCHEMA_VERSION)
     {
-        validate_metadata_ref_outside_runtime_payload(package_checks_ref, "package_checks_ref")?;
-        let package_checks_path =
-            resolve_package_path_under_root(package_dir, package_checks_ref, "package_checks_ref")?;
-        let package_checks = load_json_file(&package_checks_path).map_err(|err| {
-            anyhow!(
-                "preflight_failed: package checks missing or unreadable at {}: {}",
-                package_checks_path.display(),
-                err
-            )
-        })?;
-        if package_checks
-            .pointer("/schema_version")
-            .and_then(Value::as_str)
-            != Some(PACKAGE_CHECKS_SCHEMA_VERSION)
-        {
-            return Err(anyhow!(
-                "preflight_failed: package checks schema_version must be '{}'",
-                PACKAGE_CHECKS_SCHEMA_VERSION
-            ));
-        }
+        return Err(anyhow!(
+            "preflight_failed: package checks schema_version must be '{}'",
+            PACKAGE_CHECKS_SCHEMA_VERSION
+        ));
+    }
+    validate_schema_contract_value(&package_checks, "package checks")?;
+    validate_package_checks_report_consistency(&package_checks)?;
+    if package_checks
+        .pointer("/package_digest")
+        .and_then(Value::as_str)
+        != Some(manifest_digest)
+    {
+        return Err(anyhow!(
+            "preflight_failed: package checks digest does not match manifest package_digest"
+        ));
+    }
+    if package_checks.pointer("/passed").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow!(
+            "preflight_failed: package checks report did not pass"
+        ));
     }
     let resolved_path = resolve_package_path_under_root(
         package_dir,
@@ -222,6 +243,18 @@ fn verify_sealed_package_integrity_snapshot(
             err
         )
     })?;
+    let manifest_resolved_experiment = manifest
+        .pointer("/resolved_experiment")
+        .ok_or_else(|| anyhow!("sealed package manifest missing resolved_experiment"))?;
+    let manifest_resolved_digest = canonical_json_digest(manifest_resolved_experiment);
+    let file_resolved_digest = canonical_json_digest(&resolved_experiment);
+    if manifest_resolved_digest != file_resolved_digest {
+        return Err(anyhow!(
+            "preflight_failed: manifest resolved_experiment does not match resolved_experiment.json (manifest={}, file={})",
+            manifest_resolved_digest,
+            file_resolved_digest
+        ));
+    }
     let staging_manifest_path =
         resolve_package_path_under_root(package_dir, STAGING_MANIFEST_FILE, "checksums.files")?;
     load_json_file(&staging_manifest_path).map_err(|err| {
@@ -236,6 +269,59 @@ fn verify_sealed_package_integrity_snapshot(
         resolved_experiment,
         checksums,
     })
+}
+
+fn validate_package_checks_report_consistency(package_checks: &Value) -> Result<()> {
+    let checks = package_checks
+        .pointer("/checks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("preflight_failed: package checks checks must be an array"))?;
+    let total = checks.len();
+    let failed = checks
+        .iter()
+        .filter(|check| check.pointer("/status").and_then(Value::as_str) == Some("fail"))
+        .count();
+    let warnings = checks
+        .iter()
+        .filter(|check| check.pointer("/status").and_then(Value::as_str) == Some("warn"))
+        .count();
+    let summary_checks = package_checks
+        .pointer("/summary/checks")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("preflight_failed: package checks summary.checks is required"))?;
+    let summary_failed = package_checks
+        .pointer("/summary/failed")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("preflight_failed: package checks summary.failed is required"))?;
+    let summary_warnings = package_checks
+        .pointer("/summary/warnings")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("preflight_failed: package checks summary.warnings is required"))?;
+    if summary_checks != total as u64 {
+        return Err(anyhow!(
+            "preflight_failed: package checks summary.checks does not match checks length"
+        ));
+    }
+    if summary_failed != failed as u64 {
+        return Err(anyhow!(
+            "preflight_failed: package checks summary.failed does not match failed checks"
+        ));
+    }
+    if summary_warnings != warnings as u64 {
+        return Err(anyhow!(
+            "preflight_failed: package checks summary.warnings does not match warning checks"
+        ));
+    }
+    let passed = package_checks
+        .pointer("/passed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("preflight_failed: package checks passed is required"))?;
+    if passed != (failed == 0) {
+        return Err(anyhow!(
+            "preflight_failed: package checks passed does not match failed checks"
+        ));
+    }
+    Ok(())
 }
 
 fn run_payload_roots() -> [&'static str; 6] {
@@ -342,6 +428,45 @@ pub(crate) fn copy_verified_package_payload_for_run(
                 actual
             ));
         }
+    }
+    copy_verified_package_lock_for_run(package_dir, run_dir)?;
+    Ok(())
+}
+
+fn copy_verified_package_lock_for_run(package_dir: &Path, run_dir: &Path) -> Result<()> {
+    let package_lock_source = package_dir.join("package.lock");
+    let package_lock_destination = run_dir.join("package.lock");
+    match fs::symlink_metadata(&package_lock_destination) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+            return Err(anyhow!(
+                "preflight_failed: package.lock destination already exists with unsupported file type: {}",
+                package_lock_destination.display()
+            ));
+        }
+        Ok(_) => {
+            return Err(anyhow!(
+                "preflight_failed: package.lock destination already exists: {}",
+                package_lock_destination.display()
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    fs::copy(&package_lock_source, &package_lock_destination).with_context(|| {
+        format!(
+            "copy verified package.lock from {} to {}",
+            package_lock_source.display(),
+            package_lock_destination.display()
+        )
+    })?;
+    let source_lock_digest = sha256_file(&package_lock_source)?;
+    let destination_lock_digest = sha256_file(&package_lock_destination)?;
+    if source_lock_digest != destination_lock_digest {
+        return Err(anyhow!(
+            "preflight_failed: copied package.lock checksum mismatch (expected {}, got {})",
+            source_lock_digest,
+            destination_lock_digest
+        ));
     }
     Ok(())
 }

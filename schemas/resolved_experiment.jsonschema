@@ -3,54 +3,193 @@
   "$id": "https://agent-lab.local/schemas/resolved_experiment.json",
   "title": "Resolved Experiment",
   "type": "object",
-  "additionalProperties": true,
-  "required": ["experiment", "runtime", "matrix", "trial_runtime", "policy"],
+  "additionalProperties": false,
+  "not": {
+    "anyOf": [
+      { "required": ["cases"] },
+      { "required": ["stages"] },
+      { "required": ["ephemerals"] },
+      { "required": ["externals"] }
+    ]
+  },
+  "required": ["experiment", "runtime", "matrix", "scheduling", "trial_runtime", "policy", "evaluation"],
+  "allOf": [
+    {
+      "if": {
+        "required": ["metrics"],
+        "properties": {
+          "metrics": {
+            "contains": {
+              "type": "object",
+              "properties": {
+                "source": {
+                  "type": "object",
+                  "properties": { "type": { "const": "grader_output" } },
+                  "required": ["type"]
+                }
+              },
+              "required": ["source"]
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "trial_runtime": {
+            "properties": {
+              "grader": {
+                "required": ["strategy"],
+                "properties": {
+                  "strategy": { "not": { "const": "none" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["policy"],
+        "properties": {
+          "policy": {
+            "required": ["sanitization_profile"],
+            "properties": {
+              "sanitization_profile": { "const": "hermetic_functional" }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "runtime": {
+            "required": ["network"],
+            "properties": {
+              "network": {
+                "required": ["task_sandbox", "agent"],
+                "properties": {
+                  "task_sandbox": { "const": "none" },
+                  "agent": { "const": "none" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["metrics"],
+        "properties": {
+          "metrics": { "type": "array", "minItems": 1 }
+        }
+      },
+      "then": {
+        "properties": {
+          "metrics": {
+            "contains": {
+              "type": "object",
+              "required": ["primary"],
+              "properties": {
+                "primary": { "const": true }
+              }
+            },
+            "minContains": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["runtime"],
+        "properties": {
+          "runtime": {
+            "required": ["network"],
+            "properties": {
+              "network": {
+                "required": ["egress"],
+                "properties": {
+                  "egress": { "type": "array", "minItems": 1 }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "runtime": {
+            "properties": {
+              "network": {
+                "anyOf": [
+                  {
+                    "required": ["task_sandbox"],
+                    "properties": {
+                      "task_sandbox": { "enum": ["full", "allowlist_enforced"] }
+                    }
+                  },
+                  {
+                    "required": ["agent"],
+                    "properties": {
+                      "agent": { "enum": ["full", "allowlist_enforced", "llm_egress"] }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "experiment": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "required": ["id", "name"],
       "properties": {
-        "id": { "type": "string", "minLength": 1 },
+        "id": { "$ref": "#/$defs/nonblank_string" },
         "name": { "type": "string", "minLength": 1 },
-        "description": { "type": "string" },
-        "owner": { "type": "string" },
-        "tags": { "type": "array", "items": { "type": "string" } }
+        "description": { "type": "string", "minLength": 1 },
+        "owner": { "type": "string", "minLength": 1 },
+        "tags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
       }
     },
     "runtime": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
+      "required": ["compute", "network"],
       "properties": {
-        "compute": { "$ref": "#/$defs/backend" },
-        "storage": { "$ref": "#/$defs/backend" },
-        "traces": { "$ref": "#/$defs/backend" },
-        "registry": {
-          "type": "object",
-          "additionalProperties": true,
-          "properties": {
-            "default": { "type": "string", "minLength": 1 }
-          }
-        },
+        "compute": { "$ref": "#/$defs/compute_backend" },
         "secrets": {
           "type": "array",
           "items": { "$ref": "#/$defs/runtime_secret" }
         },
+        "externals": { "$ref": "#/$defs/externals" },
         "network": {
           "type": "object",
-          "additionalProperties": true,
+          "additionalProperties": false,
+          "required": ["task_sandbox", "agent"],
           "properties": {
-            "default": { "$ref": "#/$defs/network_mode" },
             "task_sandbox": { "type": "string", "enum": ["none", "full", "allowlist_enforced"] },
             "agent": { "$ref": "#/$defs/network_mode" },
-            "egress": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+            "egress": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true
+            }
           }
         }
       }
     },
     "matrix": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
+      "not": { "required": ["cases"] },
       "required": ["variants", "tasks", "repeats"],
       "properties": {
         "variants": {
@@ -60,19 +199,12 @@
         },
         "tasks": {
           "type": "object",
-          "additionalProperties": true,
+          "additionalProperties": false,
           "required": ["source", "path"],
           "properties": {
             "source": {
-              "oneOf": [
-                { "type": "string", "enum": ["file"] },
-                {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "required": ["type"],
-                  "properties": { "type": { "type": "string", "enum": ["file"] } }
-                }
-              ]
+              "type": "string",
+              "enum": ["file"]
             },
             "path": { "type": "string", "minLength": 1 },
             "suite_id": { "type": "string", "minLength": 1 },
@@ -80,126 +212,1356 @@
             "limit": { "type": "integer", "minimum": 0 }
           }
         },
-        "cases": {
-          "type": "object",
-          "additionalProperties": true,
-          "required": ["source", "path"],
-          "properties": {
-            "source": {
-              "oneOf": [
-                { "type": "string", "enum": ["file"] },
-                {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "required": ["type"],
-                  "properties": { "type": { "type": "string", "enum": ["file"] } }
-                }
-              ]
-            },
-            "path": { "type": "string", "minLength": 1 },
-            "suite_id": { "type": "string", "minLength": 1 },
-            "split_id": { "type": "string", "minLength": 1 },
-            "limit": { "type": "integer", "minimum": 0 }
-          }
-        },
-        "repeats": { "type": "integer", "minimum": 1 },
-        "seeds": { "type": "array", "items": { "type": "integer" } }
+        "repeats": { "type": "integer", "minimum": 1 }
       }
     },
     "scheduling": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
+      "required": ["max_concurrency", "random_seed"],
       "properties": {
         "max_concurrency": { "type": "integer", "minimum": 1 },
-        "shuffle_tasks": { "type": "boolean" },
-        "random_seed": { "type": "integer" },
-        "comparison": { "type": "string", "enum": ["paired", "unpaired", "none"] }
+        "random_seed": { "type": "integer" }
       }
     },
-    "trial_runtime": { "type": "object", "additionalProperties": true },
-    "cases": { "$ref": "#/properties/matrix/properties/cases" },
-    "stages": { "type": "object", "additionalProperties": true },
+    "trial_runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "agent", "execution", "grader"],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "execution": {
+                "properties": { "agent_site": { "const": "host" } },
+                "required": ["agent_site"]
+              }
+            },
+            "required": ["execution"]
+          },
+          "then": {
+            "properties": {
+              "agent": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["image"] },
+                    { "required": ["sidecars"] }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "execution": {
+                "properties": { "agent_site": { "const": "task_runtime" } },
+                "required": ["agent_site"]
+              }
+            },
+            "required": ["execution"]
+          },
+          "then": {
+            "properties": {
+              "task": {
+                "properties": {
+                  "interface": { "const": "writable_workspace" },
+                  "workspace": {
+                    "required": ["source"],
+                    "properties": { "source": { "const": "container_image" } }
+                  }
+                },
+                "required": ["interface", "workspace"]
+              },
+              "agent": {
+                "not": { "required": ["image"] }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "execution": {
+                "properties": { "agent_site": { "const": "agent_container" } },
+                "required": ["agent_site"]
+              }
+            },
+            "required": ["execution"]
+          },
+          "then": {
+            "properties": {
+              "agent": { "required": ["image"] }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "grader": {
+                "properties": {
+                  "strategy": { "enum": ["in_task_runtime", "injected"] }
+                },
+                "required": ["strategy"]
+              }
+            },
+            "required": ["grader"]
+          },
+          "then": {
+            "properties": {
+              "task": {
+                "properties": {
+                  "interface": { "const": "writable_workspace" },
+                  "workspace": {
+                    "required": ["source"],
+                    "properties": { "source": { "const": "container_image" } }
+                  }
+                },
+                "required": ["interface", "workspace"]
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "task": { "$ref": "#/$defs/trial_runtime_task" },
+        "agent": { "$ref": "#/$defs/trial_runtime_agent" },
+        "execution": { "$ref": "#/$defs/trial_runtime_execution" },
+        "grader": { "$ref": "#/$defs/trial_runtime_grader" }
+      }
+    },
     "sidecars": {
       "type": "object",
+      "propertyNames": { "$ref": "#/$defs/sidecar_id" },
       "additionalProperties": { "$ref": "#/$defs/sidecar" }
     },
-    "ephemerals": {
-      "type": "object",
-      "additionalProperties": { "$ref": "#/$defs/sidecar" }
-    },
-    "externals": { "type": "object", "additionalProperties": true },
     "policy": {
       "type": "object",
-      "additionalProperties": true,
-      "required": ["timeout_ms", "task_sandbox"],
+      "additionalProperties": false,
+      "required": ["timeout_ms", "sanitization_profile", "task_sandbox", "policies"],
       "properties": {
         "timeout_ms": { "type": "integer", "minimum": 1 },
         "sanitization_profile": {
           "type": "string",
           "enum": ["replay_strict", "hermetic_functional", "standard_runtime"]
         },
-        "task_sandbox": { "type": "object", "additionalProperties": true },
-        "validity": { "type": "object", "additionalProperties": true },
-        "policies": { "type": "object", "additionalProperties": true }
+        "task_sandbox": { "$ref": "#/$defs/task_sandbox_policy" },
+        "validity": { "$ref": "#/$defs/validity_policy" },
+        "policies": { "$ref": "#/$defs/policies" }
       }
     },
-    "extra_outputs": { "type": "object", "additionalProperties": true }
+    "extra_outputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/extra_output" }
+    },
+    "metrics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/resolved_metric" }
+    },
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy"],
+      "properties": {
+        "policy": { "$ref": "#/$defs/evaluation_policy" }
+      }
+    }
   },
   "$defs": {
-    "backend": {
+    "compute_backend": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "required": ["backend"],
       "properties": {
-        "backend": { "type": "string", "minLength": 1 },
-        "config": { "type": "object", "additionalProperties": true }
+        "backend": { "type": "string", "enum": ["local-docker", "modal"] },
+        "config": { "$ref": "#/$defs/empty_backend_config" }
       }
+    },
+    "empty_backend_config": {
+      "type": "object",
+      "additionalProperties": false
     },
     "network_mode": {
       "type": "string",
       "enum": ["none", "full", "allowlist_enforced", "llm_egress"]
     },
+    "task_sandbox_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hardening"],
+      "properties": {
+        "resources": { "$ref": "#/$defs/task_sandbox_resources" },
+        "hardening": { "$ref": "#/$defs/task_sandbox_hardening" }
+      }
+    },
+    "task_sandbox_resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu_count": { "type": "integer", "minimum": 1 },
+        "memory_mb": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "task_sandbox_hardening": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["no_new_privileges", "drop_all_caps"],
+      "properties": {
+        "no_new_privileges": { "type": "boolean" },
+        "drop_all_caps": { "type": "boolean" }
+      }
+    },
+    "validity_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fail_on_state_leak": { "type": "boolean" },
+        "fail_on_profile_invariant_violation": { "type": "boolean" }
+      }
+    },
+    "externals": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apis": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "credentials": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
     "variant": {
       "type": "object",
-      "additionalProperties": true,
-      "required": ["id"],
+      "additionalProperties": false,
+      "required": ["id", "baseline", "config"],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "baseline": { "type": "boolean" },
         "config": { "type": "object", "additionalProperties": true },
-        "overrides": { "type": "object", "additionalProperties": true }
+        "overrides": { "$ref": "#/$defs/resolved_variant_overrides" }
+      }
+    },
+    "resolved_variant_overrides": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "execution": {
+                "properties": { "agent_site": { "const": "host" } },
+                "required": ["agent_site"]
+              }
+            },
+            "required": ["execution"]
+          },
+          "then": {
+            "properties": {
+              "agent": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["image"] },
+                    { "required": ["sidecars"] }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "execution": {
+                "properties": { "agent_site": { "const": "task_runtime" } },
+                "required": ["agent_site"]
+              }
+            },
+            "required": ["execution"]
+          },
+          "then": {
+            "properties": {
+              "task": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["files"] },
+                    {
+                      "properties": {
+                        "interface": {
+                          "enum": ["input_only", "readonly_files"]
+                        }
+                      },
+                      "required": ["interface"]
+                    },
+                    {
+                      "properties": {
+                        "workspace": {
+                          "properties": {
+                            "source": { "not": { "const": "container_image" } }
+                          },
+                          "required": ["source"]
+                        }
+                      },
+                      "required": ["workspace"]
+                    }
+                  ]
+                }
+              },
+              "agent": {
+                "not": { "required": ["image"] }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "grader": {
+                "properties": {
+                  "strategy": { "enum": ["in_task_runtime", "injected"] }
+                },
+                "required": ["strategy"]
+              }
+            },
+            "required": ["grader"]
+          },
+          "then": {
+            "properties": {
+              "task": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["files"] },
+                    {
+                      "properties": {
+                        "interface": {
+                          "enum": ["input_only", "readonly_files"]
+                        }
+                      },
+                      "required": ["interface"]
+                    },
+                    {
+                      "properties": {
+                        "workspace": {
+                          "properties": {
+                            "source": { "not": { "const": "container_image" } }
+                          },
+                          "required": ["source"]
+                        }
+                      },
+                      "required": ["workspace"]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "task": { "$ref": "#/$defs/trial_runtime_task_patch" },
+        "agent": { "$ref": "#/$defs/trial_runtime_agent_patch" },
+        "execution": { "$ref": "#/$defs/trial_runtime_execution_patch" },
+        "grader": { "$ref": "#/$defs/trial_runtime_grader_patch" }
       }
     },
     "runtime_secret": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "required": ["name", "from"],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "from": { "const": "env" } },
+            "required": ["from"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["mount"] },
+                { "required": ["credential_cache"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "from": { "const": "file" } },
+            "required": ["from"]
+          },
+          "then": { "required": ["mount"] }
+        }
+      ],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
+        "name": { "$ref": "#/$defs/runtime_secret_name" },
         "from": { "type": "string", "enum": ["env", "file"] },
         "mount": {
           "type": "object",
-          "additionalProperties": true,
+          "additionalProperties": false,
           "required": ["target"],
           "properties": {
-            "target": { "type": "string", "minLength": 1 },
+            "target": { "$ref": "#/$defs/secret_target_path" },
             "required_for_variants": {
               "type": "array",
               "items": { "type": "string", "minLength": 1 }
             }
           }
         },
-        "credential_cache": { "type": "object", "additionalProperties": true }
+        "credential_cache": { "$ref": "#/$defs/credential_cache" }
+      }
+    },
+    "policies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheduling", "state", "retry", "pruning", "concurrency"],
+      "properties": {
+        "scheduling": {
+          "type": "string",
+          "enum": ["paired_interleaved", "variant_sequential", "randomized"]
+        },
+        "state": {
+          "type": "string",
+          "enum": ["isolate_per_trial", "persist_per_task", "accumulate"]
+        },
+        "retry": { "$ref": "#/$defs/retry_policy" },
+        "pruning": { "$ref": "#/$defs/pruning_policy" },
+        "concurrency": { "$ref": "#/$defs/concurrency_policy" }
+      }
+    },
+    "retry_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_attempts", "retry_on"],
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1 },
+        "retry_on": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "pruning_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_consecutive_failures"],
+      "properties": {
+        "max_consecutive_failures": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "concurrency_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["require_chain_lease"],
+      "properties": {
+        "max_in_flight_per_variant": { "type": "integer", "minimum": 1 },
+        "require_chain_lease": { "type": "boolean" }
+      }
+    },
+    "extra_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "source_path", "summary_path"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "source_path": { "$ref": "#/$defs/relative_artifact_path" },
+        "summary_path": { "$ref": "#/$defs/relative_artifact_path" }
+      }
+    },
+    "relative_artifact_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/]",
+      "not": {
+        "anyOf": [
+          { "pattern": "(^|/)\\.\\.(/|$)" },
+          { "pattern": "^\\./?$" }
+        ]
+      }
+    },
+    "evaluation_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_model",
+        "scoring_lifecycle",
+        "chain_failure_policy",
+        "required_evidence_classes"
+      ],
+      "properties": {
+        "task_model": {
+          "type": "string",
+          "enum": ["independent", "dependent"]
+        },
+        "scoring_lifecycle": { "type": "string", "minLength": 1 },
+        "chain_failure_policy": { "type": "string", "minLength": 1 },
+        "required_evidence_classes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "resolved_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "source", "primary", "required"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "semantic_key": { "type": "string", "minLength": 1 },
+        "value_type": { "type": "string", "minLength": 1 },
+        "unit": { "type": "string", "minLength": 1 },
+        "direction": { "type": "string", "enum": ["maximize", "minimize"] },
+        "primary": { "type": "boolean" },
+        "required": { "type": "boolean" },
+        "source": { "$ref": "#/$defs/metric_source" }
+      }
+    },
+    "metric_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["agent_response", "grader_output", "runtime_output"]
+        },
+        "output": { "type": "string", "minLength": 1 },
+        "pointer": { "type": "string" },
+        "transform": { "$ref": "#/$defs/metric_transform" }
+      }
+    },
+    "metric_transform": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "identity" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "pytest_json_report_pass_rate" },
+            "test_ids": { "$ref": "#/$defs/metric_transform_test_ids" }
+          }
+        }
+      ]
+    },
+    "metric_transform_test_ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source"],
+      "properties": {
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["task"],
+          "properties": {
+            "task": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "trial_runtime_agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "artifact_type", "integration_level", "outputs"],
+      "properties": {
+        "command": { "$ref": "#/$defs/argv" },
+        "artifact_type": {
+          "type": "string",
+          "enum": ["patch_submission", "text_response", "structured_json", "file_ref"]
+        },
+        "image": { "type": "string", "minLength": 1 },
+        "mount": { "$ref": "#/$defs/agent_mount" },
+        "integration_level": { "$ref": "#/$defs/integration_level" },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "outputs": {
+          "type": "object",
+          "required": ["result"],
+          "propertyNames": { "$ref": "#/$defs/transport_id" },
+          "properties": {
+            "result": { "$ref": "#/$defs/canonical_agent_result_output" }
+          },
+          "additionalProperties": { "$ref": "#/$defs/output" }
+        },
+        "events": {
+          "type": "array",
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/event_sink" }
+        },
+        "telemetry": { "$ref": "#/$defs/agent_telemetry" },
+        "sidecars": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sidecar_id" }
+        },
+        "output_mounts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/output_mount" }
+        }
+      }
+    },
+    "trial_runtime_agent_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": { "$ref": "#/$defs/argv" },
+        "artifact_type": {
+          "type": "string",
+          "enum": ["patch_submission", "text_response", "structured_json", "file_ref"]
+        },
+        "image": { "type": "string", "minLength": 1 },
+        "mount": { "$ref": "#/$defs/agent_mount_patch" },
+        "integration_level": { "$ref": "#/$defs/integration_level" },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "outputs": {
+          "type": "object",
+          "propertyNames": {
+            "allOf": [
+              { "$ref": "#/$defs/transport_id" },
+              { "not": { "const": "result" } }
+            ]
+          },
+          "additionalProperties": { "$ref": "#/$defs/output" }
+        },
+        "events": {
+          "type": "array",
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/event_sink" }
+        },
+        "telemetry": { "$ref": "#/$defs/agent_telemetry" },
+        "sidecars": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sidecar_id" }
+        },
+        "output_mounts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/output_mount" }
+        }
+      }
+    },
+    "trial_runtime_task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interface"],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "interface": { "const": "input_only" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["files"] },
+                { "required": ["workspace"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "interface": { "const": "readonly_files" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "required": ["files"],
+            "not": { "required": ["workspace"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "interface": { "const": "writable_workspace" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "required": ["workspace"],
+            "not": { "required": ["files"] }
+          }
+        }
+      ],
+      "properties": {
+        "interface": {
+          "type": "string",
+          "enum": ["input_only", "readonly_files", "writable_workspace"]
+        },
+        "files": { "$ref": "#/$defs/task_files" },
+        "workspace": { "$ref": "#/$defs/task_workspace" }
+      }
+    },
+    "trial_runtime_task_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "not": { "required": ["files", "workspace"] },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "interface": { "const": "input_only" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["files"] },
+                { "required": ["workspace"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "interface": { "const": "readonly_files" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "not": { "required": ["workspace"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "interface": { "const": "writable_workspace" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "not": { "required": ["files"] }
+          }
+        }
+      ],
+      "properties": {
+        "interface": {
+          "type": "string",
+          "enum": ["input_only", "readonly_files", "writable_workspace"]
+        },
+        "files": { "$ref": "#/$defs/task_files_patch" },
+        "workspace": { "$ref": "#/$defs/task_workspace_patch" }
+      }
+    },
+    "task_files": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "path", "mount_path"],
+      "properties": {
+        "source": { "$ref": "#/$defs/workspace_source" },
+        "path": { "type": "string", "minLength": 1 },
+        "mount_path": { "$ref": "#/$defs/absolute_container_path" }
+      }
+    },
+    "task_files_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": { "$ref": "#/$defs/workspace_source" },
+        "path": { "type": "string", "minLength": 1 },
+        "mount_path": { "$ref": "#/$defs/absolute_container_path" }
+      }
+    },
+    "task_workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source"],
+      "properties": {
+        "source": { "$ref": "#/$defs/workspace_source" },
+        "path": { "type": "string", "minLength": 1 },
+        "repo": { "type": "string", "minLength": 1 },
+        "rev": { "type": "string", "minLength": 1 },
+        "image": { "$ref": "#/$defs/runtime_field_source" },
+        "workdir": { "$ref": "#/$defs/runtime_field_source" }
+      }
+    },
+    "task_workspace_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": { "$ref": "#/$defs/workspace_source" },
+        "path": { "type": "string", "minLength": 1 },
+        "repo": { "type": "string", "minLength": 1 },
+        "rev": { "type": "string", "minLength": 1 },
+        "image": { "$ref": "#/$defs/runtime_field_source" },
+        "workdir": { "$ref": "#/$defs/runtime_field_source" }
+      }
+    },
+    "workspace_source": {
+      "type": "string",
+      "enum": ["container_image", "files", "archive", "git", "empty"]
+    },
+    "runtime_field_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from"],
+      "properties": {
+        "from": { "type": "string", "minLength": 1 }
+      }
+    },
+    "agent_mount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "mount"],
+      "properties": {
+        "source": { "type": "string", "minLength": 1 },
+        "digest": { "type": "string", "minLength": 1 },
+        "resolved_path": { "type": "string", "minLength": 1 },
+        "mount": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "read_only"],
+          "properties": {
+            "path": { "$ref": "#/$defs/absolute_container_path" },
+            "read_only": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "agent_mount_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": "string", "minLength": 1 },
+        "digest": { "type": "string", "minLength": 1 },
+        "resolved_path": { "type": "string", "minLength": 1 },
+        "mount": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": { "$ref": "#/$defs/absolute_container_path" },
+            "read_only": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capture"],
+      "properties": {
+        "capture": {
+          "oneOf": [
+            { "$ref": "#/$defs/file_capture" },
+            { "$ref": "#/$defs/result_json_capture" },
+            { "$ref": "#/$defs/workspace_diff_capture" }
+          ]
+        }
+      }
+    },
+    "canonical_agent_result_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capture"],
+      "properties": {
+        "capture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "path", "format", "required"],
+          "properties": {
+            "type": { "const": "file" },
+            "path": { "const": "/bucephalus/out/result.json" },
+            "format": { "const": "json" },
+            "required": { "const": true }
+          }
+        }
+      }
+    },
+    "file_capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "path", "format", "required"],
+      "properties": {
+        "type": { "const": "file" },
+        "path": { "$ref": "#/$defs/absolute_container_path" },
+        "format": { "type": "string", "enum": ["json", "text", "bytes"] },
+        "required": { "type": "boolean" }
+      }
+    },
+    "result_json_capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "path", "required"],
+      "properties": {
+        "type": { "const": "result_json" },
+        "path": { "$ref": "#/$defs/absolute_container_path" },
+        "field": { "type": "string", "minLength": 1 },
+        "required": { "type": "boolean" }
+      }
+    },
+    "workspace_diff_capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "format"],
+      "properties": {
+        "type": { "const": "workspace_diff" },
+        "format": { "const": "unified_diff" }
+      }
+    },
+    "grader_input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "materialize", "required"],
+      "properties": {
+        "source": { "$ref": "#/$defs/transport_source" },
+        "materialize": {
+          "oneOf": [
+            { "$ref": "#/$defs/file_materialize" },
+            { "$ref": "#/$defs/json_file_materialize" },
+            { "$ref": "#/$defs/env_materialize" }
+          ]
+        },
+        "required": { "type": "boolean" }
+      }
+    },
+    "transport_source": {
+      "type": "object",
+      "oneOf": [
+        { "$ref": "#/$defs/output_source" },
+        { "$ref": "#/$defs/case_source" },
+        { "$ref": "#/$defs/task_source" },
+        { "$ref": "#/$defs/object_source" }
+      ]
+    },
+    "output_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["output"],
+      "properties": {
+        "output": { "type": "string", "minLength": 1 },
+        "field": { "type": "string", "minLength": 1 }
+      }
+    },
+    "case_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case"],
+      "properties": {
+        "case": { "type": "string", "minLength": 1 }
+      }
+    },
+    "task_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task"],
+      "properties": {
+        "task": { "type": "string", "minLength": 1 }
+      }
+    },
+    "object_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["object"],
+      "properties": {
+        "object": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/transport_id" },
+          "additionalProperties": { "$ref": "#/$defs/transport_source" }
+        }
+      }
+    },
+    "file_materialize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["as", "path"],
+      "properties": {
+        "as": { "const": "file" },
+        "path": { "$ref": "#/$defs/absolute_container_path" }
+      }
+    },
+    "json_file_materialize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["as", "path"],
+      "properties": {
+        "as": { "const": "json_file" },
+        "path": { "$ref": "#/$defs/absolute_container_path" }
+      }
+    },
+    "env_materialize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["as", "name"],
+      "properties": {
+        "as": { "const": "env" },
+        "name": { "$ref": "#/$defs/env_name" }
+      }
+    },
+    "trial_runtime_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_site"],
+      "properties": {
+        "agent_site": {
+          "type": "string",
+          "enum": ["agent_container", "task_runtime", "host"]
+        }
+      }
+    },
+    "trial_runtime_execution_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent_site": {
+          "type": "string",
+          "enum": ["agent_container", "task_runtime", "host"]
+        }
+      }
+    },
+    "agent_telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "causal_extraction": { "type": "string", "minLength": 1 }
+      }
+    },
+    "trial_runtime_grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy"],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "strategy": { "const": "none" } },
+            "required": ["strategy"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["command"] },
+                { "required": ["max_concurrency"] },
+                { "required": ["sidecars"] },
+                { "required": ["inputs"] },
+                { "required": ["outputs"] },
+                { "required": ["in_task_runtime"] },
+                { "required": ["injected"] },
+                { "required": ["separate"] },
+                { "required": ["host"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "strategy": {
+                "enum": ["in_task_runtime", "injected", "separate", "host"]
+              }
+            },
+            "required": ["strategy"]
+          },
+          "then": { "required": ["command", "inputs", "outputs"] }
+        },
+        {
+          "if": {
+            "properties": { "strategy": { "const": "in_task_runtime" } },
+            "required": ["strategy"]
+          },
+          "then": { "required": ["in_task_runtime"] }
+        },
+        {
+          "if": {
+            "properties": { "strategy": { "const": "injected" } },
+            "required": ["strategy"]
+          },
+          "then": { "required": ["injected"] }
+        },
+        {
+          "if": {
+            "properties": { "strategy": { "const": "separate" } },
+            "required": ["strategy"]
+          },
+          "then": { "required": ["separate"] }
+        },
+        {
+          "if": {
+            "properties": { "strategy": { "const": "host" } },
+            "required": ["strategy"]
+          },
+          "then": {
+            "required": ["host"],
+            "not": { "required": ["sidecars"] }
+          }
+        }
+      ],
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["none", "in_task_runtime", "injected", "separate", "host"]
+        },
+        "command": { "$ref": "#/$defs/argv" },
+        "max_concurrency": { "type": "integer", "minimum": 1 },
+        "sidecars": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sidecar_id" }
+        },
+        "inputs": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/transport_id" },
+          "additionalProperties": { "$ref": "#/$defs/grader_input" }
+        },
+        "outputs": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/transport_id" },
+          "additionalProperties": { "$ref": "#/$defs/output" }
+        },
+        "in_task_runtime": { "$ref": "#/$defs/in_task_runtime_grader" },
+        "injected": { "$ref": "#/$defs/injected_grader" },
+        "separate": { "$ref": "#/$defs/separate_grader" },
+        "host": { "$ref": "#/$defs/host_grader" }
+      }
+    },
+    "trial_runtime_grader_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "strategy": { "const": "none" } },
+            "required": ["strategy"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["command"] },
+                { "required": ["max_concurrency"] },
+                { "required": ["sidecars"] },
+                { "required": ["inputs"] },
+                { "required": ["outputs"] },
+                { "required": ["in_task_runtime"] },
+                { "required": ["injected"] },
+                { "required": ["separate"] },
+                { "required": ["host"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "strategy": { "const": "host" } },
+            "required": ["strategy"]
+          },
+          "then": {
+            "not": { "required": ["sidecars"] }
+          }
+        }
+      ],
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["none", "in_task_runtime", "injected", "separate", "host"]
+        },
+        "command": { "$ref": "#/$defs/argv" },
+        "max_concurrency": { "type": "integer", "minimum": 1 },
+        "sidecars": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sidecar_id" }
+        },
+        "inputs": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/transport_id" },
+          "additionalProperties": { "$ref": "#/$defs/grader_input" }
+        },
+        "outputs": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/transport_id" },
+          "additionalProperties": { "$ref": "#/$defs/output" }
+        },
+        "in_task_runtime": { "$ref": "#/$defs/in_task_runtime_grader" },
+        "injected": { "$ref": "#/$defs/injected_grader_patch" },
+        "separate": { "$ref": "#/$defs/separate_grader_patch" },
+        "host": { "$ref": "#/$defs/host_grader_patch" }
+      }
+    },
+    "in_task_runtime_grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hidden_paths": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/absolute_container_path" }
+        },
+        "revealed_paths": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/absolute_container_path" }
+        }
+      }
+    },
+    "injected_grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundle", "copy_dest"],
+      "properties": {
+        "bundle": { "type": "string", "minLength": 1 },
+        "copy_dest": { "$ref": "#/$defs/absolute_container_path" }
+      }
+    },
+    "injected_grader_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bundle": { "type": "string", "minLength": 1 },
+        "copy_dest": { "$ref": "#/$defs/absolute_container_path" }
+      }
+    },
+    "separate_grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "workdir"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "workdir": { "$ref": "#/$defs/absolute_container_path" }
+      }
+    },
+    "separate_grader_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "workdir": { "$ref": "#/$defs/absolute_container_path" }
+      }
+    },
+    "host_grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability"],
+      "properties": {
+        "capability": { "$ref": "#/$defs/host_capability_id" }
+      }
+    },
+    "host_grader_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "capability": { "$ref": "#/$defs/host_capability_id" }
+      }
+    },
+    "absolute_container_path": {
+      "type": "string",
+      "minLength": 2,
+      "pattern": "^/.*[^/\\\\]$",
+      "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+    },
+    "host_capability_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/\\\\.][^/\\\\]*$"
+    },
+    "runtime_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "runtime_secret_name": {
+      "type": "string",
+      "pattern": "^[^=]*[^=\\s][^=]*$"
+    },
+    "nonblank_string": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "integration_level": {
+      "type": "string",
+      "enum": ["cli_basic", "cli_events", "otel", "control_checkpoint", "control_full"]
+    },
+    "transport_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "sidecar_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+    },
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/nonblank_string" }
+    },
+    "env_name": {
+      "type": "string",
+      "pattern": "^[_A-Z][_A-Z0-9]*$"
+    },
+    "secret_target_path": {
+      "type": "string",
+      "minLength": 2,
+      "pattern": "^/.*[^/\\\\]$",
+      "not": {
+        "anyOf": [
+          { "pattern": "(^|/)\\.\\.(/|$)" },
+          { "pattern": "^/bucephalus/(in|out|state|workspace|tmp)(/|$)" },
+          { "pattern": "^/workspace/task(/|$)" },
+          { "pattern": "^/testbed(/|$)" },
+          { "pattern": "^/opt/agent(/|$)" }
+        ]
+      }
+    },
+    "credential_cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target"],
+      "properties": {
+        "kind": { "const": "run_scoped" },
+        "target": { "$ref": "#/$defs/secret_target_path" },
+        "env": { "$ref": "#/$defs/env_name" }
+      }
+    },
+    "runtime_output_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/\\\\]+(?:/[^/\\\\]+)*$",
+      "not": {
+        "pattern": "(^|/)\\.{1,2}(/|$)"
+      }
+    },
+    "event_sink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "format", "mode", "ingest", "retain_raw"],
+      "properties": {
+        "id": { "$ref": "#/$defs/runtime_id" },
+        "format": { "const": "jsonl" },
+        "mode": { "const": "jsonl" },
+        "ingest": { "type": "boolean" },
+        "retain_raw": { "type": "boolean" }
+      }
+    },
+    "output_mount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "path", "persist"],
+      "properties": {
+        "id": { "$ref": "#/$defs/runtime_id" },
+        "kind": { "const": "directory" },
+        "path": { "$ref": "#/$defs/runtime_output_path" },
+        "env": { "$ref": "#/$defs/env_name" },
+        "persist": { "type": "boolean" }
       }
     },
     "sidecar": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "required": ["image", "lifecycle"],
       "properties": {
         "image": { "type": "string", "minLength": 1 },
         "lifecycle": { "type": "string", "enum": ["per-trial"] },
-        "expose": { "type": "object", "additionalProperties": { "type": "string" } }
+        "command": { "$ref": "#/$defs/argv" },
+        "workdir": { "type": "string", "minLength": 1 },
+        "expose": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
       }
     }
   }

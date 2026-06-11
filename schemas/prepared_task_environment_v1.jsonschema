@@ -41,7 +41,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["host_path", "mount_path"],
+        "required": ["host_path", "mount_path", "read_only"],
         "properties": {
           "host_path": { "type": "string", "minLength": 1 },
           "mount_path": { "type": "string", "minLength": 1 },
@@ -160,7 +160,7 @@
     "case_materialization_step": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "stage", "operation"],
+      "required": ["id", "stage", "operation", "source", "hidden"],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "stage": { "type": "string", "enum": ["case", "agent", "grader"] },
@@ -169,15 +169,17 @@
           "type": "array",
           "items": { "type": "string", "minLength": 1 }
         },
-        "resource": { "type": "string", "minLength": 1 },
         "source": {
           "type": "object",
-          "additionalProperties": true
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string", "minLength": 1 }
+          }
         },
         "mount": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["path"],
+          "required": ["path", "read_only"],
           "properties": {
             "path": { "type": "string", "minLength": 1, "pattern": "^/" },
             "read_only": { "type": "boolean" }

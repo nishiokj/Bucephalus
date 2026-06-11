@@ -1105,8 +1105,10 @@ fn capture_runtime_output(
                 .format
                 .as_deref()
                 .ok_or_else(|| anyhow!("{}.capture.format is required", label))?;
-            let Some(host_path) =
-                captured_file_host_path(ctx, label, container_path, capture.required)?
+            let required = capture
+                .required
+                .ok_or_else(|| anyhow!("{}.capture.required is required", label))?;
+            let Some(host_path) = captured_file_host_path(ctx, label, container_path, required)?
             else {
                 return Ok(CapturedTransportOutput {
                     value: Value::Null,
@@ -1275,14 +1277,17 @@ fn materialize_grader_inputs(
 ) -> Result<BTreeMap<String, String>> {
     let mut env = BTreeMap::new();
     for (id, input) in &grader.inputs {
+        let required = input
+            .required
+            .ok_or_else(|| anyhow!("grader input '{}'.required is required", id))?;
         let value = select_transport_source(&input.source, agent_outputs, task_payload)?;
         let Some(value) = value else {
-            if input.required {
+            if required {
                 return Err(anyhow!("required grader input '{}' resolved to null", id));
             }
             continue;
         };
-        if value.is_null() && input.required {
+        if value.is_null() && required {
             return Err(anyhow!("required grader input '{}' resolved to null", id));
         }
         match input.materialize.as_kind.as_str() {
@@ -2430,22 +2435,18 @@ where
     spec.mounts = mounts;
     spec.tmpfs = tmpfs;
     spec.network_mode = docker_network_mode(network_mode);
-    spec.security_opt = if request
-        .runtime_experiment
-        .pointer("/policy/task_sandbox/hardening/no_new_privileges")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-    {
+    spec.security_opt = if required_resolved_hardening_bool(
+        request.runtime_experiment,
+        "/policy/task_sandbox/hardening/no_new_privileges",
+    )? {
         vec!["no-new-privileges".to_string()]
     } else {
         Vec::new()
     };
-    spec.cap_drop = if request
-        .runtime_experiment
-        .pointer("/policy/task_sandbox/hardening/drop_all_caps")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-    {
+    spec.cap_drop = if required_resolved_hardening_bool(
+        request.runtime_experiment,
+        "/policy/task_sandbox/hardening/drop_all_caps",
+    )? {
         vec!["ALL".to_string()]
     } else {
         Vec::new()
@@ -2453,6 +2454,13 @@ where
     spec.cpu_count = cpu_count;
     spec.memory_mb = memory_mb;
     Ok(spec)
+}
+
+fn required_resolved_hardening_bool(runtime_experiment: &Value, pointer: &str) -> Result<bool> {
+    runtime_experiment
+        .pointer(pointer)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("{} is required in resolved experiments", pointer))
 }
 
 pub(crate) fn docker_network_mode(network_mode: &str) -> Option<String> {

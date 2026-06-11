@@ -22,7 +22,7 @@ stage A
 
 For the common agent-to-grader case, stage A is the agent and stage B is the grader.
 
-A downstream stage should not search for candidate artifacts or understand runner envelope internals. If it needs a file, env var, stdin payload, HTTP body, or other input view, declare how to materialize that view. If it writes a file, stdout JSON, HTTP response, or other output, declare how to capture it. Metrics then read from declared outputs.
+A downstream stage should not search for candidate artifacts or understand runner envelope internals. If it needs a file or env var, declare how to materialize that view. If it writes a file or workspace diff, declare how to capture it. Metrics then read from declared outputs.
 
 This is not a patch-specific feature. A patch is one possible output kind.
 
@@ -34,19 +34,17 @@ Stage outputs are named values captured by the runner.
 stages:
   agent:
     outputs:
-      result:
-        capture:
-          type: file
-          path: /bucephalus/out/result.json
-          format: json
-
       candidate_patch:
         capture:
           type: workspace_diff
           format: unified_diff
 ```
 
-Each output has a kind implied or declared by its capture type. Examples include JSON result files, workspace diffs, plain files, stdout, stderr, directories, archives, or external responses.
+The canonical agent `result` output is added by default and is runner-owned. Do
+not declare `stages.agent.outputs.result`; declare extra outputs only when
+downstream stages need another named value. Each output has a kind implied or
+declared by its capture type. Examples include workspace diffs, plain files,
+stdout, stderr, directories, archives, or external responses.
 
 The runner records named outputs in an internal transport envelope. Downstream bindings should reference named outputs and fields, not the envelope's physical layout.
 
@@ -70,7 +68,6 @@ stages:
         materialize:
           as: file
           path: /patch.diff
-        required: true
 ```
 
 This declaration means:
@@ -80,16 +77,20 @@ This declaration means:
 3. fail before downstream execution if a required value is missing
 
 The input name is the downstream-facing binding. It does not have to match the upstream output name.
+Declared grader inputs default to `required: true`; build writes the boolean
+into sealed packages. Set `required: false` only for optional context that the
+grader can safely run without.
 
-Materialization is not only file writing. Valid materializations can include:
+Current command-grader materializations are:
 
 ```yaml
 materialize: { as: file, path: /runtime/in/value.json }
+materialize: { as: json_file, path: /runtime/in/value.json }
 materialize: { as: env, name: CANDIDATE_VALUE }
-materialize: { as: stdin }
-materialize: { as: json_body }
-materialize: { as: multipart_field, name: artifact }
 ```
+
+`stdin`, `json_body`, and `multipart_field` are reserved for future runtime
+transports and are rejected by the current authoring schema.
 
 ## Downstream Outputs
 
@@ -125,14 +126,12 @@ Metrics can read declared outputs.
 ```yaml
 metrics:
   - id: pass_rate
-    source:
-      type: grader_output
-      output: pytest_report
-      transform:
-        type: pytest_json_report_pass_rate
-        test_ids:
-          source:
-            case: commit0.test_ids
+    from: grader.pytest_report
+    transform:
+      type: pytest_json_report_pass_rate
+      test_ids:
+        source:
+          task: commit0.test_ids
 ```
 
 The transform is runner-owned. It converts a known output format into a metric value.
@@ -165,7 +164,6 @@ stages:
         materialize:
           as: file
           path: /patch.diff
-        required: true
     outputs:
       pytest_report:
         capture:
@@ -185,14 +183,6 @@ An answer-based benchmark may not have patches at all.
 
 ```yaml
 stages:
-  agent:
-    outputs:
-      final_answer:
-        capture:
-          type: result_json
-          path: /bucephalus/out/result.json
-          field: final_answer
-
   grader:
     strategy: separate
     command:
@@ -207,12 +197,11 @@ stages:
             reference:
               case: answer
             candidate:
-              output: agent.final_answer
-              field: value
+              output: result
+              field: final_answer
         materialize:
           as: json_file
           path: /grader/in/payload.json
-        required: true
     outputs:
       grade:
         capture:
@@ -222,37 +211,8 @@ stages:
           required: true
 ```
 
-## External Graders
-
-The same model works when the grader is not a command.
-
-```yaml
-stages:
-  grader:
-    strategy: external
-    endpoint:
-      type: http
-      method: POST
-      url: https://grader.example.com/evaluate
-    inputs:
-      request_body:
-        source:
-          object:
-            case_id:
-              case: id
-            answer:
-              output: agent.result
-              field: final_answer
-        materialize:
-          as: json_body
-    outputs:
-      response:
-        capture:
-          type: http_response
-          format: json
-```
-
-`command` is one runtime implementation. Inputs, outputs, materialization, and capture are the stable parts of the contract.
+Future non-command grader transports should reuse the same inputs, outputs,
+materialization, and capture model instead of exposing runner internals.
 
 ## Validation
 
@@ -263,7 +223,7 @@ The runner should validate the chain before execution:
 - required inputs cannot be missing
 - materialization paths are allowed for the grader strategy
 - grader output paths are valid for the grader strategy
-- metrics reference known grader outputs
+- metrics reference known grader/runtime outputs
 - metric transforms support the declared output format
 
 Failures should name the broken link, such as:

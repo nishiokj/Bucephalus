@@ -59,7 +59,7 @@ while preserving durable substrate resources. Full substrate teardown remains a
 manual Terraform destroy operation and is blocked by Cloud SQL deletion
 protection unless that protection is intentionally changed.
 
-Runner provisioning for Path 1 is GCE per-run Docker VMs:
+Runner provisioning for Path 1 is GCE per-run worker VMs:
 
 - the release workflow builds and pushes API, pool-controller, migrations, and
   worker images
@@ -75,3 +75,7 @@ Runner provisioning for Path 1 is GCE per-run Docker VMs:
   (`projects/cos-cloud/global/images/family/cos-stable`) so Docker is already
   present at boot; the startup script only falls back to apt-based installation
   when an overridden boot image does not provide Docker
+- when `modal_backend_enabled=true`, the same worker VM path fetches Modal and
+  S3/R2 sync credentials from Secret Manager and advertises the `modal`
+  executor; the worker image contains the packaged `bucephalus-modal-launcher`
+  binary used by the Rust runner

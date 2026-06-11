@@ -267,6 +267,141 @@ variable "cloud_r2_secret_access_key_secret_version" {
   }
 }
 
+variable "modal_backend_enabled" {
+  description = "Whether GCE worker VMs advertise and configure the Modal execution backend."
+  type        = bool
+  default     = false
+}
+
+variable "modal_app_name" {
+  description = "Modal app name used by Cloud worker VMs when modal_backend_enabled is true."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.modal_app_name == null ? true : length(trimspace(var.modal_app_name)) > 0
+    error_message = "modal_app_name must be non-empty when set."
+  }
+}
+
+variable "modal_environment" {
+  description = "Optional Modal environment name used by Cloud worker VMs."
+  type        = string
+  default     = null
+}
+
+variable "modal_token_id_secret_version" {
+  description = "Numeric Secret Manager version for the Modal token ID."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.modal_token_id_secret_version == null || can(regex("^[1-9][0-9]*$", var.modal_token_id_secret_version))
+    error_message = "modal_token_id_secret_version must be an explicit numeric Secret Manager version when set."
+  }
+}
+
+variable "modal_token_secret_secret_version" {
+  description = "Numeric Secret Manager version for the Modal token secret."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.modal_token_secret_secret_version == null || can(regex("^[1-9][0-9]*$", var.modal_token_secret_secret_version))
+    error_message = "modal_token_secret_secret_version must be an explicit numeric Secret Manager version when set."
+  }
+}
+
+variable "modal_s3_bucket" {
+  description = "S3-compatible bucket mounted by Modal for runtime transfer and durable outputs."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.modal_s3_bucket == null || can(regex("^[A-Za-z0-9][A-Za-z0-9._-]{1,61}[A-Za-z0-9]$", var.modal_s3_bucket))
+    error_message = "modal_s3_bucket must be a valid bucket name when set."
+  }
+}
+
+variable "modal_s3_prefix" {
+  description = "Non-empty object prefix used by Modal runtime sync; run/trial/attempt paths are appended under this prefix."
+  type        = string
+  default     = ""
+}
+
+variable "modal_s3_endpoint_url" {
+  description = "Optional S3-compatible endpoint URL for Modal CloudBucketMount, such as an R2 endpoint."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.modal_s3_endpoint_url == null || can(regex("^https://[^[:space:]]+$", var.modal_s3_endpoint_url))
+    error_message = "modal_s3_endpoint_url must be an https URL when set."
+  }
+}
+
+variable "modal_s3_region" {
+  description = "Optional S3-compatible region value passed into the Modal bucket secret."
+  type        = string
+  default     = null
+}
+
+variable "modal_s3_secret_name" {
+  description = "Optional pre-created Modal secret name containing AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY for the runtime sync bucket. When unset, GCP Secret Manager versions below are injected into the worker VM."
+  type        = string
+  default     = null
+}
+
+variable "modal_s3_access_key_id_secret_version" {
+  description = "Numeric Secret Manager version for the Modal S3-compatible access key ID when modal_s3_secret_name is unset."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.modal_s3_access_key_id_secret_version == null || can(regex("^[1-9][0-9]*$", var.modal_s3_access_key_id_secret_version))
+    error_message = "modal_s3_access_key_id_secret_version must be an explicit numeric Secret Manager version when set."
+  }
+}
+
+variable "modal_s3_secret_access_key_secret_version" {
+  description = "Numeric Secret Manager version for the Modal S3-compatible secret access key when modal_s3_secret_name is unset."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.modal_s3_secret_access_key_secret_version == null || can(regex("^[1-9][0-9]*$", var.modal_s3_secret_access_key_secret_version))
+    error_message = "modal_s3_secret_access_key_secret_version must be an explicit numeric Secret Manager version when set."
+  }
+}
+
+variable "modal_s3_force_path_style" {
+  description = "Reserved for compatibility documentation. Must remain false because Modal CloudBucketMount does not expose a path-style S3 option."
+  type        = bool
+  default     = false
+}
+
+variable "modal_gcp_artifact_registry_secret_name" {
+  description = "Optional pre-created Modal secret name containing SERVICE_ACCOUNT_JSON for private GCP Artifact Registry image pulls."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.modal_gcp_artifact_registry_secret_name == null ? true : length(trimspace(var.modal_gcp_artifact_registry_secret_name)) > 0
+    error_message = "modal_gcp_artifact_registry_secret_name must be non-empty when set."
+  }
+}
+
+variable "modal_gcp_artifact_registry_service_account_json_secret_version" {
+  description = "Numeric Secret Manager version containing a GCP service account JSON blob for Modal private Artifact Registry image pulls when modal_gcp_artifact_registry_secret_name is unset."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.modal_gcp_artifact_registry_service_account_json_secret_version == null || can(regex("^[1-9][0-9]*$", var.modal_gcp_artifact_registry_service_account_json_secret_version))
+    error_message = "modal_gcp_artifact_registry_service_account_json_secret_version must be an explicit numeric Secret Manager version when set."
+  }
+}
+
 variable "pool_controller_provision_cmd_json_secret_version" {
   description = "Numeric Secret Manager version for the pool controller provision command JSON."
   type        = string

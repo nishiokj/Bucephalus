@@ -1,0 +1,1512 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/experiment_authoring_v1.json",
+  "title": "Experiment Authoring v1",
+  "description": "Public experiment.yaml authoring surface. The build step lowers this shape into the sealed resolved package contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["experiment", "matrix", "stages"],
+  "allOf": [
+    {
+      "if": {
+        "required": ["metrics"],
+        "properties": {
+          "metrics": {
+            "contains": {
+              "type": "object",
+              "properties": {
+                "from": { "type": "string", "pattern": "^grader\\." }
+              },
+              "required": ["from"]
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "stages": {
+            "required": ["grader"],
+            "properties": {
+              "grader": {
+                "required": ["strategy"],
+                "properties": {
+                  "strategy": { "not": { "const": "none" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["policy"],
+        "properties": {
+          "policy": {
+            "required": ["sanitization_profile"],
+            "properties": {
+              "sanitization_profile": { "const": "hermetic_functional" }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "runtime": {
+            "properties": {
+              "network": {
+                "properties": {
+                  "default": { "const": "none" },
+                  "task_sandbox": { "const": "none" },
+                  "agent": { "const": "none" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["metrics"],
+        "properties": {
+          "metrics": { "type": "array", "minItems": 2 }
+        }
+      },
+      "then": {
+        "properties": {
+          "metrics": {
+            "contains": {
+              "type": "object",
+              "required": ["primary"],
+              "properties": {
+                "primary": { "const": true }
+              }
+            },
+            "minContains": 1
+          }
+        }
+      }
+    },
+    {
+      "not": {
+        "anyOf": [
+          {
+            "required": ["runtime"],
+            "properties": {
+              "runtime": {
+                "required": ["network"],
+                "properties": {
+                  "network": { "required": ["default", "task_sandbox"] }
+                }
+              }
+            }
+          },
+          {
+            "required": ["runtime"],
+            "properties": {
+              "runtime": {
+                "required": ["network"],
+                "properties": {
+                  "network": { "required": ["default", "agent"] }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": ["scheduling", "policy"],
+        "properties": {
+          "scheduling": { "required": ["comparison"] },
+          "policy": {
+            "required": ["policies"],
+            "properties": {
+              "policies": { "required": ["scheduling"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["runtime"],
+        "properties": {
+          "runtime": {
+            "required": ["network"],
+            "properties": {
+              "network": {
+                "required": ["egress"],
+                "properties": {
+                  "egress": { "type": "array", "minItems": 1 }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "runtime": {
+            "properties": {
+              "network": {
+                "anyOf": [
+                  {
+                    "required": ["default"],
+                    "properties": {
+                      "default": { "enum": ["full", "allowlist_enforced"] }
+                    }
+                  },
+                  {
+                    "required": ["task_sandbox"],
+                    "properties": {
+                      "task_sandbox": { "enum": ["full", "allowlist_enforced"] }
+                    }
+                  },
+                  {
+                    "required": ["agent"],
+                    "properties": {
+                      "agent": { "enum": ["full", "allowlist_enforced", "llm_egress"] }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "experiment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonblank_string" },
+        "name": { "type": "string", "minLength": 1 },
+        "mode": { "type": "string", "enum": ["answer", "patch"] },
+        "description": { "type": "string", "minLength": 1 },
+        "owner": { "type": "string", "minLength": 1 },
+        "tags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "compute": { "$ref": "#/$defs/compute_backend" },
+        "registry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["image_rewrites"],
+          "properties": {
+            "image_rewrites": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/image_rewrite" }
+            }
+          }
+        },
+        "secrets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/runtime_secret" }
+        },
+        "network": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "default": { "$ref": "#/$defs/task_network_mode" },
+            "task_sandbox": { "$ref": "#/$defs/task_network_mode" },
+            "agent": { "$ref": "#/$defs/network_mode" },
+            "egress": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    },
+    "matrix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cases"],
+      "properties": {
+        "variants": {
+          "type": "array",
+          "minItems": 1,
+          "allOf": [
+            {
+              "not": {
+                "maxItems": 1,
+                "contains": {
+                  "type": "object",
+                  "properties": { "baseline": { "const": false } },
+                  "required": ["baseline"]
+                }
+              }
+            },
+            {
+              "if": { "minItems": 2 },
+              "then": {
+                "contains": {
+                  "type": "object",
+                  "properties": { "baseline": { "const": true } },
+                  "required": ["baseline"]
+                },
+                "minContains": 1
+              }
+            }
+          ],
+          "items": { "$ref": "#/$defs/variant" }
+        },
+        "cases": { "$ref": "#/$defs/cases" },
+        "repeats": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "scheduling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_concurrency": { "type": "integer", "minimum": 1 },
+        "random_seed": { "type": "integer" },
+        "comparison": {
+          "type": "string",
+          "const": "paired"
+        }
+      }
+    },
+    "stages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case", "agent"],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "execution": {
+                "properties": { "agent_site": { "const": "host" } },
+                "required": ["agent_site"]
+              }
+            },
+            "required": ["execution"]
+          },
+          "then": {
+            "properties": {
+              "agent": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["image"] },
+                    { "required": ["ephemerals"] }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "execution": {
+                "properties": { "agent_site": { "const": "task_runtime" } },
+                "required": ["agent_site"]
+              }
+            },
+            "required": ["execution"]
+          },
+          "then": {
+            "properties": {
+              "case": {
+                "required": ["workspace"],
+                "properties": {
+                  "workspace": {
+                    "required": ["source"],
+                    "properties": { "source": { "const": "container_image" } }
+                  }
+                }
+              },
+              "agent": {
+                "not": { "required": ["image"] }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "execution": {
+                "properties": { "agent_site": { "const": "agent_container" } },
+                "required": ["agent_site"]
+              }
+            },
+            "required": ["execution"]
+          },
+          "then": {
+            "properties": {
+              "agent": { "required": ["image"] }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "agent": {
+                "not": { "required": ["image"] }
+              },
+              "case": {
+                "anyOf": [
+                  { "required": ["files"] },
+                  {
+                    "properties": { "interface": { "const": "readonly_files" } },
+                    "required": ["interface"]
+                  },
+                  {
+                    "properties": {
+                      "workspace": {
+                        "required": ["source"],
+                        "properties": {
+                          "source": { "not": { "const": "container_image" } }
+                        }
+                      }
+                    },
+                    "required": ["workspace"]
+                  }
+                ]
+              }
+            },
+            "required": ["agent", "case"]
+          },
+          "then": {
+            "required": ["execution"],
+            "properties": {
+              "execution": { "required": ["agent_site"] }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "grader": {
+                "properties": {
+                  "strategy": { "enum": ["in_task_runtime", "injected"] }
+                },
+                "required": ["strategy"]
+              }
+            },
+            "required": ["grader"]
+          },
+          "then": {
+            "properties": {
+              "case": {
+                "required": ["workspace"],
+                "properties": {
+                  "workspace": {
+                    "required": ["source"],
+                    "properties": { "source": { "const": "container_image" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "case": { "$ref": "#/$defs/case_stage" },
+        "agent": { "$ref": "#/$defs/agent_stage" },
+        "execution": { "$ref": "#/$defs/execution_stage" },
+        "grader": { "$ref": "#/$defs/grader_stage" }
+      }
+    },
+    "ephemerals": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/sidecar_id" },
+      "additionalProperties": { "$ref": "#/$defs/ephemeral" }
+    },
+    "externals": { "$ref": "#/$defs/externals" },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeout_ms": { "type": "integer", "minimum": 1 },
+        "sanitization_profile": {
+          "type": "string",
+          "enum": ["replay_strict", "hermetic_functional", "standard_runtime"]
+        },
+        "task_sandbox": { "$ref": "#/$defs/task_sandbox_policy" },
+        "validity": { "$ref": "#/$defs/validity_policy" },
+        "policies": {
+          "$ref": "#/$defs/policies"
+        }
+      }
+    },
+    "metrics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/metric" }
+    },
+    "traces": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "const": "protocol"
+        },
+        "retain": {
+          "type": "string",
+          "enum": ["never", "on_failure", "always"]
+        }
+      }
+    },
+    "extra_outputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/extra_output" }
+    },
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": { "$ref": "#/$defs/evaluation_policy" }
+      }
+    }
+  },
+  "$defs": {
+    "compute_backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backend": { "type": "string", "enum": ["local-docker", "modal"] },
+        "config": { "$ref": "#/$defs/empty_backend_config" }
+      }
+    },
+    "empty_backend_config": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "network_mode": {
+      "type": "string",
+      "enum": ["none", "full", "allowlist_enforced", "llm_egress"]
+    },
+    "task_network_mode": {
+      "type": "string",
+      "enum": ["none", "full", "allowlist_enforced"]
+    },
+    "image_rewrite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["match_prefix", "replace_prefix"],
+      "properties": {
+        "match_prefix": { "type": "string", "minLength": 1 },
+        "replace_prefix": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "minLength": 1 }
+      }
+    },
+    "task_sandbox_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "resources": { "$ref": "#/$defs/task_sandbox_resources" },
+        "hardening": { "$ref": "#/$defs/task_sandbox_hardening" }
+      }
+    },
+    "task_sandbox_resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu_count": { "type": "integer", "minimum": 1 },
+        "memory_mb": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "task_sandbox_hardening": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "no_new_privileges": { "type": "boolean" },
+        "drop_all_caps": { "type": "boolean" }
+      }
+    },
+    "validity_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fail_on_state_leak": { "type": "boolean" },
+        "fail_on_profile_invariant_violation": { "type": "boolean" }
+      }
+    },
+    "externals": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apis": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "credentials": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "runtime_secret": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "from": { "const": "env" } },
+            "required": ["from"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["mount"] },
+                { "required": ["credential_cache"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "from": { "const": "file" } },
+            "required": ["from"]
+          },
+          "then": { "required": ["mount"] }
+        },
+        {
+          "if": { "required": ["credential_cache"] },
+          "then": { "required": ["mount"] }
+        }
+      ],
+      "properties": {
+        "name": { "$ref": "#/$defs/runtime_secret_name" },
+        "from": { "type": "string", "enum": ["env", "file"] },
+        "mount": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target"],
+          "properties": {
+            "target": { "$ref": "#/$defs/secret_target_path" },
+            "required_for_variants": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "credential_cache": {
+          "$ref": "#/$defs/credential_cache"
+        }
+      }
+    },
+    "policies": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scheduling": {
+          "type": "string",
+          "enum": ["paired_interleaved", "variant_sequential", "randomized"]
+        },
+        "state": {
+          "type": "string",
+          "enum": ["isolate_per_trial", "persist_per_task", "accumulate"]
+        },
+        "retry": { "$ref": "#/$defs/retry_policy" },
+        "pruning": { "$ref": "#/$defs/pruning_policy" },
+        "concurrency": { "$ref": "#/$defs/concurrency_policy" }
+      }
+    },
+    "retry_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1 },
+        "retry_on": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "pruning_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_consecutive_failures": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "concurrency_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_in_flight_per_variant": { "type": "integer", "minimum": 1 },
+        "require_chain_lease": { "type": "boolean" }
+      }
+    },
+    "evaluation_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task_model": {
+          "type": "string",
+          "enum": ["independent", "dependent"]
+        },
+        "scoring_lifecycle": { "type": "string", "minLength": 1 },
+        "chain_failure_policy": { "type": "string", "minLength": 1 },
+        "required_evidence_classes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "extra_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "source_path", "summary_path"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "source_path": { "$ref": "#/$defs/relative_artifact_path" },
+        "summary_path": { "$ref": "#/$defs/relative_artifact_path" }
+      }
+    },
+    "relative_artifact_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/]",
+      "not": {
+        "anyOf": [
+          { "pattern": "(^|/)\\.\\.(/|$)" },
+          { "pattern": "^\\./?$" }
+        ]
+      }
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "baseline": { "type": "boolean" },
+        "config": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "overrides": { "$ref": "#/$defs/variant_overrides" }
+      }
+    },
+    "variant_overrides": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "execution": {
+                "properties": { "agent_site": { "const": "host" } },
+                "required": ["agent_site"]
+              }
+            },
+            "required": ["execution"]
+          },
+          "then": {
+            "properties": {
+              "agent": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["image"] },
+                    { "required": ["ephemerals"] }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "execution": {
+                "properties": { "agent_site": { "const": "task_runtime" } },
+                "required": ["agent_site"]
+              }
+            },
+            "required": ["execution"]
+          },
+          "then": {
+            "properties": {
+              "case": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["files"] },
+                    {
+                      "properties": {
+                        "interface": {
+                          "enum": ["input_only", "readonly_files"]
+                        }
+                      },
+                      "required": ["interface"]
+                    },
+                    {
+                      "properties": {
+                        "workspace": {
+                          "properties": {
+                            "source": { "not": { "const": "container_image" } }
+                          },
+                          "required": ["source"]
+                        }
+                      },
+                      "required": ["workspace"]
+                    }
+                  ]
+                }
+              },
+              "agent": {
+                "not": { "required": ["image"] }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "grader": {
+                "properties": {
+                  "strategy": { "enum": ["in_task_runtime", "injected"] }
+                },
+                "required": ["strategy"]
+              }
+            },
+            "required": ["grader"]
+          },
+          "then": {
+            "properties": {
+              "case": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["files"] },
+                    {
+                      "properties": {
+                        "interface": {
+                          "enum": ["input_only", "readonly_files"]
+                        }
+                      },
+                      "required": ["interface"]
+                    },
+                    {
+                      "properties": {
+                        "workspace": {
+                          "properties": {
+                            "source": { "not": { "const": "container_image" } }
+                          },
+                          "required": ["source"]
+                        }
+                      },
+                      "required": ["workspace"]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "case": { "$ref": "#/$defs/case_stage_override" },
+        "agent": { "$ref": "#/$defs/agent_stage_override" },
+        "execution": { "$ref": "#/$defs/execution_stage" },
+        "grader": { "$ref": "#/$defs/grader_stage" }
+      }
+    },
+    "cases": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["file"]
+        },
+        "path": { "type": "string", "minLength": 1 },
+        "suite_id": { "type": "string", "minLength": 1 },
+        "split_id": { "type": "string", "minLength": 1 },
+        "limit": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "case_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "not": { "required": ["files", "workspace"] },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "interface": { "const": "input_only" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["files"] },
+                { "required": ["workspace"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "interface": { "const": "readonly_files" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "required": ["files"],
+            "not": { "required": ["workspace"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "interface": { "const": "writable_workspace" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "required": ["workspace"],
+            "not": { "required": ["files"] }
+          }
+        }
+      ],
+      "properties": {
+        "interface": {
+          "type": "string",
+          "enum": ["input_only", "readonly_files", "writable_workspace"]
+        },
+        "files": { "$ref": "#/$defs/case_files" },
+        "workspace": { "$ref": "#/$defs/case_workspace" }
+      }
+    },
+    "case_stage_override": {
+      "type": "object",
+      "additionalProperties": false,
+      "not": { "required": ["files", "workspace"] },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "interface": { "const": "input_only" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["files"] },
+                { "required": ["workspace"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "interface": { "const": "readonly_files" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "not": { "required": ["workspace"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "interface": { "const": "writable_workspace" } },
+            "required": ["interface"]
+          },
+          "then": {
+            "not": { "required": ["files"] }
+          }
+        }
+      ],
+      "properties": {
+        "interface": {
+          "type": "string",
+          "enum": ["input_only", "readonly_files", "writable_workspace"]
+        },
+        "files": { "$ref": "#/$defs/case_files" },
+        "workspace": { "$ref": "#/$defs/case_workspace_override" }
+      }
+    },
+    "case_files": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "path", "mount_path"],
+      "properties": {
+        "source": { "type": "string", "enum": ["files", "archive"] },
+        "path": { "type": "string", "minLength": 1 },
+        "mount_path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "case_workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["container_image", "files", "archive", "git", "empty"]
+        },
+        "path": { "type": "string", "minLength": 1 },
+        "repo": { "type": "string", "minLength": 1 },
+        "rev": { "type": "string", "minLength": 1 },
+        "image": { "$ref": "#/$defs/runtime_field_source" },
+        "workdir": { "$ref": "#/$defs/runtime_field_source" }
+      }
+    },
+    "case_workspace_override": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["container_image", "files", "archive", "git", "empty"]
+        },
+        "path": { "type": "string", "minLength": 1 },
+        "repo": { "type": "string", "minLength": 1 },
+        "rev": { "type": "string", "minLength": 1 },
+        "image": { "$ref": "#/$defs/runtime_field_source" },
+        "workdir": { "$ref": "#/$defs/runtime_field_source" }
+      }
+    },
+    "runtime_field_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from"],
+      "properties": {
+        "from": { "type": "string", "minLength": 1 }
+      }
+    },
+    "agent_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": { "$ref": "#/$defs/argv" },
+        "image": { "type": "string", "minLength": 1 },
+        "mount": { "$ref": "#/$defs/mount" },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "ephemerals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sidecar_id" }
+        },
+        "outputs": {
+          "type": "object",
+          "propertyNames": {
+            "not": { "const": "result" }
+          },
+          "additionalProperties": { "$ref": "#/$defs/output" }
+        },
+        "events": {
+          "type": "array",
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/event_sink" }
+        },
+        "output_mounts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/output_mount" }
+        }
+      }
+    },
+    "agent_stage_override": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": { "$ref": "#/$defs/argv" },
+        "image": { "type": "string", "minLength": 1 },
+        "mount": { "$ref": "#/$defs/mount" },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "ephemerals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sidecar_id" }
+        },
+        "outputs": {
+          "type": "object",
+          "propertyNames": {
+            "not": { "const": "result" }
+          },
+          "additionalProperties": { "$ref": "#/$defs/output" }
+        },
+        "events": {
+          "type": "array",
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/event_sink" }
+        },
+        "output_mounts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/output_mount" }
+        }
+      }
+    },
+    "execution_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent_site": {
+          "type": "string",
+          "enum": ["agent_container", "task_runtime", "host"]
+        }
+      }
+    },
+    "grader_stage": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "strategy": { "const": "none" } },
+            "required": ["strategy"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["command"] },
+                { "required": ["ephemerals"] },
+                { "required": ["max_concurrency"] },
+                { "required": ["inputs"] },
+                { "required": ["outputs"] },
+                { "required": ["in_task_runtime"] },
+                { "required": ["injected"] },
+                { "required": ["separate"] },
+                { "required": ["host"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "strategy": {
+                "enum": ["in_task_runtime", "injected", "separate", "host"]
+              }
+            },
+            "required": ["strategy"]
+          },
+          "then": { "required": ["command"] }
+        },
+        {
+          "if": {
+            "properties": { "strategy": { "const": "injected" } },
+            "required": ["strategy"]
+          },
+          "then": { "required": ["injected"] }
+        },
+        {
+          "if": {
+            "properties": { "strategy": { "const": "separate" } },
+            "required": ["strategy"]
+          },
+          "then": { "required": ["separate"] }
+        },
+        {
+          "if": {
+            "properties": { "strategy": { "const": "host" } },
+            "required": ["strategy"]
+          },
+          "then": {
+            "required": ["host"],
+            "not": { "required": ["ephemerals"] }
+          }
+        }
+      ],
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["none", "in_task_runtime", "injected", "separate", "host"]
+        },
+        "command": { "$ref": "#/$defs/argv" },
+        "ephemerals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sidecar_id" }
+        },
+        "max_concurrency": { "type": "integer", "minimum": 1 },
+        "inputs": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/transport_id" },
+          "additionalProperties": { "$ref": "#/$defs/grader_input" }
+        },
+        "outputs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/output" }
+        },
+        "in_task_runtime": { "$ref": "#/$defs/in_task_runtime_grader" },
+        "injected": { "$ref": "#/$defs/injected_grader" },
+        "separate": { "$ref": "#/$defs/separate_grader" },
+        "host": { "$ref": "#/$defs/host_grader" }
+      }
+    },
+    "in_task_runtime_grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hidden_paths": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/absolute_container_path" }
+        },
+        "revealed_paths": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/absolute_container_path" }
+        }
+      }
+    },
+    "injected_grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundle", "copy_dest"],
+      "properties": {
+        "bundle": { "type": "string", "minLength": 1 },
+        "copy_dest": { "$ref": "#/$defs/absolute_container_path" }
+      }
+    },
+    "separate_grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "workdir"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "workdir": { "$ref": "#/$defs/absolute_container_path" }
+      }
+    },
+    "host_grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability"],
+      "properties": {
+        "capability": { "$ref": "#/$defs/host_capability_id" }
+      }
+    },
+    "absolute_container_path": {
+      "type": "string",
+      "minLength": 2,
+      "pattern": "^/.*[^/\\\\]$",
+      "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+    },
+    "host_capability_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/\\\\.][^/\\\\]*$"
+    },
+    "runtime_secret_name": {
+      "type": "string",
+      "pattern": "^[^=]*[^=\\s][^=]*$"
+    },
+    "nonblank_string": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/nonblank_string" }
+    },
+    "mount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "mount"],
+      "properties": {
+        "source": { "type": "string", "minLength": 1 },
+        "mount": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "read_only"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "read_only": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capture"],
+      "properties": {
+        "capture": {
+          "oneOf": [
+            { "$ref": "#/$defs/file_capture" },
+            { "$ref": "#/$defs/result_json_capture" },
+            { "$ref": "#/$defs/workspace_diff_capture" }
+          ]
+        }
+      }
+    },
+    "grader_input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "materialize"],
+      "properties": {
+        "source": { "$ref": "#/$defs/transport_source" },
+        "materialize": {
+          "oneOf": [
+            { "$ref": "#/$defs/file_materialize" },
+            { "$ref": "#/$defs/json_file_materialize" },
+            { "$ref": "#/$defs/env_materialize" }
+          ]
+        },
+        "required": { "type": "boolean" }
+      }
+    },
+    "transport_source": {
+      "type": "object",
+      "oneOf": [
+        { "$ref": "#/$defs/output_source" },
+        { "$ref": "#/$defs/case_source" },
+        { "$ref": "#/$defs/task_source" },
+        { "$ref": "#/$defs/object_source" }
+      ]
+    },
+    "output_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["output"],
+      "properties": {
+        "output": { "type": "string", "minLength": 1 },
+        "field": { "type": "string", "minLength": 1 }
+      }
+    },
+    "case_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case"],
+      "properties": {
+        "case": { "type": "string", "minLength": 1 }
+      }
+    },
+    "task_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task"],
+      "properties": {
+        "task": { "type": "string", "minLength": 1 }
+      }
+    },
+    "object_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["object"],
+      "properties": {
+        "object": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/transport_id" },
+          "additionalProperties": { "$ref": "#/$defs/transport_source" }
+        }
+      }
+    },
+    "file_materialize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["as", "path"],
+      "properties": {
+        "as": { "const": "file" },
+        "path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "json_file_materialize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["as", "path"],
+      "properties": {
+        "as": { "const": "json_file" },
+        "path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "env_materialize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["as", "name"],
+      "properties": {
+        "as": { "const": "env" },
+        "name": { "type": "string", "pattern": "^[A-Z0-9_]+$" }
+      }
+    },
+    "transport_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "runtime_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "sidecar_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+    },
+    "env_name": {
+      "type": "string",
+      "pattern": "^[_A-Z][_A-Z0-9]*$"
+    },
+    "secret_target_path": {
+      "type": "string",
+      "minLength": 2,
+      "pattern": "^/.*[^/\\\\]$",
+      "not": {
+        "anyOf": [
+          { "pattern": "(^|/)\\.\\.(/|$)" },
+          { "pattern": "^/bucephalus/(in|out|state|workspace|tmp)(/|$)" },
+          { "pattern": "^/workspace/task(/|$)" },
+          { "pattern": "^/testbed(/|$)" },
+          { "pattern": "^/opt/agent(/|$)" }
+        ]
+      }
+    },
+    "credential_cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target"],
+      "properties": {
+        "kind": { "const": "run_scoped" },
+        "target": { "$ref": "#/$defs/secret_target_path" },
+        "env": { "$ref": "#/$defs/env_name" }
+      }
+    },
+    "runtime_output_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/\\\\]+(?:/[^/\\\\]+)*$",
+      "not": {
+        "pattern": "(^|/)\\.{1,2}(/|$)"
+      }
+    },
+    "event_sink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "$ref": "#/$defs/runtime_id" },
+        "format": { "const": "jsonl" },
+        "mode": { "const": "jsonl" },
+        "ingest": { "type": "boolean" },
+        "retain_raw": { "type": "boolean" }
+      }
+    },
+    "output_mount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path"],
+      "properties": {
+        "id": { "$ref": "#/$defs/runtime_id" },
+        "kind": { "const": "directory" },
+        "path": { "$ref": "#/$defs/runtime_output_path" },
+        "env": { "$ref": "#/$defs/env_name" },
+        "persist": { "type": "boolean" }
+      }
+    },
+    "file_capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "path", "format"],
+      "properties": {
+        "type": { "const": "file" },
+        "path": { "type": "string", "minLength": 1 },
+        "format": { "type": "string", "enum": ["json", "text", "bytes"] },
+        "required": { "type": "boolean" }
+      }
+    },
+    "result_json_capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "path"],
+      "properties": {
+        "type": { "const": "result_json" },
+        "path": { "type": "string", "minLength": 1 },
+        "field": { "type": "string", "minLength": 1 },
+        "required": { "type": "boolean" }
+      }
+    },
+    "workspace_diff_capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "format"],
+      "properties": {
+        "type": { "const": "workspace_diff" },
+        "format": { "const": "unified_diff" }
+      }
+    },
+    "ephemeral": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "lifecycle"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "lifecycle": { "type": "string", "enum": ["per-trial"] },
+        "command": { "$ref": "#/$defs/argv" },
+        "workdir": { "type": "string", "minLength": 1 },
+        "expose": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "from"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "semantic_key": { "type": "string", "minLength": 1 },
+        "value_type": { "type": "string", "minLength": 1 },
+        "unit": { "type": "string", "minLength": 1 },
+        "from": { "type": "string", "minLength": 1 },
+        "direction": { "type": "string", "enum": ["maximize", "minimize"] },
+        "primary": { "type": "boolean" },
+        "required": { "type": "boolean" },
+        "transform": { "$ref": "#/$defs/metric_transform" }
+      }
+    },
+    "metric_transform": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "identity" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "pytest_json_report_pass_rate" },
+            "test_ids": { "$ref": "#/$defs/metric_transform_test_ids" }
+          }
+        }
+      ]
+    },
+    "metric_transform_test_ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source"],
+      "properties": {
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["task"],
+          "properties": {
+            "task": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}

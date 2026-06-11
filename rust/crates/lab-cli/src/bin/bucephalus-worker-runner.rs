@@ -185,6 +185,9 @@ fn parse_runtime_env_bindings(values: &[String]) -> Result<BTreeMap<String, Stri
         if key.is_empty() {
             return Err(anyhow!("invalid --env '{}': key cannot be empty", raw));
         }
+        if out.contains_key(key) {
+            return Err(anyhow!("duplicate --env key '{}'", key));
+        }
         out.insert(key.to_string(), value_raw.to_string());
     }
     Ok(out)
@@ -250,7 +253,6 @@ fn summary_to_json(summary: &lab_runner::ExperimentSummary) -> Value {
         "agent_runtime": summary.agent_runtime_command,
         "image": summary.image,
         "network": summary.network_mode,
-        "trajectory_path": summary.trajectory_path,
         "causal_extraction": summary.causal_extraction,
         "scheduling": summary.scheduling,
         "state_policy": summary.state_policy,
@@ -299,4 +301,24 @@ fn current_unix_time_ms() -> i64 {
             i64::try_from(duration.as_millis()).expect("Unix timestamp milliseconds must fit i64")
         })
         .expect("system time must be after Unix epoch")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_runtime_env_bindings_reject_duplicate_keys() {
+        let err = parse_runtime_env_bindings(&[
+            "OPENAI_API_KEY=first".to_string(),
+            "OPENAI_API_KEY=second".to_string(),
+        ])
+        .expect_err("duplicate --env keys should fail");
+
+        assert!(
+            err.to_string()
+                .contains("duplicate --env key 'OPENAI_API_KEY'"),
+            "unexpected error: {err}"
+        );
+    }
 }

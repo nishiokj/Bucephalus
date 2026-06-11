@@ -69,7 +69,6 @@ pub(crate) fn configured_task_network_mode(json_value: &Value) -> Result<&str> {
 pub(crate) fn configured_agent_network_mode(json_value: &Value) -> Result<&str> {
     json_value
         .pointer("/runtime/network/agent")
-        .or_else(|| json_value.pointer("/runtime/network/default"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|mode| !mode.is_empty())
@@ -117,20 +116,24 @@ pub(crate) fn experiment_workload_type(json_value: &Value) -> Result<String> {
     Ok("agent_runtime".to_string())
 }
 
-pub(crate) fn experiment_random_seed(json_value: &Value) -> u64 {
+pub(crate) fn experiment_random_seed(json_value: &Value) -> Result<u64> {
     json_value
         .pointer("/scheduling/random_seed")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1)
+        .ok_or_else(|| anyhow!("missing /scheduling/random_seed"))?
+        .as_u64()
+        .ok_or_else(|| anyhow!("/scheduling/random_seed must be a non-negative integer"))
 }
 
 pub(crate) fn experiment_max_concurrency(json_value: &Value) -> Result<usize> {
     let raw = json_value
         .pointer("/scheduling/max_concurrency")
-        .or_else(|| json_value.pointer("/runtime/compute/config/max_parallel"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1);
-    usize_from_u64(raw.max(1), "/scheduling/max_concurrency")
+        .ok_or_else(|| anyhow!("missing /scheduling/max_concurrency"))?
+        .as_u64()
+        .ok_or_else(|| anyhow!("/scheduling/max_concurrency must be a positive integer"))?;
+    if raw == 0 {
+        return Err(anyhow!("/scheduling/max_concurrency must be at least 1"));
+    }
+    usize_from_u64(raw, "/scheduling/max_concurrency")
 }
 
 fn usize_from_u64(value: u64, field: &str) -> Result<usize> {
@@ -141,10 +144,13 @@ pub(crate) fn optional_json_usize_field(
     value: Option<&Value>,
     field: &str,
 ) -> Result<Option<usize>> {
-    value
-        .and_then(Value::as_u64)
-        .map(|raw| usize_from_u64(raw, field))
-        .transpose()
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_u64()
+        .ok_or_else(|| anyhow!("{} must be a non-negative integer", field))?;
+    usize_from_u64(raw, field).map(Some)
 }
 
 pub(crate) fn matrix_repeats(json_value: &Value) -> Result<usize> {
@@ -155,8 +161,6 @@ pub(crate) fn matrix_repeats(json_value: &Value) -> Result<usize> {
     usize_from_u64(raw, "/matrix/repeats")
 }
 
-pub(crate) const DEFAULT_SANITIZATION_PROFILE: &str = "standard_runtime";
-
 pub(crate) fn configured_sanitization_profile(json_value: &Value) -> Option<&str> {
     json_value
         .pointer("/policy/sanitization_profile")
@@ -165,8 +169,41 @@ pub(crate) fn configured_sanitization_profile(json_value: &Value) -> Option<&str
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn effective_sanitization_profile(json_value: &Value) -> &str {
-    configured_sanitization_profile(json_value).unwrap_or(DEFAULT_SANITIZATION_PROFILE)
+pub(crate) fn effective_sanitization_profile(json_value: &Value) -> Result<&str> {
+    configured_sanitization_profile(json_value)
+        .ok_or_else(|| anyhow!("missing /policy/sanitization_profile"))
+}
+
+pub(crate) fn validate_sanitization_profile_network_invariants(
+    json_value: &Value,
+    effective_task_network: &str,
+) -> Result<()> {
+    let profile = effective_sanitization_profile(json_value)?;
+    if profile != "hermetic_functional" {
+        return Ok(());
+    }
+
+    if effective_task_network != "none" {
+        return Err(anyhow!(
+            "sanitization_profile=hermetic_functional requires effective task network 'none' (got {}). For provider-backed or other networked agents, omit policy.sanitization_profile or set it to standard_runtime.",
+            effective_task_network
+        ));
+    }
+
+    let agent_network = json_value
+        .pointer("/runtime/network/agent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("missing /runtime/network/agent"))?;
+    if agent_network != "none" {
+        return Err(anyhow!(
+            "sanitization_profile=hermetic_functional requires runtime.network.agent 'none' when declared (got {}). For provider-backed or other networked agents, omit policy.sanitization_profile or set it to standard_runtime.",
+            agent_network
+        ));
+    }
+
+    Ok(())
 }
 
 pub(crate) fn parse_string_array_field(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
@@ -242,48 +279,69 @@ pub fn find_project_root(experiment_dir: &Path) -> PathBuf {
 }
 
 pub(crate) fn parse_policies(json_value: &Value) -> Result<PolicyConfig> {
-    let default_scheduling = default_scheduling_for_design(json_value);
-    let policies = json_value.pointer("/policy/policies");
+    reject_legacy_policy_surface(json_value)?;
 
-    let scheduling = match policies
-        .and_then(|p| p.pointer("/scheduling"))
-        .and_then(|v| v.as_str())
-    {
-        Some("paired_interleaved") => SchedulingPolicy::PairedInterleaved,
-        Some("variant_sequential") => SchedulingPolicy::VariantSequential,
-        Some("randomized") => SchedulingPolicy::Randomized,
-        Some(other) => return Err(anyhow!("unknown policy.policies.scheduling '{}'", other)),
-        None => default_scheduling,
+    let policies = match json_value.pointer("/policy/policies") {
+        Some(value) if value.is_object() => value,
+        Some(_) => return Err(anyhow!("policy.policies must be an object")),
+        None => {
+            return Err(anyhow!(
+                "/policy/policies is required in resolved experiments"
+            ))
+        }
     };
-    let state = match policies
-        .and_then(|p| p.pointer("/state"))
-        .and_then(|v| v.as_str())
-    {
-        Some(raw) => parse_state_policy_value(Some(raw))
+
+    let scheduling = match required_string_policy_field(
+        policies,
+        "/scheduling",
+        "policy.policies.scheduling",
+    )? {
+        "paired_interleaved" => SchedulingPolicy::PairedInterleaved,
+        "variant_sequential" => SchedulingPolicy::VariantSequential,
+        "randomized" => SchedulingPolicy::Randomized,
+        other => return Err(anyhow!("unknown policy.policies.scheduling '{}'", other)),
+    };
+    let state = match required_string_policy_field(policies, "/state", "policy.policies.state")? {
+        raw => parse_state_policy_value(Some(raw))
             .ok_or_else(|| anyhow!("unknown policy.policies.state '{}'", raw))?,
-        None => StatePolicy::IsolatePerTrial,
     };
     let retry_max_attempts = optional_json_usize_field(
-        policies.and_then(|p| p.pointer("/retry/max_attempts")),
+        Some(required_policy_value(
+            policies,
+            "/retry/max_attempts",
+            "policy.policies.retry.max_attempts",
+        )?),
         "policy.policies.retry.max_attempts",
     )?
-    .unwrap_or(1);
+    .expect("required numeric policy field");
     let retry_on = parse_string_array_field(
-        policies.and_then(|p| p.pointer("/retry/retry_on")),
+        Some(required_policy_value(
+            policies,
+            "/retry/retry_on",
+            "policy.policies.retry.retry_on",
+        )?),
         "policy.policies.retry.retry_on",
     )?;
     let pruning_max_consecutive_failures = optional_json_usize_field(
-        policies.and_then(|p| p.pointer("/pruning/max_consecutive_failures")),
+        Some(required_policy_value(
+            policies,
+            "/pruning/max_consecutive_failures",
+            "policy.policies.pruning.max_consecutive_failures",
+        )?),
         "policy.policies.pruning.max_consecutive_failures",
-    )?;
+    )?
+    .filter(|max_failures| *max_failures > 0);
     let max_in_flight_per_variant = optional_json_usize_field(
-        policies.and_then(|p| p.pointer("/concurrency/max_in_flight_per_variant")),
+        policies.pointer("/concurrency/max_in_flight_per_variant"),
         "policy.policies.concurrency.max_in_flight_per_variant",
     )?;
-    let require_chain_lease = policies
-        .and_then(|p| p.pointer("/concurrency/require_chain_lease"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let require_chain_lease = required_policy_value(
+        policies,
+        "/concurrency/require_chain_lease",
+        "policy.policies.concurrency.require_chain_lease",
+    )?
+    .as_bool()
+    .ok_or_else(|| anyhow!("policy.policies.concurrency.require_chain_lease must be a boolean"))?;
 
     Ok(PolicyConfig {
         scheduling,
@@ -298,14 +356,47 @@ pub(crate) fn parse_policies(json_value: &Value) -> Result<PolicyConfig> {
     })
 }
 
-fn default_scheduling_for_design(json_value: &Value) -> SchedulingPolicy {
-    match json_value
-        .pointer("/scheduling/comparison")
-        .and_then(|v| v.as_str())
-    {
-        Some("paired") => SchedulingPolicy::PairedInterleaved,
-        _ => SchedulingPolicy::VariantSequential,
+fn reject_legacy_policy_surface(json_value: &Value) -> Result<()> {
+    if json_value.pointer("/scheduling/comparison").is_some() {
+        return Err(anyhow!(
+            "/scheduling/comparison is authoring-only design intent; resolved packages must use /policy/policies/scheduling"
+        ));
     }
+    for (pointer, replacement) in [
+        (
+            "/policy/task_sandbox/network",
+            "/runtime/network/task_sandbox",
+        ),
+        (
+            "/policy/task_sandbox/profile",
+            "/policy/sanitization_profile",
+        ),
+    ] {
+        if json_value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "{} is legacy v0 policy vocabulary; resolved packages must use {}",
+                pointer,
+                replacement
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn required_policy_value<'a>(root: &'a Value, pointer: &str, field: &str) -> Result<&'a Value> {
+    root.pointer(pointer)
+        .ok_or_else(|| anyhow!("{} is required", field))
+}
+
+fn required_string_policy_field<'a>(
+    root: &'a Value,
+    pointer: &str,
+    field: &str,
+) -> Result<&'a str> {
+    let value = required_policy_value(root, pointer, field)?;
+    value
+        .as_str()
+        .ok_or_else(|| anyhow!("{} must be a string", field))
 }
 
 pub(crate) fn parse_task_model(value: Option<&str>) -> Result<TaskModel> {
@@ -339,24 +430,17 @@ fn evaluation_policy(json_value: &Value) -> Option<&Value> {
 pub(crate) fn parse_evaluation_config(json_value: &Value) -> Result<EvaluationConfig> {
     let trial_grader_root = json_value.pointer("/trial_runtime/grader");
 
-    let mut policy_config = TaskPolicyConfig::default();
-    if let Some(p) = evaluation_policy(json_value) {
-        policy_config.task_model =
-            parse_task_model(p.pointer("/task_model").and_then(|v| v.as_str()))?;
-        if let Some(v) = p.pointer("/scoring_lifecycle").and_then(|v| v.as_str()) {
-            policy_config.scoring_lifecycle = v.to_string();
-        }
-        if let Some(v) = p.pointer("/evaluator_mode").and_then(|v| v.as_str()) {
-            policy_config.evaluator_mode = v.to_string();
-        }
-        if let Some(v) = p.pointer("/chain_failure_policy").and_then(|v| v.as_str()) {
-            policy_config.chain_failure_policy = v.to_string();
-        }
-        policy_config.required_evidence_classes = parse_string_array_field(
+    let p = evaluation_policy(json_value)
+        .ok_or_else(|| anyhow!("/evaluation/policy is required in resolved experiments"))?;
+    let policy_config = TaskPolicyConfig {
+        task_model: parse_task_model(Some(required_policy_string(p, "task_model")?))?,
+        scoring_lifecycle: required_policy_string(p, "scoring_lifecycle")?.to_string(),
+        chain_failure_policy: required_policy_string(p, "chain_failure_policy")?.to_string(),
+        required_evidence_classes: parse_required_string_array_field(
             p.pointer("/required_evidence_classes"),
             "evaluation.policy.required_evidence_classes",
-        )?;
-    }
+        )?,
+    };
 
     let grader = match trial_grader_root {
         Some(g) => parse_grader_config(g, "/trial_runtime/grader")?,
@@ -367,6 +451,22 @@ pub(crate) fn parse_evaluation_config(json_value: &Value) -> Result<EvaluationCo
         policy: policy_config,
         grader,
     })
+}
+
+fn required_policy_string<'a>(policy: &'a Value, field: &str) -> Result<&'a str> {
+    policy
+        .pointer(&format!("/{}", field))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .ok_or_else(|| anyhow!("evaluation.policy.{} is required", field))
+}
+
+fn parse_required_string_array_field(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
+    if value.is_none() {
+        return Err(anyhow!("{} is required", field));
+    }
+    parse_string_array_field(value, field)
 }
 
 fn parse_grader_config(g: &Value, field: &str) -> Result<Option<GraderConfig>> {
@@ -503,20 +603,24 @@ fn parse_grader_config(g: &Value, field: &str) -> Result<Option<GraderConfig>> {
         }),
         _ => None,
     };
-    let inputs = g
-        .pointer("/inputs")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .with_context(|| format!("invalid {}.inputs", field))?
-        .unwrap_or_default();
-    let outputs = g
-        .pointer("/outputs")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .with_context(|| format!("invalid {}.outputs", field))?
-        .unwrap_or_default();
+    let inputs_value = g.pointer("/inputs").ok_or_else(|| {
+        anyhow!(
+            "{}.inputs is required in resolved experiments when strategy={}",
+            field,
+            grader_strategy_name(&strategy)
+        )
+    })?;
+    let inputs = serde_json::from_value(inputs_value.clone())
+        .with_context(|| format!("invalid {}.inputs", field))?;
+    let outputs_value = g.pointer("/outputs").ok_or_else(|| {
+        anyhow!(
+            "{}.outputs is required in resolved experiments when strategy={}",
+            field,
+            grader_strategy_name(&strategy)
+        )
+    })?;
+    let outputs = serde_json::from_value(outputs_value.clone())
+        .with_context(|| format!("invalid {}.outputs", field))?;
 
     Ok(Some(GraderConfig {
         strategy,
@@ -590,11 +694,116 @@ fn parse_metric_source(value: &Value, field: &str) -> Result<MetricSourceConfig>
             source_type
         ));
     }
+    validate_metric_transform(source.get("transform"), field)?;
 
     Ok(MetricSourceConfig {
         source_type: source_type.to_string(),
         pointer,
     })
+}
+
+fn validate_metric_transform(value: Option<&Value>, field: &str) -> Result<()> {
+    let Some(transform) = value else {
+        return Ok(());
+    };
+    let transform = transform
+        .as_object()
+        .ok_or_else(|| anyhow!("{} source.transform must be an object", field))?;
+    let transform_type = transform
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .ok_or_else(|| anyhow!("{} source.transform.type is required", field))?;
+    for key in transform.keys() {
+        if !matches!(key.as_str(), "type" | "test_ids") {
+            return Err(anyhow!(
+                "{} source.transform.{} is not supported",
+                field,
+                key
+            ));
+        }
+    }
+    match transform_type {
+        "identity" => {
+            if transform.contains_key("test_ids") {
+                return Err(anyhow!(
+                    "{} source.transform.test_ids is only supported for pytest_json_report_pass_rate",
+                    field
+                ));
+            }
+        }
+        "pytest_json_report_pass_rate" => {
+            validate_metric_transform_test_ids(transform.get("test_ids"), field)?;
+        }
+        other => {
+            return Err(anyhow!(
+                "{} source.transform.type '{}' is not supported",
+                field,
+                other
+            ))
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn required_experiment_id(json_value: &Value) -> Result<String> {
+    json_value
+        .pointer("/experiment/id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("missing /experiment/id"))
+}
+
+fn validate_metric_transform_test_ids(value: Option<&Value>, field: &str) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let test_ids = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{} source.transform.test_ids must be an object", field))?;
+    for key in test_ids.keys() {
+        if key != "source" {
+            return Err(anyhow!(
+                "{} source.transform.test_ids.{} is not supported",
+                field,
+                key
+            ));
+        }
+    }
+    let source = test_ids
+        .get("source")
+        .ok_or_else(|| anyhow!("{} source.transform.test_ids.source is required", field))?
+        .as_object()
+        .ok_or_else(|| {
+            anyhow!(
+                "{} source.transform.test_ids.source must be an object",
+                field
+            )
+        })?;
+    for key in source.keys() {
+        if key != "task" {
+            return Err(anyhow!(
+                "{} source.transform.test_ids.source.{} is not supported; use source.task",
+                field,
+                key
+            ));
+        }
+    }
+    source
+        .get("task")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "{} source.transform.test_ids.source.task is required",
+                field
+            )
+        })?;
+    Ok(())
 }
 
 pub(crate) fn parse_metric_definitions(json_value: &Value) -> Result<Vec<MetricDefinition>> {
@@ -632,18 +841,21 @@ pub(crate) fn parse_metric_definitions(json_value: &Value) -> Result<Vec<MetricD
                 unit: parse_string("unit"),
                 direction: parse_string("direction"),
                 source: parse_metric_source(item, &field)?,
-                required: item
-                    .get("required")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                primary: item
-                    .get("primary")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                required: required_bool_field(item, "required", &field)?,
+                primary: required_bool_field(item, "primary", &field)?,
                 definition_json: item.clone(),
             })
         })
         .collect()
+}
+
+fn required_bool_field(item: &Value, key: &str, field: &str) -> Result<bool> {
+    let Some(value) = item.get(key) else {
+        return Err(anyhow!("{}.{} is required", field, key));
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| anyhow!("{}.{} must be a boolean", field, key))
 }
 
 pub(crate) fn resolve_effective_task_policy(
@@ -834,16 +1046,57 @@ pub(crate) fn write_resolved_schedule(run_dir: &Path, schedule: &[TrialSlot]) ->
     atomic_write_json_pretty(&resolved_schedule_path(run_dir), &value)
 }
 
+pub(crate) fn load_run_schedule(run_dir: &Path) -> Result<Vec<TrialSlot>> {
+    let manifest_path = resolved_schedule_path(run_dir);
+    if !manifest_path.exists() {
+        return Err(anyhow!(
+            "missing resolved schedule manifest: {}; run schedule must be loaded from the recorded run plan",
+            manifest_path.display()
+        ));
+    }
+
+    let manifest_value: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    crate::package::validate::validate_schema_contract_value(
+        &manifest_value,
+        format!("resolved schedule manifest {}", manifest_path.display()).as_str(),
+    )?;
+    let manifest: ResolvedScheduleManifest = serde_json::from_value(manifest_value)?;
+    if manifest.schema_version != "resolved_schedule_v1" {
+        return Err(anyhow!(
+            "unsupported resolved schedule schema_version in {}: {}",
+            manifest_path.display(),
+            manifest.schema_version
+        ));
+    }
+    if manifest.total_slots != manifest.schedule.len() {
+        return Err(anyhow!(
+            "resolved schedule manifest total_slots mismatch in {}: declared {}, found {}",
+            manifest_path.display(),
+            manifest.total_slots,
+            manifest.schedule.len()
+        ));
+    }
+    Ok(manifest.schedule)
+}
+
 pub(crate) fn load_run_variants(
     run_dir: &Path,
     experiment: &Value,
 ) -> Result<(Vec<Variant>, String)> {
     let manifest_path = resolved_variants_path(run_dir);
     if !manifest_path.exists() {
-        return resolve_variant_plan(experiment);
+        return Err(anyhow!(
+            "missing resolved variants manifest: {}; run variants must be loaded from the recorded run plan",
+            manifest_path.display()
+        ));
     }
 
-    let manifest: ResolvedVariantsManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let manifest_value: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    crate::package::validate::validate_schema_contract_value(
+        &manifest_value,
+        format!("resolved variants manifest {}", manifest_path.display()).as_str(),
+    )?;
+    let manifest: ResolvedVariantsManifest = serde_json::from_value(manifest_value)?;
     if manifest.schema_version != "resolved_variants_v1" {
         return Err(anyhow!(
             "unsupported resolved variants schema_version in {}: {}",
@@ -867,6 +1120,18 @@ pub(crate) fn load_run_variants(
             manifest.baseline_id,
             manifest_path.display()
         ));
+    }
+    for entry in &manifest.variants {
+        let actual_digest = resolved_variant_behavior_digest(experiment, &entry.variant)?;
+        if actual_digest != entry.variant_digest {
+            return Err(anyhow!(
+                "resolved variants manifest digest mismatch for variant '{}' in {}: recorded {}, computed {}",
+                entry.variant.id,
+                manifest_path.display(),
+                entry.variant_digest,
+                actual_digest
+            ));
+        }
     }
     Ok((
         manifest
@@ -981,6 +1246,7 @@ fn resolved_variant_manifest_entry(
 }
 
 pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
+    reject_legacy_variant_plan_surface(json_value)?;
     let variant_list = json_value
         .pointer("/matrix/variants")
         .and_then(Value::as_array)
@@ -1006,7 +1272,12 @@ pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, 
                 idx
             ));
         }
-        let config = item.get("config").cloned().unwrap_or(json!({}));
+        let config = item.get("config").cloned().ok_or_else(|| {
+            anyhow!(
+                "/matrix/variants[{}].config is required in resolved experiments; authoring YAML defaults missing config to an empty object",
+                idx
+            )
+        })?;
         if !config.is_object() {
             return Err(anyhow!(
                 "/matrix/variants[{}].config must be an object",
@@ -1015,7 +1286,10 @@ pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, 
         }
         let runtime_overrides = match item.get("overrides") {
             None | Some(Value::Null) => None,
-            Some(Value::Object(_)) => item.get("overrides").cloned(),
+            Some(Value::Object(object)) => {
+                validate_variant_runtime_override_roots(idx, object)?;
+                item.get("overrides").cloned()
+            }
             Some(_) => {
                 return Err(anyhow!(
                     "/matrix/variants[{}].overrides must be an object",
@@ -1035,12 +1309,11 @@ pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, 
                 idx
             ));
         }
-        if item
+        let baseline = item
             .get("baseline")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-            && baseline_id.replace(id.clone()).is_some()
-        {
+            .ok_or_else(|| anyhow!("/matrix/variants[{}].baseline is required", idx))?;
+        if baseline && baseline_id.replace(id.clone()).is_some() {
             return Err(anyhow!(
                 "exactly one /matrix/variants[].baseline=true is required"
             ));
@@ -1055,9 +1328,52 @@ pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, 
         });
     }
     let baseline = baseline_id
-        .or_else(|| (variants.len() == 1).then(|| variants[0].id.clone()))
         .ok_or_else(|| anyhow!("exactly one /matrix/variants[].baseline=true is required"))?;
     Ok((variants, baseline))
+}
+
+fn reject_legacy_variant_plan_surface(json_value: &Value) -> Result<()> {
+    if json_value.pointer("/version").is_some() {
+        return Err(anyhow!(
+            "/version is not supported in v1 variant plans; resolved packages are schema-versioned by the package manifest"
+        ));
+    }
+    for (pointer, replacement) in [
+        ("/variant_plan", "/matrix/variants"),
+        ("/variants", "/matrix/variants"),
+        ("/baseline", "/matrix/variants[] with baseline: true"),
+    ] {
+        if json_value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "{} is legacy variant plan vocabulary; use {}",
+                pointer,
+                replacement
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_variant_runtime_override_roots(
+    variant_idx: usize,
+    object: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    for key in object.keys() {
+        if !matches!(key.as_str(), "agent" | "task" | "execution" | "grader") {
+            let hint = if key == "case" {
+                "; authoring YAML should use /matrix/variants[].overrides.case, but resolved packages must contain lowered /matrix/variants[].overrides.task"
+            } else {
+                "; overrides patch trial_runtime only"
+            };
+            return Err(anyhow!(
+                "/matrix/variants[{}].overrides.{} is not supported{}",
+                variant_idx,
+                key,
+                hint
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn merge_json_value(base: &mut Value, patch: &Value) {
@@ -1213,6 +1529,15 @@ pub(crate) fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant)
         return Err(anyhow!("invalid /trial_runtime: expected object"));
     }
     merge_json_value(&mut trial_runtime, runtime_overrides);
+    crate::trial::plan::parse_trial_runtime_config(
+        &json!({ "trial_runtime": trial_runtime.clone() }),
+    )
+    .with_context(|| {
+        format!(
+            "variant '{}' runtime overrides produce invalid trial_runtime",
+            variant.id
+        )
+    })?;
     set_json_pointer_value(&mut resolved, "/trial_runtime", trial_runtime)?;
     Ok(resolved)
 }
@@ -1223,9 +1548,7 @@ pub(crate) fn find_variant_by_id<'a>(
 ) -> Result<&'a Variant> {
     let trimmed = variant_id.trim();
     if trimmed.is_empty() {
-        return variants
-            .first()
-            .ok_or_else(|| anyhow!("no variants available in experiment"));
+        return Err(anyhow!("variant id is required"));
     }
     variants
         .iter()
@@ -1239,19 +1562,8 @@ pub(crate) fn apply_experiment_overrides(
     project_root: &Path,
 ) -> Result<Value> {
     let overrides = crate::package::validate::load_experiment_overrides(overrides_path)?;
-    if overrides.values.is_empty() {
-        return Ok(experiment);
-    }
-
-    let manifest_rel = overrides
-        .manifest_path
-        .as_deref()
-        .unwrap_or(".lab/knobs/manifest.json");
-    let manifest_path = if Path::new(manifest_rel).is_absolute() {
-        PathBuf::from(manifest_rel)
-    } else {
-        project_root.join(manifest_rel)
-    };
+    let manifest_path =
+        resolve_override_manifest_path(overrides.manifest_path.as_deref(), project_root)?;
     let manifest = crate::package::validate::load_knob_manifest(&manifest_path)?;
 
     let mut by_id: BTreeMap<String, KnobDef> = BTreeMap::new();
@@ -1263,6 +1575,25 @@ pub(crate) fn apply_experiment_overrides(
         let knob = by_id
             .get(id)
             .ok_or_else(|| anyhow!("override references unknown knob id: {}", id))?;
+        if experiment.pointer(&knob.json_pointer).is_none() {
+            return Err(anyhow!(
+                "override knob '{}' targets missing json_pointer '{}'; knob overrides only patch declared fields",
+                id,
+                knob.json_pointer
+            ));
+        }
+        let current_value = experiment
+            .pointer(&knob.json_pointer)
+            .expect("checked knob json_pointer exists");
+        if !value_matches_type(current_value, &knob.value_type) {
+            return Err(anyhow!(
+                "override knob '{}' declares type {} for json_pointer '{}', but the experiment field is {}; knob manifests must match the declared field type",
+                id,
+                knob.value_type,
+                knob.json_pointer,
+                value_type_name(current_value)
+            ));
+        }
         crate::package::validate::validate_knob_value(knob, value)?;
         set_json_pointer_value(&mut experiment, &knob.json_pointer, value.clone())?;
     }
@@ -1270,24 +1601,71 @@ pub(crate) fn apply_experiment_overrides(
     Ok(experiment)
 }
 
+fn resolve_override_manifest_path(
+    manifest_path: Option<&str>,
+    project_root: &Path,
+) -> Result<PathBuf> {
+    let manifest_rel = manifest_path.unwrap_or(".lab/knobs/manifest.json");
+    if manifest_rel.is_empty() {
+        return Err(anyhow!(
+            "overrides manifest_path must be a non-empty project-relative path"
+        ));
+    }
+    let rel = Path::new(manifest_rel);
+    if rel.is_absolute() {
+        return Err(anyhow!(
+            "overrides manifest_path '{}' must be project-relative; absolute host paths are not allowed",
+            manifest_rel
+        ));
+    }
+    for component in rel.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(anyhow!(
+                    "overrides manifest_path '{}' must stay inside the project root; '..' path segments are not allowed",
+                    manifest_rel
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "overrides manifest_path '{}' must be project-relative",
+                    manifest_rel
+                ));
+            }
+        }
+    }
+    Ok(project_root.join(rel))
+}
+
 pub(crate) fn validate_dataset_provider(json_value: &Value) -> Result<()> {
+    reject_legacy_dataset_provider_surface(json_value)?;
     match json_value.pointer("/matrix/tasks/source") {
         Some(Value::String(source)) if source == "file" => Ok(()),
         Some(Value::String(source)) => Err(anyhow!(
             "matrix.tasks.source='{}' is not supported; use source: file",
             source
         )),
-        Some(Value::Object(obj)) => match obj.get("type").and_then(Value::as_str) {
-            Some("file") => Ok(()),
-            Some(other) => Err(anyhow!(
-                "matrix.tasks.source.type='{}' is not supported; use type: file",
-                other
-            )),
-            None => Err(anyhow!("matrix.tasks.source.type is required")),
-        },
-        Some(_) => Err(anyhow!("matrix.tasks.source must be 'file' or an object")),
+        Some(Value::Object(_)) => Err(anyhow!(
+            "matrix.tasks.source object form is not accepted; use source: file"
+        )),
+        Some(_) => Err(anyhow!("matrix.tasks.source must be 'file'")),
         None => Err(anyhow!("missing /matrix/tasks/source")),
     }
+}
+
+fn reject_legacy_dataset_provider_surface(json_value: &Value) -> Result<()> {
+    if json_value.pointer("/matrix/cases").is_some() {
+        return Err(anyhow!(
+            "/matrix/cases is authoring-only case matrix vocabulary; resolved packages must use /matrix/tasks"
+        ));
+    }
+    if json_value.pointer("/dataset").is_some() {
+        return Err(anyhow!(
+            "/dataset is legacy v0 dataset vocabulary; resolved packages must use /matrix/tasks"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
@@ -1316,10 +1694,13 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
         if limit.is_some_and(|max| tasks.len() >= max) {
             break;
         }
+        crate::package::validate::reject_duplicate_json_object_keys(
+            trimmed,
+            &format!("dataset file {}:{}", path.display(), idx + 1),
+        )?;
         let task: Value = serde_json::from_str(trimmed)?;
         let task_label = task
-            .pointer("/task/id")
-            .or_else(|| task.pointer("/id"))
+            .pointer("/id")
             .and_then(Value::as_str)
             .map(|id| format!("task '{}'", id))
             .unwrap_or_else(|| format!("row {}", idx + 1));

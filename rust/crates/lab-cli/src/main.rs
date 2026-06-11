@@ -298,6 +298,18 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(
+        about = "Lint an experiment YAML by building a sealed package and running static checks"
+    )]
+    Lint {
+        target: Option<PathBuf>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        overrides: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Run static package hygiene checks against a sealed package")]
     CheckPackage {
         package: PathBuf,
@@ -452,6 +464,22 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Show per-trial scores and numeric means for a run")]
+    Scores {
+        run: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        csv: bool,
+    },
+    #[command(about = "Explain declared metrics, captured rows, and scoreboard columns for a run")]
+    ExplainMetrics {
+        run: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        csv: bool,
+    },
     #[command(about = "Show standardized views for a run; omit run in a TTY to browse and pick")]
     Views {
         run: Option<String>,
@@ -499,9 +527,9 @@ enum Commands {
         csv: bool,
     },
     SchemaValidate {
-        #[arg(long)]
+        #[arg(long, default_value = "experiment_authoring_v1.jsonschema")]
         schema: String,
-        #[arg(long)]
+        #[arg(long, default_value = "experiment.yaml")]
         file: PathBuf,
         #[arg(long)]
         json: bool,
@@ -991,6 +1019,10 @@ fn preflight_report_to_json(report: &lab_runner::PreflightReport) -> Value {
 }
 
 fn resolve_experiment_target(target: Option<&Path>) -> Result<PathBuf> {
+    resolve_experiment_target_for_command("dev", target)
+}
+
+fn resolve_experiment_target_for_command(command: &str, target: Option<&Path>) -> Result<PathBuf> {
     let path = target
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("experiment.yaml"));
@@ -999,7 +1031,8 @@ fn resolve_experiment_target(target: Option<&Path>) -> Result<PathBuf> {
         if experiment.is_file() {
             return Ok(experiment);
         }
-        return Err(dev_experiment_target_error(
+        return Err(experiment_target_error(
+            command,
             &path,
             "no experiment.yaml was found in directory",
         ));
@@ -1007,7 +1040,11 @@ fn resolve_experiment_target(target: Option<&Path>) -> Result<PathBuf> {
     if path.is_file() {
         return Ok(path);
     }
-    Err(dev_experiment_target_error(&path, "path does not exist"))
+    Err(experiment_target_error(
+        command,
+        &path,
+        "path does not exist",
+    ))
 }
 
 fn is_yaml_file(path: &Path) -> bool {
@@ -1231,11 +1268,7 @@ fn generate_init_experiment_yaml(options: &InitOptions) -> String {
   tags: [starter]
 
 runtime:
-  compute: {{ backend: local-docker }}
-  storage: {{ backend: local-fs }}
-  traces: {{ backend: local-stdout }}
   network:
-    task_sandbox: none
     agent: full
 
 matrix:
@@ -1246,14 +1279,6 @@ matrix:
   cases:
     source: file
     path: cases.jsonl
-  repeats: 1
-  seeds: [1]
-
-scheduling:
-  max_concurrency: 1
-  shuffle_tasks: false
-  random_seed: 1
-  comparison: none
 
 stages:
   case:
@@ -1266,30 +1291,18 @@ stages:
         path: /opt/agent
         read_only: true
     command: ["python3", "/opt/agent/buc_agent.py"]
-    outputs:
-      result:
-        capture:
-          type: file
-          path: /bucephalus/out/result.json
-          format: json
-          required: true
-  execution:
-    agent_site: agent_container
   grader:
     strategy: none
 
 metrics:
   - id: resolved
-    source:
-      type: agent_response
-      pointer: /metrics/resolved
+    from: result.metrics.resolved
     direction: maximize
     primary: true
 
 policy:
   timeout_ms: 120000
   sanitization_profile: standard_runtime
-  task_sandbox: {{}}
 "#,
         id = id,
         name = options.name,
@@ -1486,6 +1499,19 @@ fn run_init(options: InitOptions) -> Result<Value> {
             format!("bucephalus run {}", experiment_path.display())
         ]
     }))
+}
+
+fn read_json_or_yaml_value(path: &Path) -> Result<Value> {
+    let data = fs::read_to_string(path)
+        .with_context(|| format!("failed to read structured data file '{}'", path.display()))?;
+    if let Ok(value) = serde_json::from_str::<Value>(&data) {
+        return Ok(value);
+    }
+    lab_runner::reject_duplicate_yaml_mapping_keys(&data, path)?;
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&data)
+        .with_context(|| format!("failed to parse '{}' as JSON or YAML", path.display()))?;
+    serde_json::to_value(yaml_value)
+        .with_context(|| format!("failed to convert YAML '{}' to JSON value", path.display()))
 }
 
 fn run_mcp_stdio() -> Result<()> {
@@ -1705,7 +1731,7 @@ fn auth_status(home: &Path) -> Value {
             "status": "ready",
             "source": "env",
             "env": BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
-            "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
+            "api_url": cloud_api_base_url()
         });
     }
     if paths.access.is_file() {
@@ -1715,7 +1741,7 @@ fn auth_status(home: &Path) -> Value {
             "path": paths.access,
             "refresh_token_path": if paths.refresh.is_file() { Some(paths.refresh.display().to_string()) } else { None },
             "cache_path": if paths.cache.is_file() { Some(paths.cache.display().to_string()) } else { None },
-            "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
+            "api_url": cloud_api_base_url()
         });
     }
     json!({
@@ -1725,7 +1751,7 @@ fn auth_status(home: &Path) -> Value {
             BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
             paths.access.display().to_string()
         ],
-        "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok(),
+        "api_url": cloud_api_base_url(),
         "note": "Local Core and latch smoke fixtures do not require Cloud auth. Cloud benchmark resolution and upload require first-party user auth.",
         "actions": [
             {
@@ -1822,9 +1848,13 @@ fn run_logout(dry_run: bool) -> Result<Value> {
 fn run_login(options: DeviceLoginOptions) -> Result<Value> {
     let home = lab_runner::bucephalus_home()?;
     let paths = cloud_token_paths(&home);
+    // Resolution order everywhere: explicit flag, then env, then the cloud
+    // profile persisted by a previous login. First login pins the deployment;
+    // later logins are zero-configuration.
     let issuer = options
         .issuer
         .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV))
+        .or_else(|| lab_runner::cloud_profile_string(&home, "/oauth/issuer"))
         .ok_or_else(|| {
             anyhow!(
                 "OAuth issuer is required; pass --issuer or set {}",
@@ -1833,11 +1863,13 @@ fn run_login(options: DeviceLoginOptions) -> Result<Value> {
         })?;
     let audience = options
         .audience
-        .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV));
+        .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV))
+        .or_else(|| lab_runner::cloud_profile_string(&home, "/oauth/audience"));
     let resource = options.resource.or_else(cloud_api_base_url);
     let scope = options
         .scope
         .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV))
+        .or_else(|| lab_runner::cloud_profile_string(&home, "/oauth/scope"))
         .unwrap_or_else(|| "openid profile email".to_string());
     let (metadata_url, metadata) = fetch_oauth_metadata(&issuer)?;
     let device_authorization_endpoint = metadata
@@ -1863,6 +1895,7 @@ fn run_login(options: DeviceLoginOptions) -> Result<Value> {
     let client_id = options
         .client_id
         .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV))
+        .or_else(|| lab_runner::cloud_profile_string(&home, "/oauth/client_id"))
         .map(Ok)
         .unwrap_or_else(|| dynamic_register_oauth_client(&metadata, &issuer, &scope))?;
 
@@ -1907,6 +1940,19 @@ fn run_login(options: DeviceLoginOptions) -> Result<Value> {
         &scope,
         &token_endpoint,
         &token,
+    )?;
+    lab_runner::write_cloud_profile(
+        &home,
+        &json!({
+            "schema_version": "bucephalus_cloud_profile_v1",
+            "api_url": resource,
+            "oauth": {
+                "issuer": issuer,
+                "client_id": client_id,
+                "audience": audience,
+                "scope": scope,
+            },
+        }),
     )?;
     Ok(json!({
         "schema_version": "bucephalus_login_v1",
@@ -2868,6 +2914,11 @@ fn cloud_api_base_url() -> Option<String> {
         .ok()
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let home = lab_runner::bucephalus_home().ok()?;
+            lab_runner::cloud_profile_string(&home, "/api_url")
+                .map(|value| value.trim_end_matches('/').to_string())
+        })
 }
 
 fn cloud_bearer_token() -> Result<Option<String>> {
@@ -5439,9 +5490,9 @@ fn resolve_doctor_target(target: Option<&Path>) -> Result<DoctorTarget> {
     Err(doctor_target_error(path, "path does not exist"))
 }
 
-fn dev_experiment_target_error(path: &Path, reason: &str) -> anyhow::Error {
+fn experiment_target_error(command: &str, path: &Path, reason: &str) -> anyhow::Error {
     anyhow!(
-        "dev expected an experiment YAML, but {reason}: {}\n\nNext steps:\n  bucephalus init <new-eval-dir>\n  bucephalus dev <new-eval-dir>/experiment.yaml\n\nIf this is a sealed package, use:\n  bucephalus doctor {}\n  bucephalus run {} --smoke-test",
+        "{command} expected an experiment YAML, but {reason}: {}\n\nNext steps:\n  bucephalus init <new-eval-dir>\n  bucephalus {command} <new-eval-dir>\n\nIf this is a sealed package, use:\n  bucephalus check-package {}\n  bucephalus doctor {}",
         path.display(),
         path.display(),
         path.display()
@@ -5996,6 +6047,48 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!("package_checks: {}", build.package_checks_path.display());
             println!("package_digest: {}", validation.package_digest);
             println!("smoke_tested: {}", validation.smoke_tested);
+        }
+        Commands::Lint {
+            target,
+            out,
+            overrides,
+            json,
+        } => {
+            let experiment = resolve_experiment_target_for_command("lint", target.as_deref())?;
+            if !json {
+                eprintln!("linting experiment: {}", experiment.display());
+                eprintln!("building package...");
+            }
+            let build = build_experiment_package_for_build_run(
+                &experiment,
+                overrides.as_deref(),
+                out.as_ref(),
+            )?;
+            let package_checks = lab_runner::check_package(&build.package_dir)?;
+            let passed = package_checks_passed(&package_checks);
+            let package_digest = package_checks
+                .get("package_digest")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if json {
+                return Ok(Some(json!({
+                    "ok": passed,
+                    "command": "lint",
+                    "package_dir": build.package_dir.display().to_string(),
+                    "manifest_path": build.manifest_path.display().to_string(),
+                    "checksums_path": build.checksums_path.display().to_string(),
+                    "package_checks_path": build.package_checks_path.display().to_string(),
+                    "package_digest": package_digest,
+                    "package_checks": package_checks,
+                })));
+            }
+            print_package_check_report(&package_checks);
+            if !passed {
+                return Err(anyhow!("lint found package check failures"));
+            }
+            println!("lint_ok: true");
+            println!("package_dir: {}", build.package_dir.display());
+            println!("package_digest: {}", package_digest);
         }
         Commands::CheckPackage { package, json } => {
             let package_dir = resolve_package_command_target("check-package", &package)?;
@@ -6697,6 +6790,55 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("killed_trials: {}", result.killed_trials.join(", "));
             }
         }
+        Commands::Scores { run, json, csv } => {
+            if json && csv {
+                return Err(anyhow::anyhow!("--json and --csv are mutually exclusive"));
+            }
+            let run_dir = resolve_run_dir_arg(&run)?;
+            let table = build_scores_table(&run_dir)?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "scores",
+                    "run_dir": run_dir.display().to_string(),
+                    "result": query_table_to_json(&table),
+                })));
+            }
+            if csv {
+                print_query_table_csv(&table);
+                return Ok(None);
+            }
+            if table.rows.is_empty() {
+                println!("No score rows found for this run.");
+                println!("Try: bucephalus explain-metrics {}", run);
+                return Ok(None);
+            }
+            print_query_table(&table);
+        }
+        Commands::ExplainMetrics { run, json, csv } => {
+            if json && csv {
+                return Err(anyhow::anyhow!("--json and --csv are mutually exclusive"));
+            }
+            let run_dir = resolve_run_dir_arg(&run)?;
+            let table = build_metric_explanation_table(&run_dir)?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "explain-metrics",
+                    "run_dir": run_dir.display().to_string(),
+                    "result": query_table_to_json(&table),
+                })));
+            }
+            if csv {
+                print_query_table_csv(&table);
+                return Ok(None);
+            }
+            if table.rows.is_empty() {
+                println!("No declared or observed metrics found for this run.");
+                return Ok(None);
+            }
+            print_query_table(&table);
+        }
         Commands::Views {
             run,
             view,
@@ -7025,8 +7167,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         }
         Commands::SchemaValidate { schema, file, json } => {
             let compiled = schemas::compile_schema(&schema)?;
-            let data = std::fs::read_to_string(file)?;
-            let value: serde_json::Value = serde_json::from_str(&data)?;
+            let value = read_json_or_yaml_value(&file)?;
             if let Err(errors) = compiled.validate(&value) {
                 for e in errors {
                     eprintln!("schema error: {}", e);
@@ -7169,6 +7310,7 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Dev { json, .. }
         | Commands::Doctor { json, .. }
         | Commands::Build { json, .. }
+        | Commands::Lint { json, .. }
         | Commands::CheckPackage { json, .. }
         | Commands::PrepareRuntimeImages { json, .. }
         | Commands::BuildRun { json, .. }
@@ -7180,6 +7322,8 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Continue { json, .. }
         | Commands::Recover { json, .. }
         | Commands::Kill { json, .. }
+        | Commands::Scores { json, .. }
+        | Commands::ExplainMetrics { json, .. }
         | Commands::Views { json, .. }
         | Commands::Query { json, .. }
         | Commands::Runs { json, .. }
@@ -7323,15 +7467,34 @@ fn recover_result_to_json(result: &lab_runner::RecoverResult) -> Value {
 fn parse_set_bindings(values: &[String]) -> Result<BTreeMap<String, Value>> {
     let mut out = BTreeMap::new();
     for raw in values {
-        let (key, val_raw) = parse_key_value_arg("--set", raw, "KEY=VALUE")?;
-        if key.trim().is_empty() {
+        let (key_raw, val_raw) = parse_key_value_arg("--set", raw, "KEY=VALUE")?;
+        if key_raw.trim().is_empty() {
             return Err(anyhow!("invalid --set entry: key cannot be empty"));
+        }
+        validate_cli_set_key(key_raw)
+            .map_err(|err| anyhow!("invalid --set key '{}': {}", key_raw, err))?;
+        if out.contains_key(key_raw) {
+            return Err(anyhow!("duplicate --set key '{}'", key_raw));
         }
         let parsed =
             serde_json::from_str::<Value>(val_raw).unwrap_or(Value::String(val_raw.to_string()));
-        out.insert(key.to_string(), parsed);
+        out.insert(key_raw.to_string(), parsed);
     }
     Ok(out)
+}
+
+fn validate_cli_set_key(key: &str) -> Result<()> {
+    for segment in key.split('.') {
+        if segment.trim().is_empty() {
+            return Err(anyhow!("dotted path segments cannot be empty"));
+        }
+        if segment.trim() != segment {
+            return Err(anyhow!(
+                "dotted path segments cannot contain leading or trailing whitespace"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_key_value_arg<'a>(flag: &str, raw: &'a str, expected: &str) -> Result<(&'a str, &'a str)> {
@@ -7367,6 +7530,9 @@ fn parse_runtime_env_bindings(values: &[String]) -> Result<BTreeMap<String, Stri
         }
         validate_cli_env_name(key)
             .map_err(|err| anyhow!("invalid --env key '{}': {}", key, err))?;
+        if out.contains_key(key) {
+            return Err(anyhow!("duplicate --env key '{}'", key));
+        }
         out.insert(key.to_string(), value_raw.to_string());
     }
     Ok(out)
@@ -7386,6 +7552,9 @@ fn parse_secret_file_bindings(values: &[String]) -> Result<BTreeMap<String, Path
                 "invalid --secret-file id '{}': path cannot be empty",
                 key
             ));
+        }
+        if out.contains_key(key) {
+            return Err(anyhow!("duplicate --secret-file id '{}'", key));
         }
         out.insert(key.to_string(), PathBuf::from(value));
     }
@@ -7423,11 +7592,9 @@ fn summary_to_json(summary: &lab_runner::ExperimentSummary) -> Value {
         "agent_runtime": summary.agent_runtime_command,
         "image": summary.image,
         "network": summary.network_mode,
-        "trajectory_path": summary.trajectory_path,
         "causal_extraction": summary.causal_extraction,
         "scheduling": summary.scheduling,
         "state_policy": summary.state_policy,
-        "comparison": summary.comparison,
         "retry_max_attempts": summary.retry_max_attempts,
         "preflight_warnings": summary.preflight_warnings
     })
@@ -7446,9 +7613,6 @@ fn print_summary(summary: &lab_runner::ExperimentSummary) {
         println!("image: {}", image);
     }
     println!("network: {}", summary.network_mode);
-    if let Some(path) = &summary.trajectory_path {
-        println!("trajectory_path: {}", path);
-    }
     if let Some(mode) = &summary.causal_extraction {
         println!("causal_extraction: {}", mode);
     }
@@ -8455,20 +8619,383 @@ fn query_scoreboard(run_dir: &Path) -> Result<analysis::QueryTable> {
     })
 }
 
+const SCORE_DIAGNOSTIC_METRICS: &[&str] = &[
+    "status_code",
+    "success",
+    "mapped_grader_output_state",
+    "trial_conclusion_reported_outcome",
+    "trial_conclusion_grader",
+    "trial_conclusion_grader_strategy",
+    "trial_conclusion_payload",
+    "grade_error",
+    "grade_error_reason",
+    "primary_metric_auto_selected",
+    "primary_metric_auto_selected_reason",
+];
+
+fn score_metric_filter_sql(alias: &str) -> String {
+    let names = SCORE_DIAGNOSTIC_METRICS
+        .iter()
+        .map(|name| sql_string_literal(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}.metric_name NOT IN ({})", alias, names)
+}
+
+fn is_score_diagnostic_metric(name: &str) -> bool {
+    SCORE_DIAGNOSTIC_METRICS.contains(&name)
+}
+
+fn build_scores_table(run_dir: &Path) -> Result<analysis::QueryTable> {
+    let metric_names = fetch_score_metric_names(run_dir, 64)?;
+    let sql = build_scores_sql(&metric_names);
+    let table = analysis::query_run(run_dir, &sql)?;
+    Ok(with_score_mean_row(table))
+}
+
+fn fetch_score_metric_names(run_dir: &Path, metric_limit: usize) -> Result<Vec<String>> {
+    let filter = score_metric_filter_sql("m");
+    let sql = format!(
+        "SELECT m.metric_name
+        FROM metrics_long m
+        WHERE {}
+          AND m.metric_name IS NOT NULL
+          AND trim(m.metric_name) <> ''
+        GROUP BY metric_name
+        ORDER BY metric_name
+        LIMIT {}",
+        filter, metric_limit
+    );
+    let table = analysis::query_run(run_dir, &sql)?;
+    Ok(table
+        .rows
+        .into_iter()
+        .filter_map(|row| row.first().and_then(Value::as_str).map(str::to_string))
+        .filter(|name| !name.trim().is_empty())
+        .collect())
+}
+
+fn build_scores_sql(metric_names: &[String]) -> String {
+    let mut columns = Vec::new();
+    for metric_name in metric_names {
+        columns.push(format!(
+            "(SELECT m.metric_value
+              FROM metrics_long m
+              WHERE m.trial_id = t.trial_id
+                AND m.metric_name = {}
+              ORDER BY m.row_seq
+              LIMIT 1) AS {}",
+            sql_string_literal(metric_name),
+            sql_identifier(metric_name)
+        ));
+    }
+    let dynamic_cols = if columns.is_empty() {
+        String::new()
+    } else {
+        format!(",\n    {}", columns.join(",\n    "))
+    };
+    format!(
+        "SELECT
+            t.trial_id,
+            t.task_id,
+            t.variant_id,
+            t.outcome,
+            t.primary_metric_name,
+            t.primary_metric_value{}
+        FROM trials t
+        ORDER BY t.schedule_idx, t.trial_id, t.variant_id",
+        dynamic_cols
+    )
+}
+
+fn with_score_mean_row(mut table: analysis::QueryTable) -> analysis::QueryTable {
+    if table.rows.is_empty() {
+        return table;
+    }
+    let numeric_start = table
+        .columns
+        .iter()
+        .position(|column| column == "primary_metric_value")
+        .unwrap_or(table.columns.len());
+    let mut mean_row = vec![Value::Null; table.columns.len()];
+    if !mean_row.is_empty() {
+        mean_row[0] = json!("mean");
+    }
+
+    let mut has_numeric_mean = false;
+    for col_idx in numeric_start..table.columns.len() {
+        let values = table
+            .rows
+            .iter()
+            .filter_map(|row| row.get(col_idx).and_then(json_number_value))
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            continue;
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        mean_row[col_idx] = json!(round_four(mean));
+        has_numeric_mean = true;
+    }
+    if has_numeric_mean {
+        table.rows.push(mean_row);
+    }
+    table
+}
+
+#[derive(Clone, Debug, Default)]
+struct MetricExplanation {
+    metric_id: String,
+    label: String,
+    value_type: String,
+    direction: String,
+    source_type: String,
+    source_pointer: String,
+    source_output: String,
+    required: bool,
+    primary: bool,
+    observed_rows: i64,
+    resolved_rows: i64,
+    numeric_rows: i64,
+    numeric_sum: f64,
+    mean_value: Option<f64>,
+    first_value: Value,
+}
+
+fn build_metric_explanation_table(run_dir: &Path) -> Result<analysis::QueryTable> {
+    let mut metrics: BTreeMap<String, MetricExplanation> = BTreeMap::new();
+    let definitions = analysis::query_run(
+        run_dir,
+        "SELECT
+            metric_id,
+            label,
+            value_type,
+            direction,
+            source_type,
+            source_pointer,
+            definition_json,
+            required,
+            primary_metric
+         FROM metric_definitions
+         ORDER BY COALESCE(CAST(primary_metric AS INTEGER), 0) DESC, metric_id",
+    )?;
+    for row in definitions.rows {
+        let metric_id = row_value_str(&row, 0);
+        if metric_id.is_empty() {
+            continue;
+        }
+        let source_output = row
+            .get(6)
+            .and_then(metric_definition_source_output)
+            .unwrap_or_default();
+        metrics.insert(
+            metric_id.clone(),
+            MetricExplanation {
+                metric_id,
+                label: row_value_str(&row, 1),
+                value_type: row_value_str(&row, 2),
+                direction: row_value_str(&row, 3),
+                source_type: row_value_str(&row, 4),
+                source_pointer: row_value_str(&row, 5),
+                source_output,
+                required: row_value_bool(&row, 7),
+                primary: row_value_bool(&row, 8),
+                ..MetricExplanation::default()
+            },
+        );
+    }
+
+    let observed = analysis::query_run(
+        run_dir,
+        "SELECT metric_name, metric_value
+         FROM metrics_long
+         ORDER BY metric_name, row_seq",
+    )?;
+    for row in observed.rows {
+        let metric_id = row_value_str(&row, 0);
+        if metric_id.is_empty() {
+            continue;
+        }
+        let entry = metrics
+            .entry(metric_id.clone())
+            .or_insert_with(|| MetricExplanation {
+                metric_id,
+                ..MetricExplanation::default()
+            });
+        let metric_value = row.get(1).cloned().unwrap_or(Value::Null);
+        if entry.observed_rows == 0 {
+            entry.first_value = metric_value.clone();
+        }
+        entry.observed_rows += 1;
+        if !metric_value.is_null() {
+            entry.resolved_rows += 1;
+        }
+        if let Some(numeric_value) = json_number_value(&metric_value) {
+            entry.numeric_rows += 1;
+            entry.numeric_sum += numeric_value;
+            entry.mean_value = Some(entry.numeric_sum / entry.numeric_rows as f64);
+        }
+    }
+
+    let rows = metrics
+        .into_values()
+        .map(|metric| {
+            let status = metric_explanation_status(&metric);
+            let source = source_display(&metric);
+            let scoreboard_column =
+                if metric.numeric_rows > 0 && !is_score_diagnostic_metric(&metric.metric_id) {
+                    if metric.primary {
+                        format!(
+                            "primary_metric_mean, {}_mean",
+                            sanitize_scoreboard_alias(&metric.metric_id)
+                        )
+                    } else {
+                        format!("{}_mean", sanitize_scoreboard_alias(&metric.metric_id))
+                    }
+                } else {
+                    String::new()
+                };
+            vec![
+                json!(status),
+                json!(metric.metric_id),
+                empty_string_as_null(metric.label),
+                json!(source),
+                empty_string_as_null(metric.value_type),
+                empty_string_as_null(metric.direction),
+                json!(metric.required),
+                json!(metric.primary),
+                json!(metric.observed_rows),
+                json!(metric.resolved_rows),
+                json!(metric.numeric_rows),
+                metric
+                    .mean_value
+                    .map(|value| json!(round_four(value)))
+                    .unwrap_or(Value::Null),
+                metric.first_value,
+                empty_string_as_null(scoreboard_column),
+            ]
+        })
+        .collect();
+
+    Ok(analysis::QueryTable {
+        columns: vec![
+            "status".to_string(),
+            "metric_id".to_string(),
+            "label".to_string(),
+            "source".to_string(),
+            "value_type".to_string(),
+            "direction".to_string(),
+            "required".to_string(),
+            "primary_metric".to_string(),
+            "metric_rows".to_string(),
+            "resolved_rows".to_string(),
+            "numeric_rows".to_string(),
+            "mean_value".to_string(),
+            "first_value".to_string(),
+            "scoreboard_column".to_string(),
+        ],
+        rows,
+    })
+}
+
+fn metric_explanation_status(metric: &MetricExplanation) -> &'static str {
+    if is_score_diagnostic_metric(&metric.metric_id) {
+        "diagnostic"
+    } else if metric.source_type.is_empty() && metric.observed_rows > 0 {
+        "observed_without_definition"
+    } else if metric.observed_rows > 0 {
+        "declared_observed"
+    } else {
+        "declared_missing"
+    }
+}
+
+fn source_display(metric: &MetricExplanation) -> String {
+    let pointer_suffix = metric
+        .source_pointer
+        .strip_prefix('/')
+        .unwrap_or(&metric.source_pointer)
+        .replace('/', ".");
+    match metric.source_type.as_str() {
+        "grader_output" if !metric.source_output.is_empty() && !pointer_suffix.is_empty() => {
+            format!("grader.{}.{}", metric.source_output, pointer_suffix)
+        }
+        "grader_output" if !metric.source_output.is_empty() => {
+            format!("grader.{}", metric.source_output)
+        }
+        "runtime_output" if !metric.source_output.is_empty() && !pointer_suffix.is_empty() => {
+            format!("runtime.{}.{}", metric.source_output, pointer_suffix)
+        }
+        "runtime_output" if !metric.source_output.is_empty() => {
+            format!("runtime.{}", metric.source_output)
+        }
+        "agent_response" if !metric.source_pointer.is_empty() => {
+            format!("agent_response{}", metric.source_pointer)
+        }
+        other if !other.is_empty() => other.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn empty_string_as_null(value: String) -> Value {
+    if value.is_empty() {
+        Value::Null
+    } else {
+        Value::String(value)
+    }
+}
+
+fn row_value_str(row: &[Value], idx: usize) -> String {
+    row.get(idx)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn row_value_bool(row: &[Value], idx: usize) -> bool {
+    row.get(idx).is_some_and(|value| match value {
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_i64().unwrap_or(0) != 0,
+        Value::String(value) => matches!(value.as_str(), "true" | "1"),
+        _ => false,
+    })
+}
+
+fn metric_definition_source_output(value: &Value) -> Option<String> {
+    let parsed = match value {
+        Value::Object(_) => value.clone(),
+        Value::String(raw) => serde_json::from_str(raw).ok()?,
+        _ => return None,
+    };
+    parsed
+        .pointer("/source/output")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn json_number_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(raw) => raw.parse::<f64>().ok(),
+        Value::Bool(value) => Some(if *value { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+fn round_four(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
+}
+
 fn fetch_scoreboard_metric_names(run_dir: &Path, metric_limit: usize) -> Result<Vec<String>> {
     let sql = format!(
         "SELECT metric_name
          FROM metrics_long m
-         WHERE m.metric_name <> 'status_code'
-           AND m.metric_name <> 'success'
-           AND NOT EXISTS (
-             SELECT 1
-             FROM trials t
-             WHERE t.primary_metric_name = m.metric_name
-           )
+         WHERE {}
          GROUP BY metric_name
          ORDER BY metric_name
          LIMIT {}",
+        score_metric_filter_sql("m"),
         metric_limit
     );
     let table = analysis::query_run(run_dir, &sql)?;
@@ -8886,6 +9413,7 @@ struct TrialAttemptOutputState {
 fn latest_agent_output_columns() -> Vec<String> {
     [
         "state",
+        "agent_result_state",
         "trial_id",
         "variant_id",
         "task_id",
@@ -8990,7 +9518,10 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
         .pointer("/candidate_artifact/payload")
         .cloned()
         .unwrap_or(Value::Null);
+    let candidate_display_state =
+        candidate_artifact_display_state(&candidate_state, &candidate_source, &candidate_payload);
     let mut push_row = |state: &str,
+                        agent_result_state: &str,
                         output_id: &str,
                         format: &str,
                         preview: &str,
@@ -8999,6 +9530,7 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
                         candidate_payload_json: Value| {
         rows.push(vec![
             json!(state),
+            json!(agent_result_state),
             json!(attempt.trial_id),
             json!(attempt.variant_id),
             json!(attempt.task_id),
@@ -9014,11 +9546,7 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
             agent_result_path
                 .map(|path| json!(path.display().to_string()))
                 .unwrap_or(Value::Null),
-            if candidate_state.is_empty() {
-                Value::Null
-            } else {
-                json!(candidate_state)
-            },
+            json!(candidate_display_state),
             if candidate_source.is_empty() {
                 Value::Null
             } else {
@@ -9050,6 +9578,7 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
                 Some(result) => {
                     push_row(
                         "agent_result_file",
+                        "valid",
                         "BUCEPHALUS_RESULT_PATH",
                         "json",
                         &preview_agent_output_value(&result),
@@ -9062,6 +9591,7 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
                 None => {
                     push_row(
                         "invalid_agent_result_json",
+                        "invalid",
                         "BUCEPHALUS_RESULT_PATH",
                         "json",
                         "agent result file exists but is not valid JSON",
@@ -9082,6 +9612,7 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
             } else {
                 candidate_state.as_str()
             },
+            "missing",
             "candidate_artifact.payload",
             "",
             &preview_agent_output_value(&candidate_payload),
@@ -9094,6 +9625,7 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
 
     push_row(
         "missing_agent_result_file",
+        "missing",
         "BUCEPHALUS_RESULT_PATH",
         "",
         "no agent result file or candidate artifact payload found",
@@ -9101,6 +9633,26 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
         agent_result_path.as_deref(),
         candidate_payload,
     );
+}
+
+fn candidate_artifact_display_state(
+    candidate_state: &str,
+    candidate_source: &str,
+    candidate_payload: &Value,
+) -> &'static str {
+    let has_artifact = !candidate_source.trim().is_empty() || !candidate_payload.is_null();
+    if !has_artifact {
+        "none"
+    } else if candidate_state.trim().is_empty() {
+        "present"
+    } else {
+        match candidate_state {
+            "valid" => "valid",
+            "invalid" => "invalid",
+            "missing" => "none",
+            _ => "present",
+        }
+    }
 }
 
 fn agent_result_path(attempt: &TrialAttemptOutputState) -> Option<PathBuf> {
@@ -10421,6 +10973,8 @@ fn try_print_post_run_stats(run_dir: &Path, run_id: &str) {
     println!();
     println!("inspect:");
     println!("  live:      bucephalus views-live {} run_progress", run_id);
+    println!("  scores:    bucephalus scores {}", run_id);
+    println!("  metrics:   bucephalus explain-metrics {}", run_id);
     println!("  proof:     bucephalus views {} observability", run_id);
     println!("  trials:    bucephalus views {} trial_diagnostics", run_id);
     println!("  health:    bucephalus views {} health", run_id);
@@ -11485,6 +12039,75 @@ mod tests {
     }
 
     #[test]
+    fn cli_runtime_env_bindings_reject_duplicate_keys() {
+        let err = parse_runtime_env_bindings(&[
+            "OPENAI_API_KEY=first".to_string(),
+            "OPENAI_API_KEY=second".to_string(),
+        ])
+        .expect_err("duplicate --env keys should fail")
+        .to_string();
+
+        assert!(err.contains("duplicate --env key 'OPENAI_API_KEY'"));
+    }
+
+    #[test]
+    fn cli_set_bindings_reject_duplicate_keys() {
+        let err = parse_set_bindings(&["model=temp".to_string(), "model=other".to_string()])
+            .expect_err("duplicate --set keys should fail")
+            .to_string();
+
+        assert!(err.contains("duplicate --set key 'model'"));
+    }
+
+    #[test]
+    fn cli_set_bindings_reject_empty_path_segments() {
+        for raw in ["model.=temp", ".model=temp", "model..name=temp"] {
+            let err = parse_set_bindings(&[raw.to_string()])
+                .expect_err("malformed --set dotted paths should fail")
+                .to_string();
+
+            assert!(
+                err.contains("invalid --set key")
+                    && err.contains("dotted path segments cannot be empty"),
+                "unexpected error for {raw}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_set_bindings_reject_padded_path_segments() {
+        for raw in [
+            " model=temp",
+            "model =temp",
+            "model. name=temp",
+            "model.name =temp",
+        ] {
+            let err = parse_set_bindings(&[raw.to_string()])
+                .expect_err("padded --set dotted paths should fail")
+                .to_string();
+
+            assert!(
+                err.contains("invalid --set key") && err.contains("leading or trailing whitespace"),
+                "unexpected error for {raw}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_secret_file_bindings_reject_duplicate_ids() {
+        let err = parse_secret_file_bindings(&[
+            "codex_oauth=/tmp/first".to_string(),
+            "codex_oauth=/tmp/second".to_string(),
+        ])
+        .expect_err("duplicate --secret-file ids should fail")
+        .to_string();
+
+        assert!(err.contains("duplicate --secret-file id 'codex_oauth'"));
+        assert!(!err.contains("/tmp/first"));
+        assert!(!err.contains("/tmp/second"));
+    }
+
+    #[test]
     fn parse_run_validation_choice_maps_expected_actions() {
         assert_eq!(
             parse_run_validation_choice("1").unwrap(),
@@ -12063,6 +12686,11 @@ mod tests {
         assert_eq!(table.rows.len(), 1);
         let col = |name: &str| table.columns.iter().position(|c| c == name).unwrap();
         assert_eq!(table.rows[0][col("state")], json!("agent_result_file"));
+        assert_eq!(table.rows[0][col("agent_result_state")], json!("valid"));
+        assert_eq!(
+            table.rows[0][col("candidate_artifact_state")],
+            json!("none")
+        );
         assert_eq!(
             table.rows[0][col("output_id")],
             json!("BUCEPHALUS_RESULT_PATH")
@@ -12127,10 +12755,68 @@ mod tests {
             table.rows[0][col("state")],
             json!("missing_agent_result_file")
         );
+        assert_eq!(table.rows[0][col("agent_result_state")], json!("missing"));
+        assert_eq!(
+            table.rows[0][col("candidate_artifact_state")],
+            json!("none")
+        );
         assert!(table.rows[0][col("preview")]
             .as_str()
             .unwrap()
             .contains("no agent result file"));
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn scores_table_pivots_declared_metrics_and_adds_mean_row() {
+        let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
+        let run_dir = temp_dir("scores_table");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        seed_sqlite_run_for_analysis_query(&run_dir);
+
+        let table = build_scores_table(&run_dir).expect("scores table");
+        let col = |name: &str| table.columns.iter().position(|c| c == name).unwrap();
+        assert!(table.columns.contains(&"latency_ms".to_string()));
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0][col("trial_id")], json!("trial_1"));
+        assert_eq!(
+            json_number_value(&table.rows[0][col("latency_ms")]),
+            Some(12.3)
+        );
+        assert_eq!(table.rows[1][col("trial_id")], json!("mean"));
+        assert_eq!(
+            json_number_value(&table.rows[1][col("latency_ms")]),
+            Some(12.3)
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn metric_explanation_table_shows_declared_observed_metric_dataflow() {
+        let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
+        let run_dir = temp_dir("metric_explanation");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        seed_sqlite_run_for_analysis_query(&run_dir);
+
+        let table = build_metric_explanation_table(&run_dir).expect("metric explanation table");
+        let col = |name: &str| table.columns.iter().position(|c| c == name).unwrap();
+        let row = table
+            .rows
+            .iter()
+            .find(|row| row[col("metric_id")] == json!("latency_ms"))
+            .expect("latency metric row");
+        assert_eq!(row[col("status")], json!("declared_observed"));
+        assert_eq!(
+            row[col("source")],
+            json!("agent_response/metrics/latency_ms")
+        );
+        assert_eq!(row[col("metric_rows")], json!(1));
+        assert_eq!(row[col("numeric_rows")], json!(1));
+        assert_eq!(row[col("scoreboard_column")], json!("latency_ms_mean"));
 
         let _ = std::fs::remove_dir_all(&run_dir);
     }
@@ -12972,8 +13658,190 @@ mod tests {
 
         assert!(err.contains("dev expected an experiment YAML"));
         assert!(err.contains("bucephalus init <new-eval-dir>"));
+        assert!(err.contains("bucephalus dev <new-eval-dir>"));
         assert!(err.contains("bucephalus doctor"));
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn resolve_lint_target_accepts_directory_and_names_lint_in_errors() {
+        let root = unique_test_dir("resolve_lint_directory");
+        fs::create_dir_all(&root).expect("test dir");
+        let experiment = root.join("experiment.yaml");
+        fs::write(&experiment, "experiment:\n  id: smoke\n").expect("experiment yaml");
+
+        let resolved =
+            resolve_experiment_target_for_command("lint", Some(&root)).expect("resolved lint");
+
+        assert_eq!(resolved, experiment);
+        fs::remove_file(&resolved).expect("remove experiment");
+
+        let err = resolve_experiment_target_for_command("lint", Some(&root))
+            .expect_err("missing lint target should fail")
+            .to_string();
+
+        assert!(err.contains("lint expected an experiment YAML"));
+        assert!(err.contains("bucephalus lint <new-eval-dir>"));
+        assert!(err.contains("bucephalus check-package"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn init_experiment_yaml_uses_public_metric_refs() {
+        let options = InitOptions {
+            dir: PathBuf::from("."),
+            client: InitClientArg::Cli,
+            command: Some("agent --input {input} --output {output}".to_string()),
+            url: None,
+            stream: InitStreamArg::None,
+            language: InitLanguageArg::Python,
+            mcp_role: None,
+            mcp_tool: None,
+            mode: "answer".to_string(),
+            name: "Smoke Eval".to_string(),
+            force: false,
+        };
+
+        let yaml = generate_init_experiment_yaml(&options);
+
+        assert!(yaml.contains("from: result.metrics.resolved"));
+        assert!(!yaml.contains("type: agent_response"));
+        assert!(!yaml.contains("pointer: /metrics/resolved"));
+        assert!(!yaml.contains("compute: { backend: local-docker }"));
+        assert!(!yaml.contains("storage: { backend: local-fs }"));
+        assert!(!yaml.contains("traces: { backend: local-stdout }"));
+        assert!(!yaml.contains("task_sandbox: none"));
+        assert!(!yaml.contains("task_sandbox: {}"));
+        assert!(!yaml.contains("repeats: 1"));
+        assert!(!yaml.contains("seeds:"));
+        assert!(!yaml.contains("scheduling:"));
+        assert!(!yaml.contains("max_concurrency: 1"));
+        assert!(!yaml.contains("random_seed: 1"));
+        assert!(!yaml.contains("comparison: none"));
+        assert!(!yaml.contains("agent_site: agent_container"));
+        assert!(!yaml.contains("/bucephalus/out/result.json"));
+    }
+
+    #[test]
+    fn schema_validate_accepts_generated_experiment_yaml() {
+        let root = unique_test_dir("schema_validate_generated_yaml");
+        let options = InitOptions {
+            dir: root.clone(),
+            client: InitClientArg::Cli,
+            command: Some("agent --input {input} --output {output}".to_string()),
+            url: None,
+            stream: InitStreamArg::None,
+            language: InitLanguageArg::Python,
+            mcp_role: None,
+            mcp_tool: None,
+            mode: "answer".to_string(),
+            name: "Smoke Eval".to_string(),
+            force: true,
+        };
+        run_init(options).expect("init");
+        let value = read_json_or_yaml_value(&root.join("experiment.yaml")).expect("read yaml");
+        let schema = schemas::compile_schema("experiment_authoring_v1.jsonschema").expect("schema");
+        let errors = schema
+            .validate(&value)
+            .err()
+            .map(|errors| errors.map(|err| err.to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        assert!(errors.is_empty(), "unexpected schema errors: {errors:?}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn schema_validate_reader_rejects_duplicate_yaml_keys() {
+        let root = unique_test_dir("schema_validate_duplicate_yaml_keys");
+        fs::create_dir_all(&root).expect("root dir");
+        let experiment = root.join("experiment.yaml");
+        fs::write(
+            &experiment,
+            r#"
+experiment:
+  id: e
+runtime:
+  network:
+    default: none
+runtime:
+  compute:
+    backend: local-docker
+"#,
+        )
+        .expect("experiment yaml");
+
+        let err = read_json_or_yaml_value(&experiment)
+            .expect_err("schema reader should reject duplicate YAML keys");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("duplicate mapping key") && msg.contains("duplicate key 'runtime' at /"),
+            "unexpected error: {msg}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn schema_validate_defaults_to_authoring_schema() {
+        let cli =
+            Cli::try_parse_from(["bucephalus", "schema-validate"]).expect("parse schema validate");
+
+        let Commands::SchemaValidate { schema, file, json } = cli.command else {
+            panic!("expected schema-validate command");
+        };
+
+        assert_eq!(schema, "experiment_authoring_v1.jsonschema");
+        assert_eq!(file, PathBuf::from("experiment.yaml"));
+        assert!(!json);
+    }
+
+    #[test]
+    fn lint_command_parses_experiment_and_json_mode() {
+        let cli = Cli::try_parse_from([
+            "bucephalus",
+            "lint",
+            "experiment.yaml",
+            "--out",
+            "package",
+            "--json",
+        ])
+        .expect("parse lint");
+
+        let Commands::Lint {
+            target,
+            out,
+            overrides,
+            json,
+        } = cli.command
+        else {
+            panic!("expected lint command");
+        };
+
+        assert_eq!(target, Some(PathBuf::from("experiment.yaml")));
+        assert_eq!(out, Some(PathBuf::from("package")));
+        assert!(overrides.is_none());
+        assert!(json);
+    }
+
+    #[test]
+    fn lint_command_allows_default_target() {
+        let cli = Cli::try_parse_from(["bucephalus", "lint"]).expect("parse lint");
+
+        let Commands::Lint {
+            target,
+            out,
+            overrides,
+            json,
+        } = cli.command
+        else {
+            panic!("expected lint command");
+        };
+
+        assert!(target.is_none());
+        assert!(out.is_none());
+        assert!(overrides.is_none());
+        assert!(!json);
     }
 
     #[test]

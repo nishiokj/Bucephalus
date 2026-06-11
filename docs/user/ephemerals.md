@@ -2,7 +2,7 @@
 
 Ephemerals are per-trial resources that the runner starts and tears down, but that are not links in the stage chain. Use them for local services a stage calls during execution, such as a sidecar container, MCP server, proxy, fixture service, or benchmark helper daemon.
 
-Ephemerals are attached to the stages that declare them, recorded in runtime state when started, and cleaned up with the trial. Older suites that still use `sidecars` remain loadable during migration.
+Ephemerals are attached to the stages that declare them, recorded in runtime state when started, and cleaned up with the trial. Authoring files use `ephemerals`; the build step lowers them into the resolved package contract.
 
 ## Shape
 
@@ -44,6 +44,8 @@ Ephemerals count against the Local Docker active container cap. The default cap 
 If `runtime.network.task_sandbox: none`, the per-trial network is internal: attached containers can talk to each other, but the ephemeral network does not open external egress. If the trial needs external egress, configure the runtime network explicitly.
 
 `expose` values are injected only into stages that list the ephemeral. An ephemeral declared under `stages.agent.ephemerals` does not leak its env into the grader unless the grader also declares that ephemeral.
+Each stage-level `ephemerals` list is duplicate-free, and the attached
+ephemerals must not expose the same env name to that stage.
 
 Host stages cannot attach container ephemerals. `stages.execution.agent_site: host` rejects `stages.agent.ephemerals`, and `stages.grader.strategy: host` rejects `stages.grader.ephemerals`.
 

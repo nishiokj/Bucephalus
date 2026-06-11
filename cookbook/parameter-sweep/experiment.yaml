@@ -5,14 +5,6 @@ experiment:
   description: Multi-variant sweep template for agent configuration.
   tags: [cookbook, sweep]
 
-runtime:
-  compute: { backend: local-docker }
-  storage: { backend: local-fs }
-  traces: { backend: local-stdout }
-  network:
-    task_sandbox: none
-    agent: none
-
 matrix:
   variants:
     - id: terse
@@ -28,14 +20,9 @@ matrix:
   cases:
     source: file
     path: cases.jsonl
-  repeats: 1
-  seeds: [21]
 
 scheduling:
   max_concurrency: 3
-  shuffle_tasks: false
-  random_seed: 21
-  comparison: none
 
 stages:
   case:
@@ -52,32 +39,18 @@ stages:
         path: /opt/agent
         read_only: true
     command: ["node", "/opt/agent/run.js", "--tone", "$tone"]
-    outputs:
-      result:
-        capture:
-          type: file
-          path: /bucephalus/out/result.json
-          format: json
-          required: true
-  execution:
-    agent_site: agent_container
   grader:
     strategy: none
 
 metrics:
   - id: score
-    source:
-      type: agent_response
-      pointer: /metrics/score
+    from: result.metrics.score
     direction: maximize
     primary: true
   - id: prompt_chars
-    source:
-      type: agent_response
-      pointer: /metrics/prompt_chars
+    from: result.metrics.prompt_chars
     direction: minimize
 
 policy:
   timeout_ms: 120000
   sanitization_profile: hermetic_functional
-  task_sandbox: {}

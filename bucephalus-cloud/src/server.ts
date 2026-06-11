@@ -1,5 +1,5 @@
 import { loadConfig } from "./config";
-import { OAuthVerifier, type AuthContext } from "./auth";
+import { CloudAuthenticator, OAuthVerifier, type AuthContext } from "./auth";
 import { checkDatabase, createSql } from "./db/client";
 import { errorResponse, jsonResponse } from "./http";
 import { ImportRepository } from "./imports/repository";
@@ -9,6 +9,11 @@ import { RegistryRepository } from "./registry/repository";
 import { releaseIdentity } from "./release";
 import { RuntimeRepository } from "./runtime/repository";
 import { RunnerRepository } from "./runners/repository";
+import { CloudSecretRepository } from "./secrets/repository";
+import { createSecretStoreBackend, SecretStore } from "./secrets/store";
+import { ApiTokenRepository } from "./tokens/repository";
+import { handleAuthRoute } from "./routes/auth";
+import { handleSecretRoute } from "./routes/secrets";
 import { handleDraftRoute } from "./routes/drafts";
 import { handleImportRoute } from "./routes/imports";
 import { handleLatchRoute } from "./routes/latch";
@@ -33,7 +38,10 @@ const packages = new PackageRepository(sql);
 const runs = new RunRepository(sql);
 const runtime = new RuntimeRepository(sql, process.env.BUCEPHALUS_RUN_STORE_SCHEMA);
 const runners = new RunnerRepository(sql);
-const auth = new OAuthVerifier(config.auth);
+const secrets = new CloudSecretRepository(sql);
+const secretStore = new SecretStore(createSecretStoreBackend(config), config.secrets.prefix);
+const apiTokens = new ApiTokenRepository(sql);
+const auth = new CloudAuthenticator(new OAuthVerifier(config.auth), apiTokens);
 
 const server = Bun.serve({
   hostname: config.host,
@@ -86,7 +94,17 @@ const server = Bun.serve({
         return withCors(runnerResponse);
       }
 
-      const runResponse = await handleRunRoute(request, url, packages, runs, runtime, runners, workerToken, userAuth);
+      const authResponse = await handleAuthRoute(request, url, apiTokens, userAuth);
+      if (authResponse) {
+        return withCors(authResponse);
+      }
+
+      const secretResponse = await handleSecretRoute(request, url, secrets, secretStore, userAuth);
+      if (secretResponse) {
+        return withCors(secretResponse);
+      }
+
+      const runResponse = await handleRunRoute(request, url, packages, runs, runtime, runners, workerToken, userAuth, secrets);
       if (runResponse) {
         return withCors(runResponse);
       }
@@ -121,7 +139,7 @@ process.on("SIGTERM", async () => {
 function withCors(response: Response): Response {
   const headers = new Headers(response.headers);
   headers.set("access-control-allow-origin", "*");
-  headers.set("access-control-allow-methods", "GET,POST,PUT,OPTIONS");
+  headers.set("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS");
   headers.set("access-control-allow-headers", "authorization,content-type");
   headers.set("access-control-max-age", "600");
   return new Response(response.body, {

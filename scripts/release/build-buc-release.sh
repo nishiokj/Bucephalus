@@ -18,6 +18,7 @@ Usage: scripts/release/build-buc-release.sh --version <version> [--out <dir>] [-
 Builds a Bucephalus release directory containing:
   - bin/bucephalus
   - bin/bucephalus-worker-runner
+  - bin/bucephalus-modal-launcher
   - bucephalus-cloud worker/controller/API bundle
   - release input lockfiles used to build the bundle
   - migrations, OpenAPI specs, and deployment contracts
@@ -131,6 +132,7 @@ sha256_tree() {
 require_command cargo
 require_command bun
 require_command git
+require_command go
 require_command install
 require_command tar
 
@@ -140,7 +142,8 @@ runtime_dist_ready() {
     && -f "${dir}/worker.js" \
     && -f "${dir}/db/migrate.js" \
     && -f "${dir}/poolController.js" \
-    && -f "${dir}/secretResolver.js" ]]
+    && -f "${dir}/secretResolver.js" \
+    && -f "${dir}/networkPolicyClient.js" ]]
 }
 
 CARGO_BUILD_SUBCOMMAND="${BUCEPHALUS_RELEASE_CARGO_BUILD_SUBCOMMAND:-build}"
@@ -162,6 +165,27 @@ RELEASE_NAME="bucephalus-${VERSION}-${TARGET_LABEL}"
 RELEASE_DIR="${OUT_DIR}/${RELEASE_NAME}"
 ARCHIVE_BASENAME="${RELEASE_NAME}.tar.gz"
 ARCHIVE_PATH="${OUT_DIR}/${ARCHIVE_BASENAME}"
+
+go_target_env() {
+  case "$1" in
+    x86_64-unknown-linux-gnu|x86_64-unknown-linux-musl|x86_64-linux)
+      printf 'GOOS=linux GOARCH=amd64'
+      ;;
+    aarch64-unknown-linux-gnu|aarch64-unknown-linux-musl|arm64-linux|aarch64-linux)
+      printf 'GOOS=linux GOARCH=arm64'
+      ;;
+    x86_64-apple-darwin|x86_64-darwin)
+      printf 'GOOS=darwin GOARCH=amd64'
+      ;;
+    aarch64-apple-darwin|arm64-darwin|aarch64-darwin)
+      printf 'GOOS=darwin GOARCH=arm64'
+      ;;
+    *)
+      echo "unsupported Go release target mapping for ${1}" >&2
+      exit 2
+      ;;
+  esac
+}
 
 rm -rf "${RELEASE_DIR}" "${ARCHIVE_PATH}"
 mkdir -p "${RELEASE_DIR}/bin" "${RELEASE_DIR}/bucephalus-cloud" "${RELEASE_DIR}/release-inputs"
@@ -204,6 +228,14 @@ else
   fi
 fi
 install -m 0755 "${WORKER_RUNNER_BIN}" "${RELEASE_DIR}/bin/bucephalus-worker-runner"
+
+echo "== Building bucephalus-modal-launcher ${VERSION} =="
+read -r GOOS_VALUE GOARCH_VALUE <<< "$(go_target_env "${TARGET_LABEL}" | sed 's/GOOS=//; s/ GOARCH=/ /')"
+(
+  cd "${ROOT_DIR}/modal-launcher"
+  GOOS="${GOOS_VALUE}" GOARCH="${GOARCH_VALUE}" CGO_ENABLED=0 go build -mod=readonly -trimpath -o "${RELEASE_DIR}/bin/bucephalus-modal-launcher" .
+)
+
 install -m 0644 "${ROOT_DIR}/Cargo.lock" "${RELEASE_DIR}/release-inputs/Cargo.lock"
 
 cat > "${RELEASE_DIR}/.dockerignore" <<'EOF'
@@ -382,6 +414,7 @@ await Bun.write(join(releaseDir, "release-size-report.json"), `${JSON.stringify(
 
 CORE_SHA="$(sha256_file "${RELEASE_DIR}/bin/bucephalus")"
 WORKER_RUNNER_SHA="$(sha256_file "${RELEASE_DIR}/bin/bucephalus-worker-runner")"
+MODAL_LAUNCHER_SHA="$(sha256_file "${RELEASE_DIR}/bin/bucephalus-modal-launcher")"
 SIZE_REPORT_SHA="$(sha256_file "${RELEASE_DIR}/release-size-report.json")"
 DOCKERIGNORE_SHA="$(sha256_file "${RELEASE_DIR}/.dockerignore")"
 CARGO_LOCK_SHA="$(sha256_file "${RELEASE_DIR}/release-inputs/Cargo.lock")"
@@ -461,6 +494,10 @@ cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
     "worker_runner_binary": {
       "path": "bin/bucephalus-worker-runner",
       "sha256": "${WORKER_RUNNER_SHA}"
+    },
+    "modal_launcher_binary": {
+      "path": "bin/bucephalus-modal-launcher",
+      "sha256": "${MODAL_LAUNCHER_SHA}"
     },
     "size_report": {
       "path": "release-size-report.json",

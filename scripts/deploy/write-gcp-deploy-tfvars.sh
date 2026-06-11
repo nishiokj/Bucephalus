@@ -22,6 +22,21 @@ API_INGRESS="INGRESS_TRAFFIC_ALL"
 DEPLOY_CONTROL_PLANE_SERVICES="false"
 DEPLOY_API_SERVICES="false"
 DEPLOY_POOL_CONTROLLER="false"
+MODAL_BACKEND_ENABLED="${BUCEPHALUS_MODAL_BACKEND_ENABLED:-false}"
+MODAL_APP_NAME="${BUCEPHALUS_MODAL_APP_NAME:-}"
+MODAL_ENVIRONMENT="${BUCEPHALUS_MODAL_ENVIRONMENT:-}"
+MODAL_TOKEN_ID_SECRET_VERSION="${BUCEPHALUS_MODAL_TOKEN_ID_SECRET_VERSION:-}"
+MODAL_TOKEN_SECRET_SECRET_VERSION="${BUCEPHALUS_MODAL_TOKEN_SECRET_SECRET_VERSION:-}"
+MODAL_S3_BUCKET="${BUCEPHALUS_MODAL_S3_BUCKET:-}"
+MODAL_S3_PREFIX="${BUCEPHALUS_MODAL_S3_PREFIX:-}"
+MODAL_S3_ENDPOINT_URL="${BUCEPHALUS_MODAL_S3_ENDPOINT_URL:-}"
+MODAL_S3_REGION="${BUCEPHALUS_MODAL_S3_REGION:-}"
+MODAL_S3_SECRET_NAME="${BUCEPHALUS_MODAL_S3_SECRET_NAME:-}"
+MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION="${BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION:-}"
+MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION="${BUCEPHALUS_MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION:-}"
+MODAL_S3_FORCE_PATH_STYLE="${BUCEPHALUS_MODAL_S3_FORCE_PATH_STYLE:-false}"
+MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME="${BUCEPHALUS_MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME:-}"
+MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION="${BUCEPHALUS_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION:-}"
 
 usage() {
   cat <<'USAGE'
@@ -45,7 +60,22 @@ Usage: scripts/deploy/write-gcp-deploy-tfvars.sh --out <path> \
   [--api-ingress <Cloud Run ingress enum>] \
   [--deploy-control-plane-services true|false] \
   [--deploy-api-services true|false] \
-  [--deploy-pool-controller true|false]
+  [--deploy-pool-controller true|false] \
+  [--modal-backend-enabled true|false] \
+  [--modal-app-name <name>] \
+  [--modal-environment <name>] \
+  [--modal-token-id-secret-version <number>] \
+  [--modal-token-secret-secret-version <number>] \
+  [--modal-s3-bucket <bucket>] \
+  [--modal-s3-prefix <prefix>] \
+  [--modal-s3-endpoint-url <https-url>] \
+  [--modal-s3-region <region>] \
+  [--modal-s3-secret-name <modal-secret>] \
+  [--modal-s3-access-key-id-secret-version <number>] \
+  [--modal-s3-secret-access-key-secret-version <number>] \
+  [--modal-s3-force-path-style true|false] \
+  [--modal-gcp-artifact-registry-secret-name <modal-secret>] \
+  [--modal-gcp-artifact-registry-service-account-json-secret-version <number>]
 
 Writes a Terraform tfvars fragment for non-secret GCP deploy inputs. Image
 digest variables are intentionally not accepted here; deployment image refs must
@@ -140,6 +170,66 @@ while [[ $# -gt 0 ]]; do
       DEPLOY_POOL_CONTROLLER="${2:-}"
       shift 2
       ;;
+    --modal-backend-enabled)
+      MODAL_BACKEND_ENABLED="${2:-}"
+      shift 2
+      ;;
+    --modal-app-name)
+      MODAL_APP_NAME="${2:-}"
+      shift 2
+      ;;
+    --modal-environment)
+      MODAL_ENVIRONMENT="${2:-}"
+      shift 2
+      ;;
+    --modal-token-id-secret-version)
+      MODAL_TOKEN_ID_SECRET_VERSION="${2:-}"
+      shift 2
+      ;;
+    --modal-token-secret-secret-version)
+      MODAL_TOKEN_SECRET_SECRET_VERSION="${2:-}"
+      shift 2
+      ;;
+    --modal-s3-bucket)
+      MODAL_S3_BUCKET="${2:-}"
+      shift 2
+      ;;
+    --modal-s3-prefix)
+      MODAL_S3_PREFIX="${2:-}"
+      shift 2
+      ;;
+    --modal-s3-endpoint-url)
+      MODAL_S3_ENDPOINT_URL="${2:-}"
+      shift 2
+      ;;
+    --modal-s3-region)
+      MODAL_S3_REGION="${2:-}"
+      shift 2
+      ;;
+    --modal-s3-secret-name)
+      MODAL_S3_SECRET_NAME="${2:-}"
+      shift 2
+      ;;
+    --modal-s3-access-key-id-secret-version)
+      MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION="${2:-}"
+      shift 2
+      ;;
+    --modal-s3-secret-access-key-secret-version)
+      MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION="${2:-}"
+      shift 2
+      ;;
+    --modal-s3-force-path-style)
+      MODAL_S3_FORCE_PATH_STYLE="${2:-}"
+      shift 2
+      ;;
+    --modal-gcp-artifact-registry-secret-name)
+      MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME="${2:-}"
+      shift 2
+      ;;
+    --modal-gcp-artifact-registry-service-account-json-secret-version)
+      MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -185,6 +275,21 @@ API_INGRESS="${API_INGRESS}" \
 DEPLOY_CONTROL_PLANE_SERVICES="${DEPLOY_CONTROL_PLANE_SERVICES}" \
 DEPLOY_API_SERVICES="${DEPLOY_API_SERVICES}" \
 DEPLOY_POOL_CONTROLLER="${DEPLOY_POOL_CONTROLLER}" \
+MODAL_BACKEND_ENABLED="${MODAL_BACKEND_ENABLED}" \
+MODAL_APP_NAME="${MODAL_APP_NAME}" \
+MODAL_ENVIRONMENT="${MODAL_ENVIRONMENT}" \
+MODAL_TOKEN_ID_SECRET_VERSION="${MODAL_TOKEN_ID_SECRET_VERSION}" \
+MODAL_TOKEN_SECRET_SECRET_VERSION="${MODAL_TOKEN_SECRET_SECRET_VERSION}" \
+MODAL_S3_BUCKET="${MODAL_S3_BUCKET}" \
+MODAL_S3_PREFIX="${MODAL_S3_PREFIX}" \
+MODAL_S3_ENDPOINT_URL="${MODAL_S3_ENDPOINT_URL}" \
+MODAL_S3_REGION="${MODAL_S3_REGION}" \
+MODAL_S3_SECRET_NAME="${MODAL_S3_SECRET_NAME}" \
+MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION="${MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION}" \
+MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION="${MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION}" \
+MODAL_S3_FORCE_PATH_STYLE="${MODAL_S3_FORCE_PATH_STYLE}" \
+MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME="${MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME}" \
+MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION="${MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION}" \
 bun -e '
 function optional(value) {
   return value === undefined || value === "" ? null : value;
@@ -211,6 +316,21 @@ const values = {
   deploy_control_plane_services: process.env.DEPLOY_CONTROL_PLANE_SERVICES,
   deploy_api_services: process.env.DEPLOY_API_SERVICES,
   deploy_pool_controller: process.env.DEPLOY_POOL_CONTROLLER,
+  modal_backend_enabled: process.env.MODAL_BACKEND_ENABLED,
+  modal_app_name: optional(process.env.MODAL_APP_NAME),
+  modal_environment: optional(process.env.MODAL_ENVIRONMENT),
+  modal_token_id_secret_version: optional(process.env.MODAL_TOKEN_ID_SECRET_VERSION),
+  modal_token_secret_secret_version: optional(process.env.MODAL_TOKEN_SECRET_SECRET_VERSION),
+  modal_s3_bucket: optional(process.env.MODAL_S3_BUCKET),
+  modal_s3_prefix: process.env.MODAL_S3_PREFIX ?? "",
+  modal_s3_endpoint_url: optional(process.env.MODAL_S3_ENDPOINT_URL),
+  modal_s3_region: optional(process.env.MODAL_S3_REGION),
+  modal_s3_secret_name: optional(process.env.MODAL_S3_SECRET_NAME),
+  modal_s3_access_key_id_secret_version: optional(process.env.MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION),
+  modal_s3_secret_access_key_secret_version: optional(process.env.MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION),
+  modal_s3_force_path_style: process.env.MODAL_S3_FORCE_PATH_STYLE,
+  modal_gcp_artifact_registry_secret_name: optional(process.env.MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME),
+  modal_gcp_artifact_registry_service_account_json_secret_version: optional(process.env.MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION),
 };
 
 const alwaysChecks = [
@@ -244,9 +364,20 @@ for (const name of ["deploy_control_plane_services", "deploy_api_services", "dep
     fail(`${name} must be true or false`);
   }
 }
+for (const name of ["modal_backend_enabled", "modal_s3_force_path_style"]) {
+  if (!["true", "false"].includes(values[name])) {
+    fail(`${name} must be true or false`);
+  }
+}
 const deployServices = values.deploy_control_plane_services === "true";
 const deployApi = deployServices || values.deploy_api_services === "true" || values.deploy_pool_controller === "true";
 const deployPoolController = deployServices || values.deploy_pool_controller === "true";
+const modalEnabled = values.modal_backend_enabled === "true";
+const modalUsesGcsServiceAccountSync =
+  typeof values.modal_s3_endpoint_url === "string" &&
+  values.modal_s3_endpoint_url.includes("storage.googleapis.com") &&
+  typeof values.modal_gcp_artifact_registry_service_account_json_secret_version === "string" &&
+  /^[1-9][0-9]*$/.test(values.modal_gcp_artifact_registry_service_account_json_secret_version);
 const checks = [
   ...alwaysChecks,
   ...(deployApi ? serviceChecks : []),
@@ -260,6 +391,33 @@ for (const [name, pattern] of checks) {
 }
 if (values.cloud_gcs_bucket !== null && !/^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/.test(values.cloud_gcs_bucket)) {
   fail("cloud_gcs_bucket is invalid for deploy tfvars");
+}
+if (deployPoolController && modalEnabled) {
+  const modalChecks = [
+    ["modal_app_name", /^\S+$/],
+    ["modal_token_id_secret_version", /^[1-9][0-9]*$/],
+    ["modal_token_secret_secret_version", /^[1-9][0-9]*$/],
+    ["modal_s3_bucket", /^[A-Za-z0-9][A-Za-z0-9._-]{1,61}[A-Za-z0-9]$/],
+    ["modal_s3_prefix", /^.+$/],
+  ];
+  for (const [name, pattern] of modalChecks) {
+    if (typeof values[name] !== "string" || !pattern.test(values[name])) {
+      fail(`${name} is invalid for deploy tfvars`);
+    }
+  }
+  if (values.modal_s3_secret_name === null && !modalUsesGcsServiceAccountSync) {
+    for (const name of ["modal_s3_access_key_id_secret_version", "modal_s3_secret_access_key_secret_version"]) {
+      if (typeof values[name] !== "string" || !/^[1-9][0-9]*$/.test(values[name])) {
+        fail(`${name} is required when modal_s3_secret_name is unset and the sync bucket is not using the GCS service-account path`);
+      }
+    }
+  }
+  if (values.modal_s3_endpoint_url !== null && !/^https:\/\/\S+$/.test(values.modal_s3_endpoint_url)) {
+    fail("modal_s3_endpoint_url is invalid for deploy tfvars");
+  }
+  if (values.modal_gcp_artifact_registry_service_account_json_secret_version !== null && !/^[1-9][0-9]*$/.test(values.modal_gcp_artifact_registry_service_account_json_secret_version)) {
+    fail("modal_gcp_artifact_registry_service_account_json_secret_version is invalid for deploy tfvars");
+  }
 }
 
 for (const [name, value] of Object.entries(values)) {
@@ -303,6 +461,21 @@ const order = [
   "deploy_control_plane_services",
   "deploy_api_services",
   "deploy_pool_controller",
+  "modal_backend_enabled",
+  "modal_app_name",
+  "modal_environment",
+  "modal_token_id_secret_version",
+  "modal_token_secret_secret_version",
+  "modal_s3_bucket",
+  "modal_s3_prefix",
+  "modal_s3_endpoint_url",
+  "modal_s3_region",
+  "modal_s3_secret_name",
+  "modal_s3_access_key_id_secret_version",
+  "modal_s3_secret_access_key_secret_version",
+  "modal_s3_force_path_style",
+  "modal_gcp_artifact_registry_secret_name",
+  "modal_gcp_artifact_registry_service_account_json_secret_version",
 ];
 const lines = [
   "# Generated by scripts/deploy/write-gcp-deploy-tfvars.sh",
@@ -310,7 +483,7 @@ const lines = [
   "# Image digest variables must come from verified gcp-image-digests.tfvars.",
   "",
   ...order.map((name) => {
-    if (["deploy_control_plane_services", "deploy_api_services", "deploy_pool_controller"].includes(name)) {
+    if (["deploy_control_plane_services", "deploy_api_services", "deploy_pool_controller", "modal_backend_enabled", "modal_s3_force_path_style"].includes(name)) {
       return `${name} = ${values[name]}`;
     }
     if (values[name] === null) {

@@ -144,6 +144,10 @@ Terraform creates these Secret Manager containers:
 - API database URL
 - migrator database URL
 - worker token
+- Modal token ID
+- Modal token secret
+- Modal S3-compatible access key ID
+- Modal S3-compatible secret access key
 - pool controller provision command JSON
 - pool controller reap command JSON
 
@@ -160,6 +164,35 @@ current application interface, which accepts provider commands through
 configuration. They must point at provider code shipped in the selected image or
 another declared artifact, not at retired SSH/startup-script deployment
 materials. Path 3 should replace this with a first-class provider boundary.
+
+## Modal Backend
+
+Set `modal_backend_enabled=true` only after the Modal token and runtime sync
+bucket are ready. The pool controller then advertises both `runner-docker` and
+`modal`, and each per-run GCE worker VM fetches Modal credentials from Secret
+Manager during startup before launching the worker container.
+
+Required inputs when Modal is enabled:
+
+- `modal_app_name`
+- `modal_token_id_secret_version`
+- `modal_token_secret_secret_version`
+- `modal_s3_bucket`
+- non-empty `modal_s3_prefix`
+- either `modal_s3_secret_name` for an existing Modal Secret, or both
+  `modal_s3_access_key_id_secret_version` and
+  `modal_s3_secret_access_key_secret_version`
+
+When Modal task images live in private GCP Artifact Registry, also set either
+`modal_gcp_artifact_registry_secret_name` for an existing Modal Secret with
+`SERVICE_ACCOUNT_JSON`, or
+`modal_gcp_artifact_registry_service_account_json_secret_version` to inject the
+JSON from Secret Manager into an ephemeral Modal Secret at launch time.
+
+For Cloudflare R2, set `modal_s3_endpoint_url` to the account endpoint and
+`modal_s3_region="auto"`. Keep `modal_s3_force_path_style=false`; Modal's Go SDK
+CloudBucketMount API does not support path-style S3 mounts, so Terraform blocks
+that configuration before a worker VM is provisioned.
 
 ## Database Ownership
 

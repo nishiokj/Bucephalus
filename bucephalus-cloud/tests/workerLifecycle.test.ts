@@ -7,6 +7,7 @@ import {
   applyRuntimeNetworkPolicy,
   collectRuntimeSnapshot,
   coreRunnerEnv,
+  coreRunnerFailureMessage,
   discoverCoreRunIdsFromRunRoot,
   dockerRegistryAuthHeaders,
   loadWorkerConfig,
@@ -226,6 +227,62 @@ describe("worker lifecycle cleanup helpers", () => {
       BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
       BUCEPHALUS_WORKER_MIN_FREE_BYTES: "1",
     })).toThrow("BUCEPHALUS_CLOUD_API_URL is required");
+  });
+
+  test("core runner env keeps Modal controls while stripping generic cloud credentials", () => {
+    const previous = {
+      BUCEPHALUS_MODAL_LAUNCHER: process.env.BUCEPHALUS_MODAL_LAUNCHER,
+      BUCEPHALUS_MODAL_APP_NAME: process.env.BUCEPHALUS_MODAL_APP_NAME,
+      BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID: process.env.BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID,
+      AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+      AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+    };
+    try {
+      process.env.BUCEPHALUS_MODAL_LAUNCHER = "/usr/local/bin/bucephalus-modal-launcher";
+      process.env.BUCEPHALUS_MODAL_APP_NAME = "bucephalus-prod";
+      process.env.BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID = "modal-sync-key";
+      process.env.AWS_ACCESS_KEY_ID = "generic-aws-key";
+      process.env.AWS_SECRET_ACCESS_KEY = "generic-aws-secret";
+
+      const env = coreRunnerEnv();
+
+      expect(env.BUCEPHALUS_MODAL_LAUNCHER).toBe("/usr/local/bin/bucephalus-modal-launcher");
+      expect(env.BUCEPHALUS_MODAL_APP_NAME).toBe("bucephalus-prod");
+      expect(env.BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID).toBe("modal-sync-key");
+      expect(env.AWS_ACCESS_KEY_ID).toBeUndefined();
+      expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
+  });
+
+  test("core runner failure message preserves JSON stdout errors ahead of stderr progress logs", () => {
+    const stdout = JSON.stringify({
+      ok: false,
+      error: {
+        code: "command_failed",
+        message:
+          "local trial execution failed: modal sandbox launcher exited before emitting BUCEPHALUS_MODAL_RESULT",
+      },
+    });
+    const stderr = [
+      "preflight complete",
+      "starting schedule execution: slots=36 max_concurrency=2",
+    ].join("\n");
+
+    const message = coreRunnerFailureMessage(1, stdout, stderr);
+
+    expect(message).toContain("command_failed: local trial execution failed");
+    expect(message).toContain(
+      "modal sandbox launcher exited before emitting BUCEPHALUS_MODAL_RESULT",
+    );
+    expect(message).toContain("stderr tail: preflight complete");
   });
 
   test("Docker registry auth header decodes auth-only Docker config entries", async () => {

@@ -11,7 +11,7 @@ Bucephalus authoring uses one noun per level:
 | Workspace | The subject the machinery acts on. It is not a stage, ephemeral, or external. |
 | Stage | A link in the runner-wired chain, such as agent or grader. Each stage declares only its own input and output. |
 | Transport Envelope | The runner-owned shape that carries one stage's output into the next stage's input. |
-| Ephemeral | A per-trial resource the runner starts and tears down, but which is not a link in the stage chain. Sidecars, MCP servers, and memory systems belong here. |
+| Ephemeral | A per-trial resource the runner starts and tears down, but which is not a link in the stage chain. MCP servers, memory systems, and helper services belong here. |
 | External | Anything outside runner jurisdiction: network egress, credentials, third-party APIs, and other boundary crossings. |
 
 The classification test is:
@@ -25,8 +25,7 @@ Canonical YAML sections:
 
 | Section | Responsibility |
 | --- | --- |
-| `matrix` | Variants, cases, repeats, and seeds. |
-| `cases` | Local JSONL case source. |
+| `matrix` | Variants, cases, and repeats. |
 | `scheduling` | Concurrency, ordering, and comparison. |
 | `stages` | Stage chain and declared I/O. |
 | `ephemerals` | Per-trial resources attached to stages. |

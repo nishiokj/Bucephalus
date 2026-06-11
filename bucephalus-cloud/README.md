@@ -147,6 +147,18 @@ BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON='["bucephalus-cloud-secret-resolver"]
 The resolver supports GCP Secret Manager and AWS Secrets Manager refs via the
 provider CLI installed in the runner image.
 
+Users normally never write provider refs: the hosted secret store
+(`PUT/GET/DELETE /v1/secrets/<name>`, write-only) accepts a value once and run
+submissions reference it as `bucephalus://<name>`. The API translates hosted
+refs to backing provider refs at run creation, so workers and the resolver see
+only provider refs. Configure the backing store with
+`BUCEPHALUS_CLOUD_SECRETS_BACKEND=gcp` and
+`BUCEPHALUS_CLOUD_SECRETS_GCP_PROJECT=<project>` (the API service account needs
+`secretmanager.admin` on that project, runner service accounts need
+`secretmanager.secretAccessor`). The default `filesystem` backend is for local
+development and pairs with `BUCEPHALUS_SECRET_RESOLVER_ALLOW_FILE=true` on the
+resolver side.
+
 Runs with declared network egress require an explicit network policy enforcer:
 
 ```bash
@@ -163,6 +175,13 @@ For real deployments, configure the API as an OAuth resource server with
 user OAuth client ID, and the JWKS URL is
 `https://www.googleapis.com/oauth2/v3/certs`. Setting
 `BUCEPHALUS_CLOUD_AUTH_REQUIRED=false` is rejected at startup.
+
+The identity-provider JWT is only the sign-in credential. Clients exchange it
+once via `POST /v1/auth/sessions` for a Bucephalus session token (opaque
+`buc_` bearer, hashed at rest, sliding 30-day expiry, revocation-checked on
+every request), and `POST /v1/auth/api-keys` mints non-expiring tokens for
+scripts and CI. Both authenticate every `/v1` route interchangeably with
+OAuth JWTs; see `api/openapi/auth.yaml`.
 
 ## Web UI
 

@@ -67,7 +67,7 @@ fn run(argv: Vec<String>) -> Result<()> {
             local_command_name(group, command)
         ),
         _ if context.api_url.is_empty() => bail!(
-            "{} or --api-url is required; bucephalus-cloud only targets an explicit Cloud API",
+            "no Cloud API configured; run `bucephalus login --resource <api-url>` once to persist it, or pass --api-url / set {}",
             BUCEPHALUS_CLOUD_API_URL_ENV
         ),
         (Some("health"), _) => print_json(&cloud_fetch(
@@ -188,6 +188,13 @@ fn parse_global_args(argv: Vec<String>) -> Result<CliContext> {
     }
     if user_token.is_none() {
         user_token = shared_cloud_user_token()?;
+    }
+    if api_url.trim().is_empty() {
+        if let Ok(home) = lab_runner::bucephalus_home() {
+            if let Some(url) = lab_runner::cloud_profile_string(&home, "/api_url") {
+                api_url = url;
+            }
+        }
     }
 
     Ok(CliContext {
@@ -1376,7 +1383,8 @@ Usage:
   bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-instance drain <runner-instance-id>
 
 Environment:
-  BUCEPHALUS_CLOUD_API_URL       Required unless --api-url is set; no localhost default
+  BUCEPHALUS_CLOUD_API_URL       Cloud API base URL; falls back to the profile
+                                 persisted by `bucephalus login` (no localhost default)
   BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token override for health checks
   BUCEPHALUS_CLOUD_WORKER_TOKEN  Required for runner pool and worker management commands
   BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN

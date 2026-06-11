@@ -275,6 +275,7 @@ verifyChecksumManifest();
 
 assertBundledFile(manifest.artifacts?.core_binary, "artifacts.core_binary");
 assertBundledFile(manifest.artifacts?.worker_runner_binary, "artifacts.worker_runner_binary");
+assertBundledFile(manifest.artifacts?.modal_launcher_binary, "artifacts.modal_launcher_binary");
 assertBundledFile(manifest.artifacts?.size_report, "artifacts.size_report");
 assertBundledFile(manifest.source_inputs?.lockfiles?.cargo, "source_inputs.lockfiles.cargo");
 assertBundledFile(manifest.source_inputs?.lockfiles?.cloud_bun, "source_inputs.lockfiles.cloud_bun");

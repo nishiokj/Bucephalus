@@ -1,11 +1,14 @@
 # Package Checks
 
-Package checks are static hygiene checks for a sealed build package. They run
-after `bucephalus build` and before dynamic preflight.
+Package checks are static hygiene checks for immutable sealed package contents.
+They run after schema and resolved-contract validation, after `bucephalus build`,
+and before dynamic preflight.
 
 The split is intentional:
 
-- package checks inspect immutable package contents
+- schema and resolved-contract validation reject contradictory wiring
+- package checks inspect immutable package contents and write the package
+  evidence report
 - preflight inspects dynamic launch resources such as Docker, images, env vars,
   secrets, writable paths, and runtime smoke commands
 - runtime health is continuous and should monitor live failures such as provider
@@ -32,7 +35,7 @@ The JSON response includes:
 }
 ```
 
-You can also run the static checks again:
+You can also validate the sealed package and rewrite the static evidence report:
 
 ```bash
 bucephalus check-package <package_dir>
@@ -49,7 +52,7 @@ package_checks_v1`. Each check has:
 
 - `id`
 - `scope`
-- `status`: `pass`, `warn`, `fail`, or `skip`
+- `status`: `pass`, `warn`, or `fail`
 - `reason`
 - `evidence`
 
@@ -58,37 +61,30 @@ Current checks include:
 | Check | What it catches |
 | --- | --- |
 | `provenance.package_digest_present` | The report is tied to a sealed package digest. |
-| `variants.unique_ids` | Missing or duplicate variant ids. |
-| `design.schedule_matches_comparison` | Historical check id for scheduling contradictions, such as `scheduling.comparison: paired` with one variant, or paired experiments not using paired interleaving. |
 | `tasks.unique_valid_rows` | Historical check id for malformed packaged case rows or duplicate case ids. |
-| `trial_runtime.schema` | Historical check id for a resolved stage chain that cannot be parsed. |
-| `metrics.primary_declared` | Missing or multiple primary metrics. |
-| `grader.conditional_integrity` | `grader_output` metrics in no-grader experiments; grader checks skip cleanly when `grader.strategy: none`. |
-| `outputs.result_capture_declared` | Missing agent result capture path. |
-| `agent.protocol_supported` | Whether the selected agent protocol is supported by this runner. |
-| `events.declaration_present` | Whether agent event streams are declared. |
-| `contamination.hidden_path_mount_overlap` | Declared hidden grader paths overlapping agent output mounts. |
-| `epistemic_hygiene.qa_engineer` | Placeholder for future dynamic model-assisted QA scans. |
+| `images.task_refs_digest_pinned` | Mutable task image tags that should be pinned to a digest for reproducibility. |
 
 ## No-Grader Experiments
 
-Graders are optional. A no-grader experiment can pass package checks when its
-metrics come from `agent_response` or `runtime_output`.
+Graders are optional. A no-grader experiment validates when its metrics come
+from `from: result...` declarations.
 
 This is valid:
 
 ```yaml
-stages:
-  grader:
-    strategy: none
-
 metrics:
   - id: resolved
-    primary: true
-    source:
-      type: agent_response
-      pointer: /metrics/resolved
+    from: result.metrics.resolved
 ```
+
+A single authored metric defaults to primary in the sealed package. If you
+declare multiple metrics, mark exactly one with `primary: true`; build
+validation rejects ambiguous primary metric declarations before package checks
+are written.
+
+`stages.grader.strategy: none` may be explicit, but omitting `stages.grader`
+is the preferred no-grader default. An explicit empty `stages.grader: {}` is
+rejected.
 
 This is not valid:
 
@@ -100,18 +96,18 @@ stages:
 metrics:
   - id: score
     primary: true
-    source:
-      type: grader_output
-      output: report
-      pointer: /score
+    from: grader.report.score
 ```
+
+This relationship, metric `from:` references to declared grader outputs or the
+supported canonical runtime result output, and hidden grader path/output mount
+overlap are enforced by schema validation.
 
 ## Epistemic Hygiene
 
 Package checks are not a proof that a benchmark is semantically uncontaminated
-or that an agent could not cheat. They are a deterministic first layer for
-catching static contradictions and dangerous wiring mistakes before spending
-tokens.
+or that an agent could not cheat. They are a deterministic package-evidence
+layer after schema and resolved-contract validation, before spending tokens.
 
 Future hygiene layers can build on this report:
 

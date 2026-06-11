@@ -174,7 +174,7 @@ pub(crate) fn build_trial_input(
         .pointer("/runtime/network/egress")
         .cloned()
         .unwrap_or_else(|| json!([]));
-    let sanitization_profile = effective_sanitization_profile(json_value);
+    let sanitization_profile = effective_sanitization_profile(json_value)?;
     let artifact_type = json_value
         .pointer("/trial_runtime/agent/artifact_type")
         .and_then(Value::as_str)
@@ -250,8 +250,7 @@ pub(crate) fn load_prepared_task_environment_manifest(
 
 pub(crate) fn resolve_trial_timeout_ms(input: &Value) -> Option<u64> {
     input
-        .pointer("/policy/timeout_ms")
-        .or_else(|| input.pointer("/runtime/time_limit_ms"))
+        .pointer("/runtime/time_limit_ms")
         .and_then(|v| v.as_u64())
 }
 
@@ -261,18 +260,14 @@ pub(crate) fn build_runtime_contract_env(
     io: &PreparedTrialIo,
     task_image: Option<&str>,
     timeout_ms: Option<u64>,
+    expose_event_path: bool,
 ) -> Result<BTreeMap<String, String>> {
     if run_id.trim().is_empty() {
         return Err(anyhow!("run_id is required for runtime contract env"));
     }
     let trial_id = required_trial_input_string(input, "/ids/trial_id")?;
     let variant_id = required_trial_input_string(input, "/ids/variant_id")?;
-    let case_id = input
-        .pointer("/ids/case_id")
-        .or_else(|| input.pointer("/ids/task_id"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("trial_input /ids/case_id or /ids/task_id is required"))?;
+    let case_id = required_trial_input_string(input, "/ids/case_id")?;
     let repl_idx = input
         .pointer("/ids/repl_idx")
         .and_then(Value::as_u64)
@@ -291,10 +286,12 @@ pub(crate) fn build_runtime_contract_env(
         BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
         io.mapped_grader_output_path.clone(),
     );
-    env.insert(
-        BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
-        io.trajectory_path.clone(),
-    );
+    if expose_event_path {
+        env.insert(
+            BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
+            io.trajectory_path.clone(),
+        );
+    }
     env.insert(BUCEPHALUS_ENV_RUN_ID.to_string(), run_id.to_string());
     env.insert(BUCEPHALUS_ENV_TRIAL_ID.to_string(), trial_id.to_string());
     env.insert(
@@ -339,11 +336,6 @@ fn resolve_runtime_event_path(agent_runtime: Option<&AgentRuntimeConfig>) -> Str
     agent_runtime
         .and_then(|runtime| runtime.event_sinks.first())
         .map(|sink| sink.path.clone())
-        .or_else(|| {
-            agent_runtime
-                .and_then(|runtime| runtime.trajectory_path.as_ref())
-                .cloned()
-        })
         .unwrap_or_else(|| DEFAULT_CONTAINER_TRAJECTORY_PATH.to_string())
 }
 
@@ -540,6 +532,10 @@ fn resolve_prepared_runtime_image(
             map_path.display()
         )
     })?;
+    crate::package::validate::validate_schema_contract_value(
+        &value,
+        format!("prepared runtime image map {}", map_path.display()).as_str(),
+    )?;
     let map: PreparedRuntimeImageMap = serde_json::from_value(value).with_context(|| {
         format!(
             "failed to parse prepared runtime image map from {}",
@@ -640,15 +636,24 @@ fn build_task_sandbox_plan(
     })
 }
 
-fn trial_input_asset_kind(value: &Value) -> Option<&str> {
-    let kind = value
-        .get("type")
-        .or_else(|| value.get("kind"))
-        .and_then(Value::as_str)?;
+fn trial_input_asset_kind<'a>(value: &'a Value, context: &str) -> Result<Option<&'a str>> {
+    if let Some(alias) = value.get("kind").and_then(Value::as_str) {
+        if matches!(alias, "file" | "directory") {
+            return Err(anyhow!(
+                "{} declares case asset kind='{}'; use type='{}'",
+                context,
+                alias,
+                alias
+            ));
+        }
+    }
+    let Some(kind) = value.get("type").and_then(Value::as_str) else {
+        return Ok(None);
+    };
     if matches!(kind, "file" | "directory") {
-        Some(kind)
+        Ok(Some(kind))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -656,12 +661,6 @@ fn packaged_case_asset_path(obj: &serde_json::Map<String, Value>) -> Option<Stri
     obj.get("package_path")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .or_else(|| {
-            obj.get("uri")
-                .and_then(Value::as_str)
-                .and_then(|uri| uri.strip_prefix("package://"))
-                .map(str::to_string)
-        })
 }
 
 fn case_asset_projection_root(trial_paths: &TrialPaths) -> Result<PathBuf> {
@@ -819,11 +818,18 @@ fn materialize_trial_input_case_assets_value(
         }
         return Ok(());
     }
-    let kind = trial_input_asset_kind(value).map(str::to_string);
+    let kind = trial_input_asset_kind(value, context)?.map(str::to_string);
     let Some(obj) = value.as_object_mut() else {
         return Ok(());
     };
     if let Some(kind) = kind {
+        if obj.contains_key("uri") {
+            return Err(anyhow!(
+                "{} declares {} asset with uri; sealed case assets must use package_path",
+                context,
+                kind
+            ));
+        }
         if let Some(package_path) = packaged_case_asset_path(obj) {
             if projection_root.is_none() {
                 *projection_root = Some(case_asset_projection_root(trial_paths)?);
@@ -845,7 +851,6 @@ fn materialize_trial_input_case_assets_value(
                 )
             })?;
             obj.remove("package_path");
-            obj.remove("uri");
             obj.insert("path".to_string(), Value::String(container_path));
         } else if let Some(path) = obj.get("path").and_then(Value::as_str) {
             if !path.starts_with(&format!("{}/", BUCEPHALUS_CONTRACT_IN_DIR))
@@ -1018,7 +1023,7 @@ pub(crate) fn prepare_task_environment_with_paths(
             .declaration
             .get("schema_version")
             .and_then(Value::as_str),
-        Some("case_v1" | "case_v2" | "task_case_v1")
+        Some("case_v1" | "case_v2")
     ) {
         materialize_trial_input_case_assets(
             &mut input,
@@ -1054,6 +1059,7 @@ pub(crate) fn prepare_task_environment_with_paths(
         &io_paths,
         Some(task_boundary.task_image.as_str()),
         Some(resolved_time_limit_ms),
+        !agent_runtime.event_sinks.is_empty(),
     )?;
     let prepared_runtime_image =
         resolve_prepared_runtime_image(package_root, task_boundary, agent_runtime)?;

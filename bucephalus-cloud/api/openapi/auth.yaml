@@ -1,0 +1,172 @@
+openapi: 3.1.0
+info:
+  title: Bucephalus Cloud Auth Token API
+  version: 0.1.0
+  description: >
+    Platform-minted credentials. Browser sign-in exchanges a short-lived
+    identity-provider OAuth credential for an opaque session token with a
+    sliding 30-day expiry; API keys are non-expiring tokens for programmatic
+    access. Both are buc_-prefixed bearers, stored hashed, and checked against
+    the database on every request, so revocation is immediate. Token secrets
+    are returned exactly once at creation.
+servers:
+  - url: https://api.bucephalus.dev
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /v1/auth/sessions:
+    post:
+      operationId: createSession
+      summary: Exchange an identity-provider OAuth credential for a session token.
+      description: >
+        Requires an OAuth JWT bearer from the configured issuer. Bucephalus
+        tokens (sessions or API keys) cannot mint sessions; the exchange is the
+        point where user presence is proven. Each authenticated request slides
+        the session expiry forward by its ttl.
+      responses:
+        '201':
+          description: Session created. The token field is the only time the secret is shown.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedToken'
+        '403':
+          description: The request authenticated with a Bucephalus token instead of an OAuth credential.
+          content:
+            application/json:
+              schema:
+                $ref: './common.yaml#/components/schemas/Error'
+  /v1/auth/sessions/current:
+    delete:
+      operationId: deleteCurrentSession
+      summary: Sign out by revoking the session token presented as the bearer.
+      responses:
+        '200':
+          description: Revocation result. revoked=false means the token was already gone.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - revoked
+                properties:
+                  revoked:
+                    type: boolean
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+  /v1/auth/api-keys:
+    post:
+      operationId: createApiKey
+      summary: Create a non-expiring API key for programmatic access.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                label:
+                  type: string
+                  maxLength: 120
+                  description: Human-readable purpose, e.g. "ci deploys".
+      responses:
+        '201':
+          description: API key created. The token field is the only time the secret is shown.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedToken'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+  /v1/auth/tokens:
+    get:
+      operationId: listTokens
+      summary: List the caller's sessions and API keys (metadata only).
+      responses:
+        '200':
+          description: Tokens owned by the caller. Secrets and hashes are never included.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - tokens
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TokenMetadata'
+  /v1/auth/tokens/{token_id}:
+    delete:
+      operationId: revokeToken
+      summary: Revoke a session or API key by id.
+      parameters:
+        - name: token_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Token revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenMetadata'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+components:
+  schemas:
+    TokenMetadata:
+      type: object
+      required:
+        - token_id
+        - token_prefix
+        - kind
+        - created_at
+      properties:
+        token_id:
+          type: string
+          format: uuid
+        token_prefix:
+          type: string
+          description: First characters of the secret, for identification only.
+        kind:
+          type: string
+          enum:
+            - session
+            - api_key
+        label:
+          type:
+            - string
+            - 'null'
+        expires_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        last_used_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        revoked:
+          type: boolean
+    CreatedToken:
+      allOf:
+        - $ref: '#/components/schemas/TokenMetadata'
+        - type: object
+          required:
+            - token
+          properties:
+            token:
+              type: string
+              description: The buc_-prefixed secret. Shown once; store it now.

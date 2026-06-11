@@ -1,8 +1,8 @@
 # Agent Runtime Contract
 
 The agent runtime is your application. Bucephalus talks to it through
-`stages.agent.protocol`, which defaults to `command`. Command agents launch
-`stages.agent.command` once per trial.
+`stages.agent.command`, which launches once per trial with runner-owned
+input/output paths in the environment.
 
 ## Config Fields
 
@@ -15,8 +15,9 @@ ephemerals:
       MCP_URL: http://mcp-bash:8080
 
 runtime:
+  secrets:
+    - { name: OPENAI_API_KEY, from: env }
   network:
-    task_sandbox: none
     agent: full
 
 stages:
@@ -41,31 +42,27 @@ stages:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
     output_mounts:
       - id: session_context
-        kind: directory
         path: session-context
         env: BUCEPHALUS_SESSION_CONTEXT_ROOT
-  execution:
-    agent_site: agent_container
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `stages.agent.protocol` | How Buc invokes and observes the agent. Optional; defaults to `command`. Current supported value is `command`. |
-| `stages.agent.command` | Process argv for command agents. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for non-secret variant configuration. |
-| `stages.agent.image` | Container image for the agent process. Required for `agent_site: agent_container`; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
+| `stages.agent.command` | Process argv for command agents. `$NAME` resolves from variant config or explicit launch-time `--env` / `--env-file` inputs. Use this for non-secret variant configuration. |
+| `stages.agent.image` | Container image for the agent process. Implies `agent_site: agent_container` when `stages.execution.agent_site` is omitted; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
 | `stages.agent.ephemerals` | Optional list of top-level ephemeral ids attached to the agent stage. Local Docker injects each ephemeral's `expose` env into the agent process. Forbidden when `agent_site: host`. |
 | `stages.agent.mount` | Optional explicit agent file mount object. Omit for image-native agents. |
 | `stages.agent.mount.source` | Source path or agent build id to stage. |
 | `stages.agent.mount.mount.path` | Absolute runtime mount path, such as `/opt/agent`. |
 | `stages.agent.mount.mount.read_only` | Whether the mount is read-only. |
-| `stages.agent.env` | Env vars injected into the agent process. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for secrets and ambient runtime affordances. |
+| `stages.agent.env` | Env vars injected into the agent process. `$NAME` resolves from variant config or explicit launch-time `--env` / `--env-file` inputs. Env values are not implicit file staging declarations. For secrets, also declare the required name in `runtime.secrets`. |
 | `stages.agent.output_mounts` | Runtime-owned output directories under `/bucephalus/out`, optionally exposed through an env var and persisted with trial outputs. |
 | `runtime.network.agent` | Agent network mode, usually `none` for hermetic evals or `full` for provider-backed agents. |
-| `stages.execution.agent_site` | Where the agent runs: `agent_container`, `task_runtime`, or `host`. |
+| `stages.execution.agent_site` | Optional override for where the agent runs: `agent_container`, `task_runtime`, or `host`. |
 
 If `policy.sanitization_profile` is `hermetic_functional`, `runtime.network.task_sandbox` and `runtime.network.agent` must both be `none`.
 
-Removed execution-shaping fields such as `workspace_patches`, `launch`, `env_from_host`, `binding_args`, `support_files`, `secret_env`, and `trial_runtime.agent.network` are rejected. Use `command`, `env`, `output_mounts`, `runtime.network`, and explicit case/grader surfaces instead.
+Removed execution-shaping fields such as `workspace_patches`, `launch`, `protocol`, `env_from_host`, `binding_args`, `support_files`, `secret_env`, and `trial_runtime.agent.network` are rejected. Use `command`, `env`, `output_mounts`, `runtime.network`, and explicit case/grader surfaces instead.
 
 ## Agent Site
 
@@ -74,6 +71,12 @@ Removed execution-shaping fields such as `workspace_patches`, `launch`, `env_fro
 | `agent_container` | The agent runs in its own container image. This is the normal path for provider-backed or packaged agents. |
 | `task_runtime` | The agent runs inside the case sandbox. Requires `case.interface: writable_workspace` and `workspace.source: container_image`; forbids `agent.image`. Declare `agent.mount` only when the command needs mounted agent files. |
 | `host` | The agent runs on the runner host. For advanced local integrations only; forbids `agent.image`. |
+
+Buc infers the site when the boundary is unambiguous: an agent image means
+`agent_container`, a writable container-image case workspace without an agent
+image means `task_runtime`, and an input-only case without an agent image means
+`host`. Declare `stages.execution.agent_site` when those rules do not apply,
+for example read-only file cases without an agent image.
 
 ## Ephemerals
 
@@ -92,7 +95,11 @@ stages:
     ephemerals: [mcp-bash]
 ```
 
-The ephemeral id is the hostname alias on the per-trial network. `expose` values become agent env vars only for the stages that list the ephemeral. If the agent runs on the host, it cannot attach container ephemerals.
+The ephemeral id is the hostname alias on the per-trial network. `expose` values
+become agent env vars only for the stages that list the ephemeral. Stage-level
+`ephemerals` lists are duplicate-free, and attached ephemerals must expose
+unique env names within that stage. If the agent runs on the host, it cannot
+attach container ephemerals.
 
 ## Output Mounts
 
@@ -103,13 +110,19 @@ stages:
   agent:
     output_mounts:
       - id: session_context
-        kind: directory
         path: session-context
         env: BUCEPHALUS_SESSION_CONTEXT_ROOT
-        persist: true
 ```
 
-Bucephalus creates the directory before launch, maps it inside the container as `/bucephalus/out/<path>`, and injects `env` when provided. The `path` value is relative to `/bucephalus/out`; absolute paths and `..` segments are rejected.
+Bucephalus creates each declared directory before launch, maps it inside the
+container as `/bucephalus/out/<path>`, and injects `env` when provided. The only
+supported `kind` is `directory`. The `path` value is relative to
+`/bucephalus/out`; absolute paths, `.` segments, `..` segments, empty segments,
+and backslashes are rejected. In authoring YAML, omit `kind` and `persist`;
+build defaults them to `directory` and `true`, then writes explicit fields into
+sealed packages. Set `persist: false` only for scratch directories that do not
+belong in trial outputs. Output mount `id`, `path`, and `env` values must each
+be unique within the agent stage.
 
 ## Runtime Environment Variables
 
@@ -175,24 +188,22 @@ The response JSON is your payload. It is not automatically promoted into durable
 ```yaml
 metrics:
   - id: resolved
-    source:
-      type: agent_response
-      pointer: /metrics/resolved
+    from: result.metrics.resolved
     direction: maximize
     primary: true
 ```
 
-The declaration's `id` is the stored metric name. The pointer is only the extraction path.
+The declaration's `id` is the stored metric name. The `from` path is only the extraction path.
 
 If your agent cannot solve the case, either exit nonzero or write diagnostics into the response payload. A missing or invalid JSON result is a contract failure, not a scientific verdict.
 
-Agent outputs are declared under `stages.agent.outputs`. The canonical `result` output captures `/bucephalus/out/result.json`; additional outputs can capture files or a `workspace_diff`. If a grader needs one of those values, bind it through `stages.grader.inputs` instead of having the grader inspect trial internals.
+The canonical `result` output is added by default and captures `BUCEPHALUS_RESULT_PATH`. Declare `stages.agent.outputs` only for additional values such as files or a `workspace_diff`. If a grader needs one of those values, bind it through `stages.grader.inputs` instead of having the grader inspect trial internals.
 
 ## Events
 
 Invocation and trace collection are separate. Omit `traces` for runner
-lifecycle events only. To ask Buc to use the trace channel implied by the
-selected agent protocol, declare:
+lifecycle events only. To ask Buc to use the command-agent trace channel,
+declare:
 
 ```yaml
 traces:
@@ -201,7 +212,7 @@ traces:
 ```
 
 For command agents, `source: protocol` creates a runner-owned JSONL event path
-and exposes it as `BUCEPHALUS_TRAJECTORY_PATH`. Your agent must append
+and injects `BUCEPHALUS_TRAJECTORY_PATH`. Your agent must append
 newline-delimited JSON there. Buc will not guess or scrape arbitrary trace
 files.
 
@@ -213,10 +224,6 @@ stages:
   agent:
     events:
       - id: rex_events
-        format: jsonl
-        mode: jsonl
-        ingest: true
-        retain_raw: false
     command:
       - rex
       - run
@@ -224,14 +231,22 @@ stages:
       - __BUCEPHALUS_EVENT_PATH_rex_events__
 ```
 
-The event stream path is **runner-owned** — you do not declare it, and a
-`path:` key is rejected. Bucephalus replaces `__BUCEPHALUS_EVENT_PATH_<id>__` (and
-sets `BUCEPHALUS_TRAJECTORY_PATH`) with a container-local scratch path under
-`/bucephalus-events/`. That directory is deliberately a sibling of `/bucephalus`,
-on plain container disk: an event stream is append-heavy, and blob-storage
-mounts (such as the Modal `CloudBucketMount` used for `/bucephalus/out`) reject
-incremental appends. Your agent just appends line-by-line to the injected path
-and never thinks about where the bytes ultimately land.
+The event stream path is **runner-owned**. You do not declare it, and a `path:`
+key is rejected. The current command runtime supports one JSONL event sink; use
+`retain_raw: true` to request durable raw-file retention. Direct
+`stages.agent.events` declarations default `ingest` to `true`, `retain_raw` to
+`false`, and `format`/`mode` to `jsonl`; build writes those fields explicitly
+into sealed packages. Use `traces.source: protocol` for the default event sink.
+Bucephalus replaces `__BUCEPHALUS_EVENT_PATH_<id>__` (and injects
+`BUCEPHALUS_TRAJECTORY_PATH`) with a container-local scratch path under
+`/bucephalus-events/`. That directory is
+deliberately a sibling of `/bucephalus`, on plain container disk: an event
+stream is append-heavy, and blob-storage mounts (such as the Modal
+`CloudBucketMount` used for `/bucephalus/out`) reject incremental appends. Your
+agent just appends line-by-line to the injected path and never thinks about
+where the bytes ultimately land.
+Command YAML must use the declared sink placeholder form; the generic
+`__BUCEPHALUS_TRAJECTORY_PATH__` command placeholder is rejected.
 
 The runner owns the rest of the lifecycle: it tails the scratch file into the
 account SQLite database while the trial runs (local executor) or collects it

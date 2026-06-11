@@ -21,7 +21,7 @@ import {
 async function main() {
   const input = await readJsonStdin();
   const config = loadConfig();
-  validateRequest(input);
+  validateRequest(input, config);
 
   const provisionRequestId = requiredString(input.provision_request_id, "/provision_request_id");
   const runnerPoolId = requiredString(input.runner_pool_id, "/runner_pool_id");
@@ -43,6 +43,7 @@ async function main() {
     workerTokenSecretVersion: config.workerTokenSecretVersion,
     projectId: config.projectId,
     registryHost: registryHost(config.workerImage),
+    modal: config.modal,
   });
 
   const body = {
@@ -122,7 +123,7 @@ async function main() {
   }));
 }
 
-function loadConfig() {
+export function loadConfig() {
   const projectId = requiredEnv("BUCEPHALUS_GCP_PROJECT_ID");
   const region = requiredEnv("BUCEPHALUS_GCP_REGION");
   const zone = requiredEnv("BUCEPHALUS_GCP_ZONE");
@@ -147,13 +148,14 @@ function loadConfig() {
     workerTokenSecretVersion: requiredEnv("BUCEPHALUS_GCP_WORKER_TOKEN_SECRET_VERSION"),
     networkTags: csvEnv("BUCEPHALUS_GCP_RUNNER_NETWORK_TAGS", ["bucephalus-runner"]),
     operationTimeoutMs: integerEnv("BUCEPHALUS_GCP_OPERATION_TIMEOUT_MS", 600) * 1000,
+    modal: modalConfig(),
   };
 }
 
-function validateRequest(input) {
+export function validateRequest(input, config = loadConfig()) {
   const requirements = isRecord(input.run_requirements) ? input.run_requirements : {};
-  if (requirements.executor !== undefined && requirements.executor !== "runner-docker") {
-    throw new ProviderError(`GCE per-run provider only supports executor runner-docker, got ${requirements.executor}`);
+  if (requirements.executor !== undefined && requirements.executor !== "runner-docker" && requirements.executor !== "modal") {
+    throw new ProviderError(`GCE per-run provider only supports executor runner-docker or modal, got ${requirements.executor}`);
   }
   if (Array.isArray(requirements.accelerators) && requirements.accelerators.length > 0) {
     throw new ProviderError("GCE per-run provider v1 does not support accelerators yet");
@@ -166,6 +168,9 @@ function validateRequest(input) {
     if (requirements.isolation !== "single_use_vm") {
       throw new ProviderError("GCE runtime network policy enforcement requires isolation=single_use_vm");
     }
+  }
+  if (requirements.executor === "modal" && !config.modal.enabled) {
+    throw new ProviderError("GCE per-run provider received executor modal but Modal backend configuration is disabled");
   }
 }
 
@@ -180,10 +185,18 @@ function runnerIsolation(input) {
   return requirements.isolation === "single_use_vm" ? "single_use_vm" : "reusable_vm";
 }
 
-function renderStartupScript(config) {
+export function renderStartupScript(config) {
   for (const [name, value] of Object.entries(config)) {
+    if (name === "modal") {
+      continue;
+    }
+    if (String(value) === "") {
+      continue;
+    }
     assertSimpleToken(String(value), name);
   }
+  validateModalStartupConfig(config.modal);
+  const modalEnabled = config.modal.enabled ? "true" : "false";
   return `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -199,6 +212,26 @@ WORKER_TOKEN_SECRET_VERSION=${shellQuote(config.workerTokenSecretVersion)}
 REGISTRY_HOST=${shellQuote(config.registryHost)}
 RUNNER_ISOLATION=${shellQuote(config.runnerIsolation)}
 NETWORK_POLICY_ENABLED=${shellQuote(config.networkPolicyEnabled)}
+MODAL_ENABLED=${shellQuote(modalEnabled)}
+MODAL_APP_NAME=${shellQuote(config.modal.appName)}
+MODAL_ENVIRONMENT=${shellQuote(config.modal.environment)}
+MODAL_TOKEN_ID_SECRET=${shellQuote(config.modal.tokenIdSecret)}
+MODAL_TOKEN_ID_SECRET_VERSION=${shellQuote(config.modal.tokenIdSecretVersion)}
+MODAL_TOKEN_SECRET_SECRET=${shellQuote(config.modal.tokenSecretSecret)}
+MODAL_TOKEN_SECRET_SECRET_VERSION=${shellQuote(config.modal.tokenSecretSecretVersion)}
+MODAL_S3_BUCKET=${shellQuote(config.modal.s3Bucket)}
+MODAL_S3_PREFIX=${shellQuote(config.modal.s3Prefix)}
+MODAL_S3_ENDPOINT_URL=${shellQuote(config.modal.s3EndpointUrl)}
+MODAL_S3_REGION=${shellQuote(config.modal.s3Region)}
+MODAL_S3_SECRET_NAME=${shellQuote(config.modal.s3SecretName)}
+MODAL_S3_ACCESS_KEY_ID_SECRET=${shellQuote(config.modal.s3AccessKeyIdSecret)}
+MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION=${shellQuote(config.modal.s3AccessKeyIdSecretVersion)}
+MODAL_S3_SECRET_ACCESS_KEY_SECRET=${shellQuote(config.modal.s3SecretAccessKeySecret)}
+MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION=${shellQuote(config.modal.s3SecretAccessKeySecretVersion)}
+MODAL_S3_FORCE_PATH_STYLE=${shellQuote(config.modal.s3ForcePathStyle)}
+MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME=${shellQuote(config.modal.gcpArtifactRegistrySecretName)}
+MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET=${shellQuote(config.modal.gcpArtifactRegistryServiceAccountJsonSecret)}
+MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION=${shellQuote(config.modal.gcpArtifactRegistryServiceAccountJsonSecretVersion)}
 
 metadata_token() {
   curl -fsS -H "Metadata-Flavor: Google" \\
@@ -343,9 +376,29 @@ install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus/network-policy/acks
 install -d -m 0700 /etc/bucephalus
 worker_token="$(secret_access "\${WORKER_TOKEN_SECRET}" "\${WORKER_TOKEN_SECRET_VERSION}")"
 worker_resources=core_runner,docker_daemon,registry_pull,secret_resolver
+worker_executors=runner-docker
+if [[ "\${MODAL_ENABLED}" == "true" ]]; then
+  worker_resources="\${worker_resources},modal"
+  worker_executors="\${worker_executors},modal"
+fi
 if [[ "\${NETWORK_POLICY_ENABLED}" == "true" ]]; then
   worker_resources="\${worker_resources},network_perimeter"
   nohup bash /var/lib/bucephalus/bin/network-policy-daemon >/var/log/bucephalus-network-policy.log 2>&1 &
+fi
+if [[ "\${MODAL_ENABLED}" == "true" ]]; then
+  modal_token_id="$(secret_access "\${MODAL_TOKEN_ID_SECRET}" "\${MODAL_TOKEN_ID_SECRET_VERSION}")"
+  modal_token_secret="$(secret_access "\${MODAL_TOKEN_SECRET_SECRET}" "\${MODAL_TOKEN_SECRET_SECRET_VERSION}")"
+  modal_uses_gcs_service_account_sync=false
+  if [[ "\${MODAL_S3_ENDPOINT_URL}" == *storage.googleapis.com* && -n "\${MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET}" ]]; then
+    modal_uses_gcs_service_account_sync=true
+  fi
+  if [[ -z "\${MODAL_S3_SECRET_NAME}" && "\${modal_uses_gcs_service_account_sync}" != "true" ]]; then
+    modal_s3_access_key_id="$(secret_access "\${MODAL_S3_ACCESS_KEY_ID_SECRET}" "\${MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION}")"
+    modal_s3_secret_access_key="$(secret_access "\${MODAL_S3_SECRET_ACCESS_KEY_SECRET}" "\${MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION}")"
+  fi
+  if [[ -z "\${MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME}" && -n "\${MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET}" ]]; then
+    modal_gcp_artifact_registry_service_account_json_b64="$(secret_access "\${MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET}" "\${MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION}" | base64 | tr -d '\\n')"
+  fi
 fi
 cat >/etc/bucephalus/worker.env <<EOF
 BUCEPHALUS_CLOUD_API_URL=\${API_URL}
@@ -362,11 +415,43 @@ USERNAME=bucephalus
 HOME=/var/lib/bucephalus
 DOCKER_CONFIG=/var/lib/bucephalus/docker-config
 BUCEPHALUS_WORKER_RESOURCES=\${worker_resources}
-BUCEPHALUS_WORKER_EXECUTORS=runner-docker
+BUCEPHALUS_WORKER_EXECUTORS=\${worker_executors}
 BUCEPHALUS_WORKER_ISOLATION=\${RUNNER_ISOLATION}
 BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON=["bucephalus-cloud-secret-resolver"]
 BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH=metadata
 EOF
+if [[ "\${MODAL_ENABLED}" == "true" ]]; then
+  cat >>/etc/bucephalus/worker.env <<EOF
+BUCEPHALUS_MODAL_LAUNCHER=/usr/local/bin/bucephalus-modal-launcher
+BUCEPHALUS_MODAL_APP_NAME=\${MODAL_APP_NAME}
+MODAL_TOKEN_ID=\${modal_token_id}
+MODAL_TOKEN_SECRET=\${modal_token_secret}
+BUCEPHALUS_MODAL_S3_BUCKET=\${MODAL_S3_BUCKET}
+BUCEPHALUS_MODAL_S3_PREFIX=\${MODAL_S3_PREFIX}
+BUCEPHALUS_MODAL_S3_FORCE_PATH_STYLE=\${MODAL_S3_FORCE_PATH_STYLE}
+EOF
+  if [[ -n "\${MODAL_ENVIRONMENT}" ]]; then
+    printf 'BUCEPHALUS_MODAL_ENVIRONMENT=%s\\n' "\${MODAL_ENVIRONMENT}" >>/etc/bucephalus/worker.env
+  fi
+  if [[ -n "\${MODAL_S3_ENDPOINT_URL}" ]]; then
+    printf 'BUCEPHALUS_MODAL_S3_ENDPOINT_URL=%s\\n' "\${MODAL_S3_ENDPOINT_URL}" >>/etc/bucephalus/worker.env
+  fi
+  if [[ -n "\${MODAL_S3_REGION}" ]]; then
+    printf 'BUCEPHALUS_MODAL_S3_REGION=%s\\n' "\${MODAL_S3_REGION}" >>/etc/bucephalus/worker.env
+  fi
+  if [[ -n "\${MODAL_S3_SECRET_NAME}" ]]; then
+    printf 'BUCEPHALUS_MODAL_S3_SECRET=%s\\n' "\${MODAL_S3_SECRET_NAME}" >>/etc/bucephalus/worker.env
+  elif [[ "\${modal_uses_gcs_service_account_sync}" != "true" ]]; then
+    printf 'BUCEPHALUS_MODAL_S3_ACCESS_KEY_ID=%s\\n' "\${modal_s3_access_key_id}" >>/etc/bucephalus/worker.env
+    printf 'BUCEPHALUS_MODAL_S3_SECRET_ACCESS_KEY=%s\\n' "\${modal_s3_secret_access_key}" >>/etc/bucephalus/worker.env
+  fi
+  if [[ -n "\${MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME}" ]]; then
+    printf 'BUCEPHALUS_MODAL_GCP_ARTIFACT_REGISTRY_SECRET=%s\\n' "\${MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME}" >>/etc/bucephalus/worker.env
+  elif [[ -n "\${modal_gcp_artifact_registry_service_account_json_b64:-}" ]]; then
+    printf 'BUCEPHALUS_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_B64=%s\\n' "\${modal_gcp_artifact_registry_service_account_json_b64}" >>/etc/bucephalus/worker.env
+    printf 'BUCEPHALUS_MODAL_GCP_SERVICE_ACCOUNT_JSON_B64=%s\\n' "\${modal_gcp_artifact_registry_service_account_json_b64}" >>/etc/bucephalus/worker.env
+  fi
+fi
 if [[ "\${NETWORK_POLICY_ENABLED}" == "true" ]]; then
   printf 'BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON=["bucephalus-cloud-network-policy"]\\n' >>/etc/bucephalus/worker.env
 fi
@@ -408,7 +493,94 @@ function csvEnv(name, fallback) {
   return raw.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+function modalConfig() {
+  const enabled = boolEnv("BUCEPHALUS_GCP_MODAL_ENABLED", false);
+  const config = {
+    enabled,
+    appName: optionalEnv("BUCEPHALUS_GCP_MODAL_APP_NAME", ""),
+    environment: optionalEnv("BUCEPHALUS_GCP_MODAL_ENVIRONMENT", ""),
+    tokenIdSecret: optionalEnv("BUCEPHALUS_GCP_MODAL_TOKEN_ID_SECRET", ""),
+    tokenIdSecretVersion: optionalEnv("BUCEPHALUS_GCP_MODAL_TOKEN_ID_SECRET_VERSION", ""),
+    tokenSecretSecret: optionalEnv("BUCEPHALUS_GCP_MODAL_TOKEN_SECRET_SECRET", ""),
+    tokenSecretSecretVersion: optionalEnv("BUCEPHALUS_GCP_MODAL_TOKEN_SECRET_SECRET_VERSION", ""),
+    s3Bucket: optionalEnv("BUCEPHALUS_GCP_MODAL_S3_BUCKET", ""),
+    s3Prefix: optionalEnv("BUCEPHALUS_GCP_MODAL_S3_PREFIX", ""),
+    s3EndpointUrl: optionalEnv("BUCEPHALUS_GCP_MODAL_S3_ENDPOINT_URL", ""),
+    s3Region: optionalEnv("BUCEPHALUS_GCP_MODAL_S3_REGION", ""),
+    s3SecretName: optionalEnv("BUCEPHALUS_GCP_MODAL_S3_SECRET_NAME", ""),
+    s3AccessKeyIdSecret: optionalEnv("BUCEPHALUS_GCP_MODAL_S3_ACCESS_KEY_ID_SECRET", ""),
+    s3AccessKeyIdSecretVersion: optionalEnv("BUCEPHALUS_GCP_MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION", ""),
+    s3SecretAccessKeySecret: optionalEnv("BUCEPHALUS_GCP_MODAL_S3_SECRET_ACCESS_KEY_SECRET", ""),
+    s3SecretAccessKeySecretVersion: optionalEnv("BUCEPHALUS_GCP_MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION", ""),
+    s3ForcePathStyle: optionalEnv("BUCEPHALUS_GCP_MODAL_S3_FORCE_PATH_STYLE", "false"),
+    gcpArtifactRegistrySecretName: optionalEnv("BUCEPHALUS_GCP_MODAL_GCP_ARTIFACT_REGISTRY_SECRET_NAME", ""),
+    gcpArtifactRegistryServiceAccountJsonSecret: optionalEnv("BUCEPHALUS_GCP_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET", ""),
+    gcpArtifactRegistryServiceAccountJsonSecretVersion: optionalEnv("BUCEPHALUS_GCP_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION", ""),
+  };
+  if (enabled) {
+    validateModalStartupConfig(config);
+  }
+  return config;
+}
+
+function modalUsesGcsServiceAccountSync(config) {
+  return String(config.s3EndpointUrl || "").includes("storage.googleapis.com")
+    && String(config.gcpArtifactRegistryServiceAccountJsonSecret || "").trim()
+    && String(config.gcpArtifactRegistryServiceAccountJsonSecretVersion || "").trim();
+}
+
+function validateModalStartupConfig(config) {
+  if (!config.enabled) {
+    return;
+  }
+  const required = [
+    ["BUCEPHALUS_GCP_MODAL_APP_NAME", config.appName],
+    ["BUCEPHALUS_GCP_MODAL_TOKEN_ID_SECRET", config.tokenIdSecret],
+    ["BUCEPHALUS_GCP_MODAL_TOKEN_ID_SECRET_VERSION", config.tokenIdSecretVersion],
+    ["BUCEPHALUS_GCP_MODAL_TOKEN_SECRET_SECRET", config.tokenSecretSecret],
+    ["BUCEPHALUS_GCP_MODAL_TOKEN_SECRET_SECRET_VERSION", config.tokenSecretSecretVersion],
+    ["BUCEPHALUS_GCP_MODAL_S3_BUCKET", config.s3Bucket],
+    ["BUCEPHALUS_GCP_MODAL_S3_PREFIX", config.s3Prefix],
+  ];
+  if (!config.s3SecretName && modalUsesGcsServiceAccountSync(config)) {
+    required.push(
+      ["BUCEPHALUS_GCP_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET", config.gcpArtifactRegistryServiceAccountJsonSecret],
+      ["BUCEPHALUS_GCP_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION", config.gcpArtifactRegistryServiceAccountJsonSecretVersion],
+    );
+  } else if (!config.s3SecretName) {
+    required.push(
+      ["BUCEPHALUS_GCP_MODAL_S3_ACCESS_KEY_ID_SECRET", config.s3AccessKeyIdSecret],
+      ["BUCEPHALUS_GCP_MODAL_S3_ACCESS_KEY_ID_SECRET_VERSION", config.s3AccessKeyIdSecretVersion],
+      ["BUCEPHALUS_GCP_MODAL_S3_SECRET_ACCESS_KEY_SECRET", config.s3SecretAccessKeySecret],
+      ["BUCEPHALUS_GCP_MODAL_S3_SECRET_ACCESS_KEY_SECRET_VERSION", config.s3SecretAccessKeySecretVersion],
+    );
+  }
+  if (config.gcpArtifactRegistryServiceAccountJsonSecret && !config.gcpArtifactRegistryServiceAccountJsonSecretVersion) {
+    required.push(
+      ["BUCEPHALUS_GCP_MODAL_GCP_ARTIFACT_REGISTRY_SERVICE_ACCOUNT_JSON_SECRET_VERSION", config.gcpArtifactRegistryServiceAccountJsonSecretVersion],
+    );
+  }
+  for (const [name, value] of required) {
+    if (!String(value).trim()) {
+      throw new ProviderError(`${name} is required when BUCEPHALUS_GCP_MODAL_ENABLED=true`);
+    }
+  }
+  if (config.s3ForcePathStyle !== "false") {
+    throw new ProviderError("BUCEPHALUS_GCP_MODAL_S3_FORCE_PATH_STYLE must be false; Modal CloudBucketMount does not support path-style S3 mounts");
+  }
+}
+
+function boolEnv(name, fallback) {
+  const raw = optionalEnv(name);
+  if (!raw) {
+    return fallback;
+  }
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}

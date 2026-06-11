@@ -2018,6 +2018,7 @@ pub(crate) fn check_container_ready(
 }
 
 pub(crate) fn resolve_dataset_path(json_value: &Value, exp_dir: &Path) -> Result<PathBuf> {
+    validate_dataset_provider(json_value)?;
     let rel = json_value
         .pointer("/matrix/tasks/path")
         .and_then(|v| v.as_str())
@@ -2027,6 +2028,7 @@ pub(crate) fn resolve_dataset_path(json_value: &Value, exp_dir: &Path) -> Result
 }
 
 pub(crate) fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
+    validate_dataset_provider(json_value)?;
     let limit = optional_json_usize_field(
         json_value.pointer("/matrix/tasks/limit"),
         "matrix.tasks.limit",
@@ -2215,6 +2217,7 @@ pub(crate) fn build_preflight_probe_context(
         &io_paths,
         Some(probe_task_image.as_str()),
         smoke_timeout_ms,
+        false,
     )?;
     Ok(PreflightProbeContext {
         _root: probe_root,

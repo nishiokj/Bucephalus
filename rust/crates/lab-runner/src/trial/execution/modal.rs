@@ -998,7 +998,7 @@ fn execute_modal_trial_runtime(
 
     let event_sink = request.runtime.event_sinks.first();
     let retain_raw_events = event_sink.map(|sink| sink.persist).unwrap_or(false);
-    let ingest_events = event_sink.map(|sink| sink.ingest).unwrap_or(true);
+    let ingest_events = event_sink.map(|sink| sink.ingest).unwrap_or(false);
     if retain_raw_events {
         outcome.events = remote_blob_if_present(
             &request.io_paths.events_host,
@@ -1305,10 +1305,12 @@ fn build_modal_grading_launch_spec(
         BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
         request.io_paths.mapped_grader_output_path.clone(),
     );
-    env.insert(
-        BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
-        request.io_paths.trajectory_path.clone(),
-    );
+    if !request.runtime.event_sinks.is_empty() {
+        env.insert(
+            BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
+            request.io_paths.trajectory_path.clone(),
+        );
+    }
     let timeout_secs = task_sandbox_plan
         .time_limit_ms
         .div_ceil(1000)
@@ -1357,6 +1359,9 @@ fn modal_secret_env_names(request: &TrialRunRequest<'_>) -> Vec<String> {
     };
     let mut names = BTreeSet::new();
     for secret in secrets {
+        if secret.get("from").and_then(Value::as_str) != Some("env") {
+            continue;
+        }
         let Some(name) = secret
             .get("name")
             .and_then(Value::as_str)
@@ -1396,10 +1401,12 @@ fn build_modal_launch_spec(
         BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
         request.io_paths.mapped_grader_output_path.clone(),
     );
-    env.insert(
-        BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
-        request.io_paths.trajectory_path.clone(),
-    );
+    if !request.runtime.event_sinks.is_empty() {
+        env.insert(
+            BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
+            request.io_paths.trajectory_path.clone(),
+        );
+    }
     let secret_env = modal_secret_env_names(request);
     let mut sandbox_env = env.clone();
     for name in &secret_env {

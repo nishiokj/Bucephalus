@@ -1,6 +1,6 @@
 # Bring Your Own Agent
 
-Your agent is just an application that follows the runtime contract. Buc defaults to `stages.agent.protocol: command`, which launches `stages.agent.command`, passes trial data through environment variables, and expects any valid JSON response at `BUCEPHALUS_RESULT_PATH`.
+Your agent is just an application that follows the runtime contract. Buc launches `stages.agent.command`, passes trial data through environment variables, and expects any valid JSON response at `BUCEPHALUS_RESULT_PATH`.
 
 ## Minimal Agent
 
@@ -42,8 +42,6 @@ stages:
     command: ["agent", "run", "--model", "$model"]
     env:
       ANTHROPIC_API_KEY: "$ANTHROPIC_API_KEY"
-  execution:
-    agent_site: agent_container
 ```
 
 Run with:
@@ -58,10 +56,10 @@ bucephalus run <package_dir> --env ANTHROPIC_API_KEY=...
 | --- | --- | --- |
 | `BUCEPHALUS_TRIAL_INPUT_PATH` | Runner to agent | `schemas/trial_input_v1.jsonschema` |
 | `BUCEPHALUS_RESULT_PATH` | Agent to runner | Any valid JSON response |
-| `BUCEPHALUS_TRAJECTORY_PATH` | Agent to runner, optional | default JSONL path when `traces.source: protocol` or explicit `stages.agent.events` enables command-agent traces |
+| `BUCEPHALUS_TRAJECTORY_PATH` | Agent to runner, optional | injected only when `traces.source: protocol` or explicit `stages.agent.events` enables command-agent traces |
 | `stages.agent.events` | Agent to runner, optional | low-level JSONL event captures ingested into SQLite while the trial runs |
 | `stages.agent.output_mounts` | Agent to runner, optional | extra persisted files |
 
 The runner does not remap your app's custom input or output flags. Put the command line shape your app needs directly in `stages.agent.command`, and read/write the contract env paths inside your app or wrapper.
 
-Agent response metrics are also not remapped implicitly. If your agent writes `"metrics": {"speed": 123}`, the runner will only persist it as a custom metric when `experiment.yaml` declares a metric source pointing at `/metrics/speed`. See [Metrics](metrics.md).
+Agent response metrics are also not remapped implicitly. If your agent writes `"metrics": {"speed": 123}`, the runner will only persist it as a custom metric when `experiment.yaml` declares `from: result.metrics.speed`. See [Metrics](metrics.md).

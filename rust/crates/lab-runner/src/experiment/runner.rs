@@ -70,6 +70,81 @@ fn run_id_from_run_dir(run_dir: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("unable to infer run_id from {}", run_dir.display()))
 }
 
+fn load_recorded_resolved_experiment(run_dir: &Path) -> Result<Value> {
+    let resolved_path = run_dir.join("resolved_experiment.json");
+    let digest_path = run_dir.join("resolved_experiment.digest");
+    let json_value: Value =
+        serde_json::from_slice(&fs::read(&resolved_path).with_context(|| {
+            format!(
+                "failed to read recorded resolved experiment {}",
+                resolved_path.display()
+            )
+        })?)
+        .with_context(|| {
+            format!(
+                "failed to parse recorded resolved experiment {}",
+                resolved_path.display()
+            )
+        })?;
+    let recorded_digest = fs::read_to_string(&digest_path).with_context(|| {
+        format!(
+            "missing recorded resolved experiment digest: {}",
+            digest_path.display()
+        )
+    })?;
+    if recorded_digest.trim() != recorded_digest {
+        return Err(anyhow!(
+            "recorded resolved experiment digest contains leading or trailing whitespace: {}",
+            digest_path.display()
+        ));
+    }
+    if recorded_digest.is_empty() {
+        return Err(anyhow!(
+            "recorded resolved experiment digest is empty: {}",
+            digest_path.display()
+        ));
+    }
+    let actual_digest = canonical_json_digest(&json_value);
+    if recorded_digest != actual_digest {
+        return Err(anyhow!(
+            "recorded resolved experiment digest mismatch in {}: recorded {}, computed {}",
+            digest_path.display(),
+            recorded_digest,
+            actual_digest
+        ));
+    }
+    Ok(json_value)
+}
+
+fn build_schedule_for_run_behavior(
+    behavior: &RunBehavior,
+    variant_count: usize,
+    task_count: usize,
+    replications: usize,
+    scheduling: SchedulingPolicy,
+    random_seed: u64,
+) -> Result<Vec<TrialSlot>> {
+    if behavior.smoke_test {
+        if task_count == 0 {
+            return Err(anyhow!("smoke test requires at least one task"));
+        }
+        return Ok((0..variant_count)
+            .map(|variant_idx| TrialSlot {
+                variant_idx,
+                task_idx: 0,
+                repl_idx: 0,
+            })
+            .collect());
+    }
+    Ok(build_trial_schedule(
+        variant_count,
+        task_count,
+        replications,
+        scheduling,
+        random_seed,
+    ))
+}
+
 pub fn continue_run_with_options(
     run_dir: &Path,
     options: RunExecutionOptions,
@@ -136,8 +211,8 @@ pub fn continue_run_with_options(
         ));
     }
 
+    let json_value = load_recorded_resolved_experiment(&run_dir)?;
     let resolved_path = run_dir.join("resolved_experiment.json");
-    let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let policy_config = parse_policies(&json_value)?;
     let max_concurrency = experiment_max_concurrency(&json_value)?;
     let project_root = run_session.project_root.canonicalize().with_context(|| {
@@ -158,7 +233,6 @@ pub fn continue_run_with_options(
     }
 
     let (variants, baseline_id) = load_run_variants(&run_dir, &json_value)?;
-    write_resolved_variants(&run_dir, &json_value, &baseline_id, &variants)?;
     let exp_dir = resolved_path
         .parent()
         .ok_or_else(|| anyhow!("resolved_experiment.json has no parent directory"))?
@@ -166,27 +240,33 @@ pub fn continue_run_with_options(
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let tasks = load_tasks(&dataset_path, &json_value)?;
     let replications = matrix_repeats(&json_value)?;
-    let random_seed = experiment_random_seed(&json_value);
+    let random_seed = experiment_random_seed(&json_value)?;
 
-    let reconstructed_schedule = build_trial_schedule(
+    let schedule = load_run_schedule(&run_dir)?;
+    if schedule != progress.schedule {
+        return Err(anyhow!(
+            "resolved schedule manifest does not match schedule progress; cannot safely continue (manifest {} slots vs progress {} slots)",
+            schedule.len(),
+            progress.schedule.len()
+        ));
+    }
+    let expected_schedule = build_schedule_for_run_behavior(
+        &behavior,
         variants.len(),
         tasks.len(),
         replications,
         policy_config.scheduling,
         random_seed,
-    );
+    )?;
 
-    if reconstructed_schedule != progress.schedule {
+    if expected_schedule != schedule {
         return Err(anyhow!(
-            "schedule mismatch — the experiment configuration has changed since this run was \
-             created; cannot safely continue (reconstructed {} slots vs stored {})",
-            reconstructed_schedule.len(),
-            progress.schedule.len()
+            "schedule mismatch — the experiment configuration has changed since this run was created; cannot safely continue (expected {} slots vs recorded {})",
+            expected_schedule.len(),
+            schedule.len()
         ));
     }
 
-    let schedule = reconstructed_schedule;
-    write_resolved_schedule(&run_dir, &schedule)?;
     open_schedule_slot_store(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
     let materialize_mode = resolved_materialization_mode(&execution);
 
@@ -312,14 +392,8 @@ pub(crate) fn trial_index_from_trial_id(trial_id: &str) -> Option<usize> {
 }
 
 fn resolved_experiment_id(json_value: &Value) -> Result<String> {
-    json_value
-        .pointer("/experiment/id")
-        .or_else(|| json_value.pointer("/id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|raw| !raw.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("missing /experiment/id for metric definition registry"))
+    required_experiment_id(json_value)
+        .context("missing /experiment/id for metric definition registry")
 }
 
 fn metric_definition_records(
@@ -1023,6 +1097,17 @@ pub(crate) fn cleanup_in_flight_trial_containers(
             errors.join("; ")
         ))
     }
+}
+
+pub(crate) fn scheduler_shutdown_error_with_cleanup_failure(
+    engine_err: anyhow::Error,
+    cleanup_err: anyhow::Error,
+) -> anyhow::Error {
+    anyhow!(
+        "schedule execution failed: {:#}; in-flight cleanup also failed: {:#}",
+        engine_err,
+        cleanup_err
+    )
 }
 
 pub(crate) fn execute_local_trial(
@@ -2448,7 +2533,10 @@ pub(crate) fn execute_schedule_engine(
                 "scheduler exited with {:?} but in-flight cleanup failed",
                 outcome
             ))),
-            Err(err) => Err(err.context(format!("in-flight cleanup also failed: {}", cleanup_err))),
+            Err(err) => Err(scheduler_shutdown_error_with_cleanup_failure(
+                err,
+                cleanup_err,
+            )),
         };
     }
 
@@ -2661,27 +2749,15 @@ pub(crate) fn run_experiment_with_behavior(
 
     let policy_config = parse_policies(&json_value)?;
     let max_concurrency = experiment_max_concurrency(&json_value)?;
-    let random_seed = experiment_random_seed(&json_value);
-    let schedule = if behavior.smoke_test {
-        if tasks.is_empty() {
-            return Err(anyhow!("smoke test requires at least one task"));
-        }
-        (0..variants.len())
-            .map(|variant_idx| TrialSlot {
-                variant_idx,
-                task_idx: 0,
-                repl_idx: 0,
-            })
-            .collect::<Vec<_>>()
-    } else {
-        build_trial_schedule(
-            variants.len(),
-            tasks.len(),
-            replications,
-            policy_config.scheduling,
-            random_seed,
-        )
-    };
+    let random_seed = experiment_random_seed(&json_value)?;
+    let schedule = build_schedule_for_run_behavior(
+        &behavior,
+        variants.len(),
+        tasks.len(),
+        replications,
+        policy_config.scheduling,
+        random_seed,
+    )?;
     write_resolved_schedule(&run_dir, &schedule)?;
     open_schedule_slot_store(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
     emit_run_log(
@@ -2842,11 +2918,6 @@ pub fn experiment_summary_with_options(
     let workload_type = experiment_workload_type(&json_value)?;
 
     let policy_config = parse_policies(&json_value)?;
-    let comparison = json_value
-        .pointer("/scheduling/comparison")
-        .and_then(|v| v.as_str())
-        .unwrap_or("paired")
-        .to_string();
 
     let evaluation_config = parse_evaluation_config(&json_value)?;
     let tasks_for_preflight = load_tasks(&dataset_path, &json_value).with_context(|| {
@@ -2897,7 +2968,6 @@ pub fn experiment_summary_with_options(
         agent_runtime_command: runtime_agent.command_raw,
         image,
         network_mode,
-        trajectory_path: runtime_agent.trajectory_path,
         causal_extraction: runtime_agent.causal_extraction,
         scheduling: match policy_config.scheduling {
             SchedulingPolicy::PairedInterleaved => "paired_interleaved".to_string(),
@@ -2909,7 +2979,6 @@ pub fn experiment_summary_with_options(
             StatePolicy::PersistPerTask => "persist_per_task".to_string(),
             StatePolicy::Accumulate => "accumulate".to_string(),
         },
-        comparison,
         retry_max_attempts: policy_config.retry_max_attempts,
         preflight_warnings,
     })
@@ -3262,14 +3331,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
     let run_id = run_id_from_run_dir(&run_dir)?;
-    let resolved_path = run_dir.join("resolved_experiment.json");
-    if !resolved_path.exists() {
-        return Err(anyhow!(
-            "missing resolved_experiment.json in {}",
-            run_dir.display()
-        ));
-    }
-    let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
+    let json_value = load_recorded_resolved_experiment(&run_dir)?;
     let parent_trial_dir = run_dir.join("trials").join(trial_id);
     let prepared_manifest = load_prepared_task_environment_manifest(&parent_trial_dir)?;
     let (variants, _) = load_run_variants(&run_dir, &json_value)?;
@@ -3361,6 +3423,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         &io_paths,
         Some(replay_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
+        !agent_runtime.event_sinks.is_empty(),
     )?;
     let run_request = TrialRunRequest {
         package_root: &run_dir,
@@ -3540,14 +3603,7 @@ pub(crate) fn fork_trial_inner(
     let run_dir = run_dir
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
-    let resolved_path = run_dir.join("resolved_experiment.json");
-    if !resolved_path.exists() {
-        return Err(anyhow!(
-            "missing resolved_experiment.json in {}",
-            run_dir.display()
-        ));
-    }
-    let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
+    let json_value = load_recorded_resolved_experiment(&run_dir)?;
     let parsed_selector = parse_fork_selector(selector)?;
 
     let run_id = run_id_from_run_dir(&run_dir)?;
@@ -3667,6 +3723,7 @@ pub(crate) fn fork_trial_inner(
         &io_paths,
         Some(fork_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
+        !agent_runtime.event_sinks.is_empty(),
     )?;
     let run_request = TrialRunRequest {
         package_root: &run_dir,
@@ -3840,10 +3897,9 @@ pub(crate) fn resolve_resume_selector(
     }
 
     if let Some(label) = preferred_label {
-        let found = checkpoints.iter().any(|cp| {
-            cp.get("logical_name").and_then(|v| v.as_str()) == Some(label)
-                || cp.get("path").and_then(|v| v.as_str()) == Some(label)
-        });
+        let found = checkpoints
+            .iter()
+            .any(|cp| cp.get("logical_name").and_then(|v| v.as_str()) == Some(label));
         if !found {
             return Err(anyhow!(
                 "resume_checkpoint_not_found: label '{}' was not found in trial checkpoints",
@@ -3872,10 +3928,7 @@ pub(crate) fn resolve_resume_selector(
     if let Some(name) = chosen.get("logical_name").and_then(|v| v.as_str()) {
         return Ok(format!("checkpoint:{}", name));
     }
-    if let Some(path) = chosen.get("path").and_then(|v| v.as_str()) {
-        return Ok(format!("checkpoint:{}", path));
-    }
-    Err(anyhow!("resume_no_checkpoint_token"))
+    Err(anyhow!("resume checkpoint is missing logical_name"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4218,10 +4271,9 @@ pub(crate) fn resolve_selector_checkpoint(
         .unwrap_or(&[]);
 
     let selected = match selector {
-        ForkSelector::Checkpoint(name) => checkpoints.iter().find(|cp| {
-            cp.get("logical_name").and_then(|v| v.as_str()) == Some(name.as_str())
-                || cp.get("path").and_then(|v| v.as_str()) == Some(name.as_str())
-        }),
+        ForkSelector::Checkpoint(name) => checkpoints
+            .iter()
+            .find(|cp| cp.get("logical_name").and_then(|v| v.as_str()) == Some(name.as_str())),
         ForkSelector::Step(step) => checkpoints
             .iter()
             .filter_map(|cp| {
@@ -4301,14 +4353,51 @@ pub(crate) fn apply_variant_binding_overrides(
         return Ok(());
     }
     if !variant.bindings.is_object() {
-        variant.bindings = json!({});
+        return Err(anyhow!(
+            "variant '{}' config must be an object before applying --set overrides",
+            variant.id
+        ));
     }
     for (key, value) in set_bindings {
-        let pointer = format!("/{}", key.split('.').collect::<Vec<_>>().join("/"));
+        let pointer = set_binding_key_json_pointer(key)?;
+        if variant.bindings.pointer(&pointer).is_none() {
+            return Err(anyhow!(
+                "variant '{}' config has no field for --set key '{}'; --set only patches declared config fields",
+                variant.id,
+                key
+            ));
+        }
         set_json_pointer_value(&mut variant.bindings, &pointer, value.clone())?;
     }
     Ok(())
 }
+
+fn set_binding_key_json_pointer(key: &str) -> Result<String> {
+    if key.trim().is_empty() {
+        return Err(anyhow!(
+            "invalid --set key '{}': dotted path segments cannot be empty",
+            key
+        ));
+    }
+    let mut tokens = Vec::new();
+    for segment in key.split('.') {
+        if segment.trim().is_empty() {
+            return Err(anyhow!(
+                "invalid --set key '{}': dotted path segments cannot be empty",
+                key
+            ));
+        }
+        if segment.trim() != segment {
+            return Err(anyhow!(
+                "invalid --set key '{}': dotted path segments cannot contain leading or trailing whitespace",
+                key
+            ));
+        }
+        tokens.push(segment.replace('~', "~0").replace('/', "~1"));
+    }
+    Ok(format!("/{}", tokens.join("/")))
+}
+
 pub(crate) fn tokenize_command_string(raw: &str) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
     let mut current = String::new();

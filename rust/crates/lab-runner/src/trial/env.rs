@@ -313,10 +313,12 @@ pub(crate) fn resolve_runtime_agent_command(request: &TrialRunRequest<'_>) -> Re
 }
 
 fn replace_event_path_placeholders(raw: &str, request: &TrialRunRequest<'_>) -> Result<String> {
-    let mut rendered = raw.replace(
-        "__BUCEPHALUS_TRAJECTORY_PATH__",
-        request.io_paths.trajectory_path.as_str(),
-    );
+    if raw.contains("__BUCEPHALUS_TRAJECTORY_PATH__") {
+        return Err(anyhow!(
+            "trial_runtime.agent.command uses removed __BUCEPHALUS_TRAJECTORY_PATH__ placeholder; declare an event sink and use __BUCEPHALUS_EVENT_PATH_<id>__"
+        ));
+    }
+    let mut rendered = raw.to_string();
     for sink in &request.runtime.event_sinks {
         let placeholder = format!("__BUCEPHALUS_EVENT_PATH_{}__", sink.id);
         rendered = rendered.replace(&placeholder, sink.path.as_str());

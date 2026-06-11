@@ -88,3 +88,32 @@ pub fn default_build_root() -> Result<PathBuf> {
 pub fn default_agent_root() -> Result<PathBuf> {
     Ok(bucephalus_home()?.join("agents"))
 }
+
+/// Persisted Cloud connection profile. `bucephalus login` writes it once;
+/// every Cloud-facing command resolves its API URL and OAuth parameters from
+/// flags, then env, then this profile — so connecting to a deployment is a
+/// one-time act, not per-command environment configuration.
+pub fn cloud_profile_path(home: &std::path::Path) -> PathBuf {
+    home.join("cloud.json")
+}
+
+pub fn read_cloud_profile(home: &std::path::Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(cloud_profile_path(home)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+pub fn write_cloud_profile(home: &std::path::Path, profile: &serde_json::Value) -> Result<()> {
+    std::fs::create_dir_all(home)?;
+    let path = cloud_profile_path(home);
+    std::fs::write(&path, format!("{:#}\n", profile))
+        .map_err(|err| anyhow!("failed to write cloud profile {}: {err}", path.display()))
+}
+
+pub fn cloud_profile_string(home: &std::path::Path, pointer: &str) -> Option<String> {
+    read_cloud_profile(home)?
+        .pointer(pointer)?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}

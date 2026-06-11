@@ -6,10 +6,12 @@ const rootDir = new URL("..", import.meta.url).pathname;
 const openApiDir = join(rootDir, "api", "openapi");
 const files = [
   "common.yaml",
+  "auth.yaml",
   "registry.yaml",
   "drafts.yaml",
   "imports.yaml",
   "runs.yaml",
+  "secrets.yaml",
   "analysis.yaml",
   "observability.yaml",
 ];

@@ -19,9 +19,9 @@
         "workspace": {
           "type": "object",
           "additionalProperties": true,
+          "not": { "required": ["kind"] },
           "properties": {
             "type": { "type": "string", "enum": ["container_image"] },
-            "kind": { "type": "string", "enum": ["container_image"] },
             "image": { "type": "string", "minLength": 1 },
             "workdir": { "type": "string", "minLength": 1, "pattern": "^/" },
             "platform": { "type": "string", "minLength": 1 }

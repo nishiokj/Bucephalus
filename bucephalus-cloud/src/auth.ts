@@ -1,5 +1,6 @@
 import type { AuthConfig } from "./config";
 import { HttpError, isRecord } from "./http";
+import { TOKEN_SECRET_PREFIX, type ApiTokenRepository } from "./tokens/repository";
 
 export interface AuthContext {
   subject: string;
@@ -118,6 +119,42 @@ export class OAuthVerifier {
     this.jwks = { fetchedAt: now, keys };
     return keys;
   }
+}
+
+// Accepts either credential the platform knows: Bucephalus-minted opaque
+// tokens (sessions and API keys, prefixed buc_, revocation-checked in the
+// database on every request) or OAuth JWTs from the configured issuer. Both
+// resolve to the same issuer:subject owner identity, so nothing downstream
+// distinguishes how the caller authenticated.
+export class CloudAuthenticator {
+  constructor(
+    private readonly verifier: OAuthVerifier,
+    private readonly tokens: ApiTokenRepository,
+  ) {}
+
+  async requireUser(request: Request, scope: string): Promise<AuthContext> {
+    const token = bearerToken(request);
+    if (token?.startsWith(TOKEN_SECRET_PREFIX)) {
+      const record = await this.tokens.verifyToken(token);
+      if (!record) {
+        throw new HttpError(401, "unauthorized", `${scope} token is invalid, expired, or revoked`);
+      }
+      return {
+        subject: record.subject,
+        issuer: record.issuer,
+        audience: "bucephalus-token",
+        claims: {
+          token_id: record.token_id,
+          token_kind: record.kind,
+        },
+      };
+    }
+    return await this.verifier.requireUser(request, scope);
+  }
+}
+
+export function isTokenAuth(auth: AuthContext): boolean {
+  return typeof auth.claims.token_kind === "string";
 }
 
 export function bearerToken(request: Request): string | null {

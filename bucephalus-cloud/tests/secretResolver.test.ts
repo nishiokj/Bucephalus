@@ -40,6 +40,23 @@ describe("attempt secret resolver", () => {
     });
   });
 
+  test("rejects file: refs unless explicitly enabled for local development", () => {
+    expect(() => secretFetchPlan("file:/data/secrets/buc-abc", {}))
+      .toThrow("file: secret refs are disabled");
+  });
+
+  test("plans file: refs as local reads when explicitly enabled", () => {
+    expect(secretFetchPlan("file:/data/secrets/buc-abc", {
+      BUCEPHALUS_SECRET_RESOLVER_ALLOW_FILE: "true",
+    })).toEqual({ kind: "file", path: "/data/secrets/buc-abc" });
+  });
+
+  test("rejects relative file: refs", () => {
+    expect(() => secretFetchPlan("file:secrets/buc-abc", {
+      BUCEPHALUS_SECRET_RESOLVER_ALLOW_FILE: "true",
+    })).toThrow("absolute path");
+  });
+
   test("plans AWS Secrets Manager refs as provider CLI access", () => {
     expect(secretFetchPlan(
       "aws-secrets-manager://prod/openai-api-key",

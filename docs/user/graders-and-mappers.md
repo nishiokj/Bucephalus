@@ -26,6 +26,7 @@ stages:
       candidate:
         capture:
           type: workspace_diff
+          format: unified_diff
 
   grader:
     strategy: in_task_runtime
@@ -38,7 +39,6 @@ stages:
         materialize:
           as: file
           path: /patch.diff
-        required: true
     outputs:
       report:
         capture:
@@ -49,11 +49,9 @@ stages:
 
 metrics:
   - id: pass_rate
-    source:
-      type: grader_output
-      output: report
-      transform:
-        type: pytest_json_report_pass_rate
+    from: grader.report
+    transform:
+      type: pytest_json_report_pass_rate
 ```
 
 This keeps each responsibility in the YAML:
@@ -85,6 +83,11 @@ Container grader stages may attach top-level `ephemerals` with `stages.grader.ep
 ## Strategy Declarations
 
 Each strategy has a different packaging boundary. Declare the boundary directly instead of relying on arbitrary host paths.
+Strategy-specific config blocks are closed:
+`in_task_runtime` accepts `hidden_paths` and `revealed_paths`; `injected`
+accepts `bundle` and `copy_dest`; `separate` accepts `image` and `workdir`;
+`host` accepts `capability`. Use `stages.grader.max_concurrency` when a grader
+needs a lower concurrency limit than the run.
 
 ### None
 
@@ -94,10 +97,13 @@ Use this when the agent result is the only source of metrics.
 stages:
   grader:
     strategy: none
-    command: []
 ```
 
-Do not declare `source.type: grader_output` metrics when `strategy: none`.
+You can also omit `stages.grader` entirely for this case; the authoring build
+defaults an omitted grader to `strategy: none`. Do not declare an empty
+`stages.grader: {}`.
+
+Do not declare `from: grader...` metrics when `strategy: none`.
 
 ### In Case Runtime
 
@@ -210,7 +216,7 @@ Do not use `host` for your own local grader script. Use `in_task_runtime`, `inje
 | Agent exits non-zero but writes valid result | Grader still runs; exit code is evidence. |
 | Grader exits non-zero but writes declared outputs | Outputs are captured; reported outcome is failure. |
 | Grader exits 0 but a required declared output is missing or invalid | Grading failed. |
-| Metric source points at a missing declared output or field | Grading failed before a misleading metric is committed. |
+| Metric reference points at a missing declared output or field | Grading failed before a misleading metric is committed. |
 
 The runner should never fabricate a scientific verdict when declared grader
-outputs or required metric sources are missing or invalid.
+outputs or required metric references are missing or invalid.

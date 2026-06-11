@@ -50,6 +50,23 @@ describe("Cloud run requirements", () => {
     });
   });
 
+  test("maps modal backend packages to modal-capable Cloud runner requirements", () => {
+    const requirements = runRequirementsForArtifact(artifact({
+      resolved_experiment_json: {
+        runtime: {
+          compute: { backend: "modal" },
+        },
+      },
+    }), {});
+
+    expect(requirements).toMatchObject({
+      executor: "modal",
+      requires: ["core_runner", "modal", "registry_pull"],
+      arch: "x86_64",
+      isolation: "reusable_vm",
+    });
+  });
+
   test("infers arm64 runner architecture from packaged task image platform", () => {
     const requirements = runRequirementsForArtifact(artifact({
       target: {

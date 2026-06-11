@@ -40,3 +40,32 @@ oauth_jwks_url       = "https://www.googleapis.com/oauth2/v3/certs"
 # pool_controller_runner_pool_id = "00000000-0000-0000-0000-000000000000"
 # pool_controller_provision_cmd_json_secret_version = "1"
 # pool_controller_reap_cmd_json_secret_version = "1"
+
+# Optional: enable Modal-backed Cloud runs on the same per-run GCE worker VMs.
+# Terraform stores only Secret Manager version numbers and non-secret routing
+# values. The actual Modal token and S3/R2 sync credentials must be added to the
+# secret names emitted by the substrate output `secret_names`.
+#
+# modal_backend_enabled              = true
+# modal_app_name                     = "bucephalus-prod"
+# modal_environment                  = "main"
+# modal_token_id_secret_version      = "1"
+# modal_token_secret_secret_version  = "1"
+# modal_s3_bucket                    = "bucephalus-runtime"
+# modal_s3_prefix                    = "modal/runtime"
+# modal_s3_endpoint_url              = "https://<account-id>.r2.cloudflarestorage.com"
+# modal_s3_region                    = "auto"
+# modal_s3_access_key_id_secret_version     = "1"
+# modal_s3_secret_access_key_secret_version = "1"
+# modal_gcp_artifact_registry_service_account_json_secret_version = "1"
+#
+# If credentials already live in a Modal Secret with AWS_ACCESS_KEY_ID and
+# AWS_SECRET_ACCESS_KEY, set modal_s3_secret_name instead of the two S3 key
+# Secret Manager version inputs above. Keep modal_s3_force_path_style=false:
+# Modal CloudBucketMount does not expose path-style S3 mounting.
+#
+# If Modal task images are private GCP Artifact Registry refs, either set
+# modal_gcp_artifact_registry_service_account_json_secret_version to a Secret
+# Manager version containing a service-account JSON blob, or set
+# modal_gcp_artifact_registry_secret_name to an existing Modal Secret containing
+# SERVICE_ACCOUNT_JSON.

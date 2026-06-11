@@ -27,6 +27,15 @@ export function controlPlaneSecretIdViolation(id: string): string | null {
   return null;
 }
 
+export function controlPlaneSecretNameViolation(name: string): string | null {
+  const trimmed = name.trim();
+  if (CONTROL_PLANE_ENV_NAMES.has(trimmed.toUpperCase())
+    || CONTROL_PLANE_SECRET_PATTERNS.some((pattern) => pattern.test(trimmed.toLowerCase()))) {
+    return `Secret name '${name}' is reserved for Cloud control-plane credentials`;
+  }
+  return null;
+}
+
 export function controlPlaneSecretRefViolation(ref: string): string | null {
   const envName = envRefName(ref);
   if (envName && CONTROL_PLANE_ENV_NAMES.has(envName.toUpperCase())) {

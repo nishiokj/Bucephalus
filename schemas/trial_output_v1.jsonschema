@@ -82,10 +82,10 @@
     "checkpoint_decl": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path"],
+      "required": ["path", "logical_name"],
       "properties": {
         "path": { "type": "string", "minLength": 1 },
-        "logical_name": { "type": "string" },
+        "logical_name": { "type": "string", "minLength": 1 },
         "step": { "type": "integer", "minimum": 0 },
         "epoch": { "type": "number", "minimum": 0 }
       }

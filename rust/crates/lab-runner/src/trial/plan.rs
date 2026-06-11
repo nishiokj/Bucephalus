@@ -91,15 +91,12 @@ pub(crate) struct TrialRuntimeAgentConfig {
     pub(crate) command: Vec<String>,
     pub(crate) artifact_type: ArtifactType,
     #[serde(default)]
-    pub(crate) protocol: Option<String>,
-    #[serde(default)]
     pub(crate) image: Option<String>,
     #[serde(default)]
     pub(crate) mount: Option<TrialRuntimeAgentMountConfig>,
     #[serde(default)]
     pub(crate) sidecars: Vec<String>,
-    #[serde(default)]
-    pub(crate) integration_level: Option<String>,
+    pub(crate) integration_level: String,
     #[serde(default)]
     pub(crate) env: Value,
     #[serde(default)]
@@ -108,7 +105,6 @@ pub(crate) struct TrialRuntimeAgentConfig {
     pub(crate) telemetry: Value,
     #[serde(default)]
     pub(crate) output_mounts: Value,
-    #[serde(default)]
     pub(crate) outputs: BTreeMap<String, RuntimeOutputConfig>,
 }
 
@@ -263,7 +259,9 @@ pub(crate) fn validate_trial_runtime_config(
         }
     }
 
+    validate_agent_integration_level(config)?;
     validate_runtime_outputs("trial_runtime.agent.outputs", &config.agent.outputs)?;
+    validate_active_grader_required_fields_are_explicit(experiment)?;
     if config.grader.strategy == GradingStrategy::InTaskRuntime {
         let value = config.grader.in_task_runtime.as_ref().ok_or_else(|| {
             anyhow!(
@@ -277,8 +275,73 @@ pub(crate) fn validate_trial_runtime_config(
         }
     }
     validate_agent_mount_config(config.agent.mount.as_ref())?;
+    validate_agent_telemetry_config(&config.agent.telemetry)?;
     validate_transport_graph(experiment, config)?;
     validate_grader_metrics(experiment, config)?;
+    Ok(())
+}
+
+fn validate_active_grader_required_fields_are_explicit(experiment: &Value) -> Result<()> {
+    let Some(strategy) = experiment
+        .pointer("/trial_runtime/grader/strategy")
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    if strategy == "none" {
+        return Ok(());
+    }
+    if experiment
+        .pointer("/trial_runtime/grader/command")
+        .is_none()
+    {
+        return Err(anyhow!(
+            "trial_runtime.grader.command is required in resolved experiments when strategy={}",
+            strategy
+        ));
+    }
+    if experiment.pointer("/trial_runtime/grader/inputs").is_none() {
+        return Err(anyhow!(
+            "trial_runtime.grader.inputs is required in resolved experiments when strategy={}",
+            strategy
+        ));
+    }
+    if experiment
+        .pointer("/trial_runtime/grader/outputs")
+        .is_none()
+    {
+        return Err(anyhow!(
+            "trial_runtime.grader.outputs is required in resolved experiments when strategy={}",
+            strategy
+        ));
+    }
+    Ok(())
+}
+
+fn validate_agent_telemetry_config(telemetry: &Value) -> Result<()> {
+    if telemetry.is_null() {
+        return Ok(());
+    }
+    let object = telemetry
+        .as_object()
+        .ok_or_else(|| anyhow!("trial_runtime.agent.telemetry must be an object"))?;
+    for (key, value) in object {
+        if key != "causal_extraction" {
+            return Err(anyhow!(
+                "trial_runtime.agent.telemetry.{} is not supported",
+                key
+            ));
+        }
+        let text = value
+            .as_str()
+            .ok_or_else(|| anyhow!("trial_runtime.agent.telemetry.{} must be a string", key))?;
+        if text.trim().is_empty() {
+            return Err(anyhow!(
+                "trial_runtime.agent.telemetry.{} must not be empty",
+                key
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -480,6 +543,35 @@ fn grader_strategy_name(strategy: &GradingStrategy) -> &'static str {
     }
 }
 
+fn validate_agent_integration_level(config: &TrialRuntimeConfig) -> Result<()> {
+    let level = config.agent.integration_level.trim();
+    if level.is_empty() {
+        return Err(anyhow!(
+            "/trial_runtime/agent/integration_level is required"
+        ));
+    }
+    if !matches!(
+        level,
+        "cli_basic" | "cli_events" | "otel" | "control_checkpoint" | "control_full"
+    ) {
+        return Err(anyhow!(
+            "/trial_runtime/agent/integration_level must be one of: cli_basic, cli_events, otel, control_checkpoint, control_full (got '{}')",
+            level
+        ));
+    }
+    let has_events = config
+        .agent
+        .events
+        .as_array()
+        .is_some_and(|events| !events.is_empty());
+    if level == "cli_basic" && has_events {
+        return Err(anyhow!(
+            "/trial_runtime/agent/integration_level=cli_basic is incompatible with declared agent events; use cli_events or a control integration level"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_runtime_outputs(
     context: &str,
     outputs: &BTreeMap<String, RuntimeOutputConfig>,
@@ -515,6 +607,14 @@ fn validate_runtime_outputs(
                         id
                     ));
                 }
+                required_output_capture_flag(context, id, capture)?;
+                if capture.field.is_some() {
+                    return Err(anyhow!(
+                        "{}.{}.capture.field is only supported for result_json captures",
+                        context,
+                        id
+                    ));
+                }
             }
             "result_json" => {
                 let path = capture
@@ -527,11 +627,40 @@ fn validate_runtime_outputs(
                     path,
                     &format!("{}.{}.capture.path", context, id),
                 )?;
+                if capture.format.is_some() {
+                    return Err(anyhow!(
+                        "{}.{}.capture.format is implied as json for result_json captures",
+                        context,
+                        id
+                    ));
+                }
+                required_output_capture_flag(context, id, capture)?;
             }
             "workspace_diff" => {
                 if capture.format.as_deref() != Some("unified_diff") {
                     return Err(anyhow!(
                         "{}.{}.capture.format must be unified_diff for workspace_diff",
+                        context,
+                        id
+                    ));
+                }
+                if capture.path.is_some() {
+                    return Err(anyhow!(
+                        "{}.{}.capture.path is runner-owned for workspace_diff captures",
+                        context,
+                        id
+                    ));
+                }
+                if capture.field.is_some() {
+                    return Err(anyhow!(
+                        "{}.{}.capture.field is only supported for result_json captures",
+                        context,
+                        id
+                    ));
+                }
+                if capture.required.is_some() {
+                    return Err(anyhow!(
+                        "{}.{}.capture.required is not supported for workspace_diff captures",
                         context,
                         id
                     ));
@@ -548,6 +677,22 @@ fn validate_runtime_outputs(
         }
     }
     Ok(())
+}
+
+fn required_output_capture_flag(
+    context: &str,
+    id: &str,
+    capture: &crate::model::RuntimeOutputCaptureConfig,
+) -> Result<bool> {
+    capture
+        .required
+        .ok_or_else(|| anyhow!("{}.{}.capture.required is required", context, id))
+}
+
+fn required_grader_input_flag(id: &str, input: &RuntimeInputConfig) -> Result<bool> {
+    input
+        .required
+        .ok_or_else(|| anyhow!("trial_runtime.grader.inputs.{}.required is required", id))
 }
 
 fn validate_transport_graph(experiment: &Value, config: &TrialRuntimeConfig) -> Result<()> {
@@ -585,6 +730,7 @@ fn validate_transport_graph(experiment: &Value, config: &TrialRuntimeConfig) -> 
             input.materialize.name.as_deref(),
             &format!("trial_runtime.grader.inputs.{}.materialize", id),
         )?;
+        required_grader_input_flag(id, input)?;
     }
     if config.grader.strategy != GradingStrategy::None {
         validate_runtime_outputs("trial_runtime.grader.outputs", &config.grader.outputs)?;
@@ -613,8 +759,9 @@ fn validate_transport_graph(experiment: &Value, config: &TrialRuntimeConfig) -> 
             "grader_output" => {
                 if !grader_output_ids.contains(output) {
                     return Err(anyhow!(
-                        "metrics.{} references unknown grader output '{}'",
+                        "metric '{}' uses from: grader.{}... but trial_runtime.grader.outputs.{} is not declared",
                         metric.id,
+                        output,
                         output
                     ));
                 }
@@ -630,7 +777,7 @@ fn validate_transport_graph(experiment: &Value, config: &TrialRuntimeConfig) -> 
                 }
                 if output_id != "result" {
                     return Err(anyhow!(
-                        "metrics.{} references runtime output '{}', but only agent.result is currently persisted into metric extraction without a grader",
+                        "metrics.{} references runtime output '{}', but only the canonical result output is currently persisted into metric extraction without a grader",
                         metric.id,
                         output
                     ));

@@ -342,7 +342,7 @@ pub(crate) fn write_state_inventory(input: StateInventoryInput<'_>) -> Result<()
         task_sandbox_image,
         task_sandbox_workdir,
     } = input;
-    let sanitization_profile = effective_sanitization_profile(json_value);
+    let sanitization_profile = effective_sanitization_profile(json_value)?;
     let integration_level = agent_runtime.integration_level.as_str();
     let mode_requested = configured_task_network_mode(json_value)?;
     let mode_effective = effective_network_mode;

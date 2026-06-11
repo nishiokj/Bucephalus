@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{atomic_write_json_pretty, load_run_variants, load_tasks};
+use crate::config::{atomic_write_json_pretty, load_tasks, resolve_variant_plan};
 use crate::experiment::runtime::{
     resolve_variant_runtime_profile, validate_agent_artifact_pin, VariantRuntimeProfile,
 };
@@ -192,7 +192,7 @@ fn collect_prepared_runtime_image_plans(
     let loaded = load_sealed_package_for_run(package_dir)?;
     let dataset_path = resolve_dataset_path_in_package(&loaded.json_value, &loaded.exp_dir)?;
     let tasks = load_tasks(&dataset_path, &loaded.json_value)?;
-    let (variants, _) = load_run_variants(&loaded.exp_dir, &loaded.json_value)?;
+    let (variants, _) = resolve_variant_plan(&loaded.json_value)?;
     let behavior = RunBehavior::default();
     let execution = RunExecutionOptions {
         executor: Some(ExecutorKind::LocalDocker),
@@ -454,5 +454,10 @@ pub fn prepare_runtime_images(
 pub(crate) fn load_prepared_runtime_image_map_for_test(
     path: &Path,
 ) -> Result<PreparedRuntimeImageMapFile> {
-    serde_json::from_value(crate::config::load_json_file(path)?).map_err(Into::into)
+    let value = crate::config::load_json_file(path)?;
+    crate::package::validate::validate_schema_contract_value(
+        &value,
+        format!("prepared runtime image map {}", path.display()).as_str(),
+    )?;
+    serde_json::from_value(value).map_err(Into::into)
 }
