@@ -69,7 +69,7 @@ describe("GCE runner provider Modal bridge", () => {
       { workerImageFallback: "us-central1-docker.pkg.dev/project/repo/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } as any,
     )).toBe("us-central1-docker.pkg.dev/project/repo/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
   });
-
+  
   test("uses configured worker image only as a compatibility fallback", () => {
     expect(workerImageForRequest(
       {},
