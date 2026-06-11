@@ -1019,6 +1019,17 @@ pub(crate) fn cleanup_in_flight_trial_containers(
     }
 }
 
+pub(crate) fn scheduler_shutdown_error_with_cleanup_failure(
+    engine_err: anyhow::Error,
+    cleanup_err: anyhow::Error,
+) -> anyhow::Error {
+    anyhow!(
+        "schedule execution failed: {:#}; in-flight cleanup also failed: {:#}",
+        engine_err,
+        cleanup_err
+    )
+}
+
 pub(crate) fn execute_local_trial(
     context: &ParallelWorkerExecutionContext,
     launch: LocalTrialLaunch,
@@ -2442,7 +2453,10 @@ pub(crate) fn execute_schedule_engine(
                 "scheduler exited with {:?} but in-flight cleanup failed",
                 outcome
             ))),
-            Err(err) => Err(err.context(format!("in-flight cleanup also failed: {}", cleanup_err))),
+            Err(err) => Err(scheduler_shutdown_error_with_cleanup_failure(
+                err,
+                cleanup_err,
+            )),
         };
     }
 

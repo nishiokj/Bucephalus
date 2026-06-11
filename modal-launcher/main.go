@@ -138,17 +138,20 @@ func intValue(object map[string]any, key string, fallback int) int {
 }
 
 func stringList(value any) []string {
-	items, ok := value.([]any)
-	if !ok {
+	switch items := value.(type) {
+	case []string:
+		return append([]string(nil), items...)
+	case []any:
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
 		return nil
 	}
-	out := make([]string, 0, len(items))
-	for _, item := range items {
-		if text, ok := item.(string); ok {
-			out = append(out, text)
-		}
-	}
-	return out
 }
 
 func stringMap(value any) map[string]string {

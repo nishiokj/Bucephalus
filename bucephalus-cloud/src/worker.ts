@@ -284,10 +284,48 @@ async function executeCoreRun(
   if (result.exitCode !== 0) {
     await appendEvent(config, claim, "worker.core.failed", eventPayload);
     throw new WorkerError(
-      `Core runner exited with ${result.exitCode}: ${tail(result.stderr || result.stdout, 1000)}`,
+      coreRunnerFailureMessage(result.exitCode, result.stdout, result.stderr),
     );
   }
   await appendEvent(config, claim, "worker.core.completed", eventPayload);
+}
+
+export function coreRunnerFailureMessage(exitCode: number, stdout: string, stderr: string): string {
+  const stdoutError = coreRunnerStdoutErrorMessage(stdout);
+  const stderrTail = tail(stderr, 1000);
+  const stdoutTail = tail(stdout, 1000);
+  if (stdoutError && stderrTail) {
+    return `Core runner exited with ${exitCode}: ${stdoutError}; stderr tail: ${stderrTail}`;
+  }
+  if (stdoutError) {
+    return `Core runner exited with ${exitCode}: ${stdoutError}`;
+  }
+  return `Core runner exited with ${exitCode}: ${stderrTail || stdoutTail}`;
+}
+
+function coreRunnerStdoutErrorMessage(stdout: string): string | null {
+  for (const line of stdout.split(/\r?\n/).reverse()) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (!isRecord(parsed) || !isRecord(parsed.error)) {
+        continue;
+      }
+      const message = parsed.error.message;
+      const code = parsed.error.code;
+      if (typeof message === "string" && message.length > 0) {
+        return typeof code === "string" && code.length > 0
+          ? `${code}: ${message}`
+          : message;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 async function uploadRuntimeSnapshots(

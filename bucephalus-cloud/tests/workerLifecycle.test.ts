@@ -7,6 +7,7 @@ import {
   applyRuntimeNetworkPolicy,
   collectRuntimeSnapshot,
   coreRunnerEnv,
+  coreRunnerFailureMessage,
   discoverCoreRunIdsFromRunRoot,
   dockerRegistryAuthHeaders,
   loadWorkerConfig,
@@ -259,6 +260,29 @@ describe("worker lifecycle cleanup helpers", () => {
         }
       }
     }
+  });
+
+  test("core runner failure message preserves JSON stdout errors ahead of stderr progress logs", () => {
+    const stdout = JSON.stringify({
+      ok: false,
+      error: {
+        code: "command_failed",
+        message:
+          "local trial execution failed: modal sandbox launcher exited before emitting BUCEPHALUS_MODAL_RESULT",
+      },
+    });
+    const stderr = [
+      "preflight complete",
+      "starting schedule execution: slots=36 max_concurrency=2",
+    ].join("\n");
+
+    const message = coreRunnerFailureMessage(1, stdout, stderr);
+
+    expect(message).toContain("command_failed: local trial execution failed");
+    expect(message).toContain(
+      "modal sandbox launcher exited before emitting BUCEPHALUS_MODAL_RESULT",
+    );
+    expect(message).toContain("stderr tail: preflight complete");
   });
 
   test("Docker registry auth header decodes auth-only Docker config entries", async () => {

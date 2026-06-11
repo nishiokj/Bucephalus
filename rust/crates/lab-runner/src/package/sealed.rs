@@ -343,6 +343,45 @@ pub(crate) fn copy_verified_package_payload_for_run(
             ));
         }
     }
+    copy_verified_package_lock_for_run(package_dir, run_dir)?;
+    Ok(())
+}
+
+fn copy_verified_package_lock_for_run(package_dir: &Path, run_dir: &Path) -> Result<()> {
+    let package_lock_source = package_dir.join("package.lock");
+    let package_lock_destination = run_dir.join("package.lock");
+    match fs::symlink_metadata(&package_lock_destination) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+            return Err(anyhow!(
+                "preflight_failed: package.lock destination already exists with unsupported file type: {}",
+                package_lock_destination.display()
+            ));
+        }
+        Ok(_) => {
+            return Err(anyhow!(
+                "preflight_failed: package.lock destination already exists: {}",
+                package_lock_destination.display()
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    fs::copy(&package_lock_source, &package_lock_destination).with_context(|| {
+        format!(
+            "copy verified package.lock from {} to {}",
+            package_lock_source.display(),
+            package_lock_destination.display()
+        )
+    })?;
+    let source_lock_digest = sha256_file(&package_lock_source)?;
+    let destination_lock_digest = sha256_file(&package_lock_destination)?;
+    if source_lock_digest != destination_lock_digest {
+        return Err(anyhow!(
+            "preflight_failed: copied package.lock checksum mismatch (expected {}, got {})",
+            source_lock_digest,
+            destination_lock_digest
+        ));
+    }
     Ok(())
 }
 

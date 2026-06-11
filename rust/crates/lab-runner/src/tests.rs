@@ -2044,6 +2044,26 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_shutdown_error_preserves_original_failure_before_cleanup_failure() {
+        let original = anyhow::anyhow!(
+            "local trial execution failed (trial_id=trial_2, schedule_idx=1): modal sandbox launcher exited before emitting BUCEPHALUS_MODAL_RESULT"
+        );
+        let cleanup =
+            anyhow::anyhow!("failed to clean in-flight runtime worker(s): trial_2: missing sandbox id");
+
+        let err = scheduler_shutdown_error_with_cleanup_failure(original, cleanup);
+        let text = err.to_string();
+
+        assert!(text.contains("schedule execution failed: local trial execution failed"));
+        assert!(
+            text.contains("modal sandbox launcher exited before emitting BUCEPHALUS_MODAL_RESULT")
+        );
+        assert!(
+            text.contains("in-flight cleanup also failed: failed to clean in-flight runtime worker(s)")
+        );
+    }
+
+    #[test]
     fn inline_runtime_capture_budget_is_explicitly_configured() -> Result<()> {
         let _lock = lock_modal_env_tests();
         let root = TempDirGuard::new("bucephalus_inline_capture_budget");
@@ -25751,6 +25771,32 @@ stages:
         assert!(
             !run_dir.join("files").join("late_payload.txt").exists(),
             "late unsealed payload must not be copied into the run directory"
+        );
+    }
+
+    #[test]
+    fn copy_verified_package_payload_for_run_copies_package_lock_for_runtime_identity() {
+        let root = create_dx_authoring_fixture("bucephalus_payload_copy_package_lock");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let run_dir = root.path.join("run_copy");
+        ensure_dir(&run_dir).expect("run dir");
+
+        copy_verified_package_payload_for_run(&build.package_dir, &run_dir)
+            .expect("copy verified payload");
+
+        let package_lock = load_json_file(&build.package_dir.join("package.lock"))
+            .expect("source package lock");
+        let copied_lock = load_json_file(&run_dir.join("package.lock")).expect("copied lock");
+        assert_eq!(copied_lock, package_lock);
+        assert_eq!(
+            copied_lock.pointer("/package_digest"),
+            load_json_file(&build.package_dir.join("manifest.json"))
+                .expect("manifest")
+                .pointer("/package_digest")
         );
     }
 
