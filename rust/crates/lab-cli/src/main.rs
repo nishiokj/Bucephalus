@@ -5674,10 +5674,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let installed_version = result["installed_version"]
                 .as_str()
                 .unwrap_or(requested_version);
-            println!(
-                "version: {}",
-                installed_version
-            );
+            println!("version: {}", installed_version);
             if installed_version != requested_version {
                 println!("requested_version: {}", requested_version);
             }
