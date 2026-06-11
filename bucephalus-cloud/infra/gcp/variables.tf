@@ -279,7 +279,7 @@ variable "modal_app_name" {
   default     = null
 
   validation {
-    condition     = var.modal_app_name == null || length(trimspace(var.modal_app_name)) > 0
+    condition     = var.modal_app_name == null ? true : length(trimspace(var.modal_app_name)) > 0
     error_message = "modal_app_name must be non-empty when set."
   }
 }
@@ -386,7 +386,7 @@ variable "modal_gcp_artifact_registry_secret_name" {
   default     = null
 
   validation {
-    condition     = var.modal_gcp_artifact_registry_secret_name == null || length(trimspace(var.modal_gcp_artifact_registry_secret_name)) > 0
+    condition     = var.modal_gcp_artifact_registry_secret_name == null ? true : length(trimspace(var.modal_gcp_artifact_registry_secret_name)) > 0
     error_message = "modal_gcp_artifact_registry_secret_name must be non-empty when set."
   }
 }

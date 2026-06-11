@@ -368,6 +368,34 @@ jobs:
           )
           if [[ "${DEPLOYMENT_STAGE}" != "substrate" ]]; then
             args+=(-var-file="${GITHUB_WORKSPACE}/${IMAGE_TFVARS}")
+          else
+            args+=(
+              -target=google_project_service.required
+              -target=google_service_account.api
+              -target=google_service_account.pool_controller
+              -target=google_service_account.migrator
+              -target=google_service_account.runner
+              -target=google_artifact_registry_repository.cloud
+              -target=google_compute_network.control_plane
+              -target=google_compute_subnetwork.control_plane
+              -target=google_compute_subnetwork.serverless_connector
+              -target=google_compute_router.control_plane
+              -target=google_compute_router_nat.runner_egress
+              -target=google_compute_global_address.private_service_range
+              -target=google_service_networking_connection.private_services
+              -target=google_vpc_access_connector.control_plane
+              -target=google_sql_database_instance.primary
+              -target=google_sql_database.cloud
+              -target=google_secret_manager_secret.control_plane
+              -target=google_secret_manager_secret_iam_member.control_plane_access
+              -target=google_secret_manager_secret_iam_member.runner_worker_token_access
+              -target=google_artifact_registry_repository_iam_member.runner_image_reader
+              -target=google_project_iam_member.runner_artifact_registry_reader
+              -target=google_project_iam_member.runner_log_writer
+              -target=google_project_iam_member.runner_metric_writer
+              -target=google_project_iam_member.pool_controller_instance_admin
+              -target=google_service_account_iam_member.pool_controller_runner_service_account_user
+            )
           fi
           if [[ "${DRIFT_CHECK}" == "true" ]]; then
             set +e
