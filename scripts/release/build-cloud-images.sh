@@ -240,6 +240,23 @@ if [[ "${TARGET}" != *"linux"* ]]; then
   echo "Cloud images require a Linux release bundle; got target ${TARGET}" >&2
   exit 2
 fi
+# The image platform is dictated by the release target, never by the build
+# host. A Mac host defaults docker builds to arm64, which produces images
+# whose tags claim the release target but cannot execute on the deploy
+# substrate; pin and verify instead.
+case "${TARGET}" in
+  x86_64-*)
+    IMAGE_PLATFORM="linux/amd64"
+    ;;
+  aarch64-*)
+    IMAGE_PLATFORM="linux/arm64"
+    ;;
+  *)
+    echo "cannot derive an image platform from release target ${TARGET}" >&2
+    exit 2
+    ;;
+esac
+export IMAGE_PLATFORM
 RELEASE_MANIFEST_SHA="$(sha256_file "${RELEASE_DIR}/release-manifest.json")"
 DOCKERIGNORE_SHA="$(sha256_file "${RELEASE_DIR}/.dockerignore")"
 TAG_SUFFIX="$(printf "%s-%s-%s" "${VERSION}" "${TARGET}" "${GIT_SHA:0:12}" | tr -c 'A-Za-z0-9_.-' '-')"
@@ -281,6 +298,7 @@ for component in "${COMPONENTS[@]}"; do
   push_seconds=0
   common_build_args=(
     buildx build
+    --platform "${IMAGE_PLATFORM}"
     --file "${dockerfile}"
     --build-arg "BUCEPHALUS_BUN_BASE_IMAGE=${BASE_IMAGE}"
     --build-arg "BUCEPHALUS_RELEASE_VERSION=${VERSION}"
@@ -337,6 +355,11 @@ for component in "${COMPONENTS[@]}"; do
 
   image_id="$(cat "${iid_file}")"
   boundary_image_id="$(cat "${boundary_iid_file}")"
+  built_platform="$(docker image inspect "${inspected_ref}" --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || true)"
+  if [[ "${built_platform}" != "${IMAGE_PLATFORM}" ]]; then
+    echo "built ${component} image is ${built_platform:-unknown}, release target requires ${IMAGE_PLATFORM}" >&2
+    exit 1
+  fi
   image_size_bytes="$(docker image inspect "${inspected_ref}" --format "{{.Size}}" 2>/dev/null || true)"
   if [[ ! "${image_size_bytes}" =~ ^[0-9]+$ ]]; then
     image_size_bytes="$(docker image inspect "${image_id}" --format "{{.Size}}" 2>/dev/null || true)"
@@ -356,7 +379,7 @@ for component in "${COMPONENTS[@]}"; do
   if [[ -n "${digest}" ]]; then
     immutable_ref="${image_repository}@${digest}"
   fi
-  bun -e 'const [component, imageRepository, imageRef, immutableRef, imageId, digest, metadataFile, boundaryImageRef, boundaryImageId, boundaryMetadataFile, dockerfilePath, dockerfileSha256, contextStatsJson, imageSizeBytes, buildSeconds, boundaryVerifySeconds, pushSeconds, componentSeconds] = process.argv.slice(1); const build_context = JSON.parse(contextStatsJson); const parsedImageSize = imageSizeBytes ? Number(imageSizeBytes) : null; console.log(JSON.stringify({ component, image_repository: imageRepository, tag_ref: imageRef, immutable_ref: immutableRef || null, image_id: imageId, digest: digest || null, image_size_bytes: parsedImageSize, metadata_file: metadataFile, boundary_verified: true, boundary_image_ref: boundaryImageRef, boundary_image_id: boundaryImageId, boundary_metadata_file: boundaryMetadataFile, dockerfile: { path: dockerfilePath, sha256: dockerfileSha256 }, build_context, timings_seconds: { build: Number(buildSeconds), boundary_verify: Number(boundaryVerifySeconds), push: Number(pushSeconds), total: Number(componentSeconds) } }));' \
+  bun -e 'const [component, imageRepository, imageRef, immutableRef, imageId, digest, metadataFile, boundaryImageRef, boundaryImageId, boundaryMetadataFile, dockerfilePath, dockerfileSha256, contextStatsJson, imageSizeBytes, buildSeconds, boundaryVerifySeconds, pushSeconds, componentSeconds] = process.argv.slice(1); const build_context = JSON.parse(contextStatsJson); const parsedImageSize = imageSizeBytes ? Number(imageSizeBytes) : null; console.log(JSON.stringify({ component, image_repository: imageRepository, tag_ref: imageRef, immutable_ref: immutableRef || null, image_id: imageId, digest: digest || null, platform: process.env.IMAGE_PLATFORM, image_size_bytes: parsedImageSize, metadata_file: metadataFile, boundary_verified: true, boundary_image_ref: boundaryImageRef, boundary_image_id: boundaryImageId, boundary_metadata_file: boundaryMetadataFile, dockerfile: { path: dockerfilePath, sha256: dockerfileSha256 }, build_context, timings_seconds: { build: Number(buildSeconds), boundary_verify: Number(boundaryVerifySeconds), push: Number(pushSeconds), total: Number(componentSeconds) } }));' \
     "${component}" "${image_repository}" "${image_ref}" "${immutable_ref}" "${image_id}" "${digest}" "${metadata_name}" "${inspected_ref}" "${boundary_image_id}" "${boundary_metadata_name}" "${dockerfile_path}" "${dockerfile_sha}" "${context_stats}" "${image_size_bytes}" "${build_seconds}" "${boundary_verify_seconds}" "${push_seconds}" "${component_seconds}" >> "${ENTRIES_JSONL}"
 done
 
@@ -377,6 +400,7 @@ await Bun.write(process.env.MANIFEST_PATH, `${JSON.stringify({
   release: {
     version: manifest.version,
     target: manifest.target,
+    platform: process.env.IMAGE_PLATFORM,
     git_sha: manifest.git_sha,
     manifest_sha256: process.env.RELEASE_MANIFEST_SHA,
     archive_sha256: process.env.RELEASE_ARCHIVE_SHA || null,

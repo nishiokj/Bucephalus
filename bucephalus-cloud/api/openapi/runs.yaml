@@ -959,6 +959,14 @@ components:
           type:
             - string
             - 'null'
+        attempts:
+          type: array
+          description: >
+            Attempt history for the run, oldest first. Present on run detail
+            responses; each failed attempt carries the worker's error message
+            so failures are diagnosable without database access.
+          items:
+            $ref: '#/components/schemas/RunAttempt'
     RuntimeSummary:
       type: object
       additionalProperties: false
@@ -1411,6 +1419,15 @@ components:
           type:
             - string
             - 'null'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        attempt_token:
+          type: string
+          description: Present only in worker claim responses.
     WorkerCapabilities:
       type: object
       additionalProperties: false

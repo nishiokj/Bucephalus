@@ -1,5 +1,7 @@
 import { HttpError, jsonResponse, readJsonObject, requireBearerToken, requireString } from "../http";
+import { logWarn, newTraceContext } from "../logging";
 import type { JsonObject, JsonValue } from "../primitives";
+import { releaseIdentity } from "../release";
 import {
   RunnerRepository,
   type RunnerInstanceRecord,
@@ -92,12 +94,14 @@ export async function handleRunnerRoute(
   if (request.method === "POST" && url.pathname === "/v1/runner-instances/register") {
     requireBearerToken(request, workerToken, "runner instance registration");
     const body = await readJsonObject(request);
+    const metadata = optionalJsonObject(body.metadata as JsonValue | undefined, "/metadata");
     const instance = await runners.registerInstance({
       runnerPoolId: requireString(body.runner_pool_id, "/runner_pool_id"),
       instanceName: requireString(body.instance_name, "/instance_name"),
       capabilities: capabilitiesFromBody(body.capabilities),
-      metadata: optionalJsonObject(body.metadata as JsonValue | undefined, "/metadata"),
+      metadata,
     });
+    warnOnReleaseSkew(instance, metadata);
     return jsonResponse(instanceToWire(instance), { status: 201 });
   }
 
@@ -233,6 +237,22 @@ function limitFromUrl(url: URL): number {
   }
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) ? parsed : 100;
+}
+
+function warnOnReleaseSkew(instance: RunnerInstanceRecord, metadata: JsonObject): void {
+  const api = releaseIdentity();
+  const workerRelease = isRecord(metadata.release) ? metadata.release : null;
+  const workerVersion = typeof workerRelease?.version === "string" ? workerRelease.version : null;
+  if (!api.version || !workerVersion || api.version === workerVersion) {
+    return;
+  }
+  logWarn("runner.release_skew", newTraceContext({ component: "api" }), {
+    runner_instance_id: instance.runner_instance_id,
+    runner_pool_id: instance.runner_pool_id,
+    api_release: api,
+    worker_release: workerRelease,
+    detail: "worker and API are running different releases; package contract validation may disagree between run creation and execution",
+  });
 }
 
 function capabilitiesFromBody(value: unknown): WorkerCapabilities {

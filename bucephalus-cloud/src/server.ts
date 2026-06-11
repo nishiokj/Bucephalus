@@ -6,6 +6,7 @@ import { ImportRepository } from "./imports/repository";
 import { LatchSubmissionRepository } from "./latch/repository";
 import { PackageRepository, RunRepository } from "./packages/repository";
 import { RegistryRepository } from "./registry/repository";
+import { releaseIdentity } from "./release";
 import { RuntimeRepository } from "./runtime/repository";
 import { RunnerRepository } from "./runners/repository";
 import { handleDraftRoute } from "./routes/drafts";
@@ -50,7 +51,7 @@ const server = Bun.serve({
 
       if (request.method === "GET" && url.pathname === "/readyz") {
         await checkDatabase(sql);
-        return withCors(jsonResponse({ ok: true, database: "ok" }));
+        return withCors(jsonResponse({ ok: true, database: "ok", release: releaseIdentity() }));
       }
 
       const userAuth: AuthContext | null = requiresUserAuth(url.pathname)
@@ -102,6 +103,7 @@ logInfo("api.startup", serviceContext, {
   host: config.host,
   port: server.port,
   user_oauth_required: true,
+  release: releaseIdentity(),
 });
 
 process.on("SIGINT", async () => {

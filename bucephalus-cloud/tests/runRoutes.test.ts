@@ -9,6 +9,42 @@ import type { RuntimeRepository } from "../src/runtime/repository";
 import type { RunnerRepository } from "../src/runners/repository";
 
 describe("Cloud run routes", () => {
+  test("run detail includes attempts with failure messages", async () => {
+    const failedAttempt = {
+      ...attemptRecord(),
+      status: "failed",
+      ended_at: "2026-06-04T00:00:30Z",
+      error_message: "package shape rejected by worker",
+    };
+    const runs = {
+      async getRun() {
+        return { ...runRecord(), status: "failed", error_message: failedAttempt.error_message };
+      },
+      async listAttempts() {
+        return [failedAttempt];
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1"),
+      new URL("https://cloud.example/v1/runs/run-1"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    expect(response).not.toBeNull();
+    const body = await response!.json();
+    expect(body.error_message).toBe("package shape rejected by worker");
+    expect(body.attempts).toHaveLength(1);
+    expect(body.attempts[0].attempt_id).toBe("attempt-1");
+    expect(body.attempts[0].status).toBe("failed");
+    expect(body.attempts[0].error_message).toBe("package shape rejected by worker");
+    expect(body.attempts[0].attempt_token).toBeUndefined();
+  });
+
   test("redacts env values and secret refs from user-facing run list responses", async () => {
     const runs = {
       async listRuns() {

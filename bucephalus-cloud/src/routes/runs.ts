@@ -1,5 +1,6 @@
 import { authOwnerKey, type AuthContext } from "../auth";
 import { HttpError, jsonResponse, optionalString, readJsonObject, requireBearerToken, requireString } from "../http";
+import { logError, newTraceContext } from "../logging";
 import { readStoredObject } from "../objectStorage";
 import type { JsonObject, JsonValue } from "../primitives";
 import { RuntimeRepository } from "../runtime/repository";
@@ -150,7 +151,11 @@ export async function handleRunRoute(
     if (!run) {
       throw new HttpError(404, "run_not_found", "Run not found");
     }
-    return jsonResponse(runToWire(run));
+    const attempts = await runs.listAttempts(runId);
+    return jsonResponse({
+      ...runToWire(run),
+      attempts: attempts.map(attemptToWire),
+    });
   }
 
   return null;
@@ -268,10 +273,19 @@ async function failAttempt(
   const attemptId = attemptIdFromWorkerPath(url.pathname, "/fail");
   const runnerInstanceId = requireString(body.runner_instance_id, "/runner_instance_id");
   await requireAttemptToken(request, runs, { attemptId, runnerInstanceId });
+  const message = requireString(body.message, "/message");
   const result = await runs.failAttempt({
     attemptId,
     runnerInstanceId,
-    message: requireString(body.message, "/message"),
+    message,
+  });
+  // The durable record lives in Postgres, but operators debug from Cloud
+  // Logging; an attempt failure must be visible there without a DB query.
+  logError("run.attempt_failed", newTraceContext({ component: "api", runId: result.run.run_id, attemptId }), {
+    run_id: result.run.run_id,
+    attempt_id: attemptId,
+    runner_instance_id: runnerInstanceId,
+    error: message,
   });
   return jsonResponse(claimToWire(result));
 }
