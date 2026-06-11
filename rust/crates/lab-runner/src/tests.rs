@@ -17415,6 +17415,17 @@ mod tests {
         set_json_pointer_value(&mut manifest, "/package_digest", json!(package_digest))
             .expect("set package digest");
         atomic_write_json_pretty(manifest_path, &manifest).expect("write manifest");
+
+        let mut package_checks =
+            load_json_file(&package_dir.join(PACKAGE_CHECKS_FILE)).expect("package checks json");
+        set_json_pointer_value(
+            &mut package_checks,
+            "/package_digest",
+            json!(package_digest),
+        )
+        .expect("set package checks digest");
+        atomic_write_json_pretty(&package_dir.join(PACKAGE_CHECKS_FILE), &package_checks)
+            .expect("write package checks");
     }
 
     #[test]
