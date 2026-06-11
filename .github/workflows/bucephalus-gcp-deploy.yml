@@ -434,6 +434,37 @@ jobs:
           --region "${BUCEPHALUS_GCP_REGION}"
           --wait
 
+      - name: Prepare worker image promotion
+        if: ${{ inputs.apply && inputs.deployment_stage != 'substrate' }}
+        env:
+          PROMOTION_RUN_ID: ${{ steps.resolved_release.outputs.promotion_run_id }}
+          PROMOTION_ARTIFACT_NAME: ${{ steps.resolved_release.outputs.promotion_artifact_name }}
+        run: |
+          evidence_uri="github-actions://${GITHUB_REPOSITORY}/runs/${PROMOTION_RUN_ID}/artifacts/${PROMOTION_ARTIFACT_NAME}"
+          scripts/release/write-worker-image-promotion-env.sh \
+            --manifest "${PROMOTION_DIR}/cloud-image-build-manifest.json" \
+            --pool-id "${BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID}" \
+            --evidence-uri "${evidence_uri}" \
+            --github-env "${GITHUB_ENV}"
+
+      - name: Promote active worker image
+        if: ${{ inputs.apply && inputs.deployment_stage != 'substrate' }}
+        run: |
+          env_overrides="^|^BUCEPHALUS_PROMOTE_WORKER_POOL_ID=${BUCEPHALUS_PROMOTE_WORKER_POOL_ID}"
+          env_overrides="${env_overrides}|BUCEPHALUS_PROMOTE_WORKER_IMAGE=${BUCEPHALUS_PROMOTE_WORKER_IMAGE}"
+          env_overrides="${env_overrides}|BUCEPHALUS_PROMOTE_WORKER_RELEASE_VERSION=${BUCEPHALUS_PROMOTE_WORKER_RELEASE_VERSION}"
+          env_overrides="${env_overrides}|BUCEPHALUS_PROMOTE_WORKER_RELEASE_GIT_SHA=${BUCEPHALUS_PROMOTE_WORKER_RELEASE_GIT_SHA}"
+          env_overrides="${env_overrides}|BUCEPHALUS_PROMOTE_WORKER_EVIDENCE_URI=${BUCEPHALUS_PROMOTE_WORKER_EVIDENCE_URI}"
+          env_overrides="${env_overrides}|BUCEPHALUS_PROMOTE_WORKER_EVIDENCE_SHA256=${BUCEPHALUS_PROMOTE_WORKER_EVIDENCE_SHA256}"
+          env_overrides="${env_overrides}|BUCEPHALUS_PROMOTE_WORKER_BOUNDARY_VERIFIED_AT=${BUCEPHALUS_PROMOTE_WORKER_BOUNDARY_VERIFIED_AT}"
+          env_overrides="${env_overrides}|BUCEPHALUS_PROMOTE_WORKER_METADATA_JSON=${BUCEPHALUS_PROMOTE_WORKER_METADATA_JSON}"
+          gcloud run jobs execute \
+            "${BUCEPHALUS_GCP_RESOURCE_PREFIX}-${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}-worker-image-promotion" \
+            --project "${BUCEPHALUS_GCP_PROJECT_ID}" \
+            --region "${BUCEPHALUS_GCP_REGION}" \
+            --update-env-vars "${env_overrides}" \
+            --wait
+
       - name: Smoke deployed API
         if: ${{ inputs.apply && inputs.deployment_stage != 'substrate' }}
         env:

@@ -1093,3 +1093,44 @@ resource "google_cloud_run_v2_job" "migrations" {
     google_secret_manager_secret_iam_member.control_plane_access,
   ]
 }
+
+resource "google_cloud_run_v2_job" "worker_image_promotion" {
+  count = local.deploy_pool_controller ? 1 : 0
+
+  name     = "${local.name_prefix}-worker-image-promotion"
+  location = var.region
+  labels   = local.labels
+
+  template {
+    template {
+      service_account = google_service_account.migrator.email
+
+      vpc_access {
+        connector = google_vpc_access_connector.control_plane.id
+        egress    = "PRIVATE_RANGES_ONLY"
+      }
+
+      containers {
+        image   = var.migration_image_digest
+        command = ["bun"]
+        args    = ["runtime-dist/db/promoteWorkerImage.js"]
+
+        env {
+          name = "DATABASE_URL"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.control_plane["migrator_database_url"].secret_id
+              version = var.migrator_database_url_secret_version
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_sql_database.cloud,
+    google_cloud_run_v2_job.migrations,
+    google_secret_manager_secret_iam_member.control_plane_access,
+  ]
+}

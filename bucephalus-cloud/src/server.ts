@@ -12,6 +12,7 @@ import { RunnerRepository } from "./runners/repository";
 import { CloudSecretRepository } from "./secrets/repository";
 import { createSecretStoreBackend, SecretStore } from "./secrets/store";
 import { ApiTokenRepository } from "./tokens/repository";
+import { InMemoryRateLimiter, rateLimitResponse } from "./rateLimit";
 import { handleAuthRoute } from "./routes/auth";
 import { handleSecretRoute } from "./routes/secrets";
 import { handleDraftRoute } from "./routes/drafts";
@@ -42,6 +43,7 @@ const secrets = new CloudSecretRepository(sql);
 const secretStore = new SecretStore(createSecretStoreBackend(config), config.secrets.prefix);
 const apiTokens = new ApiTokenRepository(sql);
 const auth = new CloudAuthenticator(new OAuthVerifier(config.auth), apiTokens);
+const rateLimiter = new InMemoryRateLimiter(config.rateLimit);
 
 const server = Bun.serve({
   hostname: config.host,
@@ -60,6 +62,17 @@ const server = Bun.serve({
       if (request.method === "GET" && url.pathname === "/readyz") {
         await checkDatabase(sql);
         return withCors(jsonResponse({ ok: true, database: "ok", release: releaseIdentity() }));
+      }
+
+      const rateLimitDecision = rateLimiter.check(request, url);
+      if (rateLimitDecision && !rateLimitDecision.allowed) {
+        logInfo("api.rate_limited", newTraceContext({ component: "api" }), {
+          method: request.method,
+          path: url.pathname,
+          bucket: rateLimitDecision.bucket.kind,
+          limit: rateLimitDecision.bucket.limit,
+        });
+        return withCors(rateLimitResponse(rateLimitDecision));
       }
 
       const userAuth: AuthContext | null = requiresUserAuth(url.pathname)

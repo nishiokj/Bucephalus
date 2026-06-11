@@ -141,6 +141,7 @@ runtime_dist_ready() {
   [[ -f "${dir}/server.js" \
     && -f "${dir}/worker.js" \
     && -f "${dir}/db/migrate.js" \
+    && -f "${dir}/db/promoteWorkerImage.js" \
     && -f "${dir}/poolController.js" \
     && -f "${dir}/secretResolver.js" \
     && -f "${dir}/networkPolicyClient.js" ]]
@@ -321,6 +322,7 @@ else
       src/server.ts \
       src/worker.ts \
       src/db/migrate.ts \
+      src/db/promoteWorkerImage.ts \
       src/poolController.ts \
       src/secretResolver.ts \
       src/networkPolicyClient.ts
