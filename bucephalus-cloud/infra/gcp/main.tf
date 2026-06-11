@@ -1,5 +1,9 @@
 locals {
-  name_prefix                   = "${var.resource_prefix}-${var.environment}"
+  name_prefix = "${var.resource_prefix}-${var.environment}"
+  # Hosted user secrets are namespaced away from control-plane secret ids
+  # (which are "<name_prefix>-..."), so the runner's prefix-conditioned
+  # accessor grant can never match a control-plane credential.
+  hosted_secrets_prefix         = "${var.resource_prefix}-${var.environment}-hosted"
   deploy_control_plane_services = var.deploy_control_plane_services
   deploy_api_services           = var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller
   deploy_pool_controller        = var.deploy_control_plane_services || var.deploy_pool_controller
@@ -482,6 +486,42 @@ resource "google_secret_manager_secret_iam_member" "runner_worker_token_access" 
   member    = "serviceAccount:${google_service_account.runner.email}"
 }
 
+data "google_project" "current" {
+  project_id = var.project_id
+}
+
+# The API writes hosted user secrets (create/rotate/delete) under the hosted
+# prefix. Secret creation is authorized against the project resource, so the
+# condition must admit the project itself; for existing secrets the prefix
+# clause confines admin rights to hosted user secrets, keeping control-plane
+# credentials out of the API's write reach.
+resource "google_project_iam_member" "api_hosted_secret_admin" {
+  project = var.project_id
+  role    = "roles/secretmanager.admin"
+  member  = "serviceAccount:${google_service_account.api.email}"
+
+  condition {
+    title       = "hosted-user-secrets-admin"
+    description = "Manage hosted user secrets; project clause is required for secret creation."
+    expression  = "resource.type == \"cloudresourcemanager.googleapis.com/Project\" || resource.name.startsWith(\"projects/${data.google_project.current.number}/secrets/${local.hosted_secrets_prefix}-\")"
+  }
+}
+
+# Runners resolve hosted user secrets at attempt time, and nothing else:
+# without the prefix condition a project-level accessor grant would let any
+# runner VM read control-plane credentials such as the database URLs.
+resource "google_project_iam_member" "runner_hosted_secret_accessor" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.runner.email}"
+
+  condition {
+    title       = "hosted-user-secrets-read"
+    description = "Runner VMs may only access hosted user secrets, never control-plane credentials."
+    expression  = "resource.name.startsWith(\"projects/${data.google_project.current.number}/secrets/${local.hosted_secrets_prefix}-\")"
+  }
+}
+
 resource "google_artifact_registry_repository_iam_member" "runner_image_reader" {
   project    = var.project_id
   location   = google_artifact_registry_repository.cloud.location
@@ -664,6 +704,21 @@ resource "google_cloud_run_v2_service" "api" {
       env {
         name  = "BUCEPHALUS_CLOUD_OAUTH_JWKS_URL"
         value = var.oauth_jwks_url
+      }
+
+      env {
+        name  = "BUCEPHALUS_CLOUD_SECRETS_BACKEND"
+        value = "gcp"
+      }
+
+      env {
+        name  = "BUCEPHALUS_CLOUD_SECRETS_GCP_PROJECT"
+        value = var.project_id
+      }
+
+      env {
+        name  = "BUCEPHALUS_CLOUD_SECRETS_PREFIX"
+        value = local.hosted_secrets_prefix
       }
 
       env {
