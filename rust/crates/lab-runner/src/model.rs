@@ -226,6 +226,10 @@ pub(crate) struct KnobDef {
     pub(crate) minimum: Option<f64>,
     #[serde(default)]
     pub(crate) maximum: Option<f64>,
+    #[serde(default)]
+    pub(crate) step: Option<f64>,
+    #[serde(default)]
+    pub(crate) autotune: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

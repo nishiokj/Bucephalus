@@ -1,0 +1,156 @@
+experiment:
+  id: lm_eval_bbh_date_nova
+  name: lm-eval BBH Date Understanding Nova
+  mode: answer
+  description: >-
+    Runs Nova on a small lm-evaluation-harness Open LLM Leaderboard BBH
+    date_understanding slice and scores extracted generated answers against the
+    benchmark target labels.
+  tags: [lm-evaluation-harness, bbh, date-understanding, nova, open-source-benchmark]
+
+runtime:
+  compute: { backend: local-docker }
+  secrets:
+    - { name: OPENAI_API_KEY, from: env }
+  network:
+    task_sandbox: full
+    agent: full
+    egress: [api.openai.com]
+
+externals:
+  apis: [api.openai.com]
+  credentials: [OPENAI_API_KEY]
+
+matrix:
+  variants:
+    - id: nova_gpt_5_5
+      baseline: true
+      config:
+        provider: openai
+        model: gpt-5.5
+  cases:
+    source: file
+    path: cases.jsonl
+  repeats: 1
+
+scheduling:
+  max_concurrency: 1
+  random_seed: 1
+  comparison: none
+
+stages:
+  case:
+    interface: writable_workspace
+    workspace:
+      source: container_image
+      image: { from: case_row }
+      workdir: { from: case_row }
+  agent:
+    mount:
+      source: .
+      mount:
+        path: /opt/lm-eval-bbh-date-nova
+        read_only: true
+    command:
+      - /usr/local/bin/nova
+      - run
+      - --input-file
+      - /bucephalus/in/trial_input.json
+      - --output
+      - /bucephalus/out/result.json
+      - --events
+      - /bucephalus-events/trajectory.jsonl
+      - --config
+      - /opt/lm-eval-bbh-date-nova/agent/nova-config.json
+      - --working-dir
+      - /bucephalus/workspace
+      - --timeout-ms
+      - "240000"
+      - --provider
+      - "$provider"
+      - --model
+      - "$model"
+    env:
+      OPENAI_API_KEY: "$OPENAI_API_KEY"
+    outputs:
+      nova_stdout:
+        capture:
+          type: file
+          path: /bucephalus/out/nova/stdout.log
+          format: text
+          required: false
+      nova_stderr:
+        capture:
+          type: file
+          path: /bucephalus/out/nova/stderr.log
+          format: text
+          required: false
+  execution:
+    agent_site: task_runtime
+  grader:
+    strategy: in_task_runtime
+    in_task_runtime: {}
+    command:
+      - python3
+      - ./grader/grade_bbh_date.py
+      - --trial-input
+      - /bucephalus/in/trial_input.json
+      - --nova-result
+      - /bucephalus/out/result.json
+      - --out
+      - /bucephalus/out/lm_eval_bbh_date_score.json
+    outputs:
+      score:
+        capture:
+          type: file
+          path: /bucephalus/out/lm_eval_bbh_date_score.json
+          format: json
+          required: true
+
+metrics:
+  - id: smoke_ok
+    label: Smoke OK
+    value_type: number
+    direction: maximize
+    from: grader.score.smoke_ok
+  - id: exact_match
+    label: Exact Match
+    semantic_key: quality.exact_match
+    value_type: number
+    direction: maximize
+    primary: true
+    from: grader.score.exact_match
+  - id: answer_extracted
+    label: Answer Extracted
+    value_type: number
+    direction: maximize
+    from: grader.score.answer_extracted
+  - id: model_calls
+    label: Model Calls
+    value_type: number
+    direction: minimize
+    from: grader.score.model_calls
+  - id: tokens_in
+    label: Input Tokens
+    value_type: number
+    direction: minimize
+    from: grader.score.tokens_in
+  - id: tokens_out
+    label: Output Tokens
+    value_type: number
+    direction: minimize
+    from: grader.score.tokens_out
+  - id: latency_ms
+    label: Latency
+    value_type: number
+    unit: ms
+    direction: minimize
+    from: grader.score.latency_ms
+
+policy:
+  timeout_ms: 300000
+  sanitization_profile: standard_runtime
+  task_sandbox:
+    resources:
+      cpu_count: 2
+      memory_mb: 2048

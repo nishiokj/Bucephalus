@@ -1507,6 +1507,7 @@ fn read_json_or_yaml_value(path: &Path) -> Result<Value> {
     if let Ok(value) = serde_json::from_str::<Value>(&data) {
         return Ok(value);
     }
+    lab_runner::reject_duplicate_yaml_mapping_keys(&data, path)?;
     let yaml_value: serde_yaml::Value = serde_yaml::from_str(&data)
         .with_context(|| format!("failed to parse '{}' as JSON or YAML", path.display()))?;
     serde_json::to_value(yaml_value)
@@ -7466,15 +7467,34 @@ fn recover_result_to_json(result: &lab_runner::RecoverResult) -> Value {
 fn parse_set_bindings(values: &[String]) -> Result<BTreeMap<String, Value>> {
     let mut out = BTreeMap::new();
     for raw in values {
-        let (key, val_raw) = parse_key_value_arg("--set", raw, "KEY=VALUE")?;
-        if key.trim().is_empty() {
+        let (key_raw, val_raw) = parse_key_value_arg("--set", raw, "KEY=VALUE")?;
+        if key_raw.trim().is_empty() {
             return Err(anyhow!("invalid --set entry: key cannot be empty"));
+        }
+        validate_cli_set_key(key_raw)
+            .map_err(|err| anyhow!("invalid --set key '{}': {}", key_raw, err))?;
+        if out.contains_key(key_raw) {
+            return Err(anyhow!("duplicate --set key '{}'", key_raw));
         }
         let parsed =
             serde_json::from_str::<Value>(val_raw).unwrap_or(Value::String(val_raw.to_string()));
-        out.insert(key.to_string(), parsed);
+        out.insert(key_raw.to_string(), parsed);
     }
     Ok(out)
+}
+
+fn validate_cli_set_key(key: &str) -> Result<()> {
+    for segment in key.split('.') {
+        if segment.trim().is_empty() {
+            return Err(anyhow!("dotted path segments cannot be empty"));
+        }
+        if segment.trim() != segment {
+            return Err(anyhow!(
+                "dotted path segments cannot contain leading or trailing whitespace"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_key_value_arg<'a>(flag: &str, raw: &'a str, expected: &str) -> Result<(&'a str, &'a str)> {
@@ -7532,6 +7552,9 @@ fn parse_secret_file_bindings(values: &[String]) -> Result<BTreeMap<String, Path
                 "invalid --secret-file id '{}': path cannot be empty",
                 key
             ));
+        }
+        if out.contains_key(key) {
+            return Err(anyhow!("duplicate --secret-file id '{}'", key));
         }
         out.insert(key.to_string(), PathBuf::from(value));
     }
@@ -12028,6 +12051,63 @@ mod tests {
     }
 
     #[test]
+    fn cli_set_bindings_reject_duplicate_keys() {
+        let err = parse_set_bindings(&["model=temp".to_string(), "model=other".to_string()])
+            .expect_err("duplicate --set keys should fail")
+            .to_string();
+
+        assert!(err.contains("duplicate --set key 'model'"));
+    }
+
+    #[test]
+    fn cli_set_bindings_reject_empty_path_segments() {
+        for raw in ["model.=temp", ".model=temp", "model..name=temp"] {
+            let err = parse_set_bindings(&[raw.to_string()])
+                .expect_err("malformed --set dotted paths should fail")
+                .to_string();
+
+            assert!(
+                err.contains("invalid --set key")
+                    && err.contains("dotted path segments cannot be empty"),
+                "unexpected error for {raw}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_set_bindings_reject_padded_path_segments() {
+        for raw in [
+            " model=temp",
+            "model =temp",
+            "model. name=temp",
+            "model.name =temp",
+        ] {
+            let err = parse_set_bindings(&[raw.to_string()])
+                .expect_err("padded --set dotted paths should fail")
+                .to_string();
+
+            assert!(
+                err.contains("invalid --set key") && err.contains("leading or trailing whitespace"),
+                "unexpected error for {raw}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_secret_file_bindings_reject_duplicate_ids() {
+        let err = parse_secret_file_bindings(&[
+            "codex_oauth=/tmp/first".to_string(),
+            "codex_oauth=/tmp/second".to_string(),
+        ])
+        .expect_err("duplicate --secret-file ids should fail")
+        .to_string();
+
+        assert!(err.contains("duplicate --secret-file id 'codex_oauth'"));
+        assert!(!err.contains("/tmp/first"));
+        assert!(!err.contains("/tmp/second"));
+    }
+
+    #[test]
     fn parse_run_validation_choice_maps_expected_actions() {
         assert_eq!(
             parse_run_validation_choice("1").unwrap(),
@@ -13668,6 +13748,37 @@ mod tests {
             .unwrap_or_default();
 
         assert!(errors.is_empty(), "unexpected schema errors: {errors:?}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn schema_validate_reader_rejects_duplicate_yaml_keys() {
+        let root = unique_test_dir("schema_validate_duplicate_yaml_keys");
+        fs::create_dir_all(&root).expect("root dir");
+        let experiment = root.join("experiment.yaml");
+        fs::write(
+            &experiment,
+            r#"
+experiment:
+  id: e
+runtime:
+  network:
+    default: none
+runtime:
+  compute:
+    backend: local-docker
+"#,
+        )
+        .expect("experiment yaml");
+
+        let err = read_json_or_yaml_value(&experiment)
+            .expect_err("schema reader should reject duplicate YAML keys");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("duplicate mapping key") && msg.contains("duplicate key 'runtime' at /"),
+            "unexpected error: {msg}"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

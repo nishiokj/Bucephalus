@@ -70,6 +70,81 @@ fn run_id_from_run_dir(run_dir: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("unable to infer run_id from {}", run_dir.display()))
 }
 
+fn load_recorded_resolved_experiment(run_dir: &Path) -> Result<Value> {
+    let resolved_path = run_dir.join("resolved_experiment.json");
+    let digest_path = run_dir.join("resolved_experiment.digest");
+    let json_value: Value =
+        serde_json::from_slice(&fs::read(&resolved_path).with_context(|| {
+            format!(
+                "failed to read recorded resolved experiment {}",
+                resolved_path.display()
+            )
+        })?)
+        .with_context(|| {
+            format!(
+                "failed to parse recorded resolved experiment {}",
+                resolved_path.display()
+            )
+        })?;
+    let recorded_digest = fs::read_to_string(&digest_path).with_context(|| {
+        format!(
+            "missing recorded resolved experiment digest: {}",
+            digest_path.display()
+        )
+    })?;
+    if recorded_digest.trim() != recorded_digest {
+        return Err(anyhow!(
+            "recorded resolved experiment digest contains leading or trailing whitespace: {}",
+            digest_path.display()
+        ));
+    }
+    if recorded_digest.is_empty() {
+        return Err(anyhow!(
+            "recorded resolved experiment digest is empty: {}",
+            digest_path.display()
+        ));
+    }
+    let actual_digest = canonical_json_digest(&json_value);
+    if recorded_digest != actual_digest {
+        return Err(anyhow!(
+            "recorded resolved experiment digest mismatch in {}: recorded {}, computed {}",
+            digest_path.display(),
+            recorded_digest,
+            actual_digest
+        ));
+    }
+    Ok(json_value)
+}
+
+fn build_schedule_for_run_behavior(
+    behavior: &RunBehavior,
+    variant_count: usize,
+    task_count: usize,
+    replications: usize,
+    scheduling: SchedulingPolicy,
+    random_seed: u64,
+) -> Result<Vec<TrialSlot>> {
+    if behavior.smoke_test {
+        if task_count == 0 {
+            return Err(anyhow!("smoke test requires at least one task"));
+        }
+        return Ok((0..variant_count)
+            .map(|variant_idx| TrialSlot {
+                variant_idx,
+                task_idx: 0,
+                repl_idx: 0,
+            })
+            .collect());
+    }
+    Ok(build_trial_schedule(
+        variant_count,
+        task_count,
+        replications,
+        scheduling,
+        random_seed,
+    ))
+}
+
 pub fn continue_run_with_options(
     run_dir: &Path,
     options: RunExecutionOptions,
@@ -136,8 +211,8 @@ pub fn continue_run_with_options(
         ));
     }
 
+    let json_value = load_recorded_resolved_experiment(&run_dir)?;
     let resolved_path = run_dir.join("resolved_experiment.json");
-    let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let policy_config = parse_policies(&json_value)?;
     let max_concurrency = experiment_max_concurrency(&json_value)?;
     let project_root = run_session.project_root.canonicalize().with_context(|| {
@@ -158,7 +233,6 @@ pub fn continue_run_with_options(
     }
 
     let (variants, baseline_id) = load_run_variants(&run_dir, &json_value)?;
-    write_resolved_variants(&run_dir, &json_value, &baseline_id, &variants)?;
     let exp_dir = resolved_path
         .parent()
         .ok_or_else(|| anyhow!("resolved_experiment.json has no parent directory"))?
@@ -168,25 +242,31 @@ pub fn continue_run_with_options(
     let replications = matrix_repeats(&json_value)?;
     let random_seed = experiment_random_seed(&json_value)?;
 
-    let reconstructed_schedule = build_trial_schedule(
+    let schedule = load_run_schedule(&run_dir)?;
+    if schedule != progress.schedule {
+        return Err(anyhow!(
+            "resolved schedule manifest does not match schedule progress; cannot safely continue (manifest {} slots vs progress {} slots)",
+            schedule.len(),
+            progress.schedule.len()
+        ));
+    }
+    let expected_schedule = build_schedule_for_run_behavior(
+        &behavior,
         variants.len(),
         tasks.len(),
         replications,
         policy_config.scheduling,
         random_seed,
-    );
+    )?;
 
-    if reconstructed_schedule != progress.schedule {
+    if expected_schedule != schedule {
         return Err(anyhow!(
-            "schedule mismatch — the experiment configuration has changed since this run was \
-             created; cannot safely continue (reconstructed {} slots vs stored {})",
-            reconstructed_schedule.len(),
-            progress.schedule.len()
+            "schedule mismatch — the experiment configuration has changed since this run was created; cannot safely continue (expected {} slots vs recorded {})",
+            expected_schedule.len(),
+            schedule.len()
         ));
     }
 
-    let schedule = reconstructed_schedule;
-    write_resolved_schedule(&run_dir, &schedule)?;
     open_schedule_slot_store(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
     let materialize_mode = resolved_materialization_mode(&execution);
 
@@ -2670,26 +2750,14 @@ pub(crate) fn run_experiment_with_behavior(
     let policy_config = parse_policies(&json_value)?;
     let max_concurrency = experiment_max_concurrency(&json_value)?;
     let random_seed = experiment_random_seed(&json_value)?;
-    let schedule = if behavior.smoke_test {
-        if tasks.is_empty() {
-            return Err(anyhow!("smoke test requires at least one task"));
-        }
-        (0..variants.len())
-            .map(|variant_idx| TrialSlot {
-                variant_idx,
-                task_idx: 0,
-                repl_idx: 0,
-            })
-            .collect::<Vec<_>>()
-    } else {
-        build_trial_schedule(
-            variants.len(),
-            tasks.len(),
-            replications,
-            policy_config.scheduling,
-            random_seed,
-        )
-    };
+    let schedule = build_schedule_for_run_behavior(
+        &behavior,
+        variants.len(),
+        tasks.len(),
+        replications,
+        policy_config.scheduling,
+        random_seed,
+    )?;
     write_resolved_schedule(&run_dir, &schedule)?;
     open_schedule_slot_store(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
     emit_run_log(
@@ -3263,14 +3331,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
     let run_id = run_id_from_run_dir(&run_dir)?;
-    let resolved_path = run_dir.join("resolved_experiment.json");
-    if !resolved_path.exists() {
-        return Err(anyhow!(
-            "missing resolved_experiment.json in {}",
-            run_dir.display()
-        ));
-    }
-    let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
+    let json_value = load_recorded_resolved_experiment(&run_dir)?;
     let parent_trial_dir = run_dir.join("trials").join(trial_id);
     let prepared_manifest = load_prepared_task_environment_manifest(&parent_trial_dir)?;
     let (variants, _) = load_run_variants(&run_dir, &json_value)?;
@@ -3542,14 +3603,7 @@ pub(crate) fn fork_trial_inner(
     let run_dir = run_dir
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
-    let resolved_path = run_dir.join("resolved_experiment.json");
-    if !resolved_path.exists() {
-        return Err(anyhow!(
-            "missing resolved_experiment.json in {}",
-            run_dir.display()
-        ));
-    }
-    let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
+    let json_value = load_recorded_resolved_experiment(&run_dir)?;
     let parsed_selector = parse_fork_selector(selector)?;
 
     let run_id = run_id_from_run_dir(&run_dir)?;
@@ -4299,14 +4353,51 @@ pub(crate) fn apply_variant_binding_overrides(
         return Ok(());
     }
     if !variant.bindings.is_object() {
-        variant.bindings = json!({});
+        return Err(anyhow!(
+            "variant '{}' config must be an object before applying --set overrides",
+            variant.id
+        ));
     }
     for (key, value) in set_bindings {
-        let pointer = format!("/{}", key.split('.').collect::<Vec<_>>().join("/"));
+        let pointer = set_binding_key_json_pointer(key)?;
+        if variant.bindings.pointer(&pointer).is_none() {
+            return Err(anyhow!(
+                "variant '{}' config has no field for --set key '{}'; --set only patches declared config fields",
+                variant.id,
+                key
+            ));
+        }
         set_json_pointer_value(&mut variant.bindings, &pointer, value.clone())?;
     }
     Ok(())
 }
+
+fn set_binding_key_json_pointer(key: &str) -> Result<String> {
+    if key.trim().is_empty() {
+        return Err(anyhow!(
+            "invalid --set key '{}': dotted path segments cannot be empty",
+            key
+        ));
+    }
+    let mut tokens = Vec::new();
+    for segment in key.split('.') {
+        if segment.trim().is_empty() {
+            return Err(anyhow!(
+                "invalid --set key '{}': dotted path segments cannot be empty",
+                key
+            ));
+        }
+        if segment.trim() != segment {
+            return Err(anyhow!(
+                "invalid --set key '{}': dotted path segments cannot contain leading or trailing whitespace",
+                key
+            ));
+        }
+        tokens.push(segment.replace('~', "~0").replace('/', "~1"));
+    }
+    Ok(format!("/{}", tokens.join("/")))
+}
+
 pub(crate) fn tokenize_command_string(raw: &str) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
     let mut current = String::new();

@@ -23,6 +23,10 @@ import {
   controlPlaneSecretIdViolation,
   controlPlaneSecretRefViolation,
 } from "../secrets/policy";
+import type { CloudSecretRepository } from "../secrets/repository";
+import { SECRET_NAME_PATTERN } from "../secrets/store";
+
+const HOSTED_SECRET_REF_PREFIX = "bucephalus://";
 
 interface CloudSecretRequirement {
   id: string;
@@ -39,6 +43,7 @@ export async function handleRunRoute(
   runners: RunnerRepository,
   workerToken: string,
   auth?: AuthContext | null,
+  secrets?: CloudSecretRepository,
 ): Promise<Response | null> {
   const ownerKey = authOwnerKey(auth);
   if (request.method === "POST" && url.pathname === "/v1/worker/runs/claim") {
@@ -106,7 +111,7 @@ export async function handleRunRoute(
   }
 
   if (request.method === "POST" && url.pathname === "/v1/runs") {
-    return createRun(request, packages, runs, runners, ownerKey);
+    return createRun(request, packages, runs, runners, ownerKey, secrets);
   }
 
   if (request.method === "GET" && url.pathname === "/v1/runs") {
@@ -303,6 +308,7 @@ async function createRun(
   runs: RunRepository,
   runners: RunnerRepository,
   ownerKey?: string,
+  secrets?: CloudSecretRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
   const packageDigest = requireString(body.package_digest, "/package_digest");
@@ -328,7 +334,7 @@ async function createRun(
     packageDigest,
     runLabel: optionalString(body.run_label, "/run_label"),
     env: requireStringMap(body.env, "/env"),
-    secretRefs,
+    secretRefs: await resolveHostedSecretRefs(secretRefs, secrets, ownerKey),
     runtimeOptions,
     ownerKey,
     runRequirements,
@@ -585,7 +591,7 @@ function cloudSecretRefs(secretRefs: Record<string, string>): Record<string, str
       throw new HttpError(
         400,
         "unsupported_cloud_secret_ref",
-        `Unsupported Cloud secret ref for '${id}'. Use gcp-secret-manager://... or aws-secrets-manager://...`,
+        `Unsupported Cloud secret ref for '${id}'. Use bucephalus://<name> for hosted secrets, gcp-secret-manager://..., or aws-secrets-manager://...`,
       );
     }
     if (!allowControlPlaneRefs) {
@@ -605,7 +611,42 @@ function cloudSecretRefs(secretRefs: Record<string, string>): Record<string, str
 
 function supportedCloudSecretRef(value: string): boolean {
   const ref = value.trim();
-  return ref.startsWith("gcp-secret-manager://") || ref.startsWith("aws-secrets-manager://");
+  return ref.startsWith(HOSTED_SECRET_REF_PREFIX)
+    || ref.startsWith("gcp-secret-manager://")
+    || ref.startsWith("aws-secrets-manager://");
+}
+
+// Hosted refs are resolved to backing provider refs at run creation, so the
+// stored run (and the worker claim payload built from it) only ever carries
+// refs the attempt-scoped secret resolver understands.
+async function resolveHostedSecretRefs(
+  secretRefs: Record<string, string>,
+  secrets: CloudSecretRepository | undefined,
+  ownerKey: string | undefined,
+): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const [id, ref] of Object.entries(secretRefs)) {
+    if (!ref.startsWith(HOSTED_SECRET_REF_PREFIX)) {
+      out[id] = ref;
+      continue;
+    }
+    const name = ref.slice(HOSTED_SECRET_REF_PREFIX.length);
+    if (!SECRET_NAME_PATTERN.test(name)) {
+      throw new HttpError(400, "unsupported_cloud_secret_ref", `Invalid hosted secret name in ref '${ref}'`);
+    }
+    if (!secrets || !ownerKey) {
+      throw new HttpError(400, "hosted_secrets_unavailable", "Hosted secret refs require an authenticated owner");
+    }
+    const record = await secrets.getSecret(ownerKey, name);
+    if (!record) {
+      throw new HttpError(400, "unknown_hosted_secret", `No hosted secret named '${name}'. Upload it with PUT /v1/secrets/${name} first.`, {
+        secret_id: id,
+        secret_name: name,
+      });
+    }
+    out[id] = record.backing_ref;
+  }
+  return out;
 }
 
 function rejectUnsupportedCloudTrialRuntime(

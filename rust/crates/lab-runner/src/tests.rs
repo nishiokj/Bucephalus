@@ -121,7 +121,7 @@ mod tests {
         parse_large_file_threshold_bytes, put_file_in_package_cas, read_cas_pointer,
         should_include_agent_artifact_path, write_cas_pointer, PACKAGE_BLOBS_DIR,
     };
-    use crate::package::checks::{check_package, PACKAGE_CHECKS_SCHEMA_VERSION};
+    use crate::package::checks::{check_package, PACKAGE_CHECKS_FILE, PACKAGE_CHECKS_SCHEMA_VERSION};
     use crate::package::compile::*;
     use crate::package::prepared_image::*;
     use crate::package::registry::load_grader_capability_manifest;
@@ -2929,6 +2929,11 @@ mod tests {
         let resolved = with_resolved_schema_defaults(resolved);
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
             .expect("write resolved");
+        atomic_write_bytes(
+            &run_dir.join("resolved_experiment.digest"),
+            canonical_json_digest(&resolved).as_bytes(),
+        )
+        .expect("write resolved digest");
         let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
         write_resolved_variants(run_dir, &resolved, &baseline_id, &variants)
             .expect("write resolved variants");
@@ -3009,6 +3014,11 @@ mod tests {
         let resolved = with_resolved_schema_defaults(resolved);
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
             .expect("write resolved");
+        atomic_write_bytes(
+            &run_dir.join("resolved_experiment.digest"),
+            canonical_json_digest(&resolved).as_bytes(),
+        )
+        .expect("write resolved digest");
         let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
         write_resolved_variants(run_dir, &resolved, &baseline_id, &variants)
             .expect("write resolved variants");
@@ -3286,12 +3296,13 @@ mod tests {
             total_slots: schedule.len(),
             next_schedule_index: 0,
             next_trial_index: 0,
-            schedule,
+            schedule: schedule.clone(),
             completed_slots: Vec::new(),
             pruned_variants: Vec::new(),
             consecutive_failures: BTreeMap::new(),
             updated_at: Utc::now().to_rfc3339(),
         };
+        write_resolved_schedule(&run_dir, &schedule).expect("resolved schedule");
         write_schedule_progress(&run_dir, &schedule_progress).expect("schedule progress");
         write_run_session_state(
             &run_dir,
@@ -3907,6 +3918,76 @@ mod tests {
             .manifest
             .validate()
             .expect("prepared manifest validates");
+    }
+
+    #[test]
+    fn prepared_task_environment_rejects_schema_invalid_prepared_runtime_image_map() {
+        let _lock = lock_runtime_control_tests();
+        let _prepared_map_env =
+            EnvVarGuard::set(&[("BUCEPHALUS_PREPARED_RUNTIME_IMAGE_MAP", None)]);
+        let root = TempDirGuard::new("bucephalus_bad_prepared_runtime_image_map");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        let artifact = root.path.join("agent-linux-x64.tar.gz");
+        fs::write(&artifact, b"agent-runtime").expect("agent artifact");
+        let artifact_digest = sha256_file(&artifact).expect("artifact digest");
+        let map_path = root.path.join(PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH);
+        ensure_dir(map_path.parent().expect("map parent")).expect("map parent");
+        fs::write(
+            &map_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "prepared_runtime_image_map_v1",
+                "generated_at": "",
+                "entries": [
+                    {
+                        "base_image": "python:3.11-slim",
+                        "agent_artifact_digest": artifact_digest,
+                        "agent_artifact_mount_path": "/opt/agent",
+                        "runner_contract_version": PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION,
+                        "prepared_image": "ghcr.io/acme/python-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                ]
+            }))
+            .expect("map json"),
+        )
+        .expect("write map");
+
+        let mut runtime = legacy_contract_runtime_fixture();
+        runtime.agent_artifact = Some(artifact);
+        runtime.agent_artifact_mount_path = Some("/opt/agent".to_string());
+        runtime.agent_artifact_digest = Some(artifact_digest);
+        runtime.agent_artifact_read_only = true;
+        let variant = Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
+        let task_boundary = runtime_task_boundary(
+            json!({"id": "task_1"}),
+            "python:3.11-slim",
+            "/workspace/task",
+            Some(30_000),
+        );
+
+        let err = match prepare_task_environment_for_test(
+            &root.path,
+            &trial_dir,
+            &task_runtime_experiment_fixture(30_000),
+            &variant,
+            &task_boundary,
+            &runtime,
+        ) {
+            Ok(_) => panic!("schema-invalid prepared runtime image map should fail"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("prepared_runtime_image_map_v1 schema validation failed"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -4535,6 +4616,14 @@ mod tests {
         resolved["runtime"]["network"]["task_sandbox"] = json!("full");
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
             .expect("resolved");
+        atomic_write_bytes(
+            &run_dir.join("resolved_experiment.digest"),
+            canonical_json_digest(&resolved).as_bytes(),
+        )
+        .expect("resolved digest");
+        let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
+        write_resolved_variants(&run_dir, &resolved, &baseline_id, &variants)
+            .expect("resolved variants");
         write_test_run_control(&run_dir, "run_1", "failed", None, None);
         let schedule =
             build_trial_schedule(1, 1, 1, parse_policies(&resolved).unwrap().scheduling, 1);
@@ -4544,12 +4633,13 @@ mod tests {
             total_slots: schedule.len(),
             next_schedule_index: 0,
             next_trial_index: 0,
-            schedule,
+            schedule: schedule.clone(),
             completed_slots: Vec::new(),
             pruned_variants: Vec::new(),
             consecutive_failures: BTreeMap::new(),
             updated_at: Utc::now().to_rfc3339(),
         };
+        write_resolved_schedule(&run_dir, &schedule).expect("resolved schedule");
         write_schedule_progress(&run_dir, &schedule_progress).expect("progress");
         let behavior = RunBehavior {
             network_mode_override: None,
@@ -4565,6 +4655,74 @@ mod tests {
                 .contains("strict run requires network mode 'none'"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn continue_run_rejects_missing_resolved_schedule_manifest() {
+        let (_root, run_dir) = seed_continuable_container_run("bucephalus_continue_missing_schedule");
+        fs::remove_file(run_dir.join("resolved_schedule.json")).expect("remove schedule manifest");
+
+        let err = continue_run(&run_dir).expect_err("continue must require recorded schedule");
+        assert!(
+            err.to_string()
+                .contains("missing resolved schedule manifest"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn continue_run_rejects_missing_resolved_experiment_digest() {
+        let (_root, run_dir) =
+            seed_continuable_container_run("bucephalus_continue_missing_resolved_digest");
+        fs::remove_file(run_dir.join("resolved_experiment.digest"))
+            .expect("remove resolved digest");
+
+        let err = continue_run(&run_dir).expect_err("continue must require resolved digest");
+        assert!(
+            err.to_string()
+                .contains("missing recorded resolved experiment digest"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn continue_run_rejects_resolved_experiment_digest_mismatch() {
+        let (_root, run_dir) =
+            seed_continuable_container_run("bucephalus_continue_resolved_digest_mismatch");
+        atomic_write_bytes(
+            &run_dir.join("resolved_experiment.digest"),
+            b"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("write bad resolved digest");
+
+        let err = continue_run(&run_dir).expect_err("continue must verify resolved digest");
+        assert!(
+            err.to_string()
+                .contains("recorded resolved experiment digest mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn continue_run_rejects_resolved_schedule_progress_mismatch() {
+        let (_root, run_dir) =
+            seed_continuable_container_run("bucephalus_continue_schedule_progress_mismatch");
+        write_resolved_schedule(
+            &run_dir,
+            &[TrialSlot {
+                variant_idx: 0,
+                task_idx: 1,
+                repl_idx: 0,
+            }],
+        )
+        .expect("write mismatched resolved schedule");
+
+        let err = continue_run(&run_dir).expect_err("continue must verify recorded schedule");
+        assert!(
+            err.to_string()
+                .contains("resolved schedule manifest does not match schedule progress"),
+            "unexpected error: {err}"
         );
     }
 
@@ -5836,6 +5994,44 @@ mod tests {
     }
 
     #[test]
+    fn replay_trial_rejects_missing_resolved_experiment_digest() {
+        let (_root, run_dir) = create_run_dir("bucephalus_replay_missing_resolved_digest", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        fs::remove_file(run_dir.join("resolved_experiment.digest"))
+            .expect("remove resolved digest");
+        seed_parent_trial(&run_dir, "trial_1", json!([]), "completed", None);
+
+        let err = replay_trial(&run_dir, "trial_1", false)
+            .expect_err("replay must require recorded resolved digest");
+        assert!(
+            err.to_string()
+                .contains("missing recorded resolved experiment digest"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn replay_trial_rejects_resolved_experiment_digest_mismatch() {
+        let (_root, run_dir) =
+            create_run_dir("bucephalus_replay_resolved_digest_mismatch", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        atomic_write_bytes(
+            &run_dir.join("resolved_experiment.digest"),
+            b"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("write bad resolved digest");
+        seed_parent_trial(&run_dir, "trial_1", json!([]), "completed", None);
+
+        let err = replay_trial(&run_dir, "trial_1", false)
+            .expect_err("replay must verify recorded resolved digest");
+        assert!(
+            err.to_string()
+                .contains("recorded resolved experiment digest mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn fork_trial_requires_prepared_environment_manifest_without_legacy_input_only() {
         let (_root, run_dir) = create_run_dir("bucephalus_fork_missing_env_manifest", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
@@ -5873,6 +6069,68 @@ mod tests {
             !msg.contains("input_only"),
             "fork should not advertise legacy input_only mode, got: {}",
             msg
+        );
+    }
+
+    #[test]
+    fn fork_trial_rejects_missing_resolved_experiment_digest() {
+        let (_root, run_dir) = create_run_dir("bucephalus_fork_missing_resolved_digest", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        fs::remove_file(run_dir.join("resolved_experiment.digest"))
+            .expect("remove resolved digest");
+        seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([{"path": format!("{}/cp1", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
+            "completed",
+            None,
+        );
+
+        let err = fork_trial(
+            &run_dir,
+            "trial_1",
+            "checkpoint:cp1",
+            &BTreeMap::new(),
+            false,
+        )
+        .expect_err("fork must require recorded resolved digest");
+        assert!(
+            err.to_string()
+                .contains("missing recorded resolved experiment digest"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn fork_trial_rejects_resolved_experiment_digest_mismatch() {
+        let (_root, run_dir) =
+            create_run_dir("bucephalus_fork_resolved_digest_mismatch", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        atomic_write_bytes(
+            &run_dir.join("resolved_experiment.digest"),
+            b"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("write bad resolved digest");
+        seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([{"path": format!("{}/cp1", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
+            "completed",
+            None,
+        );
+
+        let err = fork_trial(
+            &run_dir,
+            "trial_1",
+            "checkpoint:cp1",
+            &BTreeMap::new(),
+            false,
+        )
+        .expect_err("fork must verify recorded resolved digest");
+        assert!(
+            err.to_string()
+                .contains("recorded resolved experiment digest mismatch"),
+            "unexpected error: {err}"
         );
     }
 
@@ -6370,6 +6628,1391 @@ mod tests {
     }
 
     #[test]
+    fn load_knob_manifest_rejects_duplicate_ids() {
+        let guard = TempDirGuard::new("knob_manifest_duplicate_ids");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [
+                    {
+                        "id": "temperature",
+                        "json_pointer": "/matrix/variants/0/config/temperature",
+                        "type": "number"
+                    },
+                    {
+                        "id": "temperature",
+                        "json_pointer": "/policy/timeout_ms",
+                        "type": "integer"
+                    }
+                ]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("duplicate knob ids must not shadow earlier definitions");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("duplicates knob id 'temperature'")
+                && msg.contains("knob ids must be unique"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_empty_knobs() {
+        let guard = TempDirGuard::new("knob_manifest_empty_knobs");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": []
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("knob manifests must declare at least one knob");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("knob manifest schema validation failed")
+                && msg.contains("has less than 1 item"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_whitespace_knob_ids() {
+        let guard = TempDirGuard::new("knob_manifest_whitespace_ids");
+        for (idx, (id, expected)) in [
+            (
+                "   ",
+                "declares blank knob id at knobs[0]; knob ids must be non-empty after trimming whitespace",
+            ),
+            (
+                " temperature ",
+                "declares knob id ' temperature ' with leading or trailing whitespace",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let manifest_path = guard.path.join(format!("manifest-{idx}.json"));
+            fs::write(
+                &manifest_path,
+                serde_json::to_string(&json!({
+                    "schema_version": "knob_manifest_v1",
+                    "knobs": [{
+                        "id": id,
+                        "json_pointer": "/matrix/variants/0/config/temperature",
+                        "type": "number"
+                    }]
+                }))
+                .expect("manifest json"),
+            )
+            .expect("write manifest");
+
+            let err = load_knob_manifest(&manifest_path)
+                .expect_err("whitespace knob ids must fail at manifest load");
+            let msg = err.to_string();
+
+            assert!(msg.contains(expected), "{id:?}: unexpected error: {msg}");
+        }
+    }
+
+    #[test]
+    fn apply_experiment_overrides_rejects_duplicate_knob_manifest_ids() {
+        let guard = TempDirGuard::new("apply_overrides_duplicate_knob_ids");
+        let manifest_dir = guard.path.join(".lab").join("knobs");
+        ensure_dir(&manifest_dir).expect("manifest dir");
+        let manifest_path = manifest_dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [
+                    {
+                        "id": "temperature",
+                        "json_pointer": "/matrix/variants/0/config/temperature",
+                        "type": "number"
+                    },
+                    {
+                        "id": "temperature",
+                        "json_pointer": "/policy/timeout_ms",
+                        "type": "integer"
+                    }
+                ]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "values": { "temperature": 0.7 }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let experiment = json!({
+            "experiment": { "id": "e" },
+            "matrix": {
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "temperature": 0.2 }
+                }]
+            },
+            "policy": { "timeout_ms": 600000 }
+        });
+        let err = apply_experiment_overrides(experiment, &overrides_path, &guard.path)
+            .expect_err("duplicate knob ids must fail before applying overrides");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("duplicates knob id 'temperature'")
+                && msg.contains("knob ids must be unique"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_duplicate_json_pointers() {
+        let guard = TempDirGuard::new("knob_manifest_duplicate_json_pointers");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [
+                    {
+                        "id": "temperature",
+                        "json_pointer": "/matrix/variants/0/config/temperature",
+                        "type": "number"
+                    },
+                    {
+                        "id": "temperature_alt",
+                        "json_pointer": "/matrix/variants/0/config/temperature",
+                        "type": "number"
+                    }
+                ]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("duplicate knob targets must not create order-dependent overrides");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("maps multiple knobs to json_pointer")
+                && msg.contains("/matrix/variants/0/config/temperature")
+                && msg.contains("each knob must target a unique field"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_duplicate_json_object_keys() {
+        let guard = TempDirGuard::new("knob_manifest_duplicate_json_keys");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            r#"{
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number",
+                    "type": "integer"
+                }]
+            }"#,
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("duplicate JSON keys must not be parsed with last-writer-wins behavior");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("duplicate JSON object key")
+                && msg.contains("duplicate key 'type' at /knobs/0"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_ambiguous_json_pointers() {
+        let guard = TempDirGuard::new("knob_manifest_ambiguous_json_pointers");
+        for (idx, (pointer, expected)) in [
+            ("/", "declares root json_pointer"),
+            (
+                "/matrix/variants/0/config/",
+                "empty path segments are not allowed",
+            ),
+            (
+                "/matrix/variants/0/config/bad~2key",
+                "'~' must be escaped as '~0' or '~1'",
+            ),
+            (
+                "/matrix/variants/01/config/temperature",
+                "numeric pointer segments must be canonical",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let manifest_path = guard.path.join(format!("manifest-{idx}.json"));
+            fs::write(
+                &manifest_path,
+                serde_json::to_string(&json!({
+                    "schema_version": "knob_manifest_v1",
+                    "knobs": [{
+                        "id": "temperature",
+                        "json_pointer": pointer,
+                        "type": "number"
+                    }]
+                }))
+                .expect("manifest json"),
+            )
+            .expect("write manifest");
+
+            let err = load_knob_manifest(&manifest_path)
+                .expect_err("ambiguous json_pointer shapes must fail at manifest load");
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(expected) && msg.contains("knob 'temperature'"),
+                "{pointer}: unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_knob_manifest_accepts_integer_options() {
+        let guard = TempDirGuard::new("knob_manifest_integer_options");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "max_steps",
+                    "json_pointer": "/matrix/variants/0/config/max_steps",
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "step": 1,
+                    "options": [1, 2, 5, 10]
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let manifest = load_knob_manifest(&manifest_path)
+            .expect("integer options should be valid knob manifest values");
+
+        assert_eq!(manifest.knobs[0].id, "max_steps");
+        assert_eq!(
+            manifest.knobs[0].options.as_ref().expect("options").len(),
+            4
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_accepts_array_and_object_options() {
+        let guard = TempDirGuard::new("knob_manifest_structured_options");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [
+                    {
+                        "id": "tools",
+                        "json_pointer": "/matrix/variants/0/config/tools",
+                        "type": "array",
+                        "options": [["bash"], ["bash", "python"]]
+                    },
+                    {
+                        "id": "limits",
+                        "json_pointer": "/matrix/variants/0/config/limits",
+                        "type": "object",
+                        "options": [
+                            {"max_steps": 1},
+                            {"max_steps": 2, "allow_network": false}
+                        ]
+                    }
+                ]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let manifest = load_knob_manifest(&manifest_path)
+            .expect("structured options should be valid for array/object knobs");
+
+        assert_eq!(manifest.knobs.len(), 2);
+        assert_eq!(manifest.knobs[0].id, "tools");
+        assert_eq!(manifest.knobs[1].id, "limits");
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_impossible_numeric_bounds() {
+        let guard = TempDirGuard::new("knob_manifest_impossible_numeric_bounds");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number",
+                    "minimum": 1.0,
+                    "maximum": 0.5
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("knob manifests must reject impossible numeric ranges");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("declares impossible bounds for knob 'temperature'")
+                && msg.contains("minimum 1")
+                && msg.contains("greater than maximum 0.5"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_non_numeric_bounds() {
+        let guard = TempDirGuard::new("knob_manifest_non_numeric_bounds");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "model",
+                    "json_pointer": "/matrix/variants/0/config/model",
+                    "type": "string",
+                    "minimum": 1
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("numeric bounds on non-numeric knobs must fail at declaration time");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("declares numeric controls for non-numeric knob 'model'")
+                && msg.contains("minimum, maximum, and step only apply"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_non_numeric_step() {
+        let guard = TempDirGuard::new("knob_manifest_non_numeric_step");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "model",
+                    "json_pointer": "/matrix/variants/0/config/model",
+                    "type": "string",
+                    "step": 1
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("step on non-numeric knobs must fail at declaration time");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("declares numeric controls for non-numeric knob 'model'")
+                && msg.contains("minimum, maximum, and step only apply"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_non_positive_step() {
+        let guard = TempDirGuard::new("knob_manifest_non_positive_step");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "step": 0
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("zero step must fail at declaration time");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("declares non-positive step for knob 'temperature'")
+                && msg.contains("step must be greater than 0"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_fractional_integer_controls() {
+        let guard = TempDirGuard::new("knob_manifest_fractional_integer_controls");
+        for (idx, (field, value)) in [
+            ("minimum", json!(1.5)),
+            ("maximum", json!(10.5)),
+            ("step", json!(0.5)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let manifest_path = guard.path.join(format!("manifest-{idx}.json"));
+            let mut knob = json!({
+                "id": "max_steps",
+                "json_pointer": "/matrix/variants/0/config/max_steps",
+                "type": "integer"
+            });
+            knob[field] = value;
+            fs::write(
+                &manifest_path,
+                serde_json::to_string(&json!({
+                    "schema_version": "knob_manifest_v1",
+                    "knobs": [knob]
+                }))
+                .expect("manifest json"),
+            )
+            .expect("write manifest");
+
+            let err = load_knob_manifest(&manifest_path)
+                .expect_err("integer knobs must declare integer numeric controls");
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(&format!("declares fractional {field} for integer knob 'max_steps'"))
+                    && msg.contains("integer minimum, maximum, and step values"),
+                "{field}: unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_unsupported_autotune() {
+        let guard = TempDirGuard::new("knob_manifest_unsupported_autotune");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "autotune": {
+                        "enabled": true,
+                        "requires_human_approval": true
+                    }
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("unsupported autotune declarations must not be ignored");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("declares autotune for knob 'temperature'")
+                && msg.contains("not supported by the build/package pipeline")
+                && msg.contains("explicit override values"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_invalid_options_contract() {
+        let guard = TempDirGuard::new("knob_manifest_invalid_options_contract");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "options": [0.2, "hot"]
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("knob options must match the declared knob type");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("option type mismatch for knob 'temperature'")
+                && msg.contains("options[1]")
+                && msg.contains("expected number, got string"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_duplicate_options() {
+        let guard = TempDirGuard::new("knob_manifest_duplicate_options");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number",
+                    "options": [0.2, 0.7, 0.2]
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("duplicate knob options must fail before overrides are applied");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("duplicates option for knob 'temperature'")
+                && msg.contains("options[0]")
+                && msg.contains("options[2]"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_semantically_duplicate_numeric_options() {
+        let guard = TempDirGuard::new("knob_manifest_semantic_duplicate_numeric_options");
+        for (idx, (value_type, pointer, options)) in [
+            (
+                "number",
+                "/matrix/variants/0/config/temperature",
+                r#"[1, 1.0]"#,
+            ),
+            (
+                "array",
+                "/matrix/variants/0/config/tools",
+                r#"[[1], [1.0]]"#,
+            ),
+            (
+                "object",
+                "/matrix/variants/0/config/limits",
+                r#"[{"max_steps": 1}, {"max_steps": 1.0}]"#,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let manifest_path = guard.path.join(format!("manifest-{idx}.json"));
+            fs::write(
+                &manifest_path,
+                format!(
+                    r#"{{
+                        "schema_version": "knob_manifest_v1",
+                        "knobs": [{{
+                            "id": "semantic_duplicate",
+                            "json_pointer": "{pointer}",
+                            "type": "{value_type}",
+                            "options": {options}
+                        }}]
+                    }}"#
+                ),
+            )
+            .expect("write manifest");
+
+            let err = load_knob_manifest(&manifest_path)
+                .expect_err("numeric option spellings that represent the same value must fail");
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains("duplicates option for knob 'semantic_duplicate'")
+                    && msg.contains("options[0]")
+                    && msg.contains("options[1]"),
+                "{value_type}: unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_options_outside_numeric_bounds() {
+        let guard = TempDirGuard::new("knob_manifest_options_outside_numeric_bounds");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "options": [0.2, 1.5]
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err = load_knob_manifest(&manifest_path)
+            .expect_err("knob options must respect declared numeric bounds");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("option for knob 'temperature'")
+                && msg.contains("options[1]")
+                && msg.contains("above maximum 1"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_knob_manifest_rejects_options_outside_step() {
+        let guard = TempDirGuard::new("knob_manifest_options_outside_step");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "step": 0.1,
+                    "options": [0.2, 0.25]
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let err =
+            load_knob_manifest(&manifest_path).expect_err("knob options must respect declared step");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("option for knob 'temperature'")
+                && msg.contains("options[1]")
+                && msg.contains("does not align with step 0.1 from base 0"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_experiment_overrides_rejects_duplicate_knob_manifest_targets() {
+        let guard = TempDirGuard::new("apply_overrides_duplicate_knob_targets");
+        let manifest_dir = guard.path.join(".lab").join("knobs");
+        ensure_dir(&manifest_dir).expect("manifest dir");
+        let manifest_path = manifest_dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [
+                    {
+                        "id": "temperature",
+                        "json_pointer": "/matrix/variants/0/config/temperature",
+                        "type": "number"
+                    },
+                    {
+                        "id": "temperature_alt",
+                        "json_pointer": "/matrix/variants/0/config/temperature",
+                        "type": "number"
+                    }
+                ]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "values": {
+                    "temperature": 0.7,
+                    "temperature_alt": 0.9
+                }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let experiment = json!({
+            "experiment": { "id": "e" },
+            "matrix": {
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "temperature": 0.2 }
+                }]
+            }
+        });
+        let err = apply_experiment_overrides(experiment, &overrides_path, &guard.path)
+            .expect_err("overlapping knob targets must fail before applying overrides");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("maps multiple knobs to json_pointer")
+                && msg.contains("/matrix/variants/0/config/temperature"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_experiment_overrides_rejects_missing_knob_target() {
+        let guard = TempDirGuard::new("apply_overrides_missing_knob_target");
+        let manifest_dir = guard.path.join(".lab").join("knobs");
+        ensure_dir(&manifest_dir).expect("manifest dir");
+        let manifest_path = manifest_dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [
+                    {
+                        "id": "temperature",
+                        "json_pointer": "/matrix/variants/0/config/temprature",
+                        "type": "number"
+                    }
+                ]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "values": { "temperature": 0.7 }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let experiment = json!({
+            "experiment": { "id": "e" },
+            "matrix": {
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "temperature": 0.2 }
+                }]
+            }
+        });
+        let err = apply_experiment_overrides(experiment, &overrides_path, &guard.path)
+            .expect_err("knob targets must not create new fields");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("override knob 'temperature' targets missing json_pointer")
+                && msg.contains("/matrix/variants/0/config/temprature")
+                && msg.contains("only patch declared fields"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_experiment_overrides_rejects_target_type_mismatch() {
+        let guard = TempDirGuard::new("apply_overrides_target_type_mismatch");
+        let manifest_dir = guard.path.join(".lab").join("knobs");
+        ensure_dir(&manifest_dir).expect("manifest dir");
+        let manifest_path = manifest_dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/model",
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "values": { "temperature": 0.7 }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let experiment = json!({
+            "experiment": { "id": "e" },
+            "matrix": {
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "model": "gpt-4.1" }
+                }]
+            }
+        });
+        let err = apply_experiment_overrides(experiment, &overrides_path, &guard.path)
+            .expect_err("knob manifests must match the target field type");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("override knob 'temperature' declares type number")
+                && msg.contains("/matrix/variants/0/config/model")
+                && msg.contains("experiment field is string")
+                && msg.contains("must match the declared field type"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_experiment_overrides_rejects_step_misaligned_value() {
+        let guard = TempDirGuard::new("apply_overrides_step_misaligned_value");
+        let manifest_dir = guard.path.join(".lab").join("knobs");
+        ensure_dir(&manifest_dir).expect("manifest dir");
+        let manifest_path = manifest_dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "step": 0.1
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "values": { "temperature": 0.25 }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let experiment = json!({
+            "experiment": { "id": "e" },
+            "matrix": {
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "temperature": 0.2 }
+                }]
+            }
+        });
+        let err = apply_experiment_overrides(experiment, &overrides_path, &guard.path)
+            .expect_err("override values must respect declared step");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("override value for knob temperature")
+                && msg.contains("does not align with step 0.1 from base 0"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_experiment_overrides_accepts_project_relative_manifest_path() {
+        let guard = TempDirGuard::new("apply_overrides_project_relative_manifest_path");
+        let manifest_dir = guard.path.join("manifests");
+        ensure_dir(&manifest_dir).expect("manifest dir");
+        let manifest_path = manifest_dir.join("knobs.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "step": 0.1
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "manifest_path": "manifests/knobs.json",
+                "values": { "temperature": 0.7 }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let experiment = json!({
+            "experiment": { "id": "e" },
+            "matrix": {
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "temperature": 0.2 }
+                }]
+            }
+        });
+        let resolved =
+            apply_experiment_overrides(experiment, &overrides_path, &guard.path).unwrap();
+
+        assert_eq!(
+            resolved.pointer("/matrix/variants/0/config/temperature"),
+            Some(&json!(0.7))
+        );
+    }
+
+    #[test]
+    fn apply_experiment_overrides_rejects_absolute_manifest_path() {
+        let guard = TempDirGuard::new("apply_overrides_absolute_manifest_path");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "manifest_path": "/tmp/knobs.json",
+                "values": { "temperature": 0.7 }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let experiment = json!({
+            "experiment": { "id": "e" },
+            "matrix": {
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "temperature": 0.2 }
+                }]
+            }
+        });
+        let err = apply_experiment_overrides(experiment, &overrides_path, &guard.path)
+            .expect_err("override manifests must not reference absolute host paths");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("manifest_path '/tmp/knobs.json' must be project-relative")
+                && msg.contains("absolute host paths are not allowed"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_experiment_overrides_rejects_manifest_path_traversal() {
+        let guard = TempDirGuard::new("apply_overrides_manifest_path_traversal");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "manifest_path": "../outside/knobs.json",
+                "values": { "temperature": 0.7 }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let experiment = json!({
+            "experiment": { "id": "e" },
+            "matrix": {
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "temperature": 0.2 }
+                }]
+            }
+        });
+        let err = apply_experiment_overrides(experiment, &overrides_path, &guard.path)
+            .expect_err("override manifests must stay inside the project root");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("manifest_path '../outside/knobs.json' must stay inside the project root")
+                && msg.contains("'..' path segments are not allowed"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_experiment_overrides_rejects_duplicate_json_object_keys() {
+        let guard = TempDirGuard::new("experiment_overrides_duplicate_json_keys");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            r#"{
+                "schema_version": "experiment_overrides_v1",
+                "values": {
+                    "temperature": 0.7,
+                    "temperature": 0.9
+                }
+            }"#,
+        )
+        .expect("write overrides");
+
+        let err = load_experiment_overrides(&overrides_path)
+            .expect_err("duplicate override keys must not use last-writer-wins behavior");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("duplicate JSON object key")
+                && msg.contains("duplicate key 'temperature' at /values"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_experiment_overrides_rejects_empty_values() {
+        let guard = TempDirGuard::new("experiment_overrides_empty_values");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "values": {}
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let err = load_experiment_overrides(&overrides_path)
+            .expect_err("override files must declare at least one value");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("overrides schema validation failed")
+                && msg.contains("has less than 1 property"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_experiment_overrides_rejects_whitespace_value_keys() {
+        let guard = TempDirGuard::new("experiment_overrides_whitespace_value_keys");
+        for (idx, (key, expected)) in [
+            (
+                "   ",
+                "declares blank override id; override value keys must be non-empty knob ids",
+            ),
+            (
+                " temperature ",
+                "declares override id ' temperature ' with leading or trailing whitespace",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let overrides_path = guard.path.join(format!("overrides-{idx}.json"));
+            fs::write(
+                &overrides_path,
+                serde_json::to_string(&json!({
+                    "schema_version": "experiment_overrides_v1",
+                    "values": { key: 0.7 }
+                }))
+                .expect("overrides json"),
+            )
+            .expect("write overrides");
+
+            let err = load_experiment_overrides(&overrides_path)
+                .expect_err("override value keys must be exact knob ids");
+            let msg = err.to_string();
+
+            assert!(msg.contains(expected), "{key:?}: unexpected error: {msg}");
+        }
+    }
+
+    #[test]
+    fn load_experiment_overrides_rejects_whitespace_manifest_path() {
+        let guard = TempDirGuard::new("experiment_overrides_whitespace_manifest_path");
+        for (idx, (manifest_path, expected)) in [
+            (
+                "   ",
+                "declares blank manifest_path; omit manifest_path to use the default",
+            ),
+            (
+                " manifests/knobs.json ",
+                "declares manifest_path ' manifests/knobs.json ' with leading or trailing whitespace",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let overrides_path = guard.path.join(format!("overrides-{idx}.json"));
+            fs::write(
+                &overrides_path,
+                serde_json::to_string(&json!({
+                    "schema_version": "experiment_overrides_v1",
+                    "manifest_path": manifest_path,
+                    "values": { "temperature": 0.7 }
+                }))
+                .expect("overrides json"),
+            )
+            .expect("write overrides");
+
+            let err = load_experiment_overrides(&overrides_path)
+                .expect_err("manifest_path whitespace must fail at override load");
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(expected),
+                "{manifest_path:?}: unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_experiment_overrides_rejects_empty_values() {
+        let guard = TempDirGuard::new("apply_overrides_empty_values");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "manifest_path": "/tmp/ignored.json",
+                "values": {}
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let experiment = json!({
+            "experiment": { "id": "e" },
+            "matrix": {
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "temperature": 0.2 }
+                }]
+            }
+        });
+        let err = apply_experiment_overrides(experiment, &overrides_path, &guard.path)
+            .expect_err("empty override files must not no-op during apply");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("overrides schema validation failed")
+                && msg.contains("has less than 1 property"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_experiment_overrides_rejects_whitespace_value_keys() {
+        let guard = TempDirGuard::new("apply_overrides_whitespace_value_keys");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "manifest_path": "/tmp/ignored.json",
+                "values": { " temperature ": 0.7 }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let experiment = json!({
+            "experiment": { "id": "e" },
+            "matrix": {
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "temperature": 0.2 }
+                }]
+            }
+        });
+        let err = apply_experiment_overrides(experiment, &overrides_path, &guard.path)
+            .expect_err("bad override ids must fail before manifest resolution");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("declares override id ' temperature ' with leading or trailing whitespace")
+                && msg.contains("exactly match knob ids"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_experiment_overrides_rejects_padded_manifest_path() {
+        let guard = TempDirGuard::new("apply_overrides_padded_manifest_path");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "manifest_path": " manifests/knobs.json ",
+                "values": { "temperature": 0.7 }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let experiment = json!({
+            "experiment": { "id": "e" },
+            "matrix": {
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "temperature": 0.2 }
+                }]
+            }
+        });
+        let err = apply_experiment_overrides(experiment, &overrides_path, &guard.path)
+            .expect_err("padded manifest_path must not be silently trimmed");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("declares manifest_path ' manifests/knobs.json ' with leading or trailing whitespace")
+                && msg.contains("project-relative path"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_knob_overrides_accepts_explicit_manifest_without_embedded_path() {
+        let guard = TempDirGuard::new("validate_knob_overrides_explicit_manifest");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "step": 0.1
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "values": { "temperature": 0.7 }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        validate_knob_overrides(&manifest_path, &overrides_path)
+            .expect("standalone validation should use the explicit manifest");
+    }
+
+    #[test]
+    fn validate_knob_overrides_rejects_embedded_manifest_path() {
+        let guard = TempDirGuard::new("validate_knob_overrides_embedded_manifest_path");
+        let manifest_path = guard.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&json!({
+                "schema_version": "knob_manifest_v1",
+                "knobs": [{
+                    "id": "temperature",
+                    "json_pointer": "/matrix/variants/0/config/temperature",
+                    "type": "number"
+                }]
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+        let overrides_path = guard.path.join("overrides.json");
+        fs::write(
+            &overrides_path,
+            serde_json::to_string(&json!({
+                "schema_version": "experiment_overrides_v1",
+                "manifest_path": "other/manifest.json",
+                "values": { "temperature": 0.7 }
+            }))
+            .expect("overrides json"),
+        )
+        .expect("write overrides");
+
+        let err = validate_knob_overrides(&manifest_path, &overrides_path)
+            .expect_err("standalone validation must not accept two manifest authorities");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("declares manifest_path 'other/manifest.json'")
+                && msg.contains("standalone knob override validation already received manifest")
+                && msg.contains("omit manifest_path"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn validate_required_fields_rejects_legacy_authoring_boundary_aliases() {
         let mut spec = current_trial_runtime_experiment_base();
         spec["cases"] = spec["matrix"]["tasks"].clone();
@@ -6442,6 +8085,47 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn validate_required_fields_rejects_authoring_metric_fields_in_resolved_shape() {
+        for (field, metric, expected_pointer) in [
+            (
+                "from",
+                json!({
+                    "id": "resolved",
+                    "from": "result.metrics.resolved",
+                    "primary": true,
+                    "required": true
+                }),
+                "/metrics/0/source",
+            ),
+            (
+                "transform",
+                json!({
+                    "id": "resolved",
+                    "source": {"type": "agent_response", "pointer": "/metrics/resolved"},
+                    "transform": {"type": "identity"},
+                    "primary": true,
+                    "required": true
+                }),
+                "/metrics/0/source/transform",
+            ),
+        ] {
+            let mut spec = current_trial_runtime_experiment_base();
+            spec["metrics"] = json!([metric]);
+
+            let err = validate_required_fields(&spec)
+                .expect_err("resolved packages should not accept authoring metric fields");
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(&format!(
+                    "/metrics/0 uses authoring-only field '{field}'"
+                )) && msg.contains(expected_pointer),
+                "{field}: unexpected error: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -6604,7 +8288,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_variant_plan_ignores_version_field() {
+    fn resolve_variant_plan_rejects_version_field() {
         let spec = json!({
             "version": "1.0",
             "matrix": { "variants": [
@@ -6612,10 +8296,12 @@ mod tests {
                 { "id": "hot", "baseline": false, "config": { "temperature": 0.9 } }
             ] }
         });
-        let (variants, baseline_id) = resolve_variant_plan(&spec).expect("variant plan");
-        assert_eq!(baseline_id, "base");
-        assert_eq!(variants.len(), 2);
-        assert_eq!(variants[1].id, "hot");
+        let err = resolve_variant_plan(&spec).expect_err("version should fail");
+        assert!(
+            err.to_string()
+                .contains("/version is not supported in v1 variant plans"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -6676,7 +8362,68 @@ mod tests {
     }
 
     #[test]
-    fn load_run_variants_uses_experiment_when_manifest_missing() {
+    fn load_run_schedule_rejects_missing_manifest() {
+        let (_root, run_dir) = create_run_dir("bucephalus_schedule_missing_manifest", "run_1");
+        let err = load_run_schedule(&run_dir).expect_err("missing schedule should fail");
+        assert!(
+            err.to_string()
+                .contains("missing resolved schedule manifest"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_run_schedule_rejects_total_slots_mismatch() {
+        let (_root, run_dir) = create_run_dir("bucephalus_schedule_total_slots_mismatch", "run_1");
+        fs::write(
+            run_dir.join("resolved_schedule.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "resolved_schedule_v1",
+                "generated_at": "2026-03-10T00:00:00Z",
+                "total_slots": 2,
+                "schedule": [
+                    { "variant_idx": 0, "task_idx": 0, "repl_idx": 0 }
+                ]
+            }))
+            .expect("serialize schedule"),
+        )
+        .expect("write schedule");
+
+        let err = load_run_schedule(&run_dir).expect_err("slot count mismatch should fail");
+        assert!(
+            err.to_string().contains("total_slots mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_run_schedule_rejects_unknown_manifest_fields() {
+        let (_root, run_dir) = create_run_dir("bucephalus_schedule_unknown_field", "run_1");
+        fs::write(
+            run_dir.join("resolved_schedule.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "resolved_schedule_v1",
+                "generated_at": "2026-03-10T00:00:00Z",
+                "total_slots": 1,
+                "schedule": [
+                    { "variant_idx": 0, "task_idx": 0, "repl_idx": 0, "fallback": true }
+                ]
+            }))
+            .expect("serialize schedule"),
+        )
+        .expect("write schedule");
+
+        let err =
+            load_run_schedule(&run_dir).expect_err("unknown schedule fields should fail schema");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resolved_schedule_v1 schema validation failed"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_run_variants_rejects_missing_manifest() {
         let (_root, run_dir) = create_run_dir("bucephalus_variants_from_experiment", "run_1");
         let spec = json!({
             "matrix": { "variants": [
@@ -6685,16 +8432,16 @@ mod tests {
             ] }
         });
 
-        let (variants, baseline_id) =
-            load_run_variants(&run_dir, &spec).expect("load variants from experiment");
-        assert_eq!(baseline_id, "base");
-        assert_eq!(variants.len(), 2);
-        assert_eq!(variants[0].id, "base");
-        assert_eq!(variants[1].id, "alt");
+        let err = load_run_variants(&run_dir, &spec).expect_err("missing run manifest should fail");
+        assert!(
+            err.to_string()
+                .contains("missing resolved variants manifest"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    fn load_run_variants_prefers_resolved_manifest_over_experiment() {
+    fn load_run_variants_uses_recorded_manifest_over_matrix_drift() {
         let (_root, run_dir) = create_run_dir("bucephalus_variants_manifest_preferred", "run_1");
         let project_root = find_project_root(&run_dir);
         let bundle_root = ensure_test_agent_bundle(&project_root, "agent-current");
@@ -6715,7 +8462,8 @@ mod tests {
             "matrix": { "variants": [
                 { "id": "changed", "baseline": true, "config": {} },
                 { "id": "new", "baseline": false, "config": { "temperature": 0.2 } }
-            ] }
+            ] },
+            "trial_runtime": { "agent": { "command": harness_success_command() } }
         });
         let (loaded_variants, loaded_baseline) =
             load_run_variants(&run_dir, &changed).expect("load manifest variants");
@@ -6724,6 +8472,38 @@ mod tests {
         assert_eq!(loaded_variants.len(), 2);
         assert_eq!(loaded_variants[0].id, "base");
         assert_eq!(loaded_variants[1].id, "alt");
+    }
+
+    #[test]
+    fn load_run_variants_rejects_manifest_digest_mismatch() {
+        let (_root, run_dir) = create_run_dir("bucephalus_variants_manifest_digest_mismatch", "run_1");
+        let project_root = find_project_root(&run_dir);
+        let bundle_root = ensure_test_agent_bundle(&project_root, "agent-current");
+        let _ = bundle_root;
+        let original = json!({
+            "matrix": { "variants": [
+                { "id": "base", "baseline": true, "config": {} }
+            ] },
+            "trial_runtime": { "agent": { "command": harness_success_command() } }
+        });
+        let (resolved_variants, resolved_baseline) =
+            resolve_variant_plan(&original).expect("resolve variants");
+        write_resolved_variants(&run_dir, &original, &resolved_baseline, &resolved_variants)
+            .expect("write manifest");
+
+        let changed = json!({
+            "matrix": { "variants": [
+                { "id": "base", "baseline": true, "config": {} }
+            ] },
+            "trial_runtime": { "agent": { "command": "echo changed" } }
+        });
+        let err = load_run_variants(&run_dir, &changed)
+            .expect_err("variant digest mismatch should fail");
+        assert!(
+            err.to_string()
+                .contains("resolved variants manifest digest mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -6752,6 +8532,31 @@ mod tests {
 
         let err = load_run_variants(&run_dir, &json!({})).expect_err("missing variant_digest");
         assert!(err.to_string().contains("variant_digest"), "{}", err);
+    }
+
+    #[test]
+    fn load_run_variants_rejects_unknown_manifest_fields() {
+        let (_root, run_dir) = create_run_dir("bucephalus_variants_unknown_field", "run_1");
+        fs::write(
+            run_dir.join("resolved_variants.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "resolved_variants_v1",
+                "generated_at": "2026-03-10T00:00:00Z",
+                "baseline_id": "base",
+                "fallback_variants": true,
+                "variants": []
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let err =
+            load_run_variants(&run_dir, &json!({})).expect_err("unknown variant fields should fail schema");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resolved_variants_v1 schema validation failed"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -12892,6 +14697,42 @@ mod tests {
     }
 
     #[test]
+    fn runtime_secret_files_reject_unknown_launch_time_binding() {
+        let root = TempDirGuard::new("bucephalus_runtime_secret_file_unknown_binding");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
+        let secret_path = root.path.join("auth.json");
+        fs::write(&secret_path, "{}\n").expect("secret");
+        let spec = inv07_spec_with_runtime_secret_files();
+        let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
+        let mut execution = RunExecutionOptions::default();
+        execution
+            .runtime_env
+            .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+        execution
+            .secret_files
+            .insert("codex-auth".to_string(), secret_path);
+
+        let err = match resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &exp_dir,
+            &RunBehavior::default(),
+            &execution,
+        ) {
+            Ok(_) => panic!("unknown --secret-file ids should fail before resolution"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown secret file binding 'codex-auth'")
+                && msg.contains("runtime.secrets"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn runtime_secret_files_reject_top_level_variant_gate() {
         let root = TempDirGuard::new("bucephalus_runtime_secret_top_level_variant_gate");
         let exp_dir = root.path.join("exp");
@@ -13447,6 +15288,41 @@ mod tests {
     }
 
     #[test]
+    fn inv07_runtime_bindings_reject_unknown_launch_env() {
+        let root = TempDirGuard::new("bucephalus_inv07_unknown_launch_env");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
+        let spec = inv07_spec_with_runtime_bindings();
+        let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
+        let mut execution = RunExecutionOptions::default();
+        execution
+            .runtime_env
+            .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+        execution
+            .runtime_env
+            .insert("OPENAI_APIKEY".to_string(), "typo-token".to_string());
+
+        let err = match resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &exp_dir,
+            &RunBehavior::default(),
+            &execution,
+        ) {
+            Ok(_) => panic!("unknown launch env bindings should fail"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown runtime env binding 'OPENAI_APIKEY'")
+                && msg.contains("runtime.secrets")
+                && !msg.contains("typo-token"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn output_mount_env_is_injected_into_agent_runtime_env() {
         let root = TempDirGuard::new("bucephalus_output_mount_env");
         let exp_dir = root.path.join("exp");
@@ -13598,6 +15474,11 @@ mod tests {
         }));
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
             .expect("resolved experiment");
+        atomic_write_bytes(
+            &run_dir.join("resolved_experiment.digest"),
+            canonical_json_digest(&resolved).as_bytes(),
+        )
+        .expect("resolved digest");
         let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
         write_resolved_variants(run_dir, &resolved, &baseline_id, &variants)
             .expect("write variants");
@@ -13617,12 +15498,13 @@ mod tests {
             total_slots: schedule.len(),
             next_schedule_index: 0,
             next_trial_index: 0,
-            schedule,
+            schedule: schedule.clone(),
             completed_slots: Vec::new(),
             pruned_variants: Vec::new(),
             consecutive_failures: BTreeMap::new(),
             updated_at: Utc::now().to_rfc3339(),
         };
+        write_resolved_schedule(run_dir, &schedule).expect("resolved schedule");
         write_schedule_progress(run_dir, &progress).expect("schedule progress");
         resolved
     }
@@ -14044,6 +15926,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_dataset_path_rejects_authoring_and_legacy_dataset_surfaces() {
+        let root = TempDirGuard::new("bucephalus_resolve_dataset_path_legacy_surface");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp");
+
+        for (spec, expected) in [
+            (
+                json!({"matrix": {"cases": {"source": "file", "path": "cases.jsonl"}}}),
+                "/matrix/cases is authoring-only case matrix vocabulary",
+            ),
+            (
+                json!({"dataset": {"path": "tasks.jsonl"}}),
+                "/dataset is legacy v0 dataset vocabulary",
+            ),
+        ] {
+            let err = resolve_dataset_path(&spec, &exp_dir)
+                .expect_err("dataset path resolver should reject unlowered dataset surfaces");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected) && msg.contains("/matrix/tasks"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn inv06_load_tasks_honors_zero_limit() {
         let root = TempDirGuard::new("bucephalus_inv06_load_tasks_limit_zero");
         let dataset_path = root.path.join("tasks.jsonl");
@@ -14085,6 +15993,32 @@ mod tests {
     }
 
     #[test]
+    fn count_tasks_rejects_authoring_and_legacy_dataset_surfaces() {
+        let root = TempDirGuard::new("bucephalus_count_tasks_legacy_surface");
+        let dataset_path = root.path.join("tasks.jsonl");
+        fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
+
+        for (spec, expected) in [
+            (
+                json!({"matrix": {"cases": {"source": "file", "path": "cases.jsonl"}}}),
+                "/matrix/cases is authoring-only case matrix vocabulary",
+            ),
+            (
+                json!({"dataset": {"path": "tasks.jsonl"}}),
+                "/dataset is legacy v0 dataset vocabulary",
+            ),
+        ] {
+            let err = count_tasks(&dataset_path, &spec)
+                .expect_err("count-only path should reject unlowered dataset surfaces");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected) && msg.contains("/matrix/tasks"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn inv06_load_task_rows_for_build_reads_task_rows() {
         let root = TempDirGuard::new("bucephalus_inv06_load_task_rows_for_build");
         let dataset_path = root.path.join("task_rows.jsonl");
@@ -14102,6 +16036,33 @@ mod tests {
         assert_eq!(
             tasks[0].pointer("/id").and_then(Value::as_str),
             Some("task_1")
+        );
+    }
+
+    #[test]
+    fn load_task_rows_for_build_rejects_duplicate_json_object_keys() {
+        let root = TempDirGuard::new("bucephalus_build_task_rows_duplicate_json_keys");
+        let dataset_path = root.path.join("task_rows.jsonl");
+        fs::write(
+            &dataset_path,
+            r#"{"schema_version":"case_v1","id":"CASE001","id":"CASE002","inputs":{},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+        )
+        .expect("dataset");
+        let spec = json!({
+            "matrix": { "tasks": { "source": "file", "limit": 1 } }
+        });
+
+        let err = load_task_rows_for_build(&dataset_path, &spec)
+            .expect_err("duplicate JSON object keys must fail package build");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate JSON object key"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("duplicate key 'id'"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("task_rows.jsonl:1"),
+            "error should point at the dataset row: {msg}"
         );
     }
 
@@ -14247,6 +16208,32 @@ mod tests {
     }
 
     #[test]
+    fn dataset_provider_rejects_authoring_and_legacy_surfaces() {
+        let root = TempDirGuard::new("bucephalus_dataset_provider_legacy_surfaces");
+        let dataset_path = root.path.join("tasks.jsonl");
+        fs::write(&dataset_path, "").expect("dataset");
+
+        for (spec, expected) in [
+            (
+                json!({"matrix": {"cases": {"source": "file", "path": "cases.jsonl"}}}),
+                "/matrix/cases is authoring-only case matrix vocabulary",
+            ),
+            (
+                json!({"dataset": {"path": "tasks.jsonl"}}),
+                "/dataset is legacy v0 dataset vocabulary",
+            ),
+        ] {
+            let err = load_tasks(&dataset_path, &spec)
+                .expect_err("dataset provider should reject unlowered dataset surfaces");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected) && msg.contains("/matrix/tasks"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn inv06_runtime_load_tasks_rejects_legacy_task_declaration_rows() {
         let root = TempDirGuard::new("bucephalus_inv06_runtime_rejects_legacy_task_declaration");
         let dataset_path = root.path.join("tasks.jsonl");
@@ -14288,6 +16275,36 @@ mod tests {
         assert!(
             !msg.contains("legacy_nested"),
             "nested task.id should not be used as a row label: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_tasks_rejects_duplicate_json_object_keys() {
+        let root = TempDirGuard::new("bucephalus_runtime_duplicate_json_keys");
+        let dataset_path = root.path.join("tasks.jsonl");
+        fs::write(
+            &dataset_path,
+            r#"{"schema_version":"task_row_v2","id":"task_1","task":{"id":"task_1"},"runtime":{"container_image":{"image":"python:3.11-slim","image":"python:3.12-slim","workdir":"/workspace/task"}}}"#,
+        )
+        .expect("dataset");
+        let spec = json!({
+            "matrix": { "tasks": { "source": "file", "limit": 1 } }
+        });
+
+        let err = load_tasks(&dataset_path, &spec)
+            .expect_err("duplicate JSON object keys must fail runtime task loading");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate JSON object key"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("duplicate key 'image' at /runtime/container_image"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("tasks.jsonl:1"),
+            "error should point at the dataset row: {msg}"
         );
     }
 
@@ -21681,6 +23698,361 @@ mod tests {
     }
 
     #[test]
+    fn validate_required_fields_rejects_resolved_trace_authoring_surface() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["traces"] = json!({"source": "protocol", "retain": "always"});
+
+        let err = validate_required_fields(&spec)
+            .expect_err("resolved packages should not carry authoring trace intent");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/traces is authoring-only trace intent"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("/trial_runtime/agent/events"),
+            "resolved remediation should point to concrete event sinks: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolved_validation_rejects_trace_authoring_surface() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["traces"] = json!({"source": "protocol", "retain": "always"});
+
+        let err =
+            crate::package::validate::validate_resolved_experiment_schema(&spec, "test")
+                .expect_err("resolved schema validation should reject authoring trace intent");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/traces is authoring-only trace intent")
+                && msg.contains("/trial_runtime/agent/events"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolved_validation_rejects_authoring_only_surfaces() {
+        for (label, pointer, value, expected, replacement) in [
+            (
+                "stages",
+                "/stages",
+                json!({"agent": {"command": ["agent"]}}),
+                "/stages is authoring-only stage vocabulary",
+                "/trial_runtime",
+            ),
+            (
+                "ephemerals",
+                "/ephemerals",
+                json!({"cache": {"image": "redis:7", "lifecycle": "per-trial"}}),
+                "/ephemerals is authoring-only service vocabulary",
+                "/sidecars",
+            ),
+            (
+                "externals",
+                "/externals",
+                json!({"apis": ["api.openai.com"], "credentials": ["OPENAI_API_KEY"]}),
+                "/externals is authoring-only accounting vocabulary",
+                "/runtime/externals",
+            ),
+            (
+                "matrix cases",
+                "/matrix/cases",
+                json!({"source": "file", "path": "cases.jsonl"}),
+                "/matrix/cases is authoring-only case matrix vocabulary",
+                "/matrix/tasks",
+            ),
+            (
+                "network default",
+                "/runtime/network/default",
+                json!("none"),
+                "/runtime/network/default is authoring-only shorthand",
+                "/runtime/network/task_sandbox",
+            ),
+            (
+                "registry",
+                "/runtime/registry",
+                json!({"image_rewrites": []}),
+                "/runtime/registry is authoring-only package-build input",
+                "rewritten case images directly",
+            ),
+            (
+                "experiment mode",
+                "/experiment/mode",
+                json!("answer"),
+                "/experiment/mode is authoring-only evaluation intent",
+                "explicit metrics and grader contracts",
+            ),
+            (
+                "scheduling comparison",
+                "/scheduling/comparison",
+                json!("paired"),
+                "/scheduling/comparison is authoring-only design intent",
+                "/policy/policies/scheduling",
+            ),
+        ] {
+            let mut spec = current_trial_runtime_experiment_base();
+            set_json_pointer_value(&mut spec, pointer, value).expect("set authoring-only surface");
+
+            let err =
+                crate::package::validate::validate_resolved_experiment_schema(&spec, "test")
+                    .expect_err("resolved schema validation should reject authoring-only surfaces");
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(expected) && msg.contains(replacement),
+                "{label}: unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_validation_rejects_unsupported_surfaces() {
+        for (label, pointer, value, expected, remediation) in [
+            (
+                "runtime storage",
+                "/runtime/storage",
+                json!({}),
+                "/runtime/storage is not part of the experiment contract",
+                "storage and trace sinks are runner-owned today",
+            ),
+            (
+                "runtime traces",
+                "/runtime/traces",
+                json!({}),
+                "/runtime/traces is not part of the experiment contract",
+                "storage and trace sinks are runner-owned today",
+            ),
+            (
+                "task runtime",
+                "/task_runtime",
+                json!({"agent": {"command": ["python", "main.py"]}}),
+                "/task_runtime is not supported",
+                "/trial_runtime/task",
+            ),
+            (
+                "runtime outputs",
+                "/trial_runtime/outputs",
+                json!({}),
+                "/trial_runtime/outputs is not supported",
+                "/trial_runtime/agent/outputs",
+            ),
+            (
+                "grader conclusion",
+                "/trial_runtime/grader/conclusion",
+                json!({"mode": "direct"}),
+                "/trial_runtime/grader/conclusion is not supported",
+                "declare grader outputs and metrics",
+            ),
+            (
+                "agent protocol",
+                "/trial_runtime/agent/protocol",
+                json!("command"),
+                "/trial_runtime/agent/protocol is not supported",
+                "command invocation is implied",
+            ),
+        ] {
+            let mut spec = current_trial_runtime_experiment_base();
+            set_json_pointer_value(&mut spec, pointer, value).expect("set unsupported surface");
+
+            let err =
+                crate::package::validate::validate_resolved_experiment_schema(&spec, "test")
+                    .expect_err("resolved schema validation should reject unsupported surfaces");
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(expected) && msg.contains(remediation),
+                "{label}: unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_validation_rejects_legacy_v0_surfaces() {
+        for (label, pointer, value, expected, remediation) in [
+            (
+                "version 1.0",
+                "/version",
+                json!("1.0"),
+                "experiment version '1.0' is not supported",
+                "resolved experiment schema validation failed",
+            ),
+            (
+                "version",
+                "/version",
+                json!("0.3"),
+                "/version is not supported in v1",
+                "package manifest",
+            ),
+            (
+                "baseline",
+                "/baseline",
+                json!({"variant_id": "baseline"}),
+                "/baseline is legacy v0 vocabulary",
+                "/matrix/variants[] with baseline: true",
+            ),
+            (
+                "variant_plan",
+                "/variant_plan",
+                json!([]),
+                "/variant_plan is legacy v0 vocabulary",
+                "/matrix/variants",
+            ),
+            (
+                "variants",
+                "/variants",
+                json!([]),
+                "/variants is legacy v0 vocabulary",
+                "/matrix/variants",
+            ),
+            (
+                "dataset",
+                "/dataset",
+                json!({"path": "tasks.jsonl"}),
+                "/dataset is legacy v0 vocabulary",
+                "/matrix/tasks",
+            ),
+            (
+                "design",
+                "/design",
+                json!({"replications": 1}),
+                "/design is legacy v0 vocabulary",
+                "/matrix, /scheduling, and /policy/sanitization_profile",
+            ),
+            (
+                "validity",
+                "/validity",
+                json!({}),
+                "/validity is legacy v0 vocabulary",
+                "/policy/validity",
+            ),
+            (
+                "artifacts",
+                "/artifacts",
+                json!([]),
+                "/artifacts is legacy v0 vocabulary",
+                "/extra_outputs",
+            ),
+            (
+                "agent artifact",
+                "/trial_runtime/agent/artifact",
+                json!({"path": "agent"}),
+                "/trial_runtime/agent/artifact is legacy v0 vocabulary",
+                "/trial_runtime/agent/mount",
+            ),
+            (
+                "agent network",
+                "/trial_runtime/agent/network",
+                json!("none"),
+                "/trial_runtime/agent/network is legacy v0 vocabulary",
+                "/runtime/network/agent",
+            ),
+            (
+                "agent secret files",
+                "/trial_runtime/agent/secret_files",
+                json!([]),
+                "/trial_runtime/agent/secret_files is legacy v0 vocabulary",
+                "/runtime/secrets",
+            ),
+            (
+                "task sandbox network",
+                "/policy/task_sandbox/network",
+                json!("none"),
+                "/policy/task_sandbox/network is legacy v0 vocabulary",
+                "/runtime/network/task_sandbox",
+            ),
+            (
+                "task sandbox profile",
+                "/policy/task_sandbox/profile",
+                json!("hermetic"),
+                "/policy/task_sandbox/profile is legacy v0 vocabulary",
+                "/policy/sanitization_profile",
+            ),
+            (
+                "workload type",
+                "/experiment/workload_type",
+                json!("agent_runtime"),
+                "/experiment/workload_type is legacy v0 vocabulary",
+                "<removed>",
+            ),
+        ] {
+            let mut spec = current_trial_runtime_experiment_base();
+            set_json_pointer_value(&mut spec, pointer, value).expect("set legacy v0 surface");
+
+            let err =
+                crate::package::validate::validate_resolved_experiment_schema(&spec, "test")
+                    .expect_err("resolved schema validation should reject legacy v0 surfaces");
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(expected) && msg.contains(remediation),
+                "{label}: unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_validation_rejects_variant_authoring_syntax() {
+        for (label, pointer, value, expected, remediation) in [
+            (
+                "bindings",
+                "/matrix/variants/0/bindings",
+                json!({"temperature": 0.2}),
+                "/matrix/variants/0/bindings is legacy variant vocabulary",
+                "/matrix/variants/0/config",
+            ),
+            (
+                "runtime_overrides",
+                "/matrix/variants/0/runtime_overrides",
+                json!({"agent": {"image": "example:latest"}}),
+                "/matrix/variants/0/runtime_overrides is legacy variant vocabulary",
+                "/matrix/variants/0/overrides",
+            ),
+            (
+                "variant_id",
+                "/matrix/variants/0/variant_id",
+                json!("baseline"),
+                "/matrix/variants/0/variant_id is legacy variant vocabulary",
+                "/matrix/variants/0/id",
+            ),
+            (
+                "image",
+                "/matrix/variants/0/image",
+                json!("example:latest"),
+                "/matrix/variants/0/image is legacy variant vocabulary",
+                "/matrix/variants/0/overrides/agent/image",
+            ),
+            (
+                "case override",
+                "/matrix/variants/0/overrides/case",
+                json!({"interface": "input_only"}),
+                "/matrix/variants/0/overrides/case is not supported",
+                "overrides.task",
+            ),
+            (
+                "policy override",
+                "/matrix/variants/0/overrides/policy",
+                json!({"timeout_ms": 123000}),
+                "/matrix/variants/0/overrides/policy is not supported",
+                "patch /trial_runtime only",
+            ),
+        ] {
+            let mut spec = current_trial_runtime_experiment_base();
+            set_json_pointer_value(&mut spec, pointer, value).expect("set variant syntax");
+
+            let err =
+                crate::package::validate::validate_resolved_experiment_schema(&spec, "test")
+                    .expect_err("resolved schema validation should reject variant authoring syntax");
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(expected) && msg.contains(remediation),
+                "{label}: unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_required_fields_rejects_top_level_version() {
         let mut spec = current_trial_runtime_experiment_base();
         spec["version"] = json!("0.3");
@@ -22601,7 +24973,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_variant_binding_overrides_adds_new_keys() {
+    fn apply_variant_binding_overrides_rejects_missing_keys() {
         let mut variant = Variant {
             id: "baseline".to_string(),
             bindings: json!({"existing": "value"}),
@@ -22612,8 +24984,13 @@ mod tests {
         };
         let mut overrides = BTreeMap::new();
         overrides.insert("new_key".to_string(), json!("new_value"));
-        apply_variant_binding_overrides(&mut variant, &overrides).unwrap();
-        assert_eq!(variant.bindings["new_key"], json!("new_value"));
+        let err = apply_variant_binding_overrides(&mut variant, &overrides)
+            .expect_err("--set must not create undeclared variant config");
+        assert!(
+            err.to_string()
+                .contains("--set only patches declared config fields"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -22665,7 +25042,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_variant_binding_overrides_creates_bindings_object_if_missing() {
+    fn apply_variant_binding_overrides_rejects_non_object_config() {
         let mut variant = Variant {
             id: "baseline".to_string(),
             bindings: Value::Null,
@@ -22676,15 +25053,20 @@ mod tests {
         };
         let mut overrides = BTreeMap::new();
         overrides.insert("key".to_string(), json!("value"));
-        apply_variant_binding_overrides(&mut variant, &overrides).unwrap();
-        assert_eq!(variant.bindings["key"], json!("value"));
+        let err = apply_variant_binding_overrides(&mut variant, &overrides)
+            .expect_err("--set must not repair malformed variant config");
+        assert!(
+            err.to_string()
+                .contains("variant 'baseline' config must be an object"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn apply_variant_binding_overrides_nested_key() {
         let mut variant = Variant {
             id: "baseline".to_string(),
-            bindings: json!({}),
+            bindings: json!({"nested": {"deep": {"key": 0}}}),
             args: Vec::new(),
             env: BTreeMap::new(),
             image: None,
@@ -22694,6 +25076,87 @@ mod tests {
         overrides.insert("nested.deep.key".to_string(), json!(42));
         apply_variant_binding_overrides(&mut variant, &overrides).unwrap();
         assert_eq!(variant.bindings["nested"]["deep"]["key"], json!(42));
+    }
+
+    #[test]
+    fn apply_variant_binding_overrides_rejects_missing_nested_key() {
+        let mut variant = Variant {
+            id: "baseline".to_string(),
+            bindings: json!({"nested": {"deep": {}}}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
+        let mut overrides = BTreeMap::new();
+        overrides.insert("nested.deep.key".to_string(), json!(42));
+        let err = apply_variant_binding_overrides(&mut variant, &overrides)
+            .expect_err("--set dotted paths must not create missing leaves");
+        assert!(
+            err.to_string()
+                .contains("--set only patches declared config fields"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_variant_binding_overrides_rejects_empty_path_segments() {
+        let mut variant = Variant {
+            id: "baseline".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
+        let mut overrides = BTreeMap::new();
+        overrides.insert("nested..key".to_string(), json!(42));
+        let err = apply_variant_binding_overrides(&mut variant, &overrides)
+            .expect_err("--set dotted paths must not contain empty segments");
+        assert!(
+            err.to_string()
+                .contains("dotted path segments cannot be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_variant_binding_overrides_rejects_padded_path_segments() {
+        let mut variant = Variant {
+            id: "baseline".to_string(),
+            bindings: json!({"nested": {"key": 0}}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
+        let mut overrides = BTreeMap::new();
+        overrides.insert("nested. key".to_string(), json!(42));
+        let err = apply_variant_binding_overrides(&mut variant, &overrides)
+            .expect_err("--set dotted paths must not contain padded segments");
+        assert!(
+            err.to_string()
+                .contains("leading or trailing whitespace"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_variant_binding_overrides_escapes_json_pointer_tokens() {
+        let mut variant = Variant {
+            id: "baseline".to_string(),
+            bindings: json!({"model/name": "old", "path~key": "old"}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
+        let mut overrides = BTreeMap::new();
+        overrides.insert("model/name".to_string(), json!("new"));
+        overrides.insert("path~key".to_string(), json!("updated"));
+        apply_variant_binding_overrides(&mut variant, &overrides).unwrap();
+        assert_eq!(variant.bindings["model/name"], json!("new"));
+        assert_eq!(variant.bindings["path~key"], json!("updated"));
     }
 
 
@@ -22970,13 +25433,41 @@ mod tests {
     }
 
     #[test]
-    fn parse_policies_ignores_authoring_comparison_after_lowering() {
+    fn parse_policies_rejects_authoring_comparison_after_lowering() {
         let mut spec = explicit_policy_policies();
         spec["scheduling"] = json!({"comparison": "paired"});
-        assert_eq!(
-            parse_policies(&spec).unwrap().scheduling,
-            SchedulingPolicy::VariantSequential
+        let err = parse_policies(&spec)
+            .expect_err("resolved policy parser should reject authoring comparison shorthand");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/scheduling/comparison is authoring-only design intent")
+                && msg.contains("/policy/policies/scheduling"),
+            "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_policies_rejects_legacy_policy_task_sandbox_surface() {
+        for (pointer, expected) in [
+            (
+                "/policy/task_sandbox/network",
+                "/policy/task_sandbox/network is legacy v0 policy vocabulary",
+            ),
+            (
+                "/policy/task_sandbox/profile",
+                "/policy/task_sandbox/profile is legacy v0 policy vocabulary",
+            ),
+        ] {
+            let mut spec = explicit_policy_policies();
+            set_json_pointer_value(&mut spec, pointer, json!("legacy"))
+                .expect("set legacy policy field");
+            let err = parse_policies(&spec)
+                .expect_err("resolved policy parser should reject legacy policy surface");
+            assert!(
+                err.to_string().contains(expected),
+                "legacy {pointer} should report {expected}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -24835,11 +27326,24 @@ mod tests {
 
     #[test]
     fn resolve_variant_plan_legacy_variant_array_bindings_fails() {
-        let exp = json!({
-            "baseline": { "variant_id": "b" },
-            "variant_plan": [{ "variant_id": "v1", "bindings": [1, 2] }]
-        });
-        assert!(resolve_variant_plan(&exp).is_err());
+        for (exp, expected) in [
+            (
+                json!({"variant_plan": [{ "variant_id": "v1", "bindings": [1, 2] }]}),
+                "/variant_plan is legacy variant plan vocabulary",
+            ),
+            (
+                json!({"variants": [{ "variant_id": "v1", "bindings": {} }]}),
+                "/variants is legacy variant plan vocabulary",
+            ),
+            (
+                json!({"baseline": { "variant_id": "b" }}),
+                "/baseline is legacy variant plan vocabulary",
+            ),
+        ] {
+            let err = resolve_variant_plan(&exp).expect_err("legacy variant plan should fail");
+            let msg = err.to_string();
+            assert!(msg.contains(expected), "unexpected error: {msg}");
+        }
     }
 
     #[test]
@@ -25112,12 +27616,26 @@ mod tests {
         )
         .expect("write package lock");
         fs::write(
+            package_dir.join(PACKAGE_CHECKS_FILE),
+            serde_json::to_string(&json!({
+                "schema_version": PACKAGE_CHECKS_SCHEMA_VERSION,
+                "generated_at": "2026-03-04T00:00:00Z",
+                "package_digest": package_digest,
+                "passed": true,
+                "summary": { "checks": 0, "failed": 0, "warnings": 0 },
+                "checks": []
+            }))
+            .expect("package checks json"),
+        )
+        .expect("write package checks");
+        fs::write(
             package_dir.join("manifest.json"),
             serde_json::to_string(&json!({
                 "schema_version": "sealed_run_package_v2",
                 "created_at": "2026-03-04T00:00:00Z",
                 "resolved_experiment": manifest_resolved_experiment,
                 "checksums_ref": "checksums.json",
+                "package_checks_ref": PACKAGE_CHECKS_FILE,
                 "package_digest": package_digest
             }))
             .expect("manifest json"),
@@ -25236,6 +27754,76 @@ metrics:
     }
 
     #[test]
+    fn load_authoring_input_for_build_rejects_duplicate_top_level_yaml_keys() {
+        let guard = TempDirGuard::new("load_authoring_duplicate_top_level_yaml_key");
+        let experiment = guard.path.join("experiment.yaml");
+        fs::write(
+            &experiment,
+            r#"
+experiment:
+  id: e
+runtime:
+  compute:
+    backend: local-docker
+runtime:
+  network:
+    default: none
+"#,
+        )
+        .unwrap();
+
+        let err = load_authoring_input_for_build(&experiment, None)
+            .expect_err("duplicate authoring YAML keys should fail before lowering");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("duplicate mapping key")
+                && msg.contains("duplicate key 'runtime' at /"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_authoring_input_for_build_rejects_duplicate_nested_yaml_keys() {
+        let guard = TempDirGuard::new("load_authoring_duplicate_nested_yaml_key");
+        let experiment = guard.path.join("experiment.yaml");
+        fs::write(
+            &experiment,
+            r#"
+experiment:
+  id: e
+matrix:
+  cases:
+    source: file
+    path: cases.jsonl
+  variants:
+    - id: baseline
+      baseline: true
+      config: {}
+stages:
+  case:
+    interface: input_only
+  agent:
+    command: ["agent-a"]
+    command: ["agent-b"]
+  grader:
+    strategy: none
+"#,
+        )
+        .unwrap();
+
+        let err = load_authoring_input_for_build(&experiment, None)
+            .expect_err("duplicate nested authoring YAML keys should fail before lowering");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("duplicate mapping key")
+                && msg.contains("duplicate key 'command' at /stages/agent"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn load_authoring_input_for_build_rejects_unknown_public_authoring_fields() {
         let guard = TempDirGuard::new("load_authoring_schema_unknown_field");
         let experiment = guard.path.join("experiment.yaml");
@@ -25285,6 +27873,123 @@ stages:
             "schema diagnostics should stay on public authoring nouns: {}",
             msg
         );
+    }
+
+    #[test]
+    fn load_authoring_input_for_build_rejects_nested_resolved_vocabulary() {
+        let guard = TempDirGuard::new("load_authoring_nested_resolved_vocabulary");
+        for (idx, (yaml, expected, replacement)) in [
+            (
+                r#"
+experiment: { id: e }
+stages:
+  task: {}
+"#,
+                "/stages/task",
+                "/stages/case",
+            ),
+            (
+                r#"
+experiment: { id: e }
+stages:
+  agent:
+    command: ["agent"]
+    sidecars: ["svc"]
+"#,
+                "/stages/agent/sidecars",
+                "/stages/agent/ephemerals",
+            ),
+            (
+                r#"
+experiment: { id: e }
+stages:
+  agent:
+    command: ["agent"]
+    integration_level: cli_basic
+"#,
+                "/stages/agent/integration_level",
+                "package build derives it",
+            ),
+            (
+                r#"
+experiment: { id: e }
+stages:
+  agent:
+    command: ["agent"]
+    telemetry: {}
+"#,
+                "/stages/agent/telemetry",
+                "/traces.source: protocol",
+            ),
+            (
+                r#"
+experiment: { id: e }
+stages:
+  agent:
+    command: ["agent"]
+    protocol: command
+"#,
+                "/stages/agent/protocol",
+                "/stages/agent/command",
+            ),
+            (
+                r#"
+experiment: { id: e }
+matrix:
+  variants:
+    - id: baseline
+      overrides:
+        task: {}
+"#,
+                "/matrix/variants/0/overrides/task",
+                "/matrix/variants/0/overrides/case",
+            ),
+            (
+                r#"
+experiment: { id: e }
+matrix:
+  variants:
+    - id: baseline
+      overrides:
+        grader:
+          sidecars: ["svc"]
+"#,
+                "/matrix/variants/0/overrides/grader/sidecars",
+                "/matrix/variants/0/overrides/grader/ephemerals",
+            ),
+            (
+                r#"
+experiment: { id: e }
+matrix:
+  variants:
+    - id: baseline
+      overrides:
+        agent:
+          artifact_type: structured_json
+"#,
+                "/matrix/variants/0/overrides/agent/artifact_type",
+                "canonical structured_json result contract",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let experiment = guard.path.join(format!("experiment-{idx}.yaml"));
+            fs::write(&experiment, yaml).expect("write authoring YAML");
+
+            let err = load_authoring_input_for_build(&experiment, None)
+                .expect_err("nested resolved vocabulary should fail before lowering");
+            let msg = err.to_string();
+
+            assert!(
+                msg.contains(expected) && msg.contains(replacement),
+                "expected {expected} and {replacement}, got: {msg}"
+            );
+            assert!(
+                msg.contains("resolved package vocabulary"),
+                "diagnostic should identify boundary leak: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -25586,6 +28291,215 @@ stages:
     }
 
     #[test]
+    fn check_package_requires_sealed_manifest() {
+        let root = create_dx_authoring_fixture("bucephalus_check_missing_manifest");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        fs::remove_file(build.package_dir.join("manifest.json")).expect("remove manifest");
+
+        let err = check_package(&build.package_dir)
+            .expect_err("package checks must require the sealed manifest");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("package check failed to read sealed package manifest"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_package_rejects_non_sealed_manifest_schema() {
+        let root = create_dx_authoring_fixture("bucephalus_check_non_sealed_manifest");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        atomic_write_json_pretty(
+            &build.package_dir.join("manifest.json"),
+            &json!({
+                "schema_version": "manifest_v1",
+                "created_at": "2026-03-04T00:00:00Z",
+                "resolved_experiment": {},
+                "checksums_ref": "checksums.json",
+                "package_checks_ref": PACKAGE_CHECKS_FILE,
+                "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+        )
+        .expect("write non-sealed manifest");
+
+        let err = check_package(&build.package_dir)
+            .expect_err("package checks must require sealed_run_package_v2 manifest");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("manifest schema_version must be 'sealed_run_package_v2'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_sealed_package_for_run_rejects_package_checks_digest_mismatch() {
+        let root = create_dx_authoring_fixture("bucephalus_package_checks_digest_mismatch");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let mut package_checks =
+            load_json_file(&build.package_checks_path).expect("package checks");
+        set_json_pointer_value(
+            &mut package_checks,
+            "/package_digest",
+            json!("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+        )
+        .expect("rewrite package checks digest");
+        atomic_write_json_pretty(&build.package_checks_path, &package_checks)
+            .expect("write package checks");
+
+        let err = load_sealed_package_for_run(&build.package_dir)
+            .expect_err("sealed package loader must bind package checks to package digest");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("package checks digest does not match manifest package_digest"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_sealed_package_for_run_requires_package_checks_ref() {
+        let root = create_dx_authoring_fixture("bucephalus_package_checks_ref_required");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let mut manifest = load_json_file(&build.manifest_path).expect("manifest");
+        manifest
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("package_checks_ref");
+        fs::write(
+            &build.manifest_path,
+            serde_json::to_string(&manifest).expect("manifest json"),
+        )
+        .expect("write tampered manifest");
+
+        let err = load_sealed_package_for_run(&build.package_dir)
+            .expect_err("sealed package manifest must require package_checks_ref");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sealed package manifest missing required key 'package_checks_ref'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn sealed_package_schema_requires_package_checks_ref() {
+        let schema = compile_schema("sealed_run_package_v2.jsonschema").expect("sealed schema");
+        let manifest = json!({
+            "schema_version": "sealed_run_package_v2",
+            "created_at": "2026-03-04T00:00:00Z",
+            "resolved_experiment": {},
+            "checksums_ref": "checksums.json",
+            "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+
+        let errors = schema
+            .validate(&manifest)
+            .expect_err("sealed package schema should require package_checks_ref")
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            errors
+                .iter()
+                .any(|msg| msg.contains("\"package_checks_ref\" is a required property")),
+            "unexpected schema errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn load_sealed_package_for_run_rejects_non_string_package_checks_ref() {
+        let root = create_dx_authoring_fixture("bucephalus_package_checks_ref_non_string");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let mut manifest = load_json_file(&build.manifest_path).expect("manifest");
+        set_json_pointer_value(&mut manifest, "/package_checks_ref", json!({}))
+            .expect("rewrite package checks ref");
+        fs::write(
+            &build.manifest_path,
+            serde_json::to_string(&manifest).expect("manifest json"),
+        )
+        .expect("write tampered manifest");
+
+        let err = load_sealed_package_for_run(&build.package_dir)
+            .expect_err("sealed package manifest must require string package_checks_ref");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sealed_run_package_v2 schema validation failed")
+                && msg.contains("sealed package manifest"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_package_rejects_failed_package_checks_report() {
+        let root = create_dx_authoring_fixture("bucephalus_package_checks_failed_report");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let mut package_checks =
+            load_json_file(&build.package_checks_path).expect("package checks");
+        set_json_pointer_value(&mut package_checks, "/checks/0/status", json!("fail"))
+            .expect("rewrite package check status");
+        set_json_pointer_value(&mut package_checks, "/summary/failed", json!(1))
+            .expect("rewrite package checks failed count");
+        set_json_pointer_value(&mut package_checks, "/passed", json!(false))
+            .expect("rewrite package checks passed");
+        atomic_write_json_pretty(&build.package_checks_path, &package_checks)
+            .expect("write package checks");
+
+        let err = check_package(&build.package_dir)
+            .expect_err("package check must reject a referenced failed report");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("package checks report did not pass"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_package_rejects_inconsistent_package_checks_report() {
+        let root = create_dx_authoring_fixture("bucephalus_package_checks_inconsistent_report");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let mut package_checks =
+            load_json_file(&build.package_checks_path).expect("package checks");
+        set_json_pointer_value(&mut package_checks, "/checks/0/status", json!("fail"))
+            .expect("rewrite package check status");
+        atomic_write_json_pretty(&build.package_checks_path, &package_checks)
+            .expect("write package checks");
+
+        let err = check_package(&build.package_dir)
+            .expect_err("package check must reject contradictory report summaries");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("package checks summary.failed does not match failed checks"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn check_package_requires_package_lock_digest() {
         let root = create_dx_authoring_fixture("bucephalus_check_missing_package_lock");
         let spec = minimal_new_dx_spec();
@@ -25668,7 +28582,7 @@ stages:
         symlink(&outside, root.path.join("checksums_link.json")).expect("checksums symlink");
         fs::write(
             root.path.join("manifest.json"),
-            r#"{"schema_version":"sealed_run_package_v2","created_at":"2026-03-04T00:00:00Z","resolved_experiment":{},"checksums_ref":"checksums_link.json","package_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+            r#"{"schema_version":"sealed_run_package_v2","created_at":"2026-03-04T00:00:00Z","resolved_experiment":{},"checksums_ref":"checksums_link.json","package_checks_ref":"package_checks.json","package_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
         )
         .expect("manifest");
 
@@ -25860,7 +28774,7 @@ stages:
     }
 
     #[test]
-    fn load_sealed_package_for_run_ignores_manifest_resolved_experiment_payload() {
+    fn load_sealed_package_for_run_rejects_manifest_resolved_experiment_mismatch() {
         let guard = TempDirGuard::new("load_exp_pkg_manifest_tamper");
         let resolved_path = guard.path.join("resolved_experiment.json");
         fs::write(
@@ -25880,10 +28794,12 @@ stages:
             json!({"version":"0.5","experiment":{"id":"tampered_manifest","workload_type":"agent_runtime"}}),
         );
 
-        let loaded = load_sealed_package_for_run(&guard.path).unwrap();
-        assert_eq!(
-            loaded.json_value.pointer("/experiment/id"),
-            Some(&json!("from_checksums"))
+        let err = load_sealed_package_for_run(&guard.path)
+            .expect_err("manifest resolved_experiment must match sealed resolved_experiment.json");
+        assert!(
+            err.to_string()
+                .contains("manifest resolved_experiment does not match resolved_experiment.json"),
+            "unexpected error: {err}"
         );
     }
 
@@ -25892,13 +28808,72 @@ stages:
         let guard = TempDirGuard::new("load_exp_pkg_bad_checksum");
         fs::write(guard.path.join("resolved_experiment.json"), "{}").unwrap();
         let _staging_digest = write_empty_runtime_staging_manifest(&guard.path);
+        let wrong_digest = format!("sha256:{}", "b".repeat(64));
         let files = json!({
-            "resolved_experiment.json": "deadbeef",
-            STAGING_MANIFEST_FILE: "deadbeef"
+            "resolved_experiment.json": wrong_digest,
+            STAGING_MANIFEST_FILE: wrong_digest
         });
         write_sealed_package_metadata(&guard.path, files, json!({}));
         let err = load_sealed_package_for_run(&guard.path).unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn load_sealed_package_for_run_rejects_malformed_checksum_digest() {
+        let root = create_dx_authoring_fixture("bucephalus_malformed_checksum_digest");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let mut checksums = load_json_file(&build.checksums_path).expect("checksums");
+        set_json_pointer_value(
+            &mut checksums,
+            "/files/resolved_experiment.json",
+            json!("sha256:not_hex"),
+        )
+        .expect("rewrite checksum digest");
+        fs::write(
+            &build.checksums_path,
+            serde_json::to_string(&checksums).expect("checksums json"),
+        )
+        .expect("write malformed checksums");
+
+        let err = load_sealed_package_for_run(&build.package_dir)
+            .expect_err("sealed package loader must schema-validate checksums metadata");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sealed_package_checksums_v2 schema validation failed")
+                && msg.contains("sealed package checksums"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_package_rejects_unknown_checksum_metadata_fields() {
+        let root = create_dx_authoring_fixture("bucephalus_unknown_checksum_field");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let mut checksums = load_json_file(&build.checksums_path).expect("checksums");
+        set_json_pointer_value(&mut checksums, "/extra", json!(true))
+            .expect("add checksum metadata field");
+        fs::write(
+            &build.checksums_path,
+            serde_json::to_string(&checksums).expect("checksums json"),
+        )
+        .expect("write malformed checksums");
+
+        let err = check_package(&build.package_dir)
+            .expect_err("package check must reject unknown checksums metadata fields");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sealed_package_checksums_v2 schema validation failed")
+                && msg.contains("sealed package checksums"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -25953,6 +28928,29 @@ stages:
                 .contains("runtime staging manifest missing entries for variant 'treatment'"),
             "{}",
             err
+        );
+    }
+
+    #[test]
+    fn load_staging_specs_from_package_rejects_unknown_manifest_fields() {
+        let guard = TempDirGuard::new("load_staging_specs_unknown_manifest_fields");
+        write_runtime_staging_manifest(
+            &guard.path,
+            &json!({
+                "schema_version": STAGING_MANIFEST_SCHEMA_VERSION,
+                "fallback": true,
+                "variants": {
+                    "control": []
+                }
+            }),
+        );
+
+        let err = load_staging_specs_from_package(&guard.path, "control")
+            .expect_err("runtime staging manifest schema should reject unknown fields");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("runtime_path_staging_manifest_v1 schema validation failed"),
+            "unexpected error: {msg}"
         );
     }
 

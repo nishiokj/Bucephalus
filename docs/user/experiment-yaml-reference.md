@@ -1,6 +1,6 @@
 # Experiment YAML Reference
 
-This is the canonical authoring reference for v1 `experiment.yaml`. Authoring uses `matrix.cases`, `stages`, `ephemerals`, and `externals`; packaging normalizes those names to the current internal runtime shape.
+This is the canonical authoring reference for v1 `experiment.yaml`. Authoring uses `matrix.cases`, `stages`, `ephemerals`, and `externals`; packaging normalizes those names to the current internal runtime shape. Mapping keys must be unique at every level; duplicate YAML keys are rejected instead of silently taking the last value.
 
 The editor-facing schema is
 [`schemas/experiment_authoring_v1.jsonschema`](../../schemas/experiment_authoring_v1.jsonschema).
@@ -268,4 +268,22 @@ ephemerals must expose unique env names within that stage.
 Authoring files should not use resolved package internals such as `matrix.tasks`, `trial_runtime`, or `sidecars`. Use `matrix.cases`, `stages`, `ephemerals`, and `externals`; the build step lowers them into the sealed package contract.
 Inline `knobs` are not part of `experiment.yaml`; use an external
 `knob_manifest_v1` file with `experiment_overrides_v1` when applying
-`--overrides`.
+`--overrides`. The default manifest location is `.lab/knobs/manifest.json`;
+an overrides file may set `manifest_path`, but it must be a project-relative
+path with no `..` traversal, absolute host path, blank value, or surrounding
+whitespace. Override files must contain at least one value. Override value keys
+are knob ids; they must not be blank or padded with whitespace.
+
+Every knob id and `json_pointer` target in the manifest must be unique. Knob
+manifests must declare at least one knob. Knob ids must not be blank or padded
+with whitespace. Knob pointers must target a concrete experiment field: root
+pointers, empty path segments, and malformed JSON Pointer escapes are rejected.
+Numeric pointer segments must be canonical and must not use leading zeros.
+Applying an override requires the target field to already exist and to have the
+same type declared by the knob.
+
+Knob manifests are validated as contracts, not hints. Allowed options must be
+unique, match the knob type, and respect any numeric `minimum`, `maximum`, and
+`step`. Integer knobs require integer numeric controls. `autotune` declarations
+are not accepted until the build/package pipeline implements them; materialize
+chosen values in `experiment_overrides_v1` instead.

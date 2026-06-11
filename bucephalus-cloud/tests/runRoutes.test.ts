@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { handleRunRoute } from "../src/routes/runs";
 import type { AuthContext } from "../src/auth";
 import type { PackageRepository, RunAttemptRecord, RunRepository } from "../src/packages/repository";
+import type { CloudSecretRepository } from "../src/secrets/repository";
 import type { RuntimeRepository } from "../src/runtime/repository";
 import type { RunnerRepository } from "../src/runners/repository";
 
@@ -490,6 +491,102 @@ describe("Cloud run routes", () => {
       OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/latest",
     });
     expect(observed.secretIds).toEqual(["OPENAI_API_KEY"]);
+  });
+
+  test("run creation translates hosted bucephalus:// refs to backing provider refs", async () => {
+    const packages = {
+      async getArtifact() {
+        return packageRecordWithSecrets();
+      },
+    };
+    const observed: { secretRefs?: Record<string, string> } = {};
+    const runs = {
+      async createRun(input: { secretRefs: Record<string, string> }) {
+        observed.secretRefs = input.secretRefs;
+        return runRecord();
+      },
+    };
+    const secrets = {
+      async getSecret(ownerKey: string, name: string) {
+        expect(ownerKey).toBe("issuer:user-a");
+        expect(name).toBe("OPENAI_API_KEY");
+        return {
+          secret_id: "secret-1",
+          owner_key: ownerKey,
+          name,
+          store_name: "buc-abc-OPENAI_API_KEY",
+          backing_ref: "gcp-secret-manager://projects/bucephalus-prod/secrets/buc-abc-OPENAI_API_KEY/versions/7",
+          version: 1,
+          created_at: "2026-06-11T00:00:00Z",
+          updated_at: "2026-06-11T00:00:00Z",
+        };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          secret_refs: {
+            OPENAI_API_KEY: "bucephalus://OPENAI_API_KEY",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+      secrets as unknown as CloudSecretRepository,
+    );
+
+    expect(response!.status).toBe(201);
+    expect(observed.secretRefs).toEqual({
+      OPENAI_API_KEY: "gcp-secret-manager://projects/bucephalus-prod/secrets/buc-abc-OPENAI_API_KEY/versions/7",
+    });
+  });
+
+  test("run creation rejects hosted refs that name no uploaded secret", async () => {
+    const packages = {
+      async getArtifact() {
+        return packageRecordWithSecrets();
+      },
+    };
+    const runs = {
+      async createRun() {
+        throw new Error("createRun should not be called");
+      },
+    };
+    const secrets = {
+      async getSecret() {
+        return null;
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          secret_refs: {
+            OPENAI_API_KEY: "bucephalus://OPENAI_API_KEY",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+      secrets as unknown as CloudSecretRepository,
+    )).rejects.toThrow("No hosted secret named 'OPENAI_API_KEY'");
   });
 
   test("run creation rejects requirements that no active runner pool can satisfy", async () => {

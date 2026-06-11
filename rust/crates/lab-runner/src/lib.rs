@@ -42,6 +42,7 @@ pub use model::{
     BuildResult, ExecutorKind, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,
     PreflightReport, PreflightSeverity, RecoverResult, ReplayResult, RunResult,
 };
+pub use package::authoring::reject_duplicate_yaml_mapping_keys;
 pub use package::checks::check_package;
 pub use package::compile::build_experiment_package;
 pub use package::prepared_image::{

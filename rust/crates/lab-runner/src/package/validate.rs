@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Result};
 use lab_schemas::{compile_schema, format_validation_error};
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::Path;
 
@@ -25,62 +27,12 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     } else {
         json_value
     };
-    if !authoring_surface && json_value.pointer("/runtime/network/default").is_some() {
-        return Err(anyhow!(
-            "/runtime/network/default is authoring-only shorthand; resolved packages must declare /runtime/network/task_sandbox and /runtime/network/agent explicitly"
-        ));
-    }
-    if !authoring_surface && json_value.pointer("/runtime/registry").is_some() {
-        return Err(anyhow!(
-            "/runtime/registry is authoring-only package-build input; resolved packages must carry rewritten case images directly"
-        ));
-    }
-    if !authoring_surface && json_value.pointer("/experiment/mode").is_some() {
-        return Err(anyhow!(
-            "/experiment/mode is authoring-only evaluation intent; resolved packages must carry explicit metrics and grader contracts instead"
-        ));
-    }
-    if !authoring_surface && json_value.pointer("/scheduling/comparison").is_some() {
-        return Err(anyhow!(
-            "/scheduling/comparison is authoring-only design intent; resolved packages must carry the concrete run order under /policy/policies/scheduling"
-        ));
-    }
-    for pointer in ["/runtime/storage", "/runtime/traces"] {
-        if json_value.pointer(pointer).is_some() {
-            return Err(anyhow!(
-                "{} is not part of the experiment contract; storage and trace sinks are runner-owned today, so remove this no-op backend declaration",
-                pointer
-            ));
-        }
-    }
     if json_value
         .pointer("/version")
         .and_then(|value| value.as_str())
         .is_some_and(|value| value.trim() == "1.0")
     {
         return Err(anyhow!("experiment version '1.0' is not supported"));
-    }
-    for (pointer, message) in [
-        (
-            "/task_runtime",
-            "define task behavior under /trial_runtime/task",
-        ),
-        (
-            "/trial_runtime/outputs",
-            "declare runtime outputs under /trial_runtime/agent/outputs and downstream outputs under /trial_runtime/grader/outputs",
-        ),
-        (
-            "/trial_runtime/grader/conclusion",
-            "declare grader outputs and metrics instead of grader-owned trial_conclusion_v1 mapping",
-        ),
-        (
-            "/trial_runtime/agent/protocol",
-            "command invocation is implied by /trial_runtime/agent/command",
-        ),
-    ] {
-        if json_value.pointer(pointer).is_some() {
-            return Err(anyhow!("{} is not supported; {}", pointer, message));
-        }
     }
     reject_v0_authoring_paths(json_value)
         .map_err(|err| public_authoring_error(err, authoring_surface))?;
@@ -177,7 +129,20 @@ fn normalized_authoring_value(json_value: &Value) -> Result<Value> {
 }
 
 fn reject_v0_authoring_paths(json_value: &Value) -> Result<()> {
-    for (pointer, replacement) in [
+    for (pointer, replacement) in legacy_v0_path_replacements() {
+        if json_value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "{} is not supported in v1; move to {}",
+                pointer,
+                replacement
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn legacy_v0_path_replacements() -> &'static [(&'static str, &'static str)] {
+    &[
         ("/baseline", "/matrix/variants[] with baseline: true"),
         ("/variant_plan", "/matrix/variants"),
         ("/variants", "/matrix/variants"),
@@ -203,37 +168,7 @@ fn reject_v0_authoring_paths(json_value: &Value) -> Result<()> {
             "/policy/sanitization_profile",
         ),
         ("/experiment/workload_type", "<removed>"),
-    ] {
-        if json_value.pointer(pointer).is_some() {
-            return Err(anyhow!(
-                "{} is not supported in v1; move to {}",
-                pointer,
-                replacement
-            ));
-        }
-    }
-    if let Some(variants) = json_value
-        .pointer("/matrix/variants")
-        .and_then(Value::as_array)
-    {
-        for (idx, variant) in variants.iter().enumerate() {
-            for (field, replacement) in [
-                ("bindings", "config"),
-                ("runtime_overrides", "overrides"),
-                ("variant_id", "id"),
-            ] {
-                if variant.get(field).is_some() {
-                    return Err(anyhow!(
-                        "/matrix/variants/{}/{} is not supported in v1; move to /matrix/variants[].{}",
-                        idx,
-                        field,
-                        replacement
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
+    ]
 }
 
 fn reject_unknown_top_level_sections(json_value: &Value) -> Result<()> {
@@ -253,8 +188,10 @@ fn reject_unknown_top_level_sections(json_value: &Value) -> Result<()> {
                 | "scheduling"
                 | "sidecars"
                 | "stages"
+                | "task_runtime"
                 | "traces"
                 | "trial_runtime"
+                | "version"
         ) {
             return Err(anyhow!(
                 "/{} is not supported in v1; remove it or move its fields under the v1 experiment model",
@@ -363,6 +300,11 @@ pub(crate) fn validate_schema_contract_value(value: &Value, context: &str) -> Re
 }
 
 pub(crate) fn validate_resolved_experiment_schema(value: &Value, context: &str) -> Result<()> {
+    reject_resolved_legacy_v0_surfaces(value, context)?;
+    reject_resolved_authoring_only_surfaces(value, context)?;
+    reject_resolved_unsupported_surfaces(value, context)?;
+    reject_resolved_variant_authoring_syntax(value, context)?;
+    reject_resolved_metric_authoring_syntax(value, context)?;
     validate_resolved_runtime_accounting_uniqueness(value, context)?;
     let schema = compile_schema("resolved_experiment.jsonschema")?;
     if let Some(errors) = schema.validate(value).err() {
@@ -385,6 +327,201 @@ pub(crate) fn validate_resolved_experiment_schema(value: &Value, context: &str) 
     validate_resolved_runtime_template_bindings(value, context)?;
     validate_resolved_event_placeholders(value, context)?;
     validate_resolved_hidden_path_contract(value, context)
+}
+
+fn reject_resolved_legacy_v0_surfaces(value: &Value, context: &str) -> Result<()> {
+    if let Some(version) = value.pointer("/version").and_then(Value::as_str) {
+        if version.trim() == "1.0" {
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): experiment version '1.0' is not supported",
+                context
+            ));
+        }
+        return Err(anyhow!(
+            "resolved experiment schema validation failed ({}): /version is not supported in v1; resolved packages are schema-versioned by the package manifest, not the experiment document",
+            context
+        ));
+    }
+    for (pointer, replacement) in legacy_v0_path_replacements() {
+        if value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): {} is legacy v0 vocabulary; resolved packages must use {}",
+                context,
+                pointer,
+                replacement
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_resolved_authoring_only_surfaces(value: &Value, context: &str) -> Result<()> {
+    for (pointer, message) in [
+        (
+            "/stages",
+            "/stages is authoring-only stage vocabulary; resolved packages must carry concrete stage runtime under /trial_runtime",
+        ),
+        (
+            "/ephemerals",
+            "/ephemerals is authoring-only service vocabulary; resolved packages must carry concrete service declarations under /sidecars",
+        ),
+        (
+            "/externals",
+            "/externals is authoring-only accounting vocabulary; resolved packages must carry derived external accounting under /runtime/externals",
+        ),
+        (
+            "/matrix/cases",
+            "/matrix/cases is authoring-only case matrix vocabulary; resolved packages must carry concrete task input under /matrix/tasks",
+        ),
+        (
+            "/traces",
+            "/traces is authoring-only trace intent; resolved packages must carry concrete trace ingestion sinks under /trial_runtime/agent/events",
+        ),
+        (
+            "/runtime/network/default",
+            "/runtime/network/default is authoring-only shorthand; resolved packages must declare /runtime/network/task_sandbox and /runtime/network/agent explicitly",
+        ),
+        (
+            "/runtime/registry",
+            "/runtime/registry is authoring-only package-build input; resolved packages must carry rewritten case images directly",
+        ),
+        (
+            "/experiment/mode",
+            "/experiment/mode is authoring-only evaluation intent; resolved packages must carry explicit metrics and grader contracts instead",
+        ),
+        (
+            "/scheduling/comparison",
+            "/scheduling/comparison is authoring-only design intent; resolved packages must carry the concrete run order under /policy/policies/scheduling",
+        ),
+    ] {
+        if value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): {}",
+                context,
+                message
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_resolved_unsupported_surfaces(value: &Value, context: &str) -> Result<()> {
+    for (pointer, message) in [
+        (
+            "/runtime/storage",
+            "/runtime/storage is not part of the experiment contract; storage and trace sinks are runner-owned today, so remove this no-op backend declaration",
+        ),
+        (
+            "/runtime/traces",
+            "/runtime/traces is not part of the experiment contract; storage and trace sinks are runner-owned today, so remove this no-op backend declaration",
+        ),
+        (
+            "/task_runtime",
+            "/task_runtime is not supported; define task behavior under /trial_runtime/task",
+        ),
+        (
+            "/trial_runtime/outputs",
+            "/trial_runtime/outputs is not supported; declare runtime outputs under /trial_runtime/agent/outputs and downstream outputs under /trial_runtime/grader/outputs",
+        ),
+        (
+            "/trial_runtime/grader/conclusion",
+            "/trial_runtime/grader/conclusion is not supported; declare grader outputs and metrics instead of grader-owned trial_conclusion_v1 mapping",
+        ),
+        (
+            "/trial_runtime/agent/protocol",
+            "/trial_runtime/agent/protocol is not supported; command invocation is implied by /trial_runtime/agent/command",
+        ),
+    ] {
+        if value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): {}",
+                context,
+                message
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_resolved_variant_authoring_syntax(value: &Value, context: &str) -> Result<()> {
+    let Some(variants) = value.pointer("/matrix/variants").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (idx, variant) in variants.iter().enumerate() {
+        let Some(variant) = variant.as_object() else {
+            continue;
+        };
+        for (field, replacement) in [
+            ("bindings", "config"),
+            ("runtime_overrides", "overrides"),
+            ("variant_id", "id"),
+        ] {
+            if variant.contains_key(field) {
+                return Err(anyhow!(
+                    "resolved experiment schema validation failed ({}): /matrix/variants/{}/{} is legacy variant vocabulary; resolved packages must use /matrix/variants/{}/{}",
+                    context,
+                    idx,
+                    field,
+                    idx,
+                    replacement
+                ));
+            }
+        }
+        if variant.contains_key("image") {
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): /matrix/variants/{}/image is legacy variant vocabulary; resolved packages must use /matrix/variants/{}/overrides/agent/image",
+                context,
+                idx,
+                idx
+            ));
+        }
+        let Some(overrides) = variant.get("overrides").and_then(Value::as_object) else {
+            continue;
+        };
+        for key in overrides.keys() {
+            if matches!(key.as_str(), "agent" | "task" | "execution" | "grader") {
+                continue;
+            }
+            let hint = if key == "case" {
+                "authoring YAML should use /matrix/variants[].overrides.case, but resolved packages must contain lowered /matrix/variants[].overrides.task"
+            } else {
+                "resolved variant overrides patch /trial_runtime only"
+            };
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): /matrix/variants/{}/overrides/{} is not supported; {}",
+                context,
+                idx,
+                key,
+                hint
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_resolved_metric_authoring_syntax(value: &Value, context: &str) -> Result<()> {
+    let Some(metrics) = value.pointer("/metrics").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (idx, metric) in metrics.iter().enumerate() {
+        if metric.pointer("/from").is_some() {
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): /metrics/{} uses authoring-only field 'from'; resolved packages must carry /metrics/{}/source",
+                context,
+                idx,
+                idx
+            ));
+        }
+        if metric.pointer("/transform").is_some() {
+            return Err(anyhow!(
+                "resolved experiment schema validation failed ({}): /metrics/{} uses authoring-only field 'transform'; resolved packages must carry /metrics/{}/source/transform",
+                context,
+                idx,
+                idx
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_resolved_runtime_accounting_uniqueness(value: &Value, context: &str) -> Result<()> {
@@ -1236,7 +1373,13 @@ fn validates_payload_at_write_boundary(schema_version: &str) -> bool {
             | "grader_input_v1"
             | "package_checks_v1"
             | "prepared_task_environment_v1"
+            | "prepared_runtime_image_map_v1"
+            | "resolved_schedule_v1"
+            | "resolved_variants_v1"
+            | "runtime_path_staging_manifest_v1"
+            | "sealed_package_checksums_v2"
             | "sealed_package_lock_v1"
+            | "sealed_run_package_v2"
             | "state_inventory_v1"
             | "task_row_v2"
             | "trial_claim_intent_v1"
@@ -1248,6 +1391,10 @@ fn validates_payload_at_write_boundary(schema_version: &str) -> bool {
 pub(crate) fn load_experiment_overrides(overrides_path: &Path) -> Result<ExperimentOverrides> {
     let overrides_schema = compile_schema("experiment_overrides_v1.jsonschema")?;
     let overrides_data = fs::read_to_string(overrides_path)?;
+    reject_duplicate_json_object_keys(
+        &overrides_data,
+        &format!("overrides {}", overrides_path.display()),
+    )?;
     let overrides_json: Value = serde_json::from_str(&overrides_data)?;
     if let Err(errors) = overrides_schema.validate(&overrides_json) {
         let mut msgs = Vec::new();
@@ -1267,12 +1414,63 @@ pub(crate) fn load_experiment_overrides(overrides_path: &Path) -> Result<Experim
             overrides.schema_version
         ));
     }
+    validate_override_manifest_path_field(overrides_path, &overrides)?;
+    validate_override_value_keys(overrides_path, &overrides)?;
     Ok(overrides)
+}
+
+fn validate_override_manifest_path_field(
+    overrides_path: &Path,
+    overrides: &ExperimentOverrides,
+) -> Result<()> {
+    let Some(manifest_path) = overrides.manifest_path.as_ref() else {
+        return Ok(());
+    };
+    if manifest_path.trim().is_empty() {
+        return Err(anyhow!(
+            "overrides {} declares blank manifest_path; omit manifest_path to use the default .lab/knobs/manifest.json",
+            overrides_path.display()
+        ));
+    }
+    if manifest_path.trim() != manifest_path {
+        return Err(anyhow!(
+            "overrides {} declares manifest_path '{}' with leading or trailing whitespace; manifest_path must be written exactly as a project-relative path",
+            overrides_path.display(),
+            manifest_path
+        ));
+    }
+    Ok(())
+}
+
+fn validate_override_value_keys(
+    overrides_path: &Path,
+    overrides: &ExperimentOverrides,
+) -> Result<()> {
+    for id in overrides.values.keys() {
+        if id.trim().is_empty() {
+            return Err(anyhow!(
+                "overrides {} declares blank override id; override value keys must be non-empty knob ids after trimming whitespace",
+                overrides_path.display()
+            ));
+        }
+        if id.trim() != id {
+            return Err(anyhow!(
+                "overrides {} declares override id '{}' with leading or trailing whitespace; override value keys must exactly match knob ids",
+                overrides_path.display(),
+                id
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn load_knob_manifest(manifest_path: &Path) -> Result<KnobManifest> {
     let manifest_schema = compile_schema("knob_manifest_v1.jsonschema")?;
     let manifest_data = fs::read_to_string(manifest_path)?;
+    reject_duplicate_json_object_keys(
+        &manifest_data,
+        &format!("knob manifest {}", manifest_path.display()),
+    )?;
     let manifest_json: Value = serde_json::from_str(&manifest_data)?;
     if let Err(errors) = manifest_schema.validate(&manifest_json) {
         let mut msgs = Vec::new();
@@ -1292,7 +1490,476 @@ pub(crate) fn load_knob_manifest(manifest_path: &Path) -> Result<KnobManifest> {
             manifest.schema_version
         ));
     }
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_pointers = BTreeMap::new();
+    for (idx, knob) in manifest.knobs.iter().enumerate() {
+        validate_knob_definition(manifest_path, idx, knob)?;
+        if !seen_ids.insert(knob.id.clone()) {
+            return Err(anyhow!(
+                "knob manifest {} duplicates knob id '{}' at knobs[{}]; knob ids must be unique",
+                manifest_path.display(),
+                knob.id,
+                idx
+            ));
+        }
+        if let Some(previous_idx) = seen_pointers.insert(knob.json_pointer.clone(), idx) {
+            return Err(anyhow!(
+                "knob manifest {} maps multiple knobs to json_pointer '{}' at knobs[{}] and knobs[{}]; each knob must target a unique field",
+                manifest_path.display(),
+                knob.json_pointer,
+                previous_idx,
+                idx
+            ));
+        }
+    }
     Ok(manifest)
+}
+
+fn validate_knob_definition(manifest_path: &Path, idx: usize, knob: &KnobDef) -> Result<()> {
+    validate_knob_id(manifest_path, idx, knob)?;
+    validate_knob_json_pointer(manifest_path, idx, knob)?;
+    if knob.autotune.is_some() {
+        return Err(anyhow!(
+            "knob manifest {} declares autotune for knob '{}' at knobs[{}], but autotune is not supported by the build/package pipeline yet; remove autotune or materialize it into explicit override values",
+            manifest_path.display(),
+            knob.id,
+            idx
+        ));
+    }
+    let is_numeric = matches!(knob.value_type.as_str(), "integer" | "number");
+    if !is_numeric && (knob.minimum.is_some() || knob.maximum.is_some() || knob.step.is_some()) {
+        return Err(anyhow!(
+            "knob manifest {} declares numeric controls for non-numeric knob '{}' at knobs[{}]; minimum, maximum, and step only apply to integer or number knobs",
+            manifest_path.display(),
+            knob.id,
+            idx
+        ));
+    }
+    if let Some(step) = knob.step {
+        if step <= 0.0 {
+            return Err(anyhow!(
+                "knob manifest {} declares non-positive step for knob '{}' at knobs[{}]: step must be greater than 0",
+                manifest_path.display(),
+                knob.id,
+                idx
+            ));
+        }
+    }
+    if knob.value_type == "integer" {
+        for (field, value) in [
+            ("minimum", knob.minimum),
+            ("maximum", knob.maximum),
+            ("step", knob.step),
+        ] {
+            if let Some(value) = value {
+                if !is_integral_f64(value) {
+                    return Err(anyhow!(
+                        "knob manifest {} declares fractional {} for integer knob '{}' at knobs[{}]: integer knobs require integer minimum, maximum, and step values",
+                        manifest_path.display(),
+                        field,
+                        knob.id,
+                        idx
+                    ));
+                }
+            }
+        }
+    }
+    if let (Some(minimum), Some(maximum)) = (knob.minimum, knob.maximum) {
+        if minimum > maximum {
+            return Err(anyhow!(
+                "knob manifest {} declares impossible bounds for knob '{}' at knobs[{}]: minimum {} is greater than maximum {}",
+                manifest_path.display(),
+                knob.id,
+                idx,
+                minimum,
+                maximum
+            ));
+        }
+    }
+    if let Some(options) = knob.options.as_ref() {
+        if options.is_empty() {
+            return Err(anyhow!(
+                "knob manifest {} declares empty options for knob '{}' at knobs[{}]; omit options or provide at least one allowed value",
+                manifest_path.display(),
+                knob.id,
+                idx
+            ));
+        }
+        let mut seen_options = BTreeMap::new();
+        for (option_idx, option) in options.iter().enumerate() {
+            let option_key = semantic_option_key(option);
+            if let Some(previous_idx) = seen_options.insert(option_key, option_idx) {
+                return Err(anyhow!(
+                    "knob manifest {} duplicates option for knob '{}' at knobs[{}].options[{}] and knobs[{}].options[{}]",
+                    manifest_path.display(),
+                    knob.id,
+                    idx,
+                    previous_idx,
+                    idx,
+                    option_idx
+                ));
+            }
+            if !value_matches_type(option, &knob.value_type) {
+                return Err(anyhow!(
+                    "knob manifest {} option type mismatch for knob '{}' at knobs[{}].options[{}]: expected {}, got {}",
+                    manifest_path.display(),
+                    knob.id,
+                    idx,
+                    option_idx,
+                    knob.value_type,
+                    value_type_name(option)
+                ));
+            }
+            if let Some(minimum) = knob.minimum {
+                if let Some(value) = option.as_f64() {
+                    if value < minimum {
+                        return Err(anyhow!(
+                            "knob manifest {} option for knob '{}' at knobs[{}].options[{}] is below minimum {}",
+                            manifest_path.display(),
+                            knob.id,
+                            idx,
+                            option_idx,
+                            minimum
+                        ));
+                    }
+                }
+            }
+            if let Some(maximum) = knob.maximum {
+                if let Some(value) = option.as_f64() {
+                    if value > maximum {
+                        return Err(anyhow!(
+                            "knob manifest {} option for knob '{}' at knobs[{}].options[{}] is above maximum {}",
+                            manifest_path.display(),
+                            knob.id,
+                            idx,
+                            option_idx,
+                            maximum
+                        ));
+                    }
+                }
+            }
+            if let Some(step) = knob.step {
+                if let Some(value) = option.as_f64() {
+                    let base = knob.minimum.unwrap_or(0.0);
+                    if !value_respects_step(value, base, step) {
+                        return Err(anyhow!(
+                            "knob manifest {} option for knob '{}' at knobs[{}].options[{}] does not align with step {} from base {}",
+                            manifest_path.display(),
+                            knob.id,
+                            idx,
+                            option_idx,
+                            step,
+                            base
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn semantic_option_key(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => format!("bool:{value}"),
+        Value::Number(value) => format!("number:{}", semantic_number_key(value)),
+        Value::String(value) => format!("string:{}:{value}", value.len()),
+        Value::Array(values) => {
+            let mut key = String::from("array:[");
+            for value in values {
+                let child = semantic_option_key(value);
+                key.push_str(&child.len().to_string());
+                key.push(':');
+                key.push_str(&child);
+                key.push(',');
+            }
+            key.push(']');
+            key
+        }
+        Value::Object(object) => {
+            let mut entries: Vec<_> = object.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let mut key = String::from("object:{");
+            for (name, value) in entries {
+                let child = semantic_option_key(value);
+                key.push_str(&name.len().to_string());
+                key.push(':');
+                key.push_str(name);
+                key.push('=');
+                key.push_str(&child.len().to_string());
+                key.push(':');
+                key.push_str(&child);
+                key.push(',');
+            }
+            key.push('}');
+            key
+        }
+    }
+}
+
+fn semantic_number_key(value: &serde_json::Number) -> String {
+    if let Some(value) = value.as_i64() {
+        return value.to_string();
+    }
+    if let Some(value) = value.as_u64() {
+        return value.to_string();
+    }
+    let value = value
+        .as_f64()
+        .expect("JSON numbers accepted by serde_json must convert to f64");
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+        return format!("{value:.0}");
+    }
+    format!("f64:{:016x}", value.to_bits())
+}
+
+fn validate_knob_id(manifest_path: &Path, idx: usize, knob: &KnobDef) -> Result<()> {
+    if knob.id.trim().is_empty() {
+        return Err(anyhow!(
+            "knob manifest {} declares blank knob id at knobs[{}]; knob ids must be non-empty after trimming whitespace",
+            manifest_path.display(),
+            idx
+        ));
+    }
+    if knob.id.trim() != knob.id {
+        return Err(anyhow!(
+            "knob manifest {} declares knob id '{}' with leading or trailing whitespace at knobs[{}]; knob ids must be written exactly as override keys",
+            manifest_path.display(),
+            knob.id,
+            idx
+        ));
+    }
+    Ok(())
+}
+
+fn validate_knob_json_pointer(manifest_path: &Path, idx: usize, knob: &KnobDef) -> Result<()> {
+    if knob.json_pointer == "/" {
+        return Err(anyhow!(
+            "knob manifest {} declares root json_pointer for knob '{}' at knobs[{}]; knob pointers must target a concrete experiment field",
+            manifest_path.display(),
+            knob.id,
+            idx
+        ));
+    }
+    let Some(rest) = knob.json_pointer.strip_prefix('/') else {
+        return Err(anyhow!(
+            "knob manifest {} declares invalid json_pointer '{}' for knob '{}' at knobs[{}]; pointer must start with '/'",
+            manifest_path.display(),
+            knob.json_pointer,
+            knob.id,
+            idx
+        ));
+    };
+    for token in rest.split('/') {
+        if token.is_empty() {
+            return Err(anyhow!(
+                "knob manifest {} declares invalid json_pointer '{}' for knob '{}' at knobs[{}]; empty path segments are not allowed",
+                manifest_path.display(),
+                knob.json_pointer,
+                knob.id,
+                idx
+            ));
+        }
+        validate_json_pointer_token_escapes(manifest_path, idx, knob, token)?;
+        if token.len() > 1 && token.starts_with('0') && token.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(anyhow!(
+                "knob manifest {} declares invalid json_pointer '{}' for knob '{}' at knobs[{}]; numeric pointer segments must be canonical and must not use leading zeros",
+                manifest_path.display(),
+                knob.json_pointer,
+                knob.id,
+                idx
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_pointer_token_escapes(
+    manifest_path: &Path,
+    idx: usize,
+    knob: &KnobDef,
+    token: &str,
+) -> Result<()> {
+    let bytes = token.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'~' {
+            let valid_escape = i + 1 < bytes.len() && matches!(bytes[i + 1], b'0' | b'1');
+            if !valid_escape {
+                return Err(anyhow!(
+                    "knob manifest {} declares invalid json_pointer '{}' for knob '{}' at knobs[{}]; '~' must be escaped as '~0' or '~1'",
+                    manifest_path.display(),
+                    knob.json_pointer,
+                    knob.id,
+                    idx
+                ));
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn is_integral_f64(value: f64) -> bool {
+    value.fract() == 0.0
+}
+
+fn value_respects_step(value: f64, base: f64, step: f64) -> bool {
+    let units = (value - base) / step;
+    let nearest = units.round();
+    let tolerance = 1e-9_f64.max(units.abs() * 1e-9);
+    (units - nearest).abs() <= tolerance
+}
+
+pub(crate) fn reject_duplicate_json_object_keys(raw: &str, context: &str) -> Result<()> {
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    DuplicateJsonKeySeed {
+        path: String::new(),
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|err| anyhow!("{} contains duplicate JSON object key: {}", context, err))?;
+    deserializer
+        .end()
+        .map_err(|err| anyhow!("{} is not valid JSON: {}", context, err))?;
+    Ok(())
+}
+
+struct DuplicateJsonKeySeed {
+    path: String,
+}
+
+impl<'de> DeserializeSeed<'de> for DuplicateJsonKeySeed {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateJsonKeyVisitor { path: self.path })
+    }
+}
+
+struct DuplicateJsonKeyVisitor {
+    path: String,
+}
+
+impl<'de> Visitor<'de> for DuplicateJsonKeyVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut idx = 0usize;
+        while seq
+            .next_element_seed(DuplicateJsonKeySeed {
+                path: json_pointer_child(&self.path, &idx.to_string()),
+            })?
+            .is_some()
+        {
+            idx += 1;
+        }
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen = BTreeSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                let path = if self.path.is_empty() {
+                    "/"
+                } else {
+                    &self.path
+                };
+                return Err(de::Error::custom(format!(
+                    "duplicate key '{}' at {}",
+                    key, path
+                )));
+            }
+            map.next_value_seed(DuplicateJsonKeySeed {
+                path: json_pointer_child(&self.path, &key),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn json_pointer_child(parent: &str, raw: &str) -> String {
+    let escaped = raw.replace('~', "~0").replace('/', "~1");
+    if parent.is_empty() {
+        format!("/{}", escaped)
+    } else {
+        format!("{}/{}", parent, escaped)
+    }
 }
 
 pub(crate) fn validate_knob_value(knob: &KnobDef, value: &Value) -> Result<()> {
@@ -1334,12 +2001,33 @@ pub(crate) fn validate_knob_value(knob: &KnobDef, value: &Value) -> Result<()> {
             }
         }
     }
+    if let Some(step) = knob.step {
+        if let Some(v) = value.as_f64() {
+            let base = knob.minimum.unwrap_or(0.0);
+            if !value_respects_step(v, base, step) {
+                return Err(anyhow!(
+                    "override value for knob {} does not align with step {} from base {}",
+                    knob.id,
+                    step,
+                    base
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
 pub fn validate_knob_overrides(manifest_path: &Path, overrides_path: &Path) -> Result<()> {
     let manifest = load_knob_manifest(manifest_path)?;
     let overrides = load_experiment_overrides(overrides_path)?;
+    if let Some(manifest_ref) = overrides.manifest_path.as_ref() {
+        return Err(anyhow!(
+            "overrides {} declares manifest_path '{}', but standalone knob override validation already received manifest {}; omit manifest_path from the overrides file or validate through the build/apply path",
+            overrides_path.display(),
+            manifest_ref,
+            manifest_path.display()
+        ));
+    }
     let mut by_id: BTreeMap<String, KnobDef> = BTreeMap::new();
     for knob in manifest.knobs {
         by_id.insert(knob.id.clone(), knob);

@@ -279,6 +279,8 @@ pub fn find_project_root(experiment_dir: &Path) -> PathBuf {
 }
 
 pub(crate) fn parse_policies(json_value: &Value) -> Result<PolicyConfig> {
+    reject_legacy_policy_surface(json_value)?;
+
     let policies = match json_value.pointer("/policy/policies") {
         Some(value) if value.is_object() => value,
         Some(_) => return Err(anyhow!("policy.policies must be an object")),
@@ -352,6 +354,33 @@ pub(crate) fn parse_policies(json_value: &Value) -> Result<PolicyConfig> {
             require_chain_lease,
         },
     })
+}
+
+fn reject_legacy_policy_surface(json_value: &Value) -> Result<()> {
+    if json_value.pointer("/scheduling/comparison").is_some() {
+        return Err(anyhow!(
+            "/scheduling/comparison is authoring-only design intent; resolved packages must use /policy/policies/scheduling"
+        ));
+    }
+    for (pointer, replacement) in [
+        (
+            "/policy/task_sandbox/network",
+            "/runtime/network/task_sandbox",
+        ),
+        (
+            "/policy/task_sandbox/profile",
+            "/policy/sanitization_profile",
+        ),
+    ] {
+        if json_value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "{} is legacy v0 policy vocabulary; resolved packages must use {}",
+                pointer,
+                replacement
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn required_policy_value<'a>(root: &'a Value, pointer: &str, field: &str) -> Result<&'a Value> {
@@ -1017,16 +1046,57 @@ pub(crate) fn write_resolved_schedule(run_dir: &Path, schedule: &[TrialSlot]) ->
     atomic_write_json_pretty(&resolved_schedule_path(run_dir), &value)
 }
 
+pub(crate) fn load_run_schedule(run_dir: &Path) -> Result<Vec<TrialSlot>> {
+    let manifest_path = resolved_schedule_path(run_dir);
+    if !manifest_path.exists() {
+        return Err(anyhow!(
+            "missing resolved schedule manifest: {}; run schedule must be loaded from the recorded run plan",
+            manifest_path.display()
+        ));
+    }
+
+    let manifest_value: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    crate::package::validate::validate_schema_contract_value(
+        &manifest_value,
+        format!("resolved schedule manifest {}", manifest_path.display()).as_str(),
+    )?;
+    let manifest: ResolvedScheduleManifest = serde_json::from_value(manifest_value)?;
+    if manifest.schema_version != "resolved_schedule_v1" {
+        return Err(anyhow!(
+            "unsupported resolved schedule schema_version in {}: {}",
+            manifest_path.display(),
+            manifest.schema_version
+        ));
+    }
+    if manifest.total_slots != manifest.schedule.len() {
+        return Err(anyhow!(
+            "resolved schedule manifest total_slots mismatch in {}: declared {}, found {}",
+            manifest_path.display(),
+            manifest.total_slots,
+            manifest.schedule.len()
+        ));
+    }
+    Ok(manifest.schedule)
+}
+
 pub(crate) fn load_run_variants(
     run_dir: &Path,
     experiment: &Value,
 ) -> Result<(Vec<Variant>, String)> {
     let manifest_path = resolved_variants_path(run_dir);
     if !manifest_path.exists() {
-        return resolve_variant_plan(experiment);
+        return Err(anyhow!(
+            "missing resolved variants manifest: {}; run variants must be loaded from the recorded run plan",
+            manifest_path.display()
+        ));
     }
 
-    let manifest: ResolvedVariantsManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let manifest_value: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    crate::package::validate::validate_schema_contract_value(
+        &manifest_value,
+        format!("resolved variants manifest {}", manifest_path.display()).as_str(),
+    )?;
+    let manifest: ResolvedVariantsManifest = serde_json::from_value(manifest_value)?;
     if manifest.schema_version != "resolved_variants_v1" {
         return Err(anyhow!(
             "unsupported resolved variants schema_version in {}: {}",
@@ -1050,6 +1120,18 @@ pub(crate) fn load_run_variants(
             manifest.baseline_id,
             manifest_path.display()
         ));
+    }
+    for entry in &manifest.variants {
+        let actual_digest = resolved_variant_behavior_digest(experiment, &entry.variant)?;
+        if actual_digest != entry.variant_digest {
+            return Err(anyhow!(
+                "resolved variants manifest digest mismatch for variant '{}' in {}: recorded {}, computed {}",
+                entry.variant.id,
+                manifest_path.display(),
+                entry.variant_digest,
+                actual_digest
+            ));
+        }
     }
     Ok((
         manifest
@@ -1164,6 +1246,7 @@ fn resolved_variant_manifest_entry(
 }
 
 pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
+    reject_legacy_variant_plan_surface(json_value)?;
     let variant_list = json_value
         .pointer("/matrix/variants")
         .and_then(Value::as_array)
@@ -1247,6 +1330,28 @@ pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, 
     let baseline = baseline_id
         .ok_or_else(|| anyhow!("exactly one /matrix/variants[].baseline=true is required"))?;
     Ok((variants, baseline))
+}
+
+fn reject_legacy_variant_plan_surface(json_value: &Value) -> Result<()> {
+    if json_value.pointer("/version").is_some() {
+        return Err(anyhow!(
+            "/version is not supported in v1 variant plans; resolved packages are schema-versioned by the package manifest"
+        ));
+    }
+    for (pointer, replacement) in [
+        ("/variant_plan", "/matrix/variants"),
+        ("/variants", "/matrix/variants"),
+        ("/baseline", "/matrix/variants[] with baseline: true"),
+    ] {
+        if json_value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "{} is legacy variant plan vocabulary; use {}",
+                pointer,
+                replacement
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_variant_runtime_override_roots(
@@ -1457,19 +1562,8 @@ pub(crate) fn apply_experiment_overrides(
     project_root: &Path,
 ) -> Result<Value> {
     let overrides = crate::package::validate::load_experiment_overrides(overrides_path)?;
-    if overrides.values.is_empty() {
-        return Ok(experiment);
-    }
-
-    let manifest_rel = overrides
-        .manifest_path
-        .as_deref()
-        .unwrap_or(".lab/knobs/manifest.json");
-    let manifest_path = if Path::new(manifest_rel).is_absolute() {
-        PathBuf::from(manifest_rel)
-    } else {
-        project_root.join(manifest_rel)
-    };
+    let manifest_path =
+        resolve_override_manifest_path(overrides.manifest_path.as_deref(), project_root)?;
     let manifest = crate::package::validate::load_knob_manifest(&manifest_path)?;
 
     let mut by_id: BTreeMap<String, KnobDef> = BTreeMap::new();
@@ -1481,6 +1575,25 @@ pub(crate) fn apply_experiment_overrides(
         let knob = by_id
             .get(id)
             .ok_or_else(|| anyhow!("override references unknown knob id: {}", id))?;
+        if experiment.pointer(&knob.json_pointer).is_none() {
+            return Err(anyhow!(
+                "override knob '{}' targets missing json_pointer '{}'; knob overrides only patch declared fields",
+                id,
+                knob.json_pointer
+            ));
+        }
+        let current_value = experiment
+            .pointer(&knob.json_pointer)
+            .expect("checked knob json_pointer exists");
+        if !value_matches_type(current_value, &knob.value_type) {
+            return Err(anyhow!(
+                "override knob '{}' declares type {} for json_pointer '{}', but the experiment field is {}; knob manifests must match the declared field type",
+                id,
+                knob.value_type,
+                knob.json_pointer,
+                value_type_name(current_value)
+            ));
+        }
         crate::package::validate::validate_knob_value(knob, value)?;
         set_json_pointer_value(&mut experiment, &knob.json_pointer, value.clone())?;
     }
@@ -1488,7 +1601,45 @@ pub(crate) fn apply_experiment_overrides(
     Ok(experiment)
 }
 
+fn resolve_override_manifest_path(
+    manifest_path: Option<&str>,
+    project_root: &Path,
+) -> Result<PathBuf> {
+    let manifest_rel = manifest_path.unwrap_or(".lab/knobs/manifest.json");
+    if manifest_rel.is_empty() {
+        return Err(anyhow!(
+            "overrides manifest_path must be a non-empty project-relative path"
+        ));
+    }
+    let rel = Path::new(manifest_rel);
+    if rel.is_absolute() {
+        return Err(anyhow!(
+            "overrides manifest_path '{}' must be project-relative; absolute host paths are not allowed",
+            manifest_rel
+        ));
+    }
+    for component in rel.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(anyhow!(
+                    "overrides manifest_path '{}' must stay inside the project root; '..' path segments are not allowed",
+                    manifest_rel
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "overrides manifest_path '{}' must be project-relative",
+                    manifest_rel
+                ));
+            }
+        }
+    }
+    Ok(project_root.join(rel))
+}
+
 pub(crate) fn validate_dataset_provider(json_value: &Value) -> Result<()> {
+    reject_legacy_dataset_provider_surface(json_value)?;
     match json_value.pointer("/matrix/tasks/source") {
         Some(Value::String(source)) if source == "file" => Ok(()),
         Some(Value::String(source)) => Err(anyhow!(
@@ -1501,6 +1652,20 @@ pub(crate) fn validate_dataset_provider(json_value: &Value) -> Result<()> {
         Some(_) => Err(anyhow!("matrix.tasks.source must be 'file'")),
         None => Err(anyhow!("missing /matrix/tasks/source")),
     }
+}
+
+fn reject_legacy_dataset_provider_surface(json_value: &Value) -> Result<()> {
+    if json_value.pointer("/matrix/cases").is_some() {
+        return Err(anyhow!(
+            "/matrix/cases is authoring-only case matrix vocabulary; resolved packages must use /matrix/tasks"
+        ));
+    }
+    if json_value.pointer("/dataset").is_some() {
+        return Err(anyhow!(
+            "/dataset is legacy v0 dataset vocabulary; resolved packages must use /matrix/tasks"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
@@ -1529,6 +1694,10 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
         if limit.is_some_and(|max| tasks.len() >= max) {
             break;
         }
+        crate::package::validate::reject_duplicate_json_object_keys(
+            trimmed,
+            &format!("dataset file {}:{}", path.display(), idx + 1),
+        )?;
         let task: Value = serde_json::from_str(trimmed)?;
         let task_label = task
             .pointer("/id")

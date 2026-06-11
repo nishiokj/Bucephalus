@@ -2,8 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use lab_core::{
     sha256_bytes, sha256_file, BUCEPHALUS_RESULT_PATH, BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
 };
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -45,6 +47,7 @@ pub(crate) fn load_authoring_input_for_build(
         .canonicalize()
         .with_context(|| format!("resolve project root '{}'", project_root.display()))?;
     let raw_yaml = fs::read_to_string(&canonical)?;
+    reject_duplicate_yaml_mapping_keys(&raw_yaml, &canonical)?;
     let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
     let json_value: Value = serde_json::to_value(yaml_value)?;
     let mut json_value = if let Some(overrides_path) = overrides_path {
@@ -62,6 +65,166 @@ pub(crate) fn load_authoring_input_for_build(
         exp_dir,
         project_root,
     })
+}
+
+pub fn reject_duplicate_yaml_mapping_keys(raw: &str, path: &Path) -> Result<()> {
+    for document in serde_yaml::Deserializer::from_str(raw) {
+        DuplicateYamlKeySeed {
+            path: String::new(),
+        }
+        .deserialize(document)
+        .map_err(|err| {
+            anyhow!(
+                "experiment authoring YAML {} contains duplicate mapping key: {}",
+                path.display(),
+                err
+            )
+        })?;
+    }
+    Ok(())
+}
+
+struct DuplicateYamlKeySeed {
+    path: String,
+}
+
+impl<'de> DeserializeSeed<'de> for DuplicateYamlKeySeed {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateYamlKeyVisitor { path: self.path })
+    }
+}
+
+struct DuplicateYamlKeyVisitor {
+    path: String,
+}
+
+impl<'de> Visitor<'de> for DuplicateYamlKeyVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any YAML value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<(), E>
+    where
+        E: de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut idx = 0usize;
+        while seq
+            .next_element_seed(DuplicateYamlKeySeed {
+                path: yaml_path_child(&self.path, &idx.to_string()),
+            })?
+            .is_some()
+        {
+            idx += 1;
+        }
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen = HashSet::new();
+        while let Some(key) = map.next_key::<serde_yaml::Value>()? {
+            if !seen.insert(key.clone()) {
+                let path = if self.path.is_empty() {
+                    "/"
+                } else {
+                    &self.path
+                };
+                return Err(de::Error::custom(format!(
+                    "duplicate key '{}' at {}",
+                    yaml_key_label(&key),
+                    path
+                )));
+            }
+            map.next_value_seed(DuplicateYamlKeySeed {
+                path: yaml_path_child(&self.path, &yaml_key_label(&key)),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn yaml_key_label(key: &serde_yaml::Value) -> String {
+    match key {
+        serde_yaml::Value::String(value) => value.clone(),
+        serde_yaml::Value::Bool(value) => value.to_string(),
+        serde_yaml::Value::Number(value) => value.to_string(),
+        serde_yaml::Value::Null => "null".to_string(),
+        _ => format!("{key:?}"),
+    }
+}
+
+fn yaml_path_child(parent: &str, raw: &str) -> String {
+    let escaped = raw.replace('~', "~0").replace('/', "~1");
+    if parent.is_empty() {
+        format!("/{}", escaped)
+    } else {
+        format!("{}/{}", parent, escaped)
+    }
 }
 
 fn validate_authoring_schema(json_value: &Value) -> Result<()> {
@@ -120,7 +283,96 @@ pub(crate) fn reject_legacy_authoring_surface(json_value: &Value) -> Result<()> 
     reject_duplicate_runtime_secret_names(json_value)?;
     reject_invalid_runtime_secret_provider_shapes(json_value)?;
     reject_duplicate_credential_cache_env(json_value)?;
+    reject_nested_resolved_authoring_vocabulary(json_value)?;
     reject_uninferrable_agent_site_authoring(json_value)?;
+    Ok(())
+}
+
+fn reject_nested_resolved_authoring_vocabulary(json_value: &Value) -> Result<()> {
+    if json_value.pointer("/stages/task").is_some() {
+        return Err(anyhow!(
+            "/stages/task is resolved package vocabulary and is not accepted in authoring YAML; use /stages/case"
+        ));
+    }
+    for stage in ["agent", "grader"] {
+        let pointer = format!("/stages/{}/sidecars", stage);
+        if json_value.pointer(&pointer).is_some() {
+            return Err(anyhow!(
+                "{} is resolved package vocabulary and is not accepted in authoring YAML; use /stages/{}/ephemerals",
+                pointer,
+                stage
+            ));
+        }
+    }
+    reject_agent_runtime_owned_fields(json_value, "/stages/agent", "/stages/agent")?;
+    let Some(variants) = json_value
+        .pointer("/matrix/variants")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for (idx, variant) in variants.iter().enumerate() {
+        if variant.pointer("/overrides/task").is_some() {
+            return Err(anyhow!(
+                "/matrix/variants/{}/overrides/task is resolved package vocabulary and is not accepted in authoring YAML; use /matrix/variants/{}/overrides/case",
+                idx,
+                idx
+            ));
+        }
+        for stage in ["agent", "grader"] {
+            let pointer = format!("/overrides/{}/sidecars", stage);
+            if variant.pointer(&pointer).is_some() {
+                return Err(anyhow!(
+                    "/matrix/variants/{}/overrides/{}/sidecars is resolved package vocabulary and is not accepted in authoring YAML; use /matrix/variants/{}/overrides/{}/ephemerals",
+                    idx,
+                    stage,
+                    idx,
+                    stage
+                ));
+            }
+        }
+        reject_agent_runtime_owned_fields(
+            variant,
+            "/overrides/agent",
+            &format!("/matrix/variants/{}/overrides/agent", idx),
+        )?;
+    }
+    Ok(())
+}
+
+fn reject_agent_runtime_owned_fields(
+    root: &Value,
+    pointer: &str,
+    public_context: &str,
+) -> Result<()> {
+    for (field, replacement) in [
+        (
+            "artifact_type",
+            "omit it; package build writes the canonical structured_json result contract",
+        ),
+        (
+            "integration_level",
+            "omit it; package build derives it from declared events or traces.source: protocol",
+        ),
+        (
+            "telemetry",
+            "use /traces.source: protocol or explicit /stages/agent/events",
+        ),
+        (
+            "protocol",
+            "use /stages/agent/command; command invocation is implied",
+        ),
+    ] {
+        let full_pointer = format!("{}/{}", pointer, field);
+        if root.pointer(&full_pointer).is_some() {
+            return Err(anyhow!(
+                "{}/{} is resolved package vocabulary and is not accepted in authoring YAML; {}",
+                public_context,
+                field,
+                replacement
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -3438,9 +3690,42 @@ mod tests {
             ),
             (json!({ "variants": [{ "id": "base" }] }), "/variants"),
             (json!({ "task": {} }), "/task"),
+            (json!({ "stages": { "task": {} } }), "/stages/task"),
             (json!({ "agent": {} }), "/agent"),
             (json!({ "trial_runtime": {} }), "/trial_runtime"),
             (json!({ "sidecars": {} }), "/sidecars"),
+            (
+                json!({ "stages": { "agent": { "sidecars": ["svc"] } } }),
+                "/stages/agent/sidecars",
+            ),
+            (
+                json!({ "stages": { "agent": { "command": ["agent"], "artifact_type": "structured_json" } } }),
+                "/stages/agent/artifact_type",
+            ),
+            (
+                json!({ "stages": { "agent": { "command": ["agent"], "integration_level": "cli_basic" } } }),
+                "/stages/agent/integration_level",
+            ),
+            (
+                json!({ "stages": { "agent": { "command": ["agent"], "telemetry": {} } } }),
+                "/stages/agent/telemetry",
+            ),
+            (
+                json!({ "stages": { "agent": { "command": ["agent"], "protocol": "command" } } }),
+                "/stages/agent/protocol",
+            ),
+            (
+                json!({ "matrix": { "variants": [{ "id": "base", "overrides": { "task": {} } }] } }),
+                "/matrix/variants/0/overrides/task",
+            ),
+            (
+                json!({ "matrix": { "variants": [{ "id": "base", "overrides": { "grader": { "sidecars": ["svc"] } } }] } }),
+                "/matrix/variants/0/overrides/grader/sidecars",
+            ),
+            (
+                json!({ "matrix": { "variants": [{ "id": "base", "overrides": { "agent": { "integration_level": "cli_events" } } }] } }),
+                "/matrix/variants/0/overrides/agent/integration_level",
+            ),
             (
                 json!({ "runtime": { "externals": {} } }),
                 "/runtime/externals",

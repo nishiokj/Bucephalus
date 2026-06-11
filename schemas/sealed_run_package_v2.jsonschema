@@ -9,6 +9,7 @@
     "created_at",
     "resolved_experiment",
     "checksums_ref",
+    "package_checks_ref",
     "package_digest"
   ],
   "properties": {

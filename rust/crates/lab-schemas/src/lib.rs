@@ -147,9 +147,18 @@ mod tests {
         compile_schema("grader_input_v1.jsonschema").expect("grader input schema");
         compile_schema("trial_conclusion_v1.jsonschema").expect("trial conclusion schema");
         compile_schema("trial_claim_intent_v1.jsonschema").expect("trial claim intent schema");
+        compile_schema("sealed_run_package_v2.jsonschema").expect("sealed package schema");
+        compile_schema("sealed_package_checksums_v2.jsonschema")
+            .expect("sealed package checksums schema");
         compile_schema("sealed_package_lock_v1.jsonschema").expect("sealed package lock schema");
         compile_schema("package_checks_v1.jsonschema").expect("package checks schema");
         compile_schema("resolved_experiment.jsonschema").expect("resolved experiment schema");
+        compile_schema("resolved_variants_v1.jsonschema").expect("resolved variants schema");
+        compile_schema("resolved_schedule_v1.jsonschema").expect("resolved schedule schema");
+        compile_schema("runtime_path_staging_manifest_v1.jsonschema")
+            .expect("runtime path staging manifest schema");
+        compile_schema("prepared_runtime_image_map_v1.jsonschema")
+            .expect("prepared runtime image map schema");
         compile_schema("state_inventory_v1.jsonschema").expect("state inventory schema");
         compile_schema("prepared_task_environment_v1.jsonschema")
             .expect("prepared task environment schema");

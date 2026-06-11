@@ -619,6 +619,10 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
         if limit.is_some_and(|max| tasks.len() >= max) {
             break;
         }
+        reject_duplicate_json_object_keys(
+            trimmed,
+            &format!("dataset file {}:{}", path.display(), idx + 1),
+        )?;
         let task: Value = serde_json::from_str(trimmed)?;
         let mut task_for_validation = task.clone();
         normalize_packaged_case_defaults(&mut task_for_validation)?;

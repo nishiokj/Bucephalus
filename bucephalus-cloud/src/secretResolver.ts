@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { chmod, mkdir, open } from "node:fs/promises";
+import { chmod, mkdir, open, readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import {
@@ -69,6 +69,13 @@ export async function fetchSecretValue(
     }
     return value;
   }
+  if (plan.kind === "file") {
+    try {
+      return await readFile(plan.path, "utf8");
+    } catch {
+      throw new SecretResolverError(`File secret '${plan.path}' is not readable`);
+    }
+  }
   if (plan.kind === "gcp-metadata") {
     return fetchGcpSecretWithMetadata(plan, options.fetch ?? fetch);
   }
@@ -78,6 +85,7 @@ export async function fetchSecretValue(
 
 export function secretFetchPlan(ref: string, env: NodeJS.ProcessEnv = process.env):
   | { kind: "env"; name: string }
+  | { kind: "file"; path: string }
   | { kind: "gcp-metadata"; project: string; secret: string; version: string }
   | { kind: "command"; executable: string; args: string[] } {
   const violation = allowsControlPlaneSecretRefs(env) ? null : controlPlaneSecretRefViolation(ref);
@@ -93,6 +101,19 @@ export function secretFetchPlan(ref: string, env: NodeJS.ProcessEnv = process.en
     const name = ref.slice("env:".length);
     assertEnvName(name);
     return { kind: "env", name };
+  }
+  if (ref.startsWith("file:")) {
+    if (!truthy(env.BUCEPHALUS_SECRET_RESOLVER_ALLOW_FILE)) {
+      throw new SecretResolverError(
+        "file: secret refs are disabled. Set BUCEPHALUS_SECRET_RESOLVER_ALLOW_FILE=true only for local development "
+          + "with the filesystem-backed Cloud secret store.",
+      );
+    }
+    const path = ref.slice("file:".length);
+    if (!path.startsWith("/")) {
+      throw new SecretResolverError("file: secret refs must use an absolute path");
+    }
+    return { kind: "file", path };
   }
   const gcp = parseGcpSecretRef(ref);
   if (gcp) {
@@ -138,7 +159,7 @@ export function secretFetchPlan(ref: string, env: NodeJS.ProcessEnv = process.en
   }
   throw new SecretResolverError(
     "Unsupported secret ref. Use gcp-secret-manager://projects/<project>/secrets/<secret>/versions/<version>, "
-      + "aws-secrets-manager://<secret-id>, or env:<NAME> for explicitly enabled local development.",
+      + "aws-secrets-manager://<secret-id>, or env:<NAME>/file:<path> for explicitly enabled local development.",
   );
 }
 

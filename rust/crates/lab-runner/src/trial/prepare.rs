@@ -532,6 +532,10 @@ fn resolve_prepared_runtime_image(
             map_path.display()
         )
     })?;
+    crate::package::validate::validate_schema_contract_value(
+        &value,
+        format!("prepared runtime image map {}", map_path.display()).as_str(),
+    )?;
     let map: PreparedRuntimeImageMap = serde_json::from_value(value).with_context(|| {
         format!(
             "failed to parse prepared runtime image map from {}",

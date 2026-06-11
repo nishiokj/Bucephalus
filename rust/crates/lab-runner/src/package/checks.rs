@@ -51,14 +51,14 @@ pub(crate) fn write_package_checks(
 pub fn check_package(package_dir: &Path) -> Result<Value> {
     let package_digest = read_package_digest(package_dir)?;
     let manifest_path = package_dir.join("manifest.json");
-    if manifest_path.exists() {
-        let manifest = load_json_file(&manifest_path)?;
-        if manifest.pointer("/schema_version").and_then(Value::as_str)
-            == Some("sealed_run_package_v2")
-        {
-            verify_sealed_package_integrity(package_dir, &manifest)?;
-        }
-    }
+    let manifest = load_json_file(&manifest_path).map_err(|err| {
+        anyhow!(
+            "package check failed to read sealed package manifest {}: {}",
+            manifest_path.display(),
+            err
+        )
+    })?;
+    verify_sealed_package_integrity(package_dir, &manifest)?;
     let resolved_path = package_dir.join("resolved_experiment.json");
     let resolved: Value =
         serde_json::from_slice(&std::fs::read(&resolved_path).map_err(|err| {

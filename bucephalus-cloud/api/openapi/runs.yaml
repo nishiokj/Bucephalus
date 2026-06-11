@@ -149,11 +149,13 @@ paths:
                   additionalProperties:
                     type: string
                   description: >
-                    Environment variable names mapped to provider secret
-                    references available to the runner. Supported resolver refs
-                    include gcp-secret-manager://projects/<project>/secrets/<secret>/versions/<version>,
-                    aws-secrets-manager://<secret-id>, and env:<NAME> only for
-                    explicitly enabled local development.
+                    Environment variable names mapped to secret references.
+                    bucephalus://<name> references a hosted secret previously
+                    uploaded via PUT /v1/secrets/<name> and is translated to a
+                    backing provider ref at run creation. Direct provider refs
+                    are also accepted:
+                    gcp-secret-manager://projects/<project>/secrets/<secret>/versions/<version>
+                    and aws-secrets-manager://<secret-id>.
                 runtime_options:
                   $ref: './common.yaml#/components/schemas/AnyJsonObject'
                   description: >
@@ -938,10 +940,12 @@ components:
             type: string
           description: >
             Attempt-scoped secret declarations. Values are provider/control-plane
-            references, not runner-local file paths. Workers must materialize
-            them through the configured secret resolver for the claimed attempt.
-            Provider refs currently include GCP Secret Manager and AWS Secrets
-            Manager forms; env refs require explicit local-development opt-in.
+            references, not runner-local file paths; hosted bucephalus:// refs
+            are already translated to backing provider refs by run creation.
+            Workers must materialize them through the configured secret resolver
+            for the claimed attempt. Provider refs currently include GCP Secret
+            Manager and AWS Secrets Manager forms; env/file refs require
+            explicit local-development opt-in.
         runtime_options:
           $ref: './common.yaml#/components/schemas/AnyJsonObject'
         run_requirements:

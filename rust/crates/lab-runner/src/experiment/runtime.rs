@@ -4,7 +4,7 @@ use lab_core::{
     BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
 };
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1300,6 +1300,48 @@ pub(crate) fn resolve_runtime_env_inputs(
     Ok(resolved)
 }
 
+fn declared_runtime_env_secret_names(json_value: &Value) -> Result<BTreeSet<String>> {
+    let Some(raw) = json_value.pointer("/runtime/secrets") else {
+        return Ok(BTreeSet::new());
+    };
+    let secrets = raw
+        .as_array()
+        .ok_or_else(|| anyhow!("runtime.secrets must be an array"))?;
+    let mut declared = BTreeSet::new();
+    for (idx, secret) in secrets.iter().enumerate() {
+        let object = secret
+            .as_object()
+            .ok_or_else(|| anyhow!("runtime.secrets[{}] must be an object", idx))?;
+        if object.get("from").and_then(Value::as_str) != Some("env") {
+            continue;
+        }
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow!("runtime.secrets[{}].name is required", idx))?;
+        declared.insert(name.to_string());
+    }
+    Ok(declared)
+}
+
+fn reject_unknown_runtime_env_inputs(
+    json_value: &Value,
+    runtime_env_inputs: &BTreeMap<String, String>,
+) -> Result<()> {
+    let declared = declared_runtime_env_secret_names(json_value)?;
+    for key in runtime_env_inputs.keys() {
+        if !declared.contains(key) {
+            return Err(anyhow!(
+                "unknown runtime env binding '{}'; declare it under runtime.secrets with from: env before passing --env/--env-file",
+                key
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn secret_file_active_for_variant(
     spec: &AgentRuntimeSecretFileSpec,
     variant_id: &str,
@@ -1540,6 +1582,15 @@ pub(crate) fn resolve_runtime_secret_file_mounts(
 ) -> Result<Vec<ResolvedSecretFileMount>> {
     let cwd =
         std::env::current_dir().map_err(|err| anyhow!("failed to resolve current dir: {}", err))?;
+    let declared_ids: BTreeSet<&str> = secret_files.iter().map(|spec| spec.id.as_str()).collect();
+    for id in execution.secret_files.keys() {
+        if !declared_ids.contains(id.as_str()) {
+            return Err(anyhow!(
+                "unknown secret file binding '{}'; declare it under runtime.secrets before passing --secret-file",
+                id
+            ));
+        }
+    }
     let mut mounts = Vec::new();
     for spec in secret_files
         .iter()
@@ -1831,6 +1882,7 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
     validate_sanitization_profile_network_invariants(&variant_experiment, &effective_network_mode)?;
 
     let runtime_env_inputs = resolve_runtime_env_inputs(execution)?;
+    reject_unknown_runtime_env_inputs(&variant_experiment, &runtime_env_inputs)?;
     let credential_cache_root = credential_cache_root_for_context(&context);
     let secret_file_mounts = resolve_runtime_secret_file_mounts(
         &agent_runtime.secret_files,
@@ -2020,7 +2072,17 @@ pub(crate) fn load_staging_specs_from_package(
             manifest_path.display()
         )
     })?;
-    let manifest: RuntimePathStagingManifest = serde_json::from_slice(&manifest_bytes)
+    let manifest_value: Value = serde_json::from_slice(&manifest_bytes).with_context(|| {
+        format!(
+            "failed to parse runtime staging manifest JSON at {}",
+            manifest_path.display()
+        )
+    })?;
+    crate::package::validate::validate_schema_contract_value(
+        &manifest_value,
+        format!("runtime staging manifest {}", manifest_path.display()).as_str(),
+    )?;
+    let manifest: RuntimePathStagingManifest = serde_json::from_value(manifest_value)
         .with_context(|| {
             format!(
                 "failed to parse runtime staging manifest JSON at {}",
