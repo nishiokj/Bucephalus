@@ -77,6 +77,9 @@ export async function initTelemetry(timeoutMs = 750): Promise<void> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
+      // The GCE/Cloud Run metadata service is link-local and HTTP-only by
+      // design; there is no HTTPS variant of this endpoint.
+      // nosemgrep: typescript.react.security.react-insecure-request.react-insecure-request
       const response = await fetch(METADATA_PROJECT_URL, {
         headers: { "metadata-flavor": "Google" },
         signal: controller.signal,
