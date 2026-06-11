@@ -624,7 +624,8 @@ pub fn build_experiment_package(
     let mut json_value = loaded.json_value.clone();
     let mut contract_validation_value = json_value.clone();
     strip_packaging_only_trial_runtime_catalogs(&mut contract_validation_value);
-    validate_required_fields(&contract_validation_value)?;
+    validate_required_fields(&contract_validation_value)
+        .map_err(|err| public_authoring_error(err, true))?;
 
     let experiment_id = json_value
         .pointer("/experiment/id")
@@ -667,11 +668,14 @@ pub fn build_experiment_package(
     ensure_dir(&package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR))?;
     ensure_dir(&package_dir.join(HOST_GRADER_CAPABILITIES_DIR))?;
 
-    let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)?;
+    let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)
+        .map_err(|err| public_authoring_error(err, true))?;
     let dataset_target = package_dir.join("tasks").join("tasks.jsonl");
-    let raw_tasks = load_task_rows_for_build(&dataset_path, &json_value)?;
+    let raw_tasks = load_task_rows_for_build(&dataset_path, &json_value)
+        .map_err(|err| public_authoring_error(err, true))?;
     let packaged_tasks =
-        compile_tasks_for_package(&raw_tasks, &dataset_path, &package_dir, &json_value)?;
+        compile_tasks_for_package(&raw_tasks, &dataset_path, &package_dir, &json_value)
+            .map_err(|err| public_authoring_error(err, true))?;
     write_packaged_tasks(&dataset_target, &packaged_tasks)?;
     let dataset_rel = PathBuf::from("tasks").join("tasks.jsonl");
     set_json_pointer_value(
@@ -683,7 +687,8 @@ pub fn build_experiment_package(
     let mut runtime_path_rewrite = RuntimePathRewriteContext::new(&loaded.exp_dir, &package_dir);
 
     if let Some(trial_runtime) = json_value.pointer_mut("/trial_runtime") {
-        rewrite_trial_runtime_paths_for_package(trial_runtime, &mut runtime_path_rewrite)?;
+        rewrite_trial_runtime_paths_for_package(trial_runtime, &mut runtime_path_rewrite)
+            .map_err(|err| public_authoring_error(err, true))?;
     }
     if let Some(variants) = json_value
         .pointer_mut("/matrix/variants")
@@ -694,7 +699,8 @@ pub fn build_experiment_package(
                 rewrite_trial_runtime_paths_for_package(
                     runtime_overrides,
                     &mut runtime_path_rewrite,
-                )?;
+                )
+                .map_err(|err| public_authoring_error(err, true))?;
             }
         }
     }
@@ -705,7 +711,8 @@ pub fn build_experiment_package(
     )?;
     strip_packaging_only_trial_runtime_catalogs(&mut json_value);
     strip_public_authoring_aliases_from_resolved_package(&mut json_value);
-    validate_packaged_runtime_artifacts(&package_dir, &json_value)?;
+    validate_packaged_runtime_artifacts(&package_dir, &json_value)
+        .map_err(|err| public_authoring_error(err, true))?;
 
     let resolved_for_manifest = json_value.clone();
     atomic_write_json_pretty(
@@ -761,7 +768,8 @@ pub fn build_experiment_package(
         &resolved_for_manifest,
         &packaged_tasks,
         &package_digest,
-    )?;
+    )
+    .map_err(|err| public_authoring_error(err, true))?;
     let package_manifest = json!({
         "schema_version": "sealed_run_package_v2",
         "created_at": Utc::now().to_rfc3339(),

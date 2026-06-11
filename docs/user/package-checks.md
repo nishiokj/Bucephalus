@@ -63,7 +63,7 @@ Current checks include:
 | `tasks.unique_valid_rows` | Historical check id for malformed packaged case rows or duplicate case ids. |
 | `trial_runtime.schema` | Historical check id for a resolved stage chain that cannot be parsed. |
 | `metrics.primary_declared` | Missing or multiple primary metrics. |
-| `grader.conditional_integrity` | `grader_output` metrics in no-grader experiments; grader checks skip cleanly when `grader.strategy: none`. |
+| `grader.conditional_integrity` | `from: grader...` metrics in no-grader experiments; grader checks skip cleanly when `grader.strategy: none`. |
 | `outputs.result_capture_declared` | Missing agent result capture path. |
 | `agent.protocol_supported` | Whether the selected agent protocol is supported by this runner. |
 | `events.declaration_present` | Whether agent event streams are declared. |
@@ -73,7 +73,7 @@ Current checks include:
 ## No-Grader Experiments
 
 Graders are optional. A no-grader experiment can pass package checks when its
-metrics come from `agent_response` or `runtime_output`.
+metrics come from `from: result...` declarations.
 
 This is valid:
 
@@ -85,9 +85,7 @@ stages:
 metrics:
   - id: resolved
     primary: true
-    source:
-      type: agent_response
-      pointer: /metrics/resolved
+    from: result.metrics.resolved
 ```
 
 This is not valid:
@@ -100,10 +98,7 @@ stages:
 metrics:
   - id: score
     primary: true
-    source:
-      type: grader_output
-      output: report
-      pointer: /score
+    from: grader.report.score
 ```
 
 ## Epistemic Hygiene

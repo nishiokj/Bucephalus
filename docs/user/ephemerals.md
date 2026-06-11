@@ -2,7 +2,7 @@
 
 Ephemerals are per-trial resources that the runner starts and tears down, but that are not links in the stage chain. Use them for local services a stage calls during execution, such as a sidecar container, MCP server, proxy, fixture service, or benchmark helper daemon.
 
-Ephemerals are attached to the stages that declare them, recorded in runtime state when started, and cleaned up with the trial. Older suites that still use `sidecars` remain loadable during migration.
+Ephemerals are attached to the stages that declare them, recorded in runtime state when started, and cleaned up with the trial. Authoring files use `ephemerals`; the build step lowers them into the resolved package contract.
 
 ## Shape
 

@@ -42,8 +42,6 @@ stages:
     command: ["agent", "run", "--model", "$model"]
     env:
       ANTHROPIC_API_KEY: "$ANTHROPIC_API_KEY"
-  execution:
-    agent_site: agent_container
 ```
 
 Run with:
@@ -64,4 +62,4 @@ bucephalus run <package_dir> --env ANTHROPIC_API_KEY=...
 
 The runner does not remap your app's custom input or output flags. Put the command line shape your app needs directly in `stages.agent.command`, and read/write the contract env paths inside your app or wrapper.
 
-Agent response metrics are also not remapped implicitly. If your agent writes `"metrics": {"speed": 123}`, the runner will only persist it as a custom metric when `experiment.yaml` declares a metric source pointing at `/metrics/speed`. See [Metrics](metrics.md).
+Agent response metrics are also not remapped implicitly. If your agent writes `"metrics": {"speed": 123}`, the runner will only persist it as a custom metric when `experiment.yaml` declares `from: result.metrics.speed`. See [Metrics](metrics.md).

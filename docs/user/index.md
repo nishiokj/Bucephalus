@@ -10,7 +10,7 @@ Start here:
 - [Experiment YAML Reference](experiment-yaml-reference.md): canonical v1 YAML shape.
 - [External Perimeter](external-perimeter.md): secrets and network egress.
 - [Runtime Backends](runtime-backends.md): compute, storage, registry, and traces declarations.
-- [Ephemerals](sidecars.md): per-trial resources attached to stages.
+- [Ephemerals](ephemerals.md): per-trial resources attached to stages.
 - [Environment And Secrets](env-and-secrets.md): runtime env binding and launch-time secret inputs.
 
 The rest of `docs/` contains architecture notes, patch specs, audits, and design history.

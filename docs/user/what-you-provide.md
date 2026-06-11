@@ -10,17 +10,17 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | --- | --- | --- |
 | Experiment YAML | Yes | `experiment.yaml` |
 | Cases | Yes | `cases.jsonl` with `case_v2` rows |
-| Stages | Yes | `stages.case`, `stages.agent`, `stages.agent.outputs`, `stages.execution`, `stages.grader` |
+| Stages | Yes | `stages.case`, `stages.agent`, `stages.grader`; add `stages.execution` only to override the inferred agent site |
 | Agent command | Yes | `stages.agent.command` |
-| Agent image | When `agent_site: agent_container` | `ghcr.io/my-org/my-agent-runtime:latest` |
+| Agent image | When the agent runs in its own container | `ghcr.io/my-org/my-agent-runtime:latest` |
 | Agent mount | Optional; declare only when the agent needs mounted files | `stages.agent.mount.source: ./agent`, `stages.agent.mount.mount.path: /opt/agent` |
 | Ephemerals | Optional; declare only when a stage needs a per-trial service | `ephemerals.mcp-bash`, `stages.agent.ephemerals: [mcp-bash]` |
 | Case workspace image | When workspace source is `container_image` | `case_v2.resources.workspace.image` |
 | Grader declaration | Yes, use `strategy: none` if no grader runs | `stages.grader.strategy` |
-| Metric declarations | If you want queryable custom metrics | `metrics[].id` plus `metrics[].source` |
+| Metric declarations | If you want queryable custom metrics | `metrics[].id` plus `metrics[].from` |
 | Event captures | If you want live runtime traces/progress | `stages.agent.events[]` |
 | Runtime env/secrets | If your agent needs them | `--env OPENAI_API_KEY=...` |
-| Compute backend | Yes | `runtime.compute.backend: local-docker` or `modal` |
+| Compute backend | Optional | Defaults to `runtime.compute.backend: local-docker`; declare `modal` when needed |
 | Grader inputs/outputs | If benchmark scoring needs a grader | `stages.grader.inputs`, `stages.grader.outputs` |
 
 Schema files live in `schemas/`. Current case rows should use `schemas/case_v2.jsonschema` and set `schema_version: case_v2`. `case_v1` and the older `task_row_v2` row shape remain accepted for migration and existing suites. Agent responses are arbitrary JSON written to `BUCEPHALUS_RESULT_PATH`. Benchmark graders declare native outputs and metrics read from those outputs; graders do not need to emit Bucephalus-specific conclusions.
@@ -32,16 +32,6 @@ experiment:
   id: my_eval
   name: My Agent Evaluation
 
-runtime:
-  compute: { backend: local-docker }
-  storage: { backend: local-fs }
-  traces: { backend: local-stdout }
-  secrets:
-    - { name: OPENAI_API_KEY, from: env }
-  network:
-    task_sandbox: full
-    agent: full
-
 matrix:
   variants:
     - id: control
@@ -51,13 +41,6 @@ matrix:
   cases:
     source: file
     path: cases.jsonl
-  repeats: 1
-  seeds: [1]
-
-scheduling:
-  max_concurrency: 1
-  comparison: none
-  random_seed: 1
 
 stages:
   case:
@@ -76,14 +59,6 @@ stages:
     command: ["my-agent", "run", "--model", "$model"]
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
-    outputs:
-      result:
-        capture:
-          type: file
-          path: /bucephalus/out/result.json
-          format: json
-  execution:
-    agent_site: agent_container
   grader:
     strategy: in_task_runtime
     command: ["bash", "/testbed/eval.sh"]
@@ -98,23 +73,21 @@ stages:
 
 metrics:
   - id: resolved
-    source:
-      type: grader_output
-      output: report
-      pointer: /resolved
+    from: grader.report.resolved
     direction: maximize
     primary: true
-
-policy:
-  timeout_ms: 600000
-  task_sandbox: {}
 ```
 
-Set `runtime.compute.backend` to `local-docker` for local container execution or `modal` for Modal sandbox execution. The CLI `--executor` flag can override the declared backend for an operator-run experiment.
+Omitted runtime backend fields default to local execution: `runtime.compute.backend: local-docker`, `runtime.storage.backend: local-fs`, and `runtime.traces.backend: local-stdout`. Omitted network fields default to `none`, so declare `runtime.network.agent: full` or `runtime.network.task_sandbox: full` only when that process needs egress. The CLI `--executor` flag can override the declared compute backend for an operator-run experiment.
 
-`cases.source` and `matrix.cases.source` are currently local file backed. Use `source: file` with `path: cases.jsonl`.
+`stages.execution.agent_site` is inferred in the common cases. An agent image
+defaults to `agent_container`; a writable container-image case workspace without
+an agent image defaults to `task_runtime`; an input-only case without an agent
+image defaults to `host`.
 
-`policy.sanitization_profile` is optional and defaults to `perf_benchmark`. Omit it for provider-backed or otherwise networked agents. Declare `hermetic_functional` only for experiments where both `runtime.network.task_sandbox` and `runtime.network.agent` are `none`; build and preflight reject hermetic configs that request network access.
+`matrix.cases.source` is currently local file backed. Use `source: file` with `path: cases.jsonl`.
+
+`policy.sanitization_profile` is optional and defaults to `standard_runtime`. Declare `hermetic_functional` only for experiments where both `runtime.network.task_sandbox` and `runtime.network.agent` are `none`; build and preflight reject hermetic configs that request network access.
 
 Metric declarations are the canonical analytics contract. The runner does not persist arbitrary fields from the agent response as metric rows; declare each custom metric you want to query. See [Metrics](metrics.md).
 
@@ -178,7 +151,7 @@ stages:
     ephemerals: [mcp-bash]
 ```
 
-Local Docker attaches ephemerals on a per-trial network and tracks them for cleanup. Host stages cannot attach container ephemerals. Modal rejects ephemerals until backend-native support exists. See [Ephemerals](sidecars.md).
+Local Docker attaches ephemerals on a per-trial network and tracks them for cleanup. Host stages cannot attach container ephemerals. Modal rejects ephemerals until backend-native support exists. See [Ephemerals](ephemerals.md).
 
 ## Grader Responsibilities
 

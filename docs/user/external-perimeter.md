@@ -23,7 +23,6 @@ runtime:
         env: CODEX_AUTH_CACHE_FILE
   network:
     default: none
-    task_sandbox: none
     agent: full
     egress: [api.openai.com]
 ```

@@ -5251,6 +5251,242 @@ mod tests {
     }
 
     #[test]
+    fn validate_required_fields_accepts_public_authoring_shape() {
+        let spec = json!({
+            "experiment": {"id": "e"},
+            "matrix": {
+                "cases": {"source": "file", "path": "tasks.jsonl"},
+                "variants": [{"id": "baseline", "baseline": true, "config": {}}]
+            },
+            "stages": {
+                "case": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": {"from": "case_row"},
+                        "workdir": {"from": "case_row"}
+                    }
+                },
+                "agent": {
+                    "command": ["sh", "-lc", "true"],
+                    "image": "alpine:latest",
+                    "result": "structured_json"
+                },
+                "execution": {"agent_site": "agent_container"},
+                "grader": {"strategy": "none"}
+            },
+            "metrics": [{
+                "id": "resolved",
+                "from": "result.metrics.resolved",
+                "primary": true
+            }]
+        });
+
+        validate_required_fields(&spec).expect("public authoring shape should validate");
+    }
+
+    #[test]
+    fn validate_required_fields_reports_public_paths_for_authoring_shape() {
+        let spec = json!({
+            "experiment": {"id": "e"},
+            "matrix": {
+                "cases": {"source": "file"},
+                "variants": [{"id": "baseline", "baseline": true, "config": {}}]
+            },
+            "stages": {
+                "case": {"interface": "input_only"},
+                "agent": {"image": "alpine:latest"},
+                "execution": {"agent_site": "agent_container"},
+                "grader": {"strategy": "none"}
+            },
+            "metrics": [{
+                "id": "resolved",
+                "from": "result.metrics.resolved",
+                "primary": true
+            }]
+        });
+
+        let err = validate_required_fields(&spec)
+            .expect_err("public authoring shape should report missing public fields");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/matrix/cases/path"),
+            "missing case path should use public path: {}",
+            msg
+        );
+        assert!(
+            msg.contains("/stages/agent/command"),
+            "missing agent command should use public path: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("/matrix/tasks") && !msg.contains("/trial_runtime"),
+            "authoring diagnostics should not leak resolved package paths: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn validate_required_fields_reports_public_ephemeral_declaration_paths() {
+        let spec = json!({
+            "experiment": {"id": "e"},
+            "matrix": {
+                "cases": {"source": "file", "path": "tasks.jsonl"},
+                "variants": [{"id": "baseline", "baseline": true, "config": {}}]
+            },
+            "ephemerals": {
+                "cache": {"lifecycle": "per-trial"}
+            },
+            "stages": {
+                "case": {"interface": "input_only"},
+                "agent": {
+                    "command": ["sh", "-lc", "true"],
+                    "image": "alpine:latest"
+                },
+                "execution": {"agent_site": "agent_container"},
+                "grader": {"strategy": "none"}
+            },
+            "metrics": [{
+                "id": "resolved",
+                "from": "result.metrics.resolved",
+                "primary": true
+            }]
+        });
+
+        let err = validate_required_fields(&spec)
+            .expect_err("invalid ephemeral declaration should report public paths");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/ephemerals/cache image is required"),
+            "ephemeral declaration error should use public path: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("/sidecars") && !msg.contains("sidecar"),
+            "ephemeral declaration error should not leak sidecar wording: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn validate_required_fields_reports_public_stage_ephemeral_paths() {
+        let spec = json!({
+            "experiment": {"id": "e"},
+            "matrix": {
+                "cases": {"source": "file", "path": "tasks.jsonl"},
+                "variants": [{"id": "baseline", "baseline": true, "config": {}}]
+            },
+            "stages": {
+                "case": {"interface": "input_only"},
+                "agent": {
+                    "ephemerals": ["cache"],
+                    "command": ["sh", "-lc", "true"],
+                    "image": "alpine:latest"
+                },
+                "execution": {"agent_site": "agent_container"},
+                "grader": {"strategy": "none"}
+            },
+            "metrics": [{
+                "id": "resolved",
+                "from": "result.metrics.resolved",
+                "primary": true
+            }]
+        });
+
+        let err = validate_required_fields(&spec)
+            .expect_err("unknown stage ephemeral should report public paths");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/stages/agent/ephemerals/0 references unknown ephemeral 'cache'"),
+            "stage ephemeral error should use public path: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("/trial_runtime") && !msg.contains("sidecar"),
+            "stage ephemeral error should not leak resolved wording: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn validate_required_fields_rejects_legacy_authoring_boundary_aliases() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["cases"] = spec["matrix"]["tasks"].clone();
+
+        let err = validate_required_fields(&spec)
+            .expect_err("top-level cases alias should fail at the validation boundary");
+
+        assert!(
+            err.to_string()
+                .contains("/cases is legacy authoring syntax"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_required_fields_rejects_runtime_externals_in_authoring_shape() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["matrix"]["cases"] = spec["matrix"]["tasks"].clone();
+        spec["matrix"].as_object_mut().unwrap().remove("tasks");
+        let trial_runtime = spec["trial_runtime"].clone();
+        spec["stages"] = json!({
+            "case": trial_runtime["task"].clone(),
+            "agent": trial_runtime["agent"].clone(),
+            "execution": trial_runtime["execution"].clone(),
+            "grader": trial_runtime["grader"].clone()
+        });
+        spec.as_object_mut().unwrap().remove("trial_runtime");
+        spec["runtime"]["externals"] = json!({
+            "apis": ["api.example.test"],
+            "credentials": []
+        });
+
+        let err = validate_required_fields(&spec)
+            .expect_err("runtime.externals should fail at the validation boundary");
+
+        assert!(
+            err.to_string()
+                .contains("/runtime/externals is legacy authoring syntax"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_required_fields_rejects_internal_metric_source_in_authoring_shape() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["matrix"]["cases"] = spec["matrix"]["tasks"].clone();
+        spec["matrix"].as_object_mut().unwrap().remove("tasks");
+        let trial_runtime = spec["trial_runtime"].clone();
+        spec["stages"] = json!({
+            "case": trial_runtime["task"].clone(),
+            "agent": trial_runtime["agent"].clone(),
+            "execution": trial_runtime["execution"].clone(),
+            "grader": trial_runtime["grader"].clone()
+        });
+        spec.as_object_mut().unwrap().remove("trial_runtime");
+        spec["metrics"] = json!([{
+            "id": "resolved",
+            "source": {"type": "agent_response", "pointer": "/metrics/resolved"},
+            "primary": true
+        }]);
+
+        let err = validate_required_fields(&spec)
+            .expect_err("internal metric source should fail in authoring shape");
+
+        assert!(
+            err.to_string()
+                .contains("/metrics/0 uses internal metric extraction field 'source'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn validate_required_fields_rejects_declared_extra_output_path_escape() {
         let mut spec = current_trial_runtime_experiment_base();
         spec["extra_outputs"] = json!([
@@ -19531,6 +19767,241 @@ mod tests {
             err.to_string().contains("resolve build input path"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn load_authoring_input_for_build_reports_public_missing_fields() {
+        let guard = TempDirGuard::new("load_authoring_public_missing_fields");
+        let experiment = guard.path.join("experiment.yaml");
+        fs::write(
+            &experiment,
+            r#"
+experiment:
+  id: e
+matrix:
+  cases:
+    source: file
+  variants:
+    - id: baseline
+      baseline: true
+      config: {}
+stages:
+  case:
+    interface: input_only
+  agent:
+    image: alpine:latest
+  execution:
+    agent_site: agent_container
+  grader:
+    strategy: none
+metrics:
+  - id: resolved
+    from: result.metrics.resolved
+    primary: true
+"#,
+        )
+        .unwrap();
+
+        let err = load_authoring_input_for_build(&experiment, None)
+            .expect_err("invalid authoring YAML should fail before lowering");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("/matrix/cases/path"),
+            "missing case path should use public path: {}",
+            msg
+        );
+        assert!(
+            msg.contains("/stages/agent/command"),
+            "missing agent command should use public path: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("/matrix/tasks") && !msg.contains("/trial_runtime"),
+            "build-input diagnostics should not leak resolved package paths: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn load_authoring_input_for_build_rejects_unknown_public_authoring_fields() {
+        let guard = TempDirGuard::new("load_authoring_schema_unknown_field");
+        let experiment = guard.path.join("experiment.yaml");
+        fs::write(
+            &experiment,
+            r#"
+experiment:
+  id: e
+runtime:
+  computee:
+    backend: local-docker
+matrix:
+  cases:
+    source: file
+    path: cases.jsonl
+  variants:
+    - id: baseline
+      baseline: true
+      config: {}
+stages:
+  case:
+    interface: input_only
+  agent:
+    command: ["agent"]
+  grader:
+    strategy: none
+"#,
+        )
+        .unwrap();
+
+        let err = load_authoring_input_for_build(&experiment, None)
+            .expect_err("unknown authoring fields should fail before lowering");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("experiment authoring schema validation failed"),
+            "unknown field should fail through authoring schema: {}",
+            msg
+        );
+        assert!(
+            msg.contains("computee"),
+            "unknown field name should be visible: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("trial_runtime") && !msg.contains("matrix.tasks"),
+            "schema diagnostics should stay on public authoring nouns: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn tracked_cookbook_experiments_match_public_authoring_schema() {
+        let schema =
+            compile_schema("experiment_authoring_v1.jsonschema").expect("authoring schema");
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+
+        for rel in [
+            "cookbook/agent-eval/experiment.yaml",
+            "cookbook/ab-test/experiment.yaml",
+            "cookbook/parameter-sweep/experiment.yaml",
+            "cookbook/swebench-lite-codex/experiment.yaml",
+        ] {
+            let path = repo_root.join(rel);
+            let yaml = fs::read_to_string(&path).expect("read cookbook experiment");
+            let yaml_value: serde_yaml::Value =
+                serde_yaml::from_str(&yaml).expect("parse cookbook yaml");
+            let json_value: Value =
+                serde_json::to_value(yaml_value).expect("convert cookbook yaml to json");
+            let errors = schema
+                .validate(&json_value)
+                .err()
+                .map(|errors| errors.map(|err| err.to_string()).collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            assert!(
+                errors.is_empty(),
+                "{} should match public authoring schema: {:?}",
+                rel,
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn build_experiment_package_reports_public_case_path_for_missing_cases_file() {
+        let guard = TempDirGuard::new("build_authoring_missing_cases_public_path");
+        let experiment = guard.path.join("experiment.yaml");
+        let spec = json!({
+            "experiment": {"id": "e"},
+            "matrix": {
+                "cases": {"source": "file", "path": "missing-cases.jsonl"},
+                "variants": [{"id": "baseline", "baseline": true, "config": {}}]
+            },
+            "stages": {
+                "case": {"interface": "input_only"},
+                "agent": {"command": ["agent"]},
+                "grader": {"strategy": "none"}
+            }
+        });
+        fs::write(&experiment, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let err = build_experiment_package(&experiment, None, Some(&guard.path.join("package")))
+            .expect_err("missing cases file should fail during package build");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("matrix.cases.path='missing-cases.jsonl'"),
+            "missing cases error should use public path: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("matrix.tasks") && !msg.contains("trial_runtime"),
+            "build diagnostics should not leak resolved package paths: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn build_experiment_package_reports_public_stage_paths_for_host_grader_boundary() {
+        let guard = TempDirGuard::new("build_authoring_host_grader_public_path");
+        write_test_host_grader_capability_manifest(&guard.path);
+        let scripts = guard.path.join("scripts");
+        ensure_dir(&scripts).expect("scripts dir");
+        fs::write(scripts.join("grader.py"), "#!/usr/bin/env python3\nprint('nope')\n")
+            .expect("grader script");
+        fs::write(
+            guard.path.join("cases.jsonl"),
+            r#"{"schema_version":"task_row_v2","id":"TASK001","time_limit_ms":600000,"task":{"id":"TASK001"}}"#,
+        )
+        .expect("cases");
+        let experiment = guard.path.join("experiment.yaml");
+        let spec = json!({
+            "experiment": {"id": "e"},
+            "matrix": {
+                "cases": {"source": "file", "path": "cases.jsonl"},
+                "variants": [{"id": "baseline", "baseline": true, "config": {}}]
+            },
+            "stages": {
+                "case": {"interface": "input_only"},
+                "agent": {"command": ["agent"]},
+                "grader": {
+                    "strategy": "host",
+                    "host": {"capability": TEST_HOST_GRADER_CAPABILITY},
+                    "command": ["python3", "./scripts/grader.py"],
+                    "outputs": {
+                        "mapped": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/bucephalus/out/mapped_grader_output.json",
+                                "format": "json"
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        fs::write(&experiment, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let err = build_experiment_package(&experiment, None, Some(&guard.path.join("package")))
+            .expect_err("host grader package-local file should fail at authoring boundary");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("stages.grader.command[1] references package-local file"),
+            "host grader boundary error should use public stage path: {}",
+            msg
+        );
+        assert!(
+            msg.contains("stages.grader.host.capability"),
+            "host grader remediation should use public capability path: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("trial_runtime"),
+            "build diagnostics should not leak resolved package paths: {}",
+            msg
         );
     }
 

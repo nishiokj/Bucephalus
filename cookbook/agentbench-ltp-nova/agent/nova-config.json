@@ -1,0 +1,75 @@
+{
+  "models": {
+    "available": [],
+    "default": ""
+  },
+  "agents": {
+    "standard": {
+      "llm": {
+        "role": "standard",
+        "max_tokens": 8192,
+        "temperature": 0.2
+      },
+      "budget": {
+        "max_iterations": 6,
+        "max_tool_calls": 0,
+        "max_duration_ms": 240000
+      },
+      "tools": [],
+      "output_schema": "goal_driven"
+    },
+    "context_compactor": {
+      "llm": {
+        "role": "fast",
+        "max_tokens": 4096,
+        "temperature": 0.2
+      },
+      "budget": {
+        "max_iterations": 1,
+        "max_tool_calls": 0,
+        "max_duration_ms": 30000
+      },
+      "tools": [],
+      "output_schema": "agent_action"
+    }
+  },
+  "tools": {
+    "bash_timeout_ms": 30000,
+    "max_output_length": 4000,
+    "execution_backend": "native",
+    "executioner_workspace": "existing"
+  },
+  "graphd": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9444,
+    "db_path": "~/.graphd/graphd.db"
+  },
+  "context": {
+    "max_tokens": 64000,
+    "session_ttl_ms": 1800000
+  },
+  "skills": {
+    "enabled": false,
+    "directory": ".agent/skills"
+  },
+  "hooks": {
+    "enabled": false,
+    "directory": "config/hooks"
+  },
+  "auth": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9556,
+    "session_expiry_days": null
+  },
+  "memory": {
+    "enabled": false,
+    "base_url": "http://localhost:3001",
+    "timeout_ms": 5000
+  },
+  "mcp": {
+    "enabled": false,
+    "servers": []
+  }
+}

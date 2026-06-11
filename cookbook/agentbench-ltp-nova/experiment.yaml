@@ -1,0 +1,171 @@
+experiment:
+  id: agentbench_ltp_nova
+  name: AgentBench LTP Nova
+  mode: answer
+  description: >-
+    Runs Nova on a small AgentBench Lateral Thinking Puzzle dev slice and scores
+    final-answer recall against the benchmark answer-key bullets.
+  tags: [agentbench, ltp, nova, answer, open-source-benchmark]
+
+runtime:
+  compute: { backend: local-docker }
+  storage: { backend: local-fs }
+  traces: { backend: local-stdout }
+  secrets:
+    - { name: OPENAI_API_KEY, from: env }
+  network:
+    task_sandbox: full
+    agent: full
+
+externals:
+  apis: [api.openai.com]
+  credentials: [OPENAI_API_KEY]
+
+cases:
+  source: file
+  path: cases.jsonl
+
+matrix:
+  variants:
+    - id: nova_gpt_5_5
+      baseline: true
+      config:
+        provider: openai
+        model: gpt-5.5
+  repeats: 1
+  seeds: [1]
+
+scheduling:
+  max_concurrency: 1
+  shuffle_tasks: false
+  random_seed: 1
+  comparison: none
+
+task:
+  interface: writable_workspace
+  workspace:
+    source: container_image
+    image: { from: case_row }
+    workdir: { from: case_row }
+
+agent:
+  mount:
+    source: .
+    mount:
+      path: /opt/agentbench-ltp-nova
+      read_only: true
+  command:
+    - /usr/local/bin/nova
+    - run
+    - --input-file
+    - /bucephalus/in/trial_input.json
+    - --output
+    - /bucephalus/out/result.json
+    - --events
+    - /bucephalus-events/trajectory.jsonl
+    - --config
+    - /opt/agentbench-ltp-nova/agent/nova-config.json
+    - --working-dir
+    - /bucephalus/workspace
+    - --timeout-ms
+    - "240000"
+    - --provider
+    - "$provider"
+    - --model
+    - "$model"
+  env:
+    OPENAI_API_KEY: "$OPENAI_API_KEY"
+  outputs:
+    result:
+      capture:
+        type: file
+        path: /bucephalus/out/result.json
+        format: json
+        required: true
+    nova_stdout:
+      capture:
+        type: file
+        path: /bucephalus/out/nova/stdout.log
+        format: text
+        required: false
+    nova_stderr:
+      capture:
+        type: file
+        path: /bucephalus/out/nova/stderr.log
+        format: text
+        required: false
+
+execution:
+  agent_site: task_runtime
+
+grader:
+  strategy: in_task_runtime
+  in_task_runtime: {}
+  command:
+    - python3
+    - ./grader/grade_ltp.py
+    - --trial-input
+    - /bucephalus/in/trial_input.json
+    - --nova-result
+    - /bucephalus/out/result.json
+    - --out
+    - /bucephalus/out/agentbench_ltp_score.json
+  outputs:
+    score:
+      capture:
+        type: file
+        path: /bucephalus/out/agentbench_ltp_score.json
+        format: json
+        required: true
+
+metrics:
+  - id: smoke_ok
+    label: Smoke OK
+    value_type: number
+    direction: maximize
+    from: grader.score.smoke_ok
+  - id: key_recall
+    label: Key Recall
+    semantic_key: quality.answer_key_recall
+    value_type: number
+    direction: maximize
+    from: grader.score.key_recall
+  - id: matched_keys
+    label: Matched Keys
+    value_type: number
+    direction: maximize
+    from: grader.score.matched_keys
+  - id: total_keys
+    label: Total Keys
+    value_type: number
+    direction: maximize
+    from: grader.score.total_keys
+  - id: model_calls
+    label: Model Calls
+    value_type: number
+    direction: minimize
+    from: grader.score.model_calls
+  - id: tokens_in
+    label: Input Tokens
+    value_type: number
+    direction: minimize
+    from: grader.score.tokens_in
+  - id: tokens_out
+    label: Output Tokens
+    value_type: number
+    direction: minimize
+    from: grader.score.tokens_out
+  - id: latency_ms
+    label: Latency
+    value_type: number
+    unit: ms
+    direction: minimize
+    from: grader.score.latency_ms
+
+policy:
+  timeout_ms: 300000
+  sanitization_profile: standard_runtime
+  task_sandbox:
+    resources:
+      cpu_count: 2
+      memory_mb: 2048

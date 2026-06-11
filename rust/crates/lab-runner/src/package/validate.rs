@@ -7,17 +7,17 @@ use std::path::{Component, Path};
 
 use crate::config::{declared_extra_outputs, value_matches_type, value_type_name};
 use crate::model::{ExperimentOverrides, KnobDef, KnobManifest};
-use crate::package::authoring::normalize_authoring_vocabulary;
+use crate::package::authoring::{normalize_authoring_vocabulary, reject_legacy_authoring_surface};
 use crate::trial::plan::parse_trial_runtime_config;
 
 pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     let normalized;
-    let json_value = if json_value.pointer("/cases").is_some()
+    let authoring_surface = json_value.pointer("/cases").is_some()
         || json_value.pointer("/matrix/cases").is_some()
         || json_value.pointer("/stages").is_some()
         || json_value.pointer("/ephemerals").is_some()
-        || json_value.pointer("/externals").is_some()
-    {
+        || json_value.pointer("/externals").is_some();
+    let json_value = if authoring_surface {
         normalized = normalized_authoring_value(json_value)?;
         &normalized
     } else {
@@ -48,10 +48,13 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             return Err(anyhow!("{} is not supported; {}", pointer, message));
         }
     }
-    reject_v0_authoring_paths(json_value)?;
-    reject_unknown_top_level_sections(json_value)?;
-    validate_runtime_declarations(json_value)?;
-    validate_sidecars(json_value)?;
+    reject_v0_authoring_paths(json_value)
+        .map_err(|err| public_authoring_error(err, authoring_surface))?;
+    reject_unknown_top_level_sections(json_value)
+        .map_err(|err| public_authoring_error(err, authoring_surface))?;
+    validate_runtime_declarations(json_value)
+        .map_err(|err| public_authoring_error(err, authoring_surface))?;
+    validate_sidecars(json_value).map_err(|err| public_authoring_error(err, authoring_surface))?;
     let required: &[&str] = &[
         "/matrix/variants",
         "/matrix/tasks/source",
@@ -108,20 +111,89 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     if !missing.is_empty() {
         missing.sort_unstable();
         missing.dedup();
+        let missing = display_missing_required_fields(&missing, authoring_surface);
         return Err(anyhow!(
             "missing required experiment fields: {}",
             missing.join(", ")
         ));
     }
-    validate_sanitization_profile_network_invariants(json_value, None)?;
-    parse_trial_runtime_config(json_value)?;
-    validate_extra_outputs(json_value)?;
+    validate_sanitization_profile_network_invariants(json_value, None)
+        .map_err(|err| public_authoring_error(err, authoring_surface))?;
+    parse_trial_runtime_config(json_value)
+        .map_err(|err| public_authoring_error(err, authoring_surface))?;
+    validate_extra_outputs(json_value)
+        .map_err(|err| public_authoring_error(err, authoring_surface))?;
     Ok(())
 }
 
+fn display_missing_required_fields(missing: &[&str], authoring_surface: bool) -> Vec<String> {
+    missing
+        .iter()
+        .map(|pointer| {
+            if authoring_surface {
+                public_authoring_pointer(pointer)
+            } else {
+                (*pointer).to_string()
+            }
+        })
+        .collect()
+}
+
+fn public_authoring_pointer(pointer: &str) -> String {
+    for (internal, public) in [
+        ("/matrix/tasks", "/matrix/cases"),
+        ("/trial_runtime/task", "/stages/case"),
+        ("/trial_runtime/agent", "/stages/agent"),
+        ("/trial_runtime/execution", "/stages/execution"),
+        ("/trial_runtime/grader", "/stages/grader"),
+    ] {
+        if pointer == internal {
+            return public.to_string();
+        }
+        if let Some(rest) = pointer.strip_prefix(&format!("{internal}/")) {
+            return format!("{public}/{rest}");
+        }
+    }
+    pointer.to_string()
+}
+
+pub(crate) fn public_authoring_error(err: anyhow::Error, authoring_surface: bool) -> anyhow::Error {
+    if !authoring_surface {
+        return err;
+    }
+    let mut message = err.to_string();
+    for (internal, public) in [
+        ("/trial_runtime/agent/sidecars", "/stages/agent/ephemerals"),
+        (
+            "/trial_runtime/grader/sidecars",
+            "/stages/grader/ephemerals",
+        ),
+        ("/trial_runtime/task", "/stages/case"),
+        ("/trial_runtime/agent", "/stages/agent"),
+        ("/trial_runtime/execution", "/stages/execution"),
+        ("/trial_runtime/grader", "/stages/grader"),
+        ("/matrix/tasks", "/matrix/cases"),
+        ("/sidecars", "/ephemerals"),
+        ("trial_runtime.agent.sidecars", "stages.agent.ephemerals"),
+        ("trial_runtime.grader.sidecars", "stages.grader.ephemerals"),
+        ("trial_runtime.task", "stages.case"),
+        ("trial_runtime.agent", "stages.agent"),
+        ("trial_runtime.execution", "stages.execution"),
+        ("trial_runtime.grader", "stages.grader"),
+        ("matrix.tasks", "matrix.cases"),
+        ("sidecars", "ephemerals"),
+        ("sidecar", "ephemeral"),
+    ] {
+        message = message.replace(internal, public);
+    }
+    anyhow!(message)
+}
+
 fn normalized_authoring_value(json_value: &Value) -> Result<Value> {
+    reject_legacy_authoring_surface(json_value)?;
     let mut normalized = json_value.clone();
-    normalize_authoring_vocabulary(&mut normalized)?;
+    normalize_authoring_vocabulary(&mut normalized)
+        .map_err(|err| public_authoring_error(err, true))?;
     Ok(normalized)
 }
 

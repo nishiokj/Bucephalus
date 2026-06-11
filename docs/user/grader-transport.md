@@ -34,19 +34,13 @@ Stage outputs are named values captured by the runner.
 stages:
   agent:
     outputs:
-      result:
-        capture:
-          type: file
-          path: /bucephalus/out/result.json
-          format: json
-
       candidate_patch:
         capture:
           type: workspace_diff
           format: unified_diff
 ```
 
-Each output has a kind implied or declared by its capture type. Examples include JSON result files, workspace diffs, plain files, stdout, stderr, directories, archives, or external responses.
+The canonical agent `result` output is added by default. Declare extra outputs when downstream stages need another named value. Each output has a kind implied or declared by its capture type. Examples include workspace diffs, plain files, stdout, stderr, directories, archives, or external responses.
 
 The runner records named outputs in an internal transport envelope. Downstream bindings should reference named outputs and fields, not the envelope's physical layout.
 
@@ -125,14 +119,12 @@ Metrics can read declared outputs.
 ```yaml
 metrics:
   - id: pass_rate
-    source:
-      type: grader_output
-      output: pytest_report
-      transform:
-        type: pytest_json_report_pass_rate
-        test_ids:
-          source:
-            case: commit0.test_ids
+    from: grader.pytest_report
+    transform:
+      type: pytest_json_report_pass_rate
+      test_ids:
+        source:
+          case: commit0.test_ids
 ```
 
 The transform is runner-owned. It converts a known output format into a metric value.
@@ -185,14 +177,6 @@ An answer-based benchmark may not have patches at all.
 
 ```yaml
 stages:
-  agent:
-    outputs:
-      final_answer:
-        capture:
-          type: result_json
-          path: /bucephalus/out/result.json
-          field: final_answer
-
   grader:
     strategy: separate
     command:
@@ -207,8 +191,8 @@ stages:
             reference:
               case: answer
             candidate:
-              output: agent.final_answer
-              field: value
+              output: agent.result
+              field: final_answer
         materialize:
           as: json_file
           path: /grader/in/payload.json

@@ -16,9 +16,7 @@ metrics:
     direction: minimize
     primary: true
     required: true
-    source:
-      type: agent_response
-      pointer: /metrics/speed
+    from: result.metrics.speed
 ```
 
 | Field | Meaning |
@@ -29,10 +27,9 @@ metrics:
 | `value_type` | Optional type hint, such as `number`, `boolean`, or `string`. |
 | `unit` | Optional unit, such as `ms`, `tokens`, `usd`, or `count`. |
 | `direction` | Optional optimization direction: commonly `maximize` or `minimize`. |
-| `primary` | Marks the declared metric as the primary metric. For grader-backed runs, primary metrics should read from `grader_output`. |
-| `required` | If true and the source value is missing, the run fails before the missing value is silently committed. |
-| `source.type` | Where the metric value comes from. |
-| `source.pointer` | JSON Pointer into the source payload. Required for `agent_response`; optional for declared grader outputs. |
+| `primary` | Marks the declared metric as the primary metric. For grader-backed runs, primary metrics should read from declared grader outputs. |
+| `required` | If true and the referenced value is missing, the run fails before the missing value is silently committed. |
+| `from` | Public extraction reference. Use `result.<field>` for agent responses and `grader.<output>.<field>` for declared grader outputs. |
 
 ## Canonical IDs
 
@@ -43,9 +40,7 @@ For example, this declaration:
 ```yaml
 metrics:
   - id: latency
-    source:
-      type: agent_response
-      pointer: /metrics/speed
+    from: result.metrics.speed
 ```
 
 with this agent response:
@@ -62,14 +57,12 @@ persists a metric named `latency`, not `speed`.
 
 ## Source Types
 
-`agent_response` metrics are extracted from the agent response JSON written to `BUCEPHALUS_RESULT_PATH`.
+`from: result...` metrics are extracted from the agent response JSON written to `BUCEPHALUS_RESULT_PATH`.
 
 ```yaml
 metrics:
   - id: hidden_cases_passed
-    source:
-      type: agent_response
-      pointer: /metrics/hidden_cases_passed
+    from: result.metrics.hidden_cases_passed
 ```
 
 For grader-backed benchmark runs, prefer reading metrics from declared grader outputs:
@@ -86,20 +79,16 @@ stages:
 
 metrics:
   - id: pass_rate
-    source:
-      type: grader_output
-      output: report
-      pointer: /pass_rate
+    from: grader.report.pass_rate
 ```
 
-The grader writes its native output. The runner captures the declared output, applies the metric source, and builds the internal trial conclusion used by scheduling and persistence.
+The grader writes its native output. The runner captures the declared output, applies the metric reference, and builds the internal trial conclusion used by scheduling and persistence.
 
-If you need multiple custom metrics without a grader, write them into the agent response and declare each one with `source.type: agent_response`.
+If you need multiple custom metrics without a grader, write them into the agent response and declare each one with `from: result...`.
 
 `bucephalus check-package` validates the metric/grader relationship statically. A
-no-grader experiment may use `agent_response` or `runtime_output` metrics, but
-it fails package checks if any metric uses `source.type: grader_output` while
-`stages.grader.strategy: none`.
+no-grader experiment may use `from: result...` metrics, but it fails package
+checks if any metric uses `from: grader...` while `stages.grader.strategy: none`.
 
 ## Events Are Not Metrics
 
@@ -110,24 +99,23 @@ ingested into SQLite and exposed through the `events` view while a trial runs.
 Metrics are scalar observations that become rows in `metrics_long`. If an event
 stream contains values you eventually want to analyze as metrics, derive those
 values into the agent response or a grader output today, then declare normal
-metric sources for them. Event-derived metric declarations are intentionally a
+metric references for them. Event-derived metric declarations are intentionally a
 separate future extension.
 
 ## Strict Shape
 
-Metric sources must use the object form:
+Metric references must use the `from` form:
 
 ```yaml
-source:
-  type: agent_response
-  pointer: /metrics/resolved
+from: result.metrics.resolved
 ```
 
 These legacy forms are rejected:
 
 ```yaml
-source: output
-json_pointer: /metrics/resolved
+source:
+  type: agent_response
+  pointer: /metrics/resolved
 ```
 
 ```yaml

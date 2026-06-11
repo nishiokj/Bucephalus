@@ -2845,7 +2845,7 @@ pub fn experiment_summary_with_options(
     let comparison = json_value
         .pointer("/scheduling/comparison")
         .and_then(|v| v.as_str())
-        .unwrap_or("paired")
+        .unwrap_or("none")
         .to_string();
 
     let evaluation_config = parse_evaluation_config(&json_value)?;

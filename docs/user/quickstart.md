@@ -62,7 +62,7 @@ Important files:
 | `cookbook/agent-eval/agent/run.js` | Tiny agent runtime app that reads trial input and writes the result JSON. |
 
 The recipe uses `stages.grader.strategy: none`, so the metric rows come directly
-from the declared `agent_response` pointers. The agent reads
+from the declared `from: result...` references. The agent reads
 `BUCEPHALUS_TRIAL_INPUT_PATH` and writes JSON to `BUCEPHALUS_RESULT_PATH`.
 
 ## 4. Validate The Experiment Locally

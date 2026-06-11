@@ -6,9 +6,6 @@ experiment:
   tags: [cookbook, swebench-lite, codex, real-grader]
 
 runtime:
-  compute: { backend: local-docker }
-  storage: { backend: local-fs }
-  traces: { backend: local-stdout }
   secrets:
     - { name: OPENAI_API_KEY, from: env }
   network:
@@ -28,16 +25,6 @@ matrix:
   cases:
     source: file
     path: cases.jsonl
-  repeats: 1
-  seeds: [1]
-
-scheduling:
-  max_concurrency: 1
-  shuffle_tasks: false
-  random_seed: 1
-  comparison: none
-
-ephemerals: {}
 
 stages:
   case:
@@ -57,18 +44,10 @@ stages:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
       CODEX_TIMEOUT_SECONDS: "900"
     outputs:
-      result:
-        capture:
-          type: file
-          path: /bucephalus/out/result.json
-          format: json
-          required: true
       candidate_patch:
         capture:
           type: workspace_diff
           format: unified_diff
-  execution:
-    agent_site: task_runtime
   grader:
     strategy: in_task_runtime
     command:
@@ -103,24 +82,15 @@ stages:
 
 metrics:
   - id: resolved
-    source:
-      type: grader_output
-      output: report
-      pointer: /resolved
+    from: grader.report.resolved
     direction: maximize
     primary: true
     required: true
   - id: fail_to_pass_passed
-    source:
-      type: grader_output
-      output: report
-      pointer: /fail_to_pass_passed
+    from: grader.report.fail_to_pass_passed
     direction: maximize
   - id: pass_to_pass_passed
-    source:
-      type: grader_output
-      output: report
-      pointer: /pass_to_pass_passed
+    from: grader.report.pass_to_pass_passed
     direction: maximize
 
 policy:

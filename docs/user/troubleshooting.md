@@ -52,7 +52,7 @@ Common causes:
 - `comparison: paired` is declared with only one resolved variant.
 - variant ids or case ids are duplicated.
 - no primary metric is declared, or multiple metrics are marked primary.
-- a no-grader experiment declares a `grader_output` metric.
+- a no-grader experiment declares a `from: grader...` metric.
 - agent result output capture is missing a path.
 - declared hidden grader paths overlap agent output mounts.
 
@@ -139,7 +139,7 @@ Symptoms:
 
 - `result.json` missing
 - invalid JSON
-- missing values referenced by declared metric `source.pointer` fields
+- missing values referenced by declared metric `from` fields
 - artifact paths point to files that do not exist
 
 If a value appears in the agent response but not in `bucephalus query <run_id> "SELECT * FROM metrics_long"`, check that `experiment.yaml` declares that metric. Bucephalus does not persist undeclared custom metrics.
@@ -158,7 +158,7 @@ Symptoms:
 
 - a required declared grader output is missing
 - a declared grader output is invalid JSON
-- a metric source points at a missing output or field
+- a metric reference points at a missing output or field
 - grader command depends on a tool absent from the case image
 - `strategy: host` command references package-local files, case-workdir support paths, `/bucephalus` paths, or arbitrary absolute host paths
 

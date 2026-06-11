@@ -5,14 +5,6 @@ experiment:
   description: Smallest no-key agent evaluation template.
   tags: [cookbook, starter]
 
-runtime:
-  compute: { backend: local-docker }
-  storage: { backend: local-fs }
-  traces: { backend: local-stdout }
-  network:
-    task_sandbox: none
-    agent: none
-
 matrix:
   variants:
     - id: balanced
@@ -22,14 +14,6 @@ matrix:
   cases:
     source: file
     path: cases.jsonl
-  repeats: 1
-  seeds: [1]
-
-scheduling:
-  max_concurrency: 1
-  shuffle_tasks: false
-  random_seed: 1
-  comparison: none
 
 stages:
   case:
@@ -46,32 +30,18 @@ stages:
         path: /opt/agent
         read_only: true
     command: ["node", "/opt/agent/run.js", "--profile", "$profile"]
-    outputs:
-      result:
-        capture:
-          type: file
-          path: /bucephalus/out/result.json
-          format: json
-          required: true
-  execution:
-    agent_site: agent_container
   grader:
     strategy: none
 
 metrics:
   - id: resolved
-    source:
-      type: agent_response
-      pointer: /metrics/resolved
+    from: result.metrics.resolved
     direction: maximize
     primary: true
   - id: keyword_hits
-    source:
-      type: agent_response
-      pointer: /metrics/keyword_hits
+    from: result.metrics.keyword_hits
     direction: maximize
 
 policy:
   timeout_ms: 120000
   sanitization_profile: hermetic_functional
-  task_sandbox: {}

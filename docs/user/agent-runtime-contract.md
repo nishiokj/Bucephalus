@@ -16,7 +16,6 @@ ephemerals:
 
 runtime:
   network:
-    task_sandbox: none
     agent: full
 
 stages:
@@ -44,15 +43,13 @@ stages:
         kind: directory
         path: session-context
         env: BUCEPHALUS_SESSION_CONTEXT_ROOT
-  execution:
-    agent_site: agent_container
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `stages.agent.protocol` | How Buc invokes and observes the agent. Optional; defaults to `command`. Current supported value is `command`. |
 | `stages.agent.command` | Process argv for command agents. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for non-secret variant configuration. |
-| `stages.agent.image` | Container image for the agent process. Required for `agent_site: agent_container`; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
+| `stages.agent.image` | Container image for the agent process. Implies `agent_site: agent_container` when `stages.execution.agent_site` is omitted; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
 | `stages.agent.ephemerals` | Optional list of top-level ephemeral ids attached to the agent stage. Local Docker injects each ephemeral's `expose` env into the agent process. Forbidden when `agent_site: host`. |
 | `stages.agent.mount` | Optional explicit agent file mount object. Omit for image-native agents. |
 | `stages.agent.mount.source` | Source path or agent build id to stage. |
@@ -61,7 +58,7 @@ stages:
 | `stages.agent.env` | Env vars injected into the agent process. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for secrets and ambient runtime affordances. |
 | `stages.agent.output_mounts` | Runtime-owned output directories under `/bucephalus/out`, optionally exposed through an env var and persisted with trial outputs. |
 | `runtime.network.agent` | Agent network mode, usually `none` for hermetic evals or `full` for provider-backed agents. |
-| `stages.execution.agent_site` | Where the agent runs: `agent_container`, `task_runtime`, or `host`. |
+| `stages.execution.agent_site` | Optional override for where the agent runs: `agent_container`, `task_runtime`, or `host`. |
 
 If `policy.sanitization_profile` is `hermetic_functional`, `runtime.network.task_sandbox` and `runtime.network.agent` must both be `none`.
 
@@ -74,6 +71,11 @@ Removed execution-shaping fields such as `workspace_patches`, `launch`, `env_fro
 | `agent_container` | The agent runs in its own container image. This is the normal path for provider-backed or packaged agents. |
 | `task_runtime` | The agent runs inside the case sandbox. Requires `case.interface: writable_workspace` and `workspace.source: container_image`; forbids `agent.image`. Declare `agent.mount` only when the command needs mounted agent files. |
 | `host` | The agent runs on the runner host. For advanced local integrations only; forbids `agent.image`. |
+
+Buc infers the site when the boundary is unambiguous: an agent image means
+`agent_container`, a writable container-image case workspace without an agent
+image means `task_runtime`, and an input-only case without an agent image means
+`host`.
 
 ## Ephemerals
 
@@ -175,18 +177,16 @@ The response JSON is your payload. It is not automatically promoted into durable
 ```yaml
 metrics:
   - id: resolved
-    source:
-      type: agent_response
-      pointer: /metrics/resolved
+    from: result.metrics.resolved
     direction: maximize
     primary: true
 ```
 
-The declaration's `id` is the stored metric name. The pointer is only the extraction path.
+The declaration's `id` is the stored metric name. The `from` path is only the extraction path.
 
 If your agent cannot solve the case, either exit nonzero or write diagnostics into the response payload. A missing or invalid JSON result is a contract failure, not a scientific verdict.
 
-Agent outputs are declared under `stages.agent.outputs`. The canonical `result` output captures `/bucephalus/out/result.json`; additional outputs can capture files or a `workspace_diff`. If a grader needs one of those values, bind it through `stages.grader.inputs` instead of having the grader inspect trial internals.
+The canonical `result` output is added by default and captures `BUCEPHALUS_RESULT_PATH`. Declare `stages.agent.outputs` only for additional values such as files or a `workspace_diff`. If a grader needs one of those values, bind it through `stages.grader.inputs` instead of having the grader inspect trial internals.
 
 ## Events
 

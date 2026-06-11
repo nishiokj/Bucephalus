@@ -1,0 +1,431 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/experiment_authoring_v1.json",
+  "title": "Experiment Authoring v1",
+  "description": "Public experiment.yaml authoring surface. The build step lowers this shape into the sealed resolved package contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["experiment", "matrix", "stages"],
+  "properties": {
+    "version": { "type": "string" },
+    "experiment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "mode": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "owner": { "type": "string" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "compute": { "$ref": "#/$defs/backend" },
+        "storage": { "$ref": "#/$defs/backend" },
+        "traces": { "$ref": "#/$defs/backend" },
+        "registry": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "default": { "type": "string", "minLength": 1 }
+          }
+        },
+        "secrets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/runtime_secret" }
+        },
+        "network": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "default": { "$ref": "#/$defs/network_mode" },
+            "task_sandbox": { "$ref": "#/$defs/network_mode" },
+            "agent": { "$ref": "#/$defs/network_mode" },
+            "egress": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "matrix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["variants", "cases"],
+      "properties": {
+        "variants": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/variant" }
+        },
+        "cases": { "$ref": "#/$defs/cases" },
+        "repeats": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "scheduling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_concurrency": { "type": "integer", "minimum": 1 },
+        "random_seed": { "type": "integer" },
+        "comparison": {
+          "type": "string",
+          "enum": ["none", "paired", "unpaired"]
+        }
+      }
+    },
+    "stages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case", "agent", "grader"],
+      "properties": {
+        "case": { "$ref": "#/$defs/case_stage" },
+        "agent": { "$ref": "#/$defs/agent_stage" },
+        "execution": { "$ref": "#/$defs/execution_stage" },
+        "grader": { "$ref": "#/$defs/grader_stage" }
+      }
+    },
+    "ephemerals": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/ephemeral" }
+    },
+    "externals": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeout_ms": { "type": "integer", "minimum": 1 },
+        "sanitization_profile": {
+          "type": "string",
+          "enum": ["replay_strict", "hermetic_functional", "standard_runtime"]
+        },
+        "task_sandbox": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "validity": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "policies": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "metrics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/metric" }
+    },
+    "traces": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["none", "protocol"]
+        },
+        "retain": {
+          "type": "string",
+          "enum": ["never", "on_failure", "always"]
+        }
+      }
+    },
+    "extra_outputs": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "knobs": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend"],
+      "properties": {
+        "backend": { "type": "string", "minLength": 1 },
+        "config": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "network_mode": {
+      "type": "string",
+      "enum": ["none", "full", "allowlist_enforced", "llm_egress"]
+    },
+    "runtime_secret": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "from"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "from": { "type": "string", "enum": ["env", "file"] },
+        "mount": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target"],
+          "properties": {
+            "target": { "type": "string", "minLength": 1 },
+            "required_for_variants": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "credential_cache": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "baseline": { "type": "boolean" },
+        "config": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "overrides": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "cases": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "path"],
+      "properties": {
+        "source": {
+          "oneOf": [
+            { "type": "string", "enum": ["file"] },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type"],
+              "properties": {
+                "type": { "type": "string", "enum": ["file"] }
+              }
+            }
+          ]
+        },
+        "path": { "type": "string", "minLength": 1 },
+        "suite_id": { "type": "string", "minLength": 1 },
+        "split_id": { "type": "string", "minLength": 1 },
+        "limit": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "case_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interface"],
+      "properties": {
+        "interface": {
+          "type": "string",
+          "enum": ["input_only", "readonly_files", "writable_workspace"]
+        },
+        "files": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "workspace": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": ["container_image", "files", "archive", "git", "empty"]
+            }
+          }
+        }
+      }
+    },
+    "agent_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "protocol": { "type": "string", "enum": ["command"] },
+        "command": { "$ref": "#/$defs/argv" },
+        "image": { "type": "string", "minLength": 1 },
+        "mount": { "$ref": "#/$defs/mount" },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "ephemerals": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "result": {
+          "oneOf": [
+            { "type": "string", "enum": ["structured_json"] },
+            { "type": "object", "additionalProperties": true }
+          ]
+        },
+        "outputs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/output" }
+        },
+        "events": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "output_mounts": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      }
+    },
+    "execution_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent_site": {
+          "type": "string",
+          "enum": ["agent_container", "task_runtime", "host"]
+        }
+      }
+    },
+    "grader_stage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["strategy"],
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["none", "in_task_runtime", "injected", "separate", "host"]
+        },
+        "command": { "$ref": "#/$defs/argv" },
+        "ephemerals": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "outputs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/output" }
+        },
+        "in_task_runtime": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "injected": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "separate": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "host": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "mount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "mount"],
+      "properties": {
+        "source": { "type": "string", "minLength": 1 },
+        "mount": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "read_only"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "read_only": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "capture": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["type"],
+          "properties": {
+            "type": { "type": "string", "minLength": 1 },
+            "path": { "type": "string", "minLength": 1 },
+            "format": { "type": "string", "minLength": 1 },
+            "required": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "ephemeral": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "lifecycle"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "lifecycle": { "type": "string", "enum": ["per-trial"] },
+        "expose": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "from"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "from": { "type": "string", "minLength": 1 },
+        "direction": { "type": "string", "enum": ["maximize", "minimize"] },
+        "primary": { "type": "boolean" },
+        "required": { "type": "boolean" },
+        "transform": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

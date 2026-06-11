@@ -52,7 +52,10 @@ pub(crate) fn load_authoring_input_for_build(
         json_value
     };
     reject_legacy_authoring_surface(&json_value)?;
-    normalize_authoring_vocabulary(&mut json_value)?;
+    crate::package::validate::validate_required_fields(&json_value)?;
+    validate_authoring_schema(&json_value)?;
+    normalize_authoring_vocabulary(&mut json_value)
+        .map_err(|err| crate::package::validate::public_authoring_error(err, true))?;
     Ok(LoadedExperimentInput {
         json_value,
         exp_dir,
@@ -60,12 +63,41 @@ pub(crate) fn load_authoring_input_for_build(
     })
 }
 
-fn reject_legacy_authoring_surface(json_value: &Value) -> Result<()> {
+fn validate_authoring_schema(json_value: &Value) -> Result<()> {
+    let schema = lab_schemas::compile_schema("experiment_authoring_v1.jsonschema")?;
+    let Some(errors) = schema.validate(json_value).err() else {
+        return Ok(());
+    };
+    let messages = errors
+        .map(|err| {
+            let path = err.instance_path.to_string();
+            if path.is_empty() {
+                err.to_string()
+            } else {
+                format!("{}: {}", path, err)
+            }
+        })
+        .collect::<Vec<_>>();
+    Err(anyhow!(
+        "experiment authoring schema validation failed: {}",
+        messages.join("; ")
+    ))
+}
+
+pub(crate) fn reject_legacy_authoring_surface(json_value: &Value) -> Result<()> {
     for (pointer, replacement) in [
         ("/agent_builds", "/matrix/variants[].overrides"),
         ("/baseline", "/matrix/variants[] with baseline: true"),
-        ("/matrix/cases", "/cases"),
-        ("/stages", "/task, /agent, /execution, and /grader"),
+        ("/cases", "/matrix/cases"),
+        ("/variants", "/matrix/variants"),
+        ("/task", "/stages/case"),
+        ("/agent", "/stages/agent"),
+        ("/execution", "/stages/execution"),
+        ("/grader", "/stages/grader"),
+        ("/trial_runtime", "/stages"),
+        ("/sidecars", "/ephemerals"),
+        ("/matrix/tasks", "/matrix/cases"),
+        ("/runtime/externals", "/externals"),
         ("/variant_plan", "/matrix/variants"),
         (
             "/overrides",
@@ -103,17 +135,18 @@ fn reject_metric_source_authoring(json_value: &Value) -> Result<()> {
 }
 
 pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<()> {
-    alias_top_level_value(json_value, "cases", &["matrix", "tasks"])?;
-    alias_top_level_value(json_value, "variants", &["matrix", "variants"])?;
-    alias_top_level_value(json_value, "task", &["trial_runtime", "task"])?;
-    alias_top_level_value(json_value, "agent", &["trial_runtime", "agent"])?;
-    alias_top_level_value(json_value, "execution", &["trial_runtime", "execution"])?;
-    alias_top_level_value(json_value, "grader", &["trial_runtime", "grader"])?;
     alias_top_level_value(json_value, "ephemerals", &["sidecars"])?;
     alias_top_level_value(json_value, "externals", &["runtime", "externals"])?;
+    if let Some(matrix) = json_value.get_mut("matrix") {
+        alias_child_value(matrix, "cases", "tasks")?;
+    }
+    normalize_authoring_defaults(json_value)?;
 
     let Some(stages) = json_value.get("stages").cloned() else {
         normalize_stage_ephemerals(json_value.pointer_mut("/trial_runtime"))?;
+        normalize_agent_site_default(json_value)?;
+        normalize_agent_protocol_default(json_value)?;
+        normalize_grader_defaults(json_value)?;
         normalize_agent_result_output(json_value)?;
         normalize_metric_authoring(json_value)?;
         normalize_trace_policy(json_value)?;
@@ -134,10 +167,164 @@ pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<(
         insert_alias_value(&mut trial_runtime, target, normalized_stage, "/stages")?;
     }
     alias_object_value(json_value, &["trial_runtime"], Value::Object(trial_runtime))?;
+    if let Some(object) = json_value.as_object_mut() {
+        object.remove("stages");
+    }
     normalize_stage_ephemerals(json_value.pointer_mut("/trial_runtime"))?;
+    normalize_agent_site_default(json_value)?;
+    normalize_agent_protocol_default(json_value)?;
+    normalize_grader_defaults(json_value)?;
     normalize_agent_result_output(json_value)?;
     normalize_metric_authoring(json_value)?;
     normalize_trace_policy(json_value)?;
+    Ok(())
+}
+
+fn normalize_authoring_defaults(json_value: &mut Value) -> Result<()> {
+    default_object_path(json_value, &["runtime"])?;
+    default_object_path(json_value, &["runtime", "compute"])?;
+    default_object_path(json_value, &["runtime", "storage"])?;
+    default_object_path(json_value, &["runtime", "traces"])?;
+    default_object_path(json_value, &["runtime", "network"])?;
+    default_object_path(json_value, &["policy"])?;
+    default_object_path(json_value, &["scheduling"])?;
+
+    insert_default_value(
+        json_value,
+        &["runtime", "compute", "backend"],
+        json!("local-docker"),
+    )?;
+    insert_default_value(
+        json_value,
+        &["runtime", "storage", "backend"],
+        json!("local-fs"),
+    )?;
+    insert_default_value(
+        json_value,
+        &["runtime", "traces", "backend"],
+        json!("local-stdout"),
+    )?;
+    insert_default_value(
+        json_value,
+        &["runtime", "network", "task_sandbox"],
+        json!("none"),
+    )?;
+    insert_default_value(json_value, &["runtime", "network", "agent"], json!("none"))?;
+    insert_default_value(json_value, &["matrix", "repeats"], json!(1))?;
+    insert_default_value(json_value, &["scheduling", "max_concurrency"], json!(1))?;
+    insert_default_value(json_value, &["scheduling", "random_seed"], json!(1))?;
+    insert_default_value(json_value, &["scheduling", "comparison"], json!("none"))?;
+    insert_default_value(json_value, &["policy", "timeout_ms"], json!(600000))?;
+    insert_default_value(json_value, &["policy", "task_sandbox"], json!({}))?;
+    Ok(())
+}
+
+fn default_object_path(root: &mut Value, path: &[&str]) -> Result<()> {
+    let Some((last, parents)) = path.split_last() else {
+        return Ok(());
+    };
+    let parent = ensure_object_path(root, parents)?;
+    match parent.get(*last) {
+        Some(value) if value.is_object() => Ok(()),
+        Some(_) => Err(anyhow!("/{} must be an object", path.join("/"))),
+        None => {
+            parent.insert((*last).to_string(), Value::Object(Map::new()));
+            Ok(())
+        }
+    }
+}
+
+fn insert_default_value(root: &mut Value, path: &[&str], value: Value) -> Result<()> {
+    let Some((last, parents)) = path.split_last() else {
+        return Ok(());
+    };
+    let parent = ensure_object_path(root, parents)?;
+    parent.entry((*last).to_string()).or_insert(value);
+    Ok(())
+}
+
+fn normalize_agent_site_default(json_value: &mut Value) -> Result<()> {
+    let agent_site = json_value.pointer("/trial_runtime/execution/agent_site");
+    if agent_site.is_some() {
+        return Ok(());
+    }
+    let default = inferred_agent_site(json_value);
+    let Some(default) = default else {
+        return Ok(());
+    };
+    let execution = ensure_object_path(json_value, &["trial_runtime", "execution"])?;
+    execution.insert("agent_site".to_string(), json!(default));
+    Ok(())
+}
+
+fn inferred_agent_site(json_value: &Value) -> Option<&'static str> {
+    if json_value
+        .pointer("/trial_runtime/agent/image")
+        .and_then(Value::as_str)
+        .is_some_and(|image| !image.trim().is_empty())
+    {
+        return Some("agent_container");
+    }
+    let interface = json_value
+        .pointer("/trial_runtime/task/interface")
+        .and_then(Value::as_str)?;
+    match interface {
+        "input_only" => Some("host"),
+        "writable_workspace"
+            if json_value
+                .pointer("/trial_runtime/task/workspace/source")
+                .and_then(Value::as_str)
+                == Some("container_image") =>
+        {
+            Some("task_runtime")
+        }
+        _ => None,
+    }
+}
+
+fn ensure_object_path<'a>(
+    root: &'a mut Value,
+    path: &[&str],
+) -> Result<&'a mut Map<String, Value>> {
+    let mut current = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("experiment authoring input must be an object"))?;
+    for segment in path {
+        let entry = current
+            .entry((*segment).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        current = entry
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("/{} must be an object", segment))?;
+    }
+    Ok(current)
+}
+
+fn normalize_agent_protocol_default(json_value: &mut Value) -> Result<()> {
+    let Some(agent) = json_value.pointer_mut("/trial_runtime/agent") else {
+        return Ok(());
+    };
+    let agent = agent
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("/agent must be an object"))?;
+    if agent.get("protocol").is_none() && agent.get("command").is_some() {
+        agent.insert("protocol".to_string(), json!("command"));
+    }
+    Ok(())
+}
+
+fn normalize_grader_defaults(json_value: &mut Value) -> Result<()> {
+    let Some(grader) = json_value.pointer_mut("/trial_runtime/grader") else {
+        return Ok(());
+    };
+    let grader = grader
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("/grader must be an object"))?;
+    if grader.get("strategy").and_then(Value::as_str) == Some("in_task_runtime")
+        && grader.get("in_task_runtime").is_none()
+    {
+        grader.insert("in_task_runtime".to_string(), json!({}));
+    }
     Ok(())
 }
 
@@ -153,9 +340,7 @@ fn normalize_agent_result_output(json_value: &mut Value) -> Result<()> {
     }
     let result = agent.remove("result");
     let Some(result) = result else {
-        if agent.get("outputs").is_none() {
-            agent.insert("outputs".to_string(), default_agent_result_outputs());
-        }
+        ensure_default_agent_result_output(agent)?;
         return Ok(());
     };
     if agent.get("outputs").is_some() {
@@ -187,6 +372,27 @@ fn normalize_agent_result_output(json_value: &mut Value) -> Result<()> {
         }
     };
     agent.insert("outputs".to_string(), result);
+    Ok(())
+}
+
+fn ensure_default_agent_result_output(agent: &mut Map<String, Value>) -> Result<()> {
+    let Some(outputs) = agent.get_mut("outputs") else {
+        agent.insert("outputs".to_string(), default_agent_result_outputs());
+        return Ok(());
+    };
+    let outputs = outputs
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("/agent.outputs must be an object"))?;
+    if !outputs.contains_key("result") {
+        let mut defaults = default_agent_result_outputs();
+        let Some(default_result) = defaults
+            .as_object_mut()
+            .and_then(|defaults| defaults.remove("result"))
+        else {
+            return Err(anyhow!("internal default agent result output is malformed"));
+        };
+        outputs.insert("result".to_string(), default_result);
+    }
     Ok(())
 }
 
@@ -229,10 +435,14 @@ fn normalize_metric_authoring(json_value: &mut Value) -> Result<()> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("{}/from must be a non-empty string", context))?;
-        metric.insert(
-            "source".to_string(),
-            metric_source_from_public_ref(from, &context)?,
-        );
+        let mut source = metric_source_from_public_ref(from, &context)?;
+        if let Some(transform) = metric.remove("transform") {
+            source
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("{} lowered source must be an object", context))?
+                .insert("transform".to_string(), transform);
+        }
+        metric.insert("source".to_string(), source);
     }
     Ok(())
 }
@@ -251,20 +461,18 @@ fn metric_source_from_public_ref(raw: &str, context: &str) -> Result<Value> {
         return Ok(json!({ "type": "agent_response", "pointer": "" }));
     }
     if let Some(rest) = raw.strip_prefix("grader.") {
-        let (output, path) = rest.split_once('.').ok_or_else(|| {
-            anyhow!(
-                "{}/from='{}' must name a grader output and field, e.g. grader.report.resolved",
-                context,
-                raw
-            )
-        })?;
+        let (output, pointer) = if let Some((output, path)) = rest.split_once('.') {
+            (output, public_path_to_json_pointer(path, context)?)
+        } else {
+            (rest, String::new())
+        };
         if output.trim().is_empty() {
             return Err(anyhow!("{}/from has an empty grader output id", context));
         }
         return Ok(json!({
             "type": "grader_output",
             "output": output,
-            "pointer": public_path_to_json_pointer(path, context)?
+            "pointer": pointer
         }));
     }
     Err(anyhow!(
@@ -479,7 +687,9 @@ fn alias_child_value(root: &mut Value, source: &str, target: &str) -> Result<()>
     let object = root
         .as_object_mut()
         .ok_or_else(|| anyhow!("stage authoring input must be an object"))?;
-    insert_alias_value(object, target, value, "stage authoring vocabulary")
+    insert_alias_value(object, target, value, "stage authoring vocabulary")?;
+    object.remove(source);
+    Ok(())
 }
 
 fn insert_alias_value(
@@ -657,9 +867,9 @@ mod tests {
     #[test]
     fn normalizes_case_stage_ephemeral_authoring_nouns() {
         let mut value = json!({
-            "cases": { "source": "file", "path": "cases.jsonl" },
             "matrix": {
                 "variants": [{ "id": "base" }],
+                "cases": { "source": "file", "path": "cases.jsonl" },
                 "repeats": 1
             },
             "stages": {
@@ -704,27 +914,35 @@ mod tests {
     #[test]
     fn normalizes_public_noun_authoring_and_metric_refs() {
         let mut value = json!({
-            "cases": { "source": "file", "path": "cases.jsonl" },
-            "variants": [{ "id": "base", "baseline": true, "config": {} }],
-            "task": {
-                "interface": "writable_workspace",
-                "workspace": {
-                    "source": "container_image",
-                    "image": { "from": "case_row" },
-                    "workdir": { "from": "case_row" }
-                }
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }],
+                "repeats": 1
             },
-            "agent": {
-                "image": "python:3.11-slim",
-                "command": ["agent"],
-                "result": "structured_json"
+            "stages": {
+                "case": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": { "from": "case_row" },
+                        "workdir": { "from": "case_row" }
+                    }
+                },
+                "agent": {
+                    "image": "python:3.11-slim",
+                    "command": ["agent"],
+                    "result": "structured_json"
+                },
+                "grader": { "strategy": "none" }
             },
-            "execution": { "agent_site": "agent_container" },
-            "grader": { "strategy": "none" },
             "metrics": [{
                 "id": "risk",
                 "from": "result.alerts[0].revenue_at_risk",
                 "primary": true
+            }, {
+                "id": "pass_rate",
+                "from": "grader.report",
+                "transform": { "type": "pytest_json_report_pass_rate" }
             }]
         });
 
@@ -740,6 +958,14 @@ mod tests {
             Some(&json!("structured_json"))
         );
         assert_eq!(
+            value.pointer("/trial_runtime/agent/protocol"),
+            Some(&json!("command"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/execution/agent_site"),
+            Some(&json!("agent_container"))
+        );
+        assert_eq!(
             value.pointer("/trial_runtime/agent/outputs/result/capture/path"),
             Some(&json!(BUCEPHALUS_RESULT_PATH))
         );
@@ -750,18 +976,162 @@ mod tests {
                 "pointer": "/alerts/0/revenue_at_risk"
             }))
         );
+        assert_eq!(
+            value.pointer("/metrics/1/source"),
+            Some(&json!({
+                "type": "grader_output",
+                "output": "report",
+                "pointer": "",
+                "transform": { "type": "pytest_json_report_pass_rate" }
+            }))
+        );
         assert!(value.pointer("/cases").is_none());
         assert!(value.pointer("/agent").is_none());
+    }
+
+    #[test]
+    fn normalizes_default_result_output_with_extra_agent_outputs() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }]
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": {
+                    "command": ["agent"],
+                    "outputs": {
+                        "candidate_patch": {
+                            "capture": {
+                                "type": "workspace_diff",
+                                "format": "unified_diff"
+                            }
+                        }
+                    }
+                },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/outputs/result/capture/path"),
+            Some(&json!(BUCEPHALUS_RESULT_PATH))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/outputs/candidate_patch/capture/type"),
+            Some(&json!("workspace_diff"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/execution/agent_site"),
+            Some(&json!("host"))
+        );
+    }
+
+    #[test]
+    fn normalizes_safe_authoring_defaults() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }]
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "command": ["agent"] },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/runtime/compute/backend"),
+            Some(&json!("local-docker"))
+        );
+        assert_eq!(
+            value.pointer("/runtime/storage/backend"),
+            Some(&json!("local-fs"))
+        );
+        assert_eq!(
+            value.pointer("/runtime/traces/backend"),
+            Some(&json!("local-stdout"))
+        );
+        assert_eq!(
+            value.pointer("/runtime/network/task_sandbox"),
+            Some(&json!("none"))
+        );
+        assert_eq!(
+            value.pointer("/runtime/network/agent"),
+            Some(&json!("none"))
+        );
+        assert_eq!(value.pointer("/matrix/repeats"), Some(&json!(1)));
+        assert_eq!(
+            value.pointer("/scheduling/max_concurrency"),
+            Some(&json!(1))
+        );
+        assert_eq!(value.pointer("/scheduling/random_seed"), Some(&json!(1)));
+        assert_eq!(
+            value.pointer("/scheduling/comparison"),
+            Some(&json!("none"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/execution/agent_site"),
+            Some(&json!("host"))
+        );
+        assert_eq!(value.pointer("/policy/timeout_ms"), Some(&json!(600000)));
+        assert_eq!(value.pointer("/policy/task_sandbox"), Some(&json!({})));
+    }
+
+    #[test]
+    fn defaults_agent_site_to_task_runtime_for_container_workspace_agents() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }]
+            },
+            "stages": {
+                "case": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": { "from": "case_row" },
+                        "workdir": { "from": "case_row" }
+                    }
+                },
+                "agent": { "command": ["agent"] },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/execution/agent_site"),
+            Some(&json!("task_runtime"))
+        );
     }
 
     #[test]
     fn rejects_removed_authoring_fallbacks_at_file_boundary() {
         for (value, expected) in [
             (
-                json!({ "matrix": { "cases": { "source": "file", "path": "cases.jsonl" } } }),
-                "/matrix/cases",
+                json!({ "matrix": { "tasks": { "source": "file", "path": "cases.jsonl" } } }),
+                "/matrix/tasks",
             ),
-            (json!({ "stages": {} }), "/stages"),
+            (
+                json!({ "cases": { "source": "file", "path": "cases.jsonl" } }),
+                "/cases",
+            ),
+            (json!({ "variants": [{ "id": "base" }] }), "/variants"),
+            (json!({ "task": {} }), "/task"),
+            (json!({ "agent": {} }), "/agent"),
+            (json!({ "trial_runtime": {} }), "/trial_runtime"),
+            (json!({ "sidecars": {} }), "/sidecars"),
+            (
+                json!({ "runtime": { "externals": {} } }),
+                "/runtime/externals",
+            ),
             (
                 json!({ "metrics": [{ "id": "score", "source": { "type": "agent_response", "pointer": "/score" } }] }),
                 "/metrics/0 uses internal metric extraction field 'source'",
@@ -826,7 +1196,26 @@ mod tests {
     }
 
     #[test]
-    fn declared_traces_require_explicit_source_and_protocol() {
+    fn in_task_runtime_grader_defaults_to_empty_config() {
+        let mut value = json!({
+            "stages": {
+                "grader": {
+                    "strategy": "in_task_runtime",
+                    "command": ["pytest"]
+                }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/grader/in_task_runtime"),
+            Some(&json!({}))
+        );
+    }
+
+    #[test]
+    fn declared_traces_require_explicit_source() {
         fn assert_authoring_error(mut value: Value, expected: &str) {
             let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
             assert!(
@@ -838,9 +1227,24 @@ mod tests {
             json!({"traces": {}, "stages": { "agent": { "command": ["agent"] } }}),
             "/traces.source is required when /traces is declared",
         );
-        assert_authoring_error(
-            json!({"traces": { "source": "protocol" }, "stages": { "agent": { "command": ["agent"] } }}),
-            "/traces.source=protocol requires agent.protocol",
+    }
+
+    #[test]
+    fn trace_source_protocol_uses_default_command_protocol() {
+        let mut value = json!({
+            "traces": { "source": "protocol" },
+            "stages": { "agent": { "command": ["agent"] } }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/protocol"),
+            Some(&json!("command"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/events/0/id"),
+            Some(&json!("trajectory"))
         );
     }
 

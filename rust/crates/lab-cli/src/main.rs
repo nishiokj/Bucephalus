@@ -1231,11 +1231,7 @@ fn generate_init_experiment_yaml(options: &InitOptions) -> String {
   tags: [starter]
 
 runtime:
-  compute: {{ backend: local-docker }}
-  storage: {{ backend: local-fs }}
-  traces: {{ backend: local-stdout }}
   network:
-    task_sandbox: none
     agent: full
 
 matrix:
@@ -1246,14 +1242,6 @@ matrix:
   cases:
     source: file
     path: cases.jsonl
-  repeats: 1
-  seeds: [1]
-
-scheduling:
-  max_concurrency: 1
-  shuffle_tasks: false
-  random_seed: 1
-  comparison: none
 
 stages:
   case:
@@ -1266,30 +1254,18 @@ stages:
         path: /opt/agent
         read_only: true
     command: ["python3", "/opt/agent/buc_agent.py"]
-    outputs:
-      result:
-        capture:
-          type: file
-          path: /bucephalus/out/result.json
-          format: json
-          required: true
-  execution:
-    agent_site: agent_container
   grader:
     strategy: none
 
 metrics:
   - id: resolved
-    source:
-      type: agent_response
-      pointer: /metrics/resolved
+    from: result.metrics.resolved
     direction: maximize
     primary: true
 
 policy:
   timeout_ms: 120000
   sanitization_profile: standard_runtime
-  task_sandbox: {{}}
 "#,
         id = id,
         name = options.name,
@@ -12999,6 +12975,42 @@ mod tests {
         assert!(err.contains("bucephalus init <new-eval-dir>"));
         assert!(err.contains("bucephalus doctor"));
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn init_experiment_yaml_uses_public_metric_refs() {
+        let options = InitOptions {
+            dir: PathBuf::from("."),
+            client: InitClientArg::Cli,
+            command: Some("agent --input {input} --output {output}".to_string()),
+            url: None,
+            stream: InitStreamArg::None,
+            language: InitLanguageArg::Python,
+            mcp_role: None,
+            mcp_tool: None,
+            mode: "answer".to_string(),
+            name: "Smoke Eval".to_string(),
+            force: false,
+        };
+
+        let yaml = generate_init_experiment_yaml(&options);
+
+        assert!(yaml.contains("from: result.metrics.resolved"));
+        assert!(!yaml.contains("type: agent_response"));
+        assert!(!yaml.contains("pointer: /metrics/resolved"));
+        assert!(!yaml.contains("compute: { backend: local-docker }"));
+        assert!(!yaml.contains("storage: { backend: local-fs }"));
+        assert!(!yaml.contains("traces: { backend: local-stdout }"));
+        assert!(!yaml.contains("task_sandbox: none"));
+        assert!(!yaml.contains("task_sandbox: {}"));
+        assert!(!yaml.contains("repeats: 1"));
+        assert!(!yaml.contains("seeds:"));
+        assert!(!yaml.contains("scheduling:"));
+        assert!(!yaml.contains("max_concurrency: 1"));
+        assert!(!yaml.contains("random_seed: 1"));
+        assert!(!yaml.contains("comparison: none"));
+        assert!(!yaml.contains("agent_site: agent_container"));
+        assert!(!yaml.contains("/bucephalus/out/result.json"));
     }
 
     #[test]
