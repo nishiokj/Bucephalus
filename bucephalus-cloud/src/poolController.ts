@@ -9,6 +9,7 @@ import {
   type RunnerInstanceRecord,
   type RunnerPoolRecord,
   type RunnerProvisionRequestRecord,
+  type RunnerWorkerImageRecord,
 } from "./runners/repository";
 import type { JsonObject } from "./primitives";
 import type { WorkerCapabilities } from "./packages/repository";
@@ -195,6 +196,15 @@ export async function reconcileOnce(
     if (openProvisionRequests.some((request) => request.run_id === run.run_id)) {
       continue;
     }
+    const activeWorkerImage = await runners.getActiveWorkerImageForPool(pool.runner_pool_id);
+    if (!activeWorkerImage) {
+      logError("pool_controller.active_worker_image_missing", context, {
+        runner_pool_id: pool.runner_pool_id,
+        run_id: run.run_id,
+        detail: "pool matches queued demand but has no active worker image",
+      });
+      continue;
+    }
 
     const request = await runners.createProvisionRequest({
       runnerPoolId: pool.runner_pool_id,
@@ -204,6 +214,12 @@ export async function reconcileOnce(
       metadata: {
         requested_by: "bucephalus-pool-controller",
         requested_at: new Date().toISOString(),
+        worker_image: {
+          runner_worker_image_id: activeWorkerImage.runner_worker_image_id,
+          image_ref: activeWorkerImage.image_ref,
+          release_version: activeWorkerImage.release_version,
+          release_git_sha: activeWorkerImage.release_git_sha,
+        },
       },
     });
     if (!request) {
@@ -213,7 +229,7 @@ export async function reconcileOnce(
       component: "pool-controller-provision",
       runId: run.run_id,
     });
-    await provisionRunner(config, runners, pool, run, request, runContext);
+    await provisionRunner(config, runners, pool, activeWorkerImage, run, request, runContext);
   }
 }
 
@@ -280,6 +296,7 @@ async function provisionRunner(
   config: PoolControllerConfig,
   runners: RunnerRepository,
   pool: RunnerPoolRecord,
+  activeWorkerImage: RunnerWorkerImageRecord,
   run: QueuedRunDemandRecord,
   request: RunnerProvisionRequestRecord,
   context: TraceContext,
@@ -289,9 +306,15 @@ async function provisionRunner(
       provisionRequestId: request.provision_request_id,
       metadata: {
         provider_started_at: new Date().toISOString(),
+        worker_image: {
+          runner_worker_image_id: activeWorkerImage.runner_worker_image_id,
+          image_ref: activeWorkerImage.image_ref,
+          release_version: activeWorkerImage.release_version,
+          release_git_sha: activeWorkerImage.release_git_sha,
+        },
       },
     });
-    const output = await runProvisionCommand(config, pool, run, request);
+    const output = await runProvisionCommand(config, pool, activeWorkerImage, run, request);
     await runners.markProvisioning({
       provisionRequestId: request.provision_request_id,
       providerInstanceId: output.provider_instance_id,
@@ -370,6 +393,7 @@ async function runReapCommand(
 async function runProvisionCommand(
   config: PoolControllerConfig,
   pool: RunnerPoolRecord,
+  activeWorkerImage: RunnerWorkerImageRecord,
   run: QueuedRunDemandRecord,
   request: RunnerProvisionRequestRecord,
 ): Promise<ProvisionOutput> {
@@ -383,6 +407,7 @@ async function runProvisionCommand(
     provision_request_id: request.provision_request_id,
     run_id: run.run_id,
     run_requirements: run.run_requirements,
+    worker_image: activeWorkerImage.image_ref,
     worker_env: {
       BUCEPHALUS_CLOUD_API_URL: config.apiUrl,
       BUCEPHALUS_RUNNER_POOL_ID: pool.runner_pool_id,
@@ -398,6 +423,7 @@ async function runProvisionCommand(
       BUCEPHALUS_CLOUD_WORKER_TOKEN: config.workerToken,
       BUCEPHALUS_RUNNER_POOL_ID: pool.runner_pool_id,
       BUCEPHALUS_RUNNER_PROVISION_REQUEST_ID: request.provision_request_id,
+      BUCEPHALUS_GCP_RUNNER_IMAGE: activeWorkerImage.image_ref,
     },
     config.providerCommandTimeoutMs,
   );

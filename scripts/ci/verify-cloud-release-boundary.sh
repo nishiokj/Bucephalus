@@ -1179,7 +1179,7 @@ for (const script of [
   if (/const isGithubActions = process\.env\.GITHUB_ACTIONS === "true"/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
     fail(`${script} must only write GitHub image builder fields for GitHub Actions runs`);
   }
-  if (/verify-cloud-image-build-manifest\.sh" "\$\{MANIFEST_PATH\}" --release "\$\{RELEASE_INPUT\}"/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
+  if (!(/verify-cloud-image-build-manifest\.sh" "\$\{MANIFEST_PATH\}" --release "\$\{RELEASE_INPUT\}"/.test(text) || /verify_manifest_args=\("\$\{MANIFEST_PATH\}" --release "\$\{RELEASE_INPUT\}"\)/.test(text)) && script === "scripts/release/build-cloud-images.sh") {
     fail(`${script} must verify generated image build manifests against the release input`);
   }
   if (/pushed=true/.test(text) === false && script === "scripts/release/write-gcp-image-tfvars.sh") {
@@ -1469,8 +1469,8 @@ if (/apt-get/.test(provisionRunnerVmText)) {
 if (!provisionRunnerVmText.includes('"google-logging-enabled"')) {
   fail("GCE runner provisioning must enable COS logging so worker container logs reach Cloud Logging");
 }
-if (!/const workerImage = requiredEnv\("BUCEPHALUS_GCP_RUNNER_IMAGE"\);[\s\S]*return \{[\s\S]*\bworkerImage,\s*[\s\S]*\};/.test(provisionRunnerVmText)) {
-  fail("GCE runner provisioning must return the validated worker image from loadConfig");
+if (!/const workerImageFallback = optionalEnv\("BUCEPHALUS_GCP_RUNNER_IMAGE", ""\);[\s\S]*workerImageForRequest/.test(provisionRunnerVmText)) {
+  fail("GCE runner provisioning must take worker image from request state and keep BUCEPHALUS_GCP_RUNNER_IMAGE as a fallback only");
 }
 if (!provisionRunnerVmText.includes('onHostMaintenance: "MIGRATE"')) {
   fail("GCE runner provisioning must use onHostMaintenance=MIGRATE for default non-preemptible E2 runners");

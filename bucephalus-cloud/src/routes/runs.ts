@@ -348,8 +348,27 @@ async function requireSchedulableRun(
 ): Promise<void> {
   const pools = await runners.listPools();
   const activePools = pools.filter((pool) => pool.status === "active");
-  if (activePools.some((pool) => poolSatisfiesRun(pool, requirements))) {
+  const runnablePools = activePools.filter((pool) => pool.active_worker_image_id);
+  if (runnablePools.some((pool) => poolSatisfiesRun(pool, requirements))) {
     return;
+  }
+  const matchingPoolsWithoutWorker = activePools
+    .filter((pool) => !pool.active_worker_image_id && poolSatisfiesRun(pool, requirements));
+  if (matchingPoolsWithoutWorker.length > 0) {
+    throw new HttpError(
+      409,
+      "runner_pool_worker_image_missing",
+      "An active runner pool can satisfy this run, but it has no active worker image promoted",
+      {
+        required_executor: requirements.executor,
+        required_resources: requirements.requires,
+        matching_pools_without_worker_image: matchingPoolsWithoutWorker.map((pool) => ({
+          runner_pool_id: pool.runner_pool_id,
+          name: pool.name,
+          capabilities: pool.capabilities as unknown as JsonObject,
+        })),
+      },
+    );
   }
   throw new HttpError(
     409,
@@ -361,6 +380,7 @@ async function requireSchedulableRun(
       active_pools: activePools.map((pool) => ({
         runner_pool_id: pool.runner_pool_id,
         name: pool.name,
+        active_worker_image_id: pool.active_worker_image_id,
         capabilities: pool.capabilities as unknown as JsonObject,
       })),
     },

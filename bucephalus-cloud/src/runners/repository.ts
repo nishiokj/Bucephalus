@@ -7,10 +7,28 @@ export interface RunnerPoolRecord {
   runner_pool_id: string;
   name: string;
   status: "active" | "draining" | "disabled";
+  active_worker_image_id: string | null;
   capabilities: WorkerCapabilities;
   metadata: JsonObject;
   created_at: string;
   updated_at: string;
+}
+
+export interface RunnerWorkerImageRecord {
+  runner_worker_image_id: string;
+  image_ref: string;
+  registry_host: string;
+  repository: string;
+  digest: string;
+  release_version: string | null;
+  release_git_sha: string | null;
+  promotion_evidence_uri: string | null;
+  promotion_evidence_sha256: string | null;
+  modal_launcher_sha256: string | null;
+  worker_runner_sha256: string | null;
+  boundary_verified_at: string | null;
+  metadata: JsonObject;
+  created_at: string;
 }
 
 export interface RunnerInstanceRecord {
@@ -143,6 +161,91 @@ export class RunnerRepository {
       throw new HttpError(404, "runner_pool_not_found", "Runner pool not found");
     }
     return pool;
+  }
+
+  async getActiveWorkerImageForPool(poolId: string): Promise<RunnerWorkerImageRecord | null> {
+    const rows = await this.sql`
+      select image.*
+      from cloud.runner_pools pool
+      join cloud.runner_worker_images image
+        on image.runner_worker_image_id = pool.active_worker_image_id
+      where pool.runner_pool_id = ${poolId}
+      limit 1
+    `;
+    return (rows[0] as RunnerWorkerImageRecord | undefined) ?? null;
+  }
+
+  async promoteWorkerImage(input: {
+    poolId: string;
+    imageRef: string;
+    registryHost: string;
+    repository: string;
+    digest: string;
+    releaseVersion?: string | null;
+    releaseGitSha?: string | null;
+    promotionEvidenceUri?: string | null;
+    promotionEvidenceSha256?: string | null;
+    modalLauncherSha256?: string | null;
+    workerRunnerSha256?: string | null;
+    boundaryVerifiedAt?: string | null;
+    metadata?: JsonObject;
+  }): Promise<{ pool: RunnerPoolRecord; workerImage: RunnerWorkerImageRecord }> {
+    return await this.sql.begin(async (tx) => {
+      const imageRows = await tx`
+        insert into cloud.runner_worker_images (
+          image_ref,
+          registry_host,
+          repository,
+          digest,
+          release_version,
+          release_git_sha,
+          promotion_evidence_uri,
+          promotion_evidence_sha256,
+          modal_launcher_sha256,
+          worker_runner_sha256,
+          boundary_verified_at,
+          metadata
+        )
+        values (
+          ${input.imageRef},
+          ${input.registryHost},
+          ${input.repository},
+          ${input.digest},
+          ${input.releaseVersion ?? null},
+          ${input.releaseGitSha ?? null},
+          ${input.promotionEvidenceUri ?? null},
+          ${input.promotionEvidenceSha256 ?? null},
+          ${input.modalLauncherSha256 ?? null},
+          ${input.workerRunnerSha256 ?? null},
+          ${input.boundaryVerifiedAt ?? null},
+          ${this.sql.json(input.metadata ?? {})}
+        )
+        on conflict (image_ref) do update
+        set release_version = excluded.release_version,
+            release_git_sha = excluded.release_git_sha,
+            promotion_evidence_uri = excluded.promotion_evidence_uri,
+            promotion_evidence_sha256 = excluded.promotion_evidence_sha256,
+            modal_launcher_sha256 = excluded.modal_launcher_sha256,
+            worker_runner_sha256 = excluded.worker_runner_sha256,
+            boundary_verified_at = excluded.boundary_verified_at,
+            metadata = cloud.runner_worker_images.metadata || excluded.metadata
+        returning *
+      `;
+      const workerImage = imageRows[0] as RunnerWorkerImageRecord;
+
+      const poolRows = await tx`
+        update cloud.runner_pools
+        set active_worker_image_id = ${workerImage.runner_worker_image_id},
+            updated_at = now()
+        where runner_pool_id = ${input.poolId}
+        returning *
+      `;
+      const pool = poolRows[0] as RunnerPoolRecord | undefined;
+      if (!pool) {
+        throw new HttpError(404, "runner_pool_not_found", "Runner pool not found");
+      }
+      return { pool, workerImage };
+    });
   }
 
   async registerInstance(input: {

@@ -1,0 +1,54 @@
+name: Bucephalus Auto Release Tag
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
+
+permissions:
+  contents: write
+  actions: write
+
+# Serialize runs so two close pushes cannot race to create the same tag.
+concurrency:
+  group: bucephalus-auto-release
+  cancel-in-progress: false
+
+jobs:
+  tag-release:
+    name: Tag and dispatch release on version bump
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from Cargo.toml
+        id: version
+        run: |
+          scripts/release/resolve-release-version.sh \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Create release tag if version is unreleased
+        id: tag
+        run: |
+          tag="v${{ steps.version.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+            echo "${tag} already exists; nothing to release"
+            echo "created=false" >> "${GITHUB_OUTPUT}"
+          else
+            git tag "${tag}" "${GITHUB_SHA}"
+            git push origin "refs/tags/${tag}"
+            echo "created=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # Tags pushed with GITHUB_TOKEN do not fire push-event workflows, so the
+      # release workflow must be dispatched explicitly on the new tag ref.
+      - name: Dispatch release workflow
+        if: ${{ steps.tag.outputs.created == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh workflow run bucephalus-release.yml
+          --ref "v${{ steps.version.outputs.version }}"
+          -f version_override="${{ steps.version.outputs.version }}"

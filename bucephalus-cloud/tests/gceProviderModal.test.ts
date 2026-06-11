@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 // @ts-ignore: provider scripts are shipped as runtime JavaScript deploy assets.
-import { renderStartupScript, validateRequest } from "../deploy/provider/gcp/provision-runner-vm.js";
+import { renderStartupScript, validateRequest, workerImageForRequest } from "../deploy/provider/gcp/provision-runner-vm.js";
 
 describe("GCE runner provider Modal bridge", () => {
   test("rejects modal provisioning when Modal config is disabled", () => {
@@ -61,6 +61,25 @@ describe("GCE runner provider Modal bridge", () => {
         s3ForcePathStyle: "true",
       },
     })).toThrow("does not support path-style S3 mounts");
+  });
+
+  test("resolves worker image from provision request active pool state", () => {
+    expect(workerImageForRequest(
+      { worker_image: "us-central1-docker.pkg.dev/project/repo/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+      { workerImageFallback: "us-central1-docker.pkg.dev/project/repo/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } as any,
+    )).toBe("us-central1-docker.pkg.dev/project/repo/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+  });
+  
+  test("uses configured worker image only as a compatibility fallback", () => {
+    expect(workerImageForRequest(
+      {},
+      { workerImageFallback: "us-central1-docker.pkg.dev/project/repo/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } as any,
+    )).toBe("us-central1-docker.pkg.dev/project/repo/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  });
+
+  test("fails fast when neither provision request nor fallback carries a worker image", () => {
+    expect(() => workerImageForRequest({}, { workerImageFallback: "" } as any))
+      .toThrow("provision request requires /worker_image or BUCEPHALUS_GCP_RUNNER_IMAGE");
   });
 });
 

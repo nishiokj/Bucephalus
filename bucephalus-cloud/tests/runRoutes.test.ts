@@ -624,6 +624,57 @@ describe("Cloud run routes", () => {
       authContext("user-a"),
     )).rejects.toThrow("No active runner pool can satisfy this run");
   });
+
+  test("run creation rejects matching pools without an active worker image", async () => {
+    const packages = {
+      async getArtifact() {
+        return {
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          upload_id: "upload-1",
+          storage_path: "/tmp/package.tgz",
+          byte_size: 1,
+          media_type: "application/gzip",
+          manifest_json: {
+            schema_version: "sealed_run_package_v2",
+            resolved_experiment: {
+              runtime: {
+                compute: { backend: "local-docker" },
+              },
+            },
+          },
+          resolved_experiment_json: {},
+          target: null,
+          image_refs: [],
+          diagnostics: [],
+          status: "accepted",
+          created_at: "2026-06-04T00:00:00Z",
+          updated_at: "2026-06-04T00:00:00Z",
+        };
+      },
+    };
+    const runs = {
+      async createRun() {
+        throw new Error("createRun should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPoolWithoutWorkerImage() as any,
+      "worker-token",
+      authContext("user-a"),
+    )).rejects.toThrow("has no active worker image promoted");
+  });
 });
 
 function runnersWithDockerPool(): Pick<RunnerRepository, "listPools"> {
@@ -634,6 +685,7 @@ function runnersWithDockerPool(): Pick<RunnerRepository, "listPools"> {
           runner_pool_id: "pool-1",
           name: "docker",
           status: "active",
+          active_worker_image_id: "worker-image-1",
           capabilities: {
             executors: ["runner-docker"],
             resources: ["core_runner", "docker_daemon", "registry_pull", "secret_resolver"],
@@ -648,6 +700,15 @@ function runnersWithDockerPool(): Pick<RunnerRepository, "listPools"> {
           updated_at: "2026-06-04T00:00:00Z",
         },
       ];
+    },
+  };
+}
+
+function runnersWithDockerPoolWithoutWorkerImage(): Pick<RunnerRepository, "listPools"> {
+  return {
+    async listPools() {
+      const pool = (await runnersWithDockerPool().listPools())[0]!;
+      return [{ ...pool, active_worker_image_id: null }];
     },
   };
 }
