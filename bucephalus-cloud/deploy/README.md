@@ -29,10 +29,21 @@ The first Path 1 replacement surface is:
 - `path1-readiness.md`: remaining end-to-end readiness blockers.
 - `.github/workflows/bucephalus-cloud-candidate.yml`: fast Cloud candidate
   workflow that builds deployable x86_64 images after `main` Cloud CI succeeds
-  and deploys the exact promotion evidence to the development environment.
+  and classifies the change before deciding whether to deploy, plan, or stop.
 - `.github/workflows/bucephalus-gcp-deploy.yml`: manual GCP deploy workflow
   and reusable deployment backend that consumes verified pushed-image promotion
   evidence instead of handwritten image digests.
+
+The candidate workflow separates changes into four high-level lanes:
+
+- Runtime/release-bundle changes build pushed candidate images and auto-apply
+  `deployment_stage=services` to `bucephalus-dev`.
+- Deploy/Terraform boundary changes run a plan-only services deploy against the
+  latest promotion evidence.
+- Mixed runtime plus deploy-boundary changes build the candidate images, then
+  run plan-only against that same candidate evidence.
+- Docs, tests, examples, and CI-policy-only changes stop after Cloud CI and the
+  classifier summary; unknown new paths are treated as runtime-affecting.
 
 The normal deploy workflow is a single service promotion:
 

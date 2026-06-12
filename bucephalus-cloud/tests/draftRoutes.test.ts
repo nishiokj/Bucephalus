@@ -137,6 +137,28 @@ describe("draft routes", () => {
     }));
   });
 
+  test("suggest rejects limits outside the hosted authoring contract", async () => {
+    const repository = {
+      async search() {
+        throw new Error("registry search should not be called");
+      },
+    };
+
+    await expect(handleDraftRoute(
+      new Request("https://cloud.example/v1/drafts/suggest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          draft: minimalDraft(),
+          target: "variant",
+          limit: 101,
+        }),
+      }),
+      new URL("https://cloud.example/v1/drafts/suggest"),
+      repository as unknown as RegistryRepository,
+    )).rejects.toThrow("/limit must be <= 100");
+  });
+
   test("validate applies requested package-level checks", async () => {
     const draft = {
       ...minimalDraft(),

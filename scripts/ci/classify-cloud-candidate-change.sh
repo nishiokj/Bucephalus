@@ -110,6 +110,9 @@ add_reason() {
 
 for file in "${changed_files[@]}"; do
   case "${file}" in
+    docs/*|README.md|bucephalus-cloud/README.md|bucephalus-cloud/deploy/*.md|bucephalus-cloud/infra/gcp/*.md|bucephalus-cloud/infra/gcp/environments/*.example|bucephalus-cloud/tests/*|rust/crates/*/tests/*|cookbook/*)
+      add_reason docs "${file}"
+      ;;
     Cargo.toml|Cargo.lock|rust/*|schemas/*|modal-launcher/*)
       add_reason runtime "${file}"
       ;;
@@ -130,9 +133,6 @@ for file in "${changed_files[@]}"; do
       ;;
     .github/workflows/*|scripts/ci/*)
       add_reason pipeline "${file}"
-      ;;
-    docs/*|README.md|bucephalus-cloud/README.md|bucephalus-cloud/tests/*|rust/crates/*/tests/*|cookbook/*)
-      add_reason docs "${file}"
       ;;
     *)
       # Unknown files are treated as runtime-affecting so new source roots do

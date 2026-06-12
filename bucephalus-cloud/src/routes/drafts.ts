@@ -149,7 +149,10 @@ function boundedLimit(value: unknown): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
     throw new HttpError(400, "invalid_request", "/limit must be an integer >= 1");
   }
-  return Math.min(value, 100);
+  if (value > 100) {
+    throw new HttpError(400, "invalid_request", "/limit must be <= 100");
+  }
+  return value;
 }
 
 function registryHitSuggestion(hit: RegistrySearchHit) {

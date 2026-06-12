@@ -33,6 +33,45 @@ export async function readJsonObject(request: Request): Promise<Record<string, u
   return value;
 }
 
+export function queryInteger(
+  url: URL,
+  key: string,
+  options: { defaultValue?: number; min?: number; max?: number } = {},
+): number {
+  const raw = url.searchParams.get(key);
+  if (raw === null || raw === "") {
+    if (options.defaultValue !== undefined) {
+      return options.defaultValue;
+    }
+    throw new HttpError(400, "invalid_query", `/${key} is required`);
+  }
+  if (!/^[0-9]+$/.test(raw)) {
+    throw new HttpError(400, "invalid_query", `/${key} must be an integer`);
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new HttpError(400, "invalid_query", `/${key} must be a safe integer`);
+  }
+  if (options.min !== undefined && parsed < options.min) {
+    throw new HttpError(400, "invalid_query", `/${key} must be >= ${options.min}`);
+  }
+  if (options.max !== undefined && parsed > options.max) {
+    throw new HttpError(400, "invalid_query", `/${key} must be <= ${options.max}`);
+  }
+  return parsed;
+}
+
+export function optionalQueryInteger(
+  url: URL,
+  key: string,
+  options: { min?: number; max?: number } = {},
+): number | undefined {
+  if (!url.searchParams.has(key)) {
+    return undefined;
+  }
+  return queryInteger(url, key, options);
+}
+
 async function readBoundedRequestText(request: Request, maxBytes: number): Promise<string> {
   const contentLength = request.headers.get("content-length");
   if (contentLength !== null) {

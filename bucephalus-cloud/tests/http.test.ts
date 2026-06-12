@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { errorResponse, readJsonObject } from "../src/http";
+import { errorResponse, optionalQueryInteger, queryInteger, readJsonObject } from "../src/http";
 
 describe("HTTP helpers", () => {
   test("rejects JSON requests whose declared content-length exceeds the configured cap", async () => {
@@ -28,6 +28,30 @@ describe("HTTP helpers", () => {
       },
       body: "{}",
     }))).rejects.toThrow("Invalid content-length");
+  });
+
+  test("strictly parses bounded integer query parameters", () => {
+    expect(queryInteger(
+      new URL("https://cloud.example/v1/runs"),
+      "limit",
+      { defaultValue: 50, min: 1, max: 200 },
+    )).toBe(50);
+    expect(queryInteger(
+      new URL("https://cloud.example/v1/runs?limit=12"),
+      "limit",
+      { defaultValue: 50, min: 1, max: 200 },
+    )).toBe(12);
+    expect(optionalQueryInteger(
+      new URL("https://cloud.example/v1/runs?after_row_seq=0"),
+      "after_row_seq",
+      { min: 0 },
+    )).toBe(0);
+    expect(() => queryInteger(new URL("https://cloud.example/v1/runs?limit=12x"), "limit", { min: 1 }))
+      .toThrow("/limit must be an integer");
+    expect(() => queryInteger(new URL("https://cloud.example/v1/runs?limit=0"), "limit", { min: 1 }))
+      .toThrow("/limit must be >= 1");
+    expect(() => queryInteger(new URL("https://cloud.example/v1/runs?limit=201"), "limit", { max: 200 }))
+      .toThrow("/limit must be <= 200");
   });
 
   test("redacts unexpected internal errors by default", async () => {

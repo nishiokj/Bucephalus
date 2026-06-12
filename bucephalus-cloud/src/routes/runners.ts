@@ -1,4 +1,4 @@
-import { HttpError, jsonResponse, readJsonObject, requireBearerToken, requireStaticToken, requireString } from "../http";
+import { HttpError, jsonResponse, queryInteger, readJsonObject, requireBearerToken, requireStaticToken, requireString } from "../http";
 import { logWarn, newTraceContext } from "../logging";
 import type { JsonObject, JsonValue } from "../primitives";
 import { releaseIdentity } from "../release";
@@ -250,12 +250,7 @@ function provisionRequestToWire(request: {
 }
 
 function limitFromUrl(url: URL): number {
-  const raw = url.searchParams.get("limit");
-  if (!raw) {
-    return 100;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : 100;
+  return queryInteger(url, "limit", { defaultValue: 100, min: 1, max: 200 });
 }
 
 function warnOnReleaseSkew(instance: RunnerInstanceRecord, metadata: JsonObject): void {

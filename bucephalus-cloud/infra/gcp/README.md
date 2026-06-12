@@ -107,10 +107,13 @@ single service-stage production promotion:
 1. Run `.github/workflows/bucephalus-gcp-deploy.yml` with
    `deployment_stage=substrate` and `apply=true`.
 2. For normal development, merge to `main`. After `Bucephalus Cloud CI` passes,
-   `.github/workflows/bucephalus-cloud-candidate.yml` builds and pushes the
-   deployable x86_64 Cloud images, writes promotion evidence, and deploys that
-   exact evidence to the `bucephalus-dev` GitHub Environment with
-   `deployment_stage=services`. Unless that environment overrides
+   `.github/workflows/bucephalus-cloud-candidate.yml` classifies the change. A
+   runtime-only change builds and pushes the deployable x86_64 Cloud images,
+   writes promotion evidence, and deploys that exact evidence to the
+   `bucephalus-dev` GitHub Environment with `deployment_stage=services`.
+   Deploy-boundary-only changes run plan-only against the latest evidence, and
+   mixed runtime/deploy-boundary changes build images but stop at a plan against
+   that candidate evidence. Unless that environment overrides
    `BUCEPHALUS_DEPLOYMENT_ENVIRONMENT`, the deploy workflow maps it to the
    Terraform-safe environment label `dev`.
 3. For production-style releases, run `.github/workflows/bucephalus-release.yml`

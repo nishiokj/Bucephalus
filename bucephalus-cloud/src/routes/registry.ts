@@ -2,11 +2,13 @@ import {
   HttpError,
   jsonResponse,
   optionalString,
+  queryInteger,
   readJsonObject,
   requireRecord,
   requireString,
 } from "../http";
 import {
+  ENTITY_KINDS,
   canonicalizeEntity,
   normalizationHints,
   resolveRegistryRef,
@@ -46,14 +48,14 @@ export async function handleRegistryRoute(
 
   if (request.method === "GET" && url.pathname === "/v1/registry/search") {
     const q = url.searchParams.get("q")?.trim() ?? "";
-    const rawKind = url.searchParams.get("kind");
-    const limit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+    const kind = optionalEntityKind(url.searchParams.get("kind"), "/kind");
+    const limit = queryInteger(url, "limit", { defaultValue: 50, min: 1, max: 200 });
     const searchOptions = {
       q,
-      limit: Number.isFinite(limit) ? limit : 50,
+      limit,
     };
     const hits = await repository.search(
-      rawKind ? { ...searchOptions, kind: rawKind as EntityKind } : searchOptions,
+      kind ? { ...searchOptions, kind } : searchOptions,
     );
     return jsonResponse({
       hits,
@@ -329,6 +331,16 @@ function suggestedReviewActions(input: {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function optionalEntityKind(value: string | null, pointer: string): EntityKind | undefined {
+  if (value === null || value.trim() === "") {
+    return undefined;
+  }
+  if (!ENTITY_KINDS.includes(value as EntityKind)) {
+    throw new HttpError(400, "invalid_request", `${pointer} must be a valid entity kind`);
+  }
+  return value as EntityKind;
 }
 
 function isNonemptyString(value: string | null): value is string {

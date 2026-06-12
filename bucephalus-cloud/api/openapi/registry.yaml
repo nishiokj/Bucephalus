@@ -48,21 +48,10 @@ paths:
             $ref: './common.yaml#/components/schemas/EntityKind'
         - name: q
           in: query
-          required: true
-          schema:
-            type: string
-            minLength: 1
-        - name: scope_type
-          in: query
           required: false
           schema:
             type: string
-            default: global
-        - name: scope_id
-          in: query
-          required: false
-          schema:
-            type: string
+          description: Optional search text. Omit or pass blank text to list recent registry inventory.
         - $ref: './common.yaml#/components/parameters/Limit'
         - $ref: './common.yaml#/components/parameters/Cursor'
       responses:
@@ -83,6 +72,8 @@ paths:
                       $ref: './common.yaml#/components/schemas/SearchHit'
                   page:
                     $ref: './common.yaml#/components/schemas/PageInfo'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
   /v1/registry/canonicalize:
     post:
       operationId: canonicalizeRegistryObject

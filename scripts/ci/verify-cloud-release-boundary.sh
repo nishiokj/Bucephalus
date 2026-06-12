@@ -496,12 +496,72 @@ if (candidateDispatchInputs.apply?.type !== "boolean" || candidateDispatchInputs
 if (/docker\s+(?:push|login)\b/.test(candidateWorkflowText)) {
   fail(`${candidateWorkflowPath} must not call docker push/login directly; use release scripts and Artifact Registry auth helper`);
 }
+if (!candidateWorkflowText.includes(candidateClassifierPath)) {
+  fail(`${candidateWorkflowPath} must classify changed paths before deciding whether to build, plan, or deploy`);
+}
+for (const required of [
+  "build_candidate=\"true\"",
+  "auto_deploy=\"true\"",
+  "plan_services=\"true\"",
+  "mixed-runtime-infra",
+  "Unknown files are treated as runtime-affecting",
+  "bucephalus-cloud/deploy/*.md|bucephalus-cloud/infra/gcp/*.md|bucephalus-cloud/infra/gcp/environments/*.example",
+  "bucephalus-cloud/infra/gcp/*|scripts/deploy/*|.github/workflows/bucephalus-gcp-deploy.yml|.github/workflows/bucephalus-gcp-cleanup.yml",
+  ".github/workflows/*|scripts/ci/*",
+]) {
+  if (!candidateClassifierText.includes(required)) {
+    fail(`${candidateClassifierPath} must encode the Cloud candidate change-classification policy: ${required}`);
+  }
+}
+
+const candidateClassify = candidateJobs["classify"];
+if (!candidateClassify) {
+  fail(`${candidateWorkflowPath} must classify changes before build/deploy jobs`);
+} else {
+  const classifyIf = String(candidateClassify.if ?? "");
+  if (!classifyIf.includes("workflow_dispatch") || !classifyIf.includes("github.event.workflow_run.conclusion == 'success'")) {
+    fail(`${candidateWorkflowPath} classify job must run only for manual dispatches or successful Cloud CI workflow_run events`);
+  }
+  const classifyOutputs = candidateClassify.outputs ?? {};
+  for (const outputName of ["candidate_sha", "base_sha", "change_class", "build_candidate", "auto_deploy", "plan_services"]) {
+    if (!classifyOutputs[outputName]) {
+      fail(`${candidateWorkflowPath} classify job must expose ${outputName}`);
+    }
+  }
+  const steps = candidateClassify.steps ?? [];
+  const stepNames = steps.map((step) => step.name).filter(Boolean);
+  for (const required of ["Resolve candidate source", "Classify changed paths", "Record classification summary"]) {
+    if (!stepNames.includes(required)) {
+      fail(`${candidateWorkflowPath} classify job missing step: ${required}`);
+    }
+  }
+  const sourceStep = steps.find((step) => step.name === "Resolve candidate source");
+  if (!String(sourceStep?.run ?? "").includes("github.event.workflow_run.head_sha || github.sha") || !String(sourceStep?.run ?? "").includes("base_sha=\"${candidate_sha}^\"")) {
+    fail(`${candidateWorkflowPath} classify job must resolve the exact candidate SHA and compare workflow_run candidates against their first parent`);
+  }
+  const checkoutStep = steps.find((step) => step.uses === "actions/checkout@v4");
+  if (!String(checkoutStep?.with?.ref ?? "").includes("steps.source.outputs.candidate_sha") || checkoutStep?.with?.["fetch-depth"] !== 0) {
+    fail(`${candidateWorkflowPath} classify job must check out full history at the exact candidate SHA`);
+  }
+  const classifyStep = steps.find((step) => step.name === "Classify changed paths");
+  const classifyRun = String(classifyStep?.run ?? "");
+  if (!classifyRun.includes(candidateClassifierPath) || !classifyRun.includes("--head") || !classifyRun.includes("--base") || !classifyRun.includes("--github-output")) {
+    fail(`${candidateWorkflowPath} classify job must run ${candidateClassifierPath} with explicit base/head outputs`);
+  }
+}
+
 const candidateBuild = candidateJobs["build-cloud-candidate"];
 if (!candidateBuild) {
   fail(`${candidateWorkflowPath} must contain build-cloud-candidate job`);
 } else {
   if (candidateBuild.permissions?.contents !== "read" || candidateBuild.permissions?.actions !== "read" || candidateBuild.permissions?.["id-token"] !== "write") {
     fail(`${candidateWorkflowPath} build-cloud-candidate must receive contents/actions read and OIDC token write permissions`);
+  }
+  if (!jobNeeds(candidateBuild).includes("classify")) {
+    fail(`${candidateWorkflowPath} build-cloud-candidate must depend on the classifier`);
+  }
+  if (!String(candidateBuild.if ?? "").includes("needs.classify.outputs.build_candidate == 'true'")) {
+    fail(`${candidateWorkflowPath} build-cloud-candidate must run only when the classifier requests a candidate image rebuild`);
   }
   const steps = candidateBuild.steps ?? [];
   const stepNames = steps.map((step) => step.name).filter(Boolean);
@@ -529,6 +589,10 @@ if (!candidateBuild) {
     if (!stepNames.includes(required)) {
       fail(`${candidateWorkflowPath} build-cloud-candidate missing step: ${required}`);
     }
+  }
+  const sourceStep = steps.find((step) => step.name === "Resolve candidate source");
+  if (!String(sourceStep?.run ?? "").includes("needs.classify.outputs.candidate_sha")) {
+    fail(`${candidateWorkflowPath} build-cloud-candidate must source candidate_sha from the classifier output`);
   }
   const checkoutStep = steps.find((step) => step.uses === "actions/checkout@v4");
   if (!String(checkoutStep?.with?.ref ?? "").includes("steps.source.outputs.candidate_sha")) {
@@ -576,11 +640,22 @@ const candidateDeploy = candidateJobs["deploy-dev"];
 if (!candidateDeploy) {
   fail(`${candidateWorkflowPath} must contain deploy-dev reusable deploy job`);
 } else {
+  const deployNeeds = jobNeeds(candidateDeploy);
+  if (!deployNeeds.includes("classify") || !deployNeeds.includes("build-cloud-candidate")) {
+    fail(`${candidateWorkflowPath} deploy-dev must depend on classify and build-cloud-candidate`);
+  }
+  const deployIf = String(candidateDeploy.if ?? "");
+  if (!deployIf.includes("needs.classify.outputs.auto_deploy == 'true'") || !deployIf.includes("inputs.deploy") || !deployIf.includes("workflow_run")) {
+    fail(`${candidateWorkflowPath} deploy-dev must auto-apply only for classifier-approved runtime changes or explicit manual dispatch`);
+  }
   if (candidateDeploy.uses !== "./.github/workflows/bucephalus-gcp-deploy.yml") {
     fail(`${candidateWorkflowPath} deploy-dev must call the canonical GCP deploy workflow`);
   }
   if (candidateDeploy.with?.deployment_stage !== "services") {
     fail(`${candidateWorkflowPath} deploy-dev must use the combined services deployment stage`);
+  }
+  if (!String(candidateDeploy.with?.apply ?? "").includes("github.event_name == 'workflow_run' || inputs.apply")) {
+    fail(`${candidateWorkflowPath} deploy-dev must apply automatically for workflow_run dev candidates and obey the manual apply toggle for dispatches`);
   }
   if (!String(candidateDeploy.with?.github_environment ?? "").includes("bucephalus-dev")) {
     fail(`${candidateWorkflowPath} deploy-dev must default to bucephalus-dev`);
@@ -590,6 +665,51 @@ if (!candidateDeploy) {
   }
   if (!String(candidateDeploy.with?.checkout_ref ?? "").includes("needs.build-cloud-candidate.outputs.candidate_sha")) {
     fail(`${candidateWorkflowPath} deploy-dev must run deploy scripts from the candidate SHA`);
+  }
+}
+
+const planCandidateDev = candidateJobs["plan-candidate-dev"];
+if (!planCandidateDev) {
+  fail(`${candidateWorkflowPath} must contain plan-candidate-dev for mixed runtime+deploy-boundary changes`);
+} else {
+  const planNeeds = jobNeeds(planCandidateDev);
+  if (!planNeeds.includes("classify") || !planNeeds.includes("build-cloud-candidate")) {
+    fail(`${candidateWorkflowPath} plan-candidate-dev must depend on classify and build-cloud-candidate`);
+  }
+  const planIf = String(planCandidateDev.if ?? "");
+  if (!planIf.includes("needs.classify.outputs.plan_services == 'true'") || !planIf.includes("needs.classify.outputs.build_candidate == 'true'")) {
+    fail(`${candidateWorkflowPath} plan-candidate-dev must run only for classifier-approved mixed runtime/deploy-boundary changes`);
+  }
+  if (planCandidateDev.uses !== "./.github/workflows/bucephalus-gcp-deploy.yml" || planCandidateDev.with?.deployment_stage !== "services" || planCandidateDev.with?.apply !== false) {
+    fail(`${candidateWorkflowPath} plan-candidate-dev must call the canonical services deploy workflow in plan-only mode`);
+  }
+  if (planCandidateDev.with?.promotion_run_id !== "${{ github.run_id }}" || !String(planCandidateDev.with?.promotion_artifact_name ?? "").includes("needs.build-cloud-candidate.outputs.promotion_artifact_name")) {
+    fail(`${candidateWorkflowPath} plan-candidate-dev must plan against same-run candidate promotion evidence`);
+  }
+  if (!String(planCandidateDev.with?.checkout_ref ?? "").includes("needs.build-cloud-candidate.outputs.candidate_sha")) {
+    fail(`${candidateWorkflowPath} plan-candidate-dev must run deploy scripts from the candidate SHA`);
+  }
+}
+
+const planExistingDev = candidateJobs["plan-existing-dev"];
+if (!planExistingDev) {
+  fail(`${candidateWorkflowPath} must contain plan-existing-dev for deploy-boundary-only changes`);
+} else {
+  if (!jobNeeds(planExistingDev).includes("classify")) {
+    fail(`${candidateWorkflowPath} plan-existing-dev must depend on classify`);
+  }
+  const planIf = String(planExistingDev.if ?? "");
+  if (!planIf.includes("needs.classify.outputs.plan_services == 'true'") || !planIf.includes("needs.classify.outputs.build_candidate != 'true'")) {
+    fail(`${candidateWorkflowPath} plan-existing-dev must run only for classifier-approved deploy-boundary-only changes`);
+  }
+  if (planExistingDev.uses !== "./.github/workflows/bucephalus-gcp-deploy.yml" || planExistingDev.with?.deployment_stage !== "services" || planExistingDev.with?.apply !== false) {
+    fail(`${candidateWorkflowPath} plan-existing-dev must call the canonical services deploy workflow in plan-only mode`);
+  }
+  if (planExistingDev.with?.promotion_run_id || planExistingDev.with?.promotion_artifact_name) {
+    fail(`${candidateWorkflowPath} plan-existing-dev must use latest promotion evidence instead of pretending deploy-boundary-only changes rebuilt images`);
+  }
+  if (!String(planExistingDev.with?.checkout_ref ?? "").includes("needs.classify.outputs.candidate_sha")) {
+    fail(`${candidateWorkflowPath} plan-existing-dev must run deploy scripts from the classified candidate SHA`);
   }
 }
 

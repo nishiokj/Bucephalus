@@ -74,6 +74,57 @@ describe("Cloud run routes", () => {
     expect(JSON.stringify(body)).not.toContain("projects/acme/secrets/openai");
   });
 
+  test("rejects malformed pagination query values instead of silently defaulting", async () => {
+    const packages = {
+      async listArtifacts() {
+        throw new Error("listArtifacts should not be called");
+      },
+    };
+    const runs = {
+      async listRuns() {
+        throw new Error("listRuns should not be called");
+      },
+    };
+    const runtime = {
+      async eventRows() {
+        throw new Error("eventRows should not be called");
+      },
+      async workerLifecycleEvents() {
+        throw new Error("workerLifecycleEvents should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/packages?limit=potato"),
+      new URL("https://cloud.example/v1/packages?limit=potato"),
+      packages as unknown as PackageRepository,
+      {} as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    )).rejects.toThrow("/limit must be an integer");
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs?limit=0"),
+      new URL("https://cloud.example/v1/runs?limit=0"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    )).rejects.toThrow("/limit must be >= 1");
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/events?after_row_seq=nan"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/events?after_row_seq=nan"),
+      {} as PackageRepository,
+      { async getRun() { return runRecord(); } } as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    )).rejects.toThrow("/after_row_seq must be an integer");
+  });
+
   test("keeps env values and secret refs in worker claim responses", async () => {
     const runs = {
       async claimNextRun() {

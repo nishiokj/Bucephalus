@@ -34,6 +34,8 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/PackageArtifact'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
   /v1/packages/{package_digest}:
     get:
       operationId: getPackageArtifact
@@ -132,6 +134,8 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/CloudRun'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
     post:
       operationId: createRun
       summary: Create a Cloud run request for an accepted sealed package.
@@ -295,6 +299,8 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RuntimeEvent'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
   /v1/runs/{run_id}/runtime/results:
@@ -328,6 +334,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RuntimeResults'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
   /v1/runs/{run_id}/runtime/kv/{key}:

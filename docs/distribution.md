@@ -532,8 +532,11 @@ substrate through a remote GCS backend, and creates prerequisites such as
 Artifact Registry without accepting placeholder image digests. After the release
 or candidate workflow pushes real images and uploads promotion evidence, run the
 deploy workflow with `deployment_stage=services` for the normal app promotion.
-The workflow resolves the version to the pushed-image handoff, or receives exact
-same-run candidate evidence from automation, downloads it, verifies
+The candidate workflow does this automatically only for runtime-only main
+changes; deploy-boundary changes stop at plan-only, and mixed runtime plus
+deploy-boundary changes build images but still stop at a plan. The workflow
+resolves the version to the pushed-image handoff, or receives exact same-run
+candidate evidence from automation, downloads it, verifies
 `cloud-image-promotion-evidence.json`, writes non-secret deploy tfvars with
 `scripts/deploy/write-gcp-deploy-tfvars.sh`, and runs Terraform with a remote
 GCS backend.

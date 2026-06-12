@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { authOwnerKey, type AuthContext } from "../auth";
 import { loadConfig } from "../config";
-import { HttpError, jsonResponse, optionalString, readJsonObject, requireString } from "../http";
+import { HttpError, jsonResponse, optionalString, queryInteger, readJsonObject, requireString } from "../http";
 import { ImportJobRecord, ImportRepository, UploadRecord } from "../imports/repository";
 import { inspectSealedPackageArchive, SealedPackageInspectionError } from "../imports/sealedPackage";
 import { materializeStoredObject, putUploadObject } from "../objectStorage";
@@ -53,12 +53,7 @@ export async function handleImportRoute(
 }
 
 function limitFromUrl(url: URL): number {
-  const raw = url.searchParams.get("limit");
-  if (!raw) {
-    return 50;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : 50;
+  return queryInteger(url, "limit", { defaultValue: 50, min: 1, max: 200 });
 }
 
 async function createUpload(request: Request, imports: ImportRepository, ownerKey?: string): Promise<Response> {

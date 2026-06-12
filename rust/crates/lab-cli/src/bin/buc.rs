@@ -506,13 +506,14 @@ fn package_upload(context: CliContext) -> Result<()> {
 fn package_list(context: CliContext) -> Result<()> {
     reject_unknown_options(&context.args, &["--limit"], &["--json"])?;
     reject_no_positionals(&context.args, "buc packages list")?;
+    let limit = bounded_number_option_string(&context.args, "--limit", 200)?;
     ensure_api_configured(&context)?;
     let packages = cloud_fetch(
         &context,
         Method::GET,
         &path_with_query(
             "/v1/packages",
-            &[("limit", option_value(&context.args, "--limit")?)],
+            &[("limit", limit)],
         ),
         None,
         None,
@@ -689,13 +690,14 @@ fn run_create(context: CliContext) -> Result<()> {
 fn run_list(context: CliContext) -> Result<()> {
     reject_unknown_options(&context.args, &["--limit"], &["--json"])?;
     reject_no_positionals(&context.args, "buc runs list")?;
+    let limit = bounded_number_option_string(&context.args, "--limit", 200)?;
     ensure_api_configured(&context)?;
     let runs = cloud_fetch(
         &context,
         Method::GET,
         &path_with_query(
             "/v1/runs",
-            &[("limit", option_value(&context.args, "--limit")?)],
+            &[("limit", limit)],
         ),
         None,
         None,
@@ -752,6 +754,8 @@ fn run_events(context: CliContext) -> Result<()> {
         &["--json"],
     )?;
     let run_id = run_id_arg(&context.args)?;
+    let limit = bounded_number_option_string(&context.args, "--limit", 1000)?;
+    let after_row_seq = non_negative_number_option_string(&context.args, "--after-row-seq")?;
     ensure_api_configured(&context)?;
     let events = cloud_fetch(
         &context,
@@ -759,11 +763,8 @@ fn run_events(context: CliContext) -> Result<()> {
         &path_with_query(
             &format!("/v1/runs/{}/runtime/events", encode_path_segment(&run_id)),
             &[
-                ("limit", option_value(&context.args, "--limit")?),
-                (
-                    "after_row_seq",
-                    option_value(&context.args, "--after-row-seq")?,
-                ),
+                ("limit", limit),
+                ("after_row_seq", after_row_seq),
             ],
         ),
         None,
@@ -780,13 +781,14 @@ fn run_events(context: CliContext) -> Result<()> {
 fn run_results(context: CliContext) -> Result<()> {
     reject_unknown_options(&context.args, &["--run-id", "--limit"], &["--json"])?;
     let run_id = run_id_arg(&context.args)?;
+    let limit = bounded_number_option_string(&context.args, "--limit", 1000)?;
     ensure_api_configured(&context)?;
     let results = cloud_fetch(
         &context,
         Method::GET,
         &path_with_query(
             &format!("/v1/runs/{}/runtime/results", encode_path_segment(&run_id)),
-            &[("limit", option_value(&context.args, "--limit")?)],
+            &[("limit", limit)],
         ),
         None,
         None,
@@ -965,13 +967,14 @@ fn draft_suggest(context: CliContext) -> Result<()> {
         &["--file", "--target", "--q", "--limit"],
         &["--json"],
     )?;
+    let limit = bounded_number_option(&context.args, "--limit", 100)?;
     let draft = draft_from_args(&context.args)?;
     let target = required_option(&context.args, "--target")?;
     let mut body = Map::new();
     body.insert("draft".to_string(), draft);
     body.insert("target".to_string(), json!(target));
     insert_option_string(&mut body, "q", option_value(&context.args, "--q")?);
-    if let Some(limit) = number_option(&context.args, "--limit")? {
+    if let Some(limit) = limit {
         body.insert("limit".to_string(), json!(limit));
     }
     ensure_api_configured(&context)?;
@@ -3168,6 +3171,30 @@ fn number_option(args: &[String], name: &str) -> Result<Option<u64>> {
         bail!("{name} requires a positive integer");
     }
     Ok(Some(parsed))
+}
+
+fn bounded_number_option_string(args: &[String], name: &str, max: u64) -> Result<Option<String>> {
+    Ok(bounded_number_option(args, name, max)?.map(|value| value.to_string()))
+}
+
+fn bounded_number_option(args: &[String], name: &str, max: u64) -> Result<Option<u64>> {
+    let Some(value) = number_option(args, name)? else {
+        return Ok(None);
+    };
+    if value > max {
+        bail!("{name} must be <= {max}");
+    }
+    Ok(Some(value))
+}
+
+fn non_negative_number_option_string(args: &[String], name: &str) -> Result<Option<String>> {
+    let Some(value) = option_value(args, name)? else {
+        return Ok(None);
+    };
+    let parsed = value
+        .parse::<u64>()
+        .with_context(|| format!("{name} requires a non-negative integer"))?;
+    Ok(Some(parsed.to_string()))
 }
 
 fn positional_args(args: &[String]) -> Vec<String> {
@@ -6084,6 +6111,20 @@ mod tests {
         assert!(suggest_err.contains("unknown option --targt"));
         assert!(!suggest_err.contains("failed to read"));
 
+        let suggest_limit_err = run(vec![
+            "author".to_string(),
+            "suggest".to_string(),
+            "missing-draft.yaml".to_string(),
+            "--target".to_string(),
+            "variant".to_string(),
+            "--limit".to_string(),
+            "101".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(suggest_limit_err.contains("--limit must be <= 100"));
+        assert!(!suggest_limit_err.contains("failed to read"));
+
         let validate_err = run(vec![
             "author".to_string(),
             "validate".to_string(),
@@ -6522,6 +6563,55 @@ mod tests {
         assert_eq!(requests[0].method, "GET");
         assert_eq!(requests[0].path, "/v1/runs?limit=3");
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn list_and_runtime_commands_reject_bad_pagination_before_api_calls() {
+        let packages_err = run(vec![
+            "packages".to_string(),
+            "list".to_string(),
+            "--limit".to_string(),
+            "potato".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(packages_err.contains("--limit requires a positive integer"));
+        assert!(!packages_err.contains("hosted API URL"));
+
+        let runs_err = run(vec![
+            "runs".to_string(),
+            "list".to_string(),
+            "--limit".to_string(),
+            "0".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(runs_err.contains("--limit requires a positive integer"));
+        assert!(!runs_err.contains("hosted API URL"));
+
+        let too_large_limit_err = run(vec![
+            "runs".to_string(),
+            "results".to_string(),
+            "run-1".to_string(),
+            "--limit".to_string(),
+            "1001".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(too_large_limit_err.contains("--limit must be <= 1000"));
+        assert!(!too_large_limit_err.contains("hosted API URL"));
+
+        let events_err = run(vec![
+            "runs".to_string(),
+            "events".to_string(),
+            "run-1".to_string(),
+            "--after-row-seq".to_string(),
+            "nan".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(events_err.contains("--after-row-seq requires a non-negative integer"));
+        assert!(!events_err.contains("hosted API URL"));
     }
 
     #[test]

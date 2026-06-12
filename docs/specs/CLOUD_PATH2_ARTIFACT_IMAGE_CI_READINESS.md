@@ -218,10 +218,13 @@ user-secret policy.
   one workflow run. The older `api` and `pool` stage names remain compatibility
   aliases rather than required manual hops.
 - `.github/workflows/bucephalus-cloud-candidate.yml` is the fast main-to-dev
-  lane: after `Bucephalus Cloud CI` succeeds on `main`, it builds the deployable
-  Linux x86_64 Cloud bundle/images, uploads verified promotion evidence named
-  by version plus git SHA, and calls the GCP deploy workflow for
-  `bucephalus-dev`. Full public GitHub Release asset publication remains in
+  lane: after `Bucephalus Cloud CI` succeeds on `main`, it classifies the
+  changed paths. Runtime-only changes build the deployable Linux x86_64 Cloud
+  bundle/images, upload verified promotion evidence named by version plus git
+  SHA, and call the GCP deploy workflow for `bucephalus-dev`. Deploy-boundary
+  changes run services plan-only, using either the latest promotion evidence or,
+  for mixed runtime/deploy-boundary changes, the same-run candidate evidence.
+  Full public GitHub Release asset publication remains in
   `.github/workflows/bucephalus-release.yml`.
 - `scripts/deploy/bootstrap-gcp-github-oidc.sh` is the audited one-time
   bootstrap for release/deploy Workload Identity: it is dry-run by default and

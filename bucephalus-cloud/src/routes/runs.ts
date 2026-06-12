@@ -1,5 +1,5 @@
 import { authOwnerKey, type AuthContext } from "../auth";
-import { HttpError, jsonResponse, optionalString, readJsonObject, requireBearerToken, requireString } from "../http";
+import { HttpError, jsonResponse, optionalQueryInteger, optionalString, queryInteger, readJsonObject, requireBearerToken, requireString } from "../http";
 import { logError, newTraceContext } from "../logging";
 import { readStoredObject } from "../objectStorage";
 import type { JsonObject, JsonValue } from "../primitives";
@@ -182,21 +182,11 @@ export async function handleRunRoute(
 }
 
 function limitFromUrl(url: URL): number {
-  const raw = url.searchParams.get("limit");
-  if (!raw) {
-    return 50;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : 50;
+  return queryInteger(url, "limit", { defaultValue: 50, min: 1, max: 1000 });
 }
 
 function optionalIntFromUrl(url: URL, key: string): number | undefined {
-  const raw = url.searchParams.get(key);
-  if (!raw) {
-    return undefined;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  return optionalQueryInteger(url, key, { min: 0 });
 }
 
 function runtimePath(pathname: string):
