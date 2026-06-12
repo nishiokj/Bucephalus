@@ -69,6 +69,17 @@ fn run(argv: Vec<String>) -> Result<()> {
             print_help();
             Ok(())
         }
+        _ if help_requested(&context.args) || group_command_without_leaf(group, command) => {
+            if let Some(text) = command_help_text(group, command) {
+                println!("{text}");
+                Ok(())
+            } else {
+                bail!(
+                    "unknown hosted command: {}\n\nRun `buc help` for the Cloud product commands.",
+                    entered_command_name(group, command)
+                )
+            }
+        }
         _ if !known_hosted_command(group, command) => bail!(
             "unknown hosted command: {}\n\nRun `buc help` for the Cloud product commands.",
             entered_command_name(group, command)
@@ -95,6 +106,14 @@ fn known_hosted_command(group: Option<&str>, command: Option<&str>) -> bool {
             | (Some("experiments"), Some("build" | "doctor"))
             | (Some("runs"), Some("create" | "get"))
     )
+}
+
+fn group_command_without_leaf(group: Option<&str>, command: Option<&str>) -> bool {
+    command.is_none() && matches!(group, Some("packages" | "experiments" | "runs"))
+}
+
+fn help_requested(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--help" || arg == "-h")
 }
 
 fn entered_command_name(group: Option<&str>, command: Option<&str>) -> String {
@@ -366,10 +385,11 @@ fn package_upload(context: CliContext) -> Result<()> {
         "/v1/imports/sealed-package",
     )?;
     if json_output {
-        print_json(&imported)
+        print_json(&imported)?;
     } else {
-        print_import_summary(&imported, Some(&prepared.source_label))
+        print_import_summary(&imported, Some(&prepared.source_label))?;
     }
+    ensure_import_accepted(&imported, "package upload")
 }
 
 fn experiment_build(context: CliContext) -> Result<()> {
@@ -385,10 +405,11 @@ fn experiment_build(context: CliContext) -> Result<()> {
         "/v1/experiments/builds",
     )?;
     if json_output {
-        print_json(&build)
+        print_json(&build)?;
     } else {
-        print_build_summary(&build, &prepared.source_label)
+        print_build_summary(&build, &prepared.source_label)?;
     }
+    ensure_import_accepted(&build, "hosted build")
 }
 
 fn package_inspect(context: CliContext) -> Result<()> {
@@ -547,6 +568,7 @@ fn prepare_package_directory(package_dir: &Path) -> Result<PreparedPackageInput>
             package_dir.display()
         );
     }
+    preflight_sealed_package_directory(package_dir)?;
     let temp_root = make_temp_dir("buc-package-upload")?;
     let archive_path = temp_root.join("package.tgz");
     create_package_archive(package_dir, &archive_path)?;
@@ -588,6 +610,72 @@ fn create_package_archive(package_dir: &Path, archive_path: &Path) -> Result<()>
     }
     builder.finish()?;
     Ok(())
+}
+
+fn preflight_sealed_package_directory(package_dir: &Path) -> Result<()> {
+    let manifest_path = package_dir.join("manifest.json");
+    let manifest_raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest: Value = serde_json::from_str(&manifest_raw).with_context(|| {
+        format!(
+            "manifest.json is not valid JSON: {}",
+            manifest_path.display()
+        )
+    })?;
+    if !manifest.is_object() {
+        bail!(
+            "manifest.json must be a JSON object: {}",
+            manifest_path.display()
+        );
+    }
+    if manifest.pointer("/schema_version").and_then(Value::as_str) != Some("sealed_run_package_v2")
+    {
+        bail!(
+            "manifest.json is not a sealed_run_package_v2 manifest. `buc` uploads sealed packages produced by `bucephalus build`; for authoring YAML run `bucephalus build experiment.yaml --out <package-dir>` first."
+        );
+    }
+    for (pointer, label) in [
+        ("/checksums_ref", "checksums metadata"),
+        ("/package_checks_ref", "package preflight report"),
+    ] {
+        let reference = manifest.pointer(pointer).and_then(Value::as_str).ok_or_else(|| {
+            anyhow!(
+                "sealed package manifest is missing {pointer}. This does not look like a complete `bucephalus build` output; rebuild locally before uploading."
+            )
+        })?;
+        let path = resolve_metadata_ref(package_dir, reference, pointer)?;
+        if !path.is_file() {
+            bail!(
+                "sealed package manifest {pointer} points to missing {label}: {}",
+                path.display()
+            );
+        }
+    }
+    let resolved_experiment = package_dir.join("resolved_experiment.json");
+    if !resolved_experiment.is_file() {
+        bail!(
+            "sealed package directory is missing resolved_experiment.json. Rebuild with `bucephalus build experiment.yaml --out <package-dir>` before `buc experiments build`."
+        );
+    }
+    Ok(())
+}
+
+fn resolve_metadata_ref(package_dir: &Path, reference: &str, pointer: &str) -> Result<PathBuf> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        bail!("sealed package manifest {pointer} must be a non-empty relative path");
+    }
+    let path = Path::new(reference);
+    if path.is_absolute()
+        || reference
+            .split('/')
+            .any(|part| part == ".." || part.is_empty())
+    {
+        bail!(
+            "sealed package manifest {pointer} must be a simple relative path inside the package, got {reference:?}"
+        );
+    }
+    Ok(package_dir.join(path))
 }
 
 fn upload_sealed_package_artifact(
@@ -639,6 +727,29 @@ fn upload_sealed_package_artifact(
         Some(json!({ "upload_id": upload_id, "label": label })),
         None,
     )
+}
+
+fn ensure_import_accepted(value: &Value, noun: &str) -> Result<()> {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("import")
+                .and_then(|import| import.get("status"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("unknown");
+    if status == "accepted" {
+        return Ok(());
+    }
+    let import = value.get("import").unwrap_or(value);
+    let detail = import
+        .get("error_message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("the Cloud importer rejected the sealed package");
+    bail!("{noun} failed: {detail}");
 }
 
 fn package_get_object(context: &CliContext, digest: &str) -> Result<Value> {
@@ -981,36 +1092,76 @@ fn print_import_summary(value: &Value, source: Option<&str>) -> Result<()> {
 }
 
 fn print_build_summary(value: &Value, source: &str) -> Result<()> {
-    let package_digest = value
-        .get("package_digest")
+    println!("{}", build_summary_lines(value, source)?.join("\n"));
+    Ok(())
+}
+
+fn build_summary_lines(value: &Value, source: &str) -> Result<Vec<String>> {
+    let status = value
+        .get("status")
         .and_then(Value::as_str)
         .unwrap_or("(unknown)");
-    println!(
-        "{}",
-        [
-            format!("source: {source}"),
-            format!(
-                "build_id: {}",
-                value
-                    .get("build_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("(unknown)")
-            ),
-            format!(
-                "status: {}",
-                value
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("(unknown)")
-            ),
-            format!("package_digest: {package_digest}"),
-            format!(
+    let mut lines = vec![
+        format!("source: {source}"),
+        format!(
+            "build_id: {}",
+            value
+                .get("build_id")
+                .and_then(Value::as_str)
+                .unwrap_or("(unknown)")
+        ),
+        format!("status: {status}"),
+    ];
+    if let Some(kind) = value.get("build_kind").and_then(Value::as_str) {
+        lines.push(format!("build_kind: {kind}"));
+    }
+    if let Some(package_digest) = value.get("package_digest").and_then(Value::as_str) {
+        lines.push(format!("package_digest: {package_digest}"));
+        if status == "accepted" {
+            lines.push(format!(
                 "next: buc experiments doctor {package_digest} --secret-ref NAME=provider://ref"
-            ),
-        ]
-        .join("\n")
-    );
-    Ok(())
+            ));
+        }
+    }
+    let import = value.get("import").unwrap_or(value);
+    if let Some(error_message) = import.get("error_message").and_then(Value::as_str) {
+        lines.push(format!("error: {error_message}"));
+    }
+    if let Some(diagnostics) = import.get("diagnostics").and_then(Value::as_array) {
+        let diagnostics = diagnostics
+            .iter()
+            .filter_map(format_import_diagnostic)
+            .collect::<Vec<_>>();
+        if !diagnostics.is_empty() {
+            lines.push("diagnostics:".to_string());
+            lines.extend(diagnostics);
+        }
+    }
+    if status != "accepted" {
+        lines.push(
+            "next: fix the package diagnostics, rebuild locally with `bucephalus build`, then rerun `buc experiments build <package-dir>`."
+                .to_string(),
+        );
+    }
+    Ok(lines)
+}
+
+fn format_import_diagnostic(value: &Value) -> Option<String> {
+    let severity = value
+        .get("severity")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("diagnostic");
+    let pointer = value.get("pointer").and_then(Value::as_str).unwrap_or("/");
+    let message = value.get("message").and_then(Value::as_str).unwrap_or("");
+    if message.is_empty() {
+        None
+    } else {
+        Some(format!("  - [{severity}] {code} {pointer}: {message}"))
+    }
 }
 
 fn print_package_summary(value: &Value) -> Result<()> {
@@ -1138,6 +1289,117 @@ Environment:
   BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token override
 "#
 }
+
+fn command_help_text(group: Option<&str>, command: Option<&str>) -> Option<&'static str> {
+    match (group, command) {
+        (Some("health"), None) | (Some("health"), Some("--help" | "-h")) => Some(HEALTH_HELP),
+        (Some("packages"), None) | (Some("packages"), Some("--help" | "-h")) => Some(PACKAGES_HELP),
+        (Some("packages"), Some("upload")) => Some(PACKAGES_UPLOAD_HELP),
+        (Some("packages"), Some("inspect")) => Some(PACKAGES_INSPECT_HELP),
+        (Some("experiments"), None) | (Some("experiments"), Some("--help" | "-h")) => {
+            Some(EXPERIMENTS_HELP)
+        }
+        (Some("experiments"), Some("build")) => Some(EXPERIMENTS_BUILD_HELP),
+        (Some("experiments"), Some("doctor")) => Some(EXPERIMENTS_DOCTOR_HELP),
+        (Some("runs"), None) | (Some("runs"), Some("--help" | "-h")) => Some(RUNS_HELP),
+        (Some("runs"), Some("create")) => Some(RUNS_CREATE_HELP),
+        (Some("runs"), Some("get")) => Some(RUNS_GET_HELP),
+        _ => None,
+    }
+}
+
+const HEALTH_HELP: &str = r#"buc health
+
+Check hosted API readiness.
+
+Usage:
+  buc health
+"#;
+
+const PACKAGES_HELP: &str = r#"buc packages
+
+Hosted package commands.
+
+Usage:
+  buc packages upload <package-dir|package.tgz> [--label TEXT] [--json]
+  buc packages inspect <package-digest> [--json]
+"#;
+
+const PACKAGES_UPLOAD_HELP: &str = r#"buc packages upload
+
+Upload and import a sealed package directory/archive.
+
+Usage:
+  buc packages upload <package-dir|package.tgz> [--label TEXT] [--json]
+
+Input:
+  A directory produced by `bucephalus build ... --out <package-dir>`, or an
+  archive of that directory. Authoring YAML is rejected before any API call.
+"#;
+
+const PACKAGES_INSPECT_HELP: &str = r#"buc packages inspect
+
+Fetch package metadata and secret requirements from the hosted API.
+
+Usage:
+  buc packages inspect <package-digest> [--json]
+"#;
+
+const EXPERIMENTS_HELP: &str = r#"buc experiments
+
+Hosted experiment workflow commands.
+
+Usage:
+  buc experiments build <package-dir|package.tgz> [--label TEXT] [--json]
+  buc experiments doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
+"#;
+
+const EXPERIMENTS_BUILD_HELP: &str = r#"buc experiments build
+
+Upload a sealed package and create a hosted build/import record.
+
+Usage:
+  buc experiments build <package-dir|package.tgz> [--label TEXT] [--json]
+
+Boundary:
+  This command calls POST /v1/experiments/builds after upload. It does not
+  compile experiment.yaml in the Cloud yet, and it never shells out to local
+  `bucephalus build`. Pass a sealed package from `bucephalus build`.
+"#;
+
+const EXPERIMENTS_DOCTOR_HELP: &str = r#"buc experiments doctor
+
+Ask the hosted API whether a package can run with the supplied secrets and
+runtime options. This uses the same gates as `buc runs create`.
+
+Usage:
+  buc experiments doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
+"#;
+
+const RUNS_HELP: &str = r#"buc runs
+
+Hosted run commands.
+
+Usage:
+  buc runs create <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--label TEXT] [--json]
+  buc runs get <run-id> [--json]
+"#;
+
+const RUNS_CREATE_HELP: &str = r#"buc runs create
+
+Preflight with Cloud doctor, then queue a hosted run.
+
+Usage:
+  buc runs create <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--label TEXT] [--json]
+"#;
+
+const RUNS_GET_HELP: &str = r#"buc runs get
+
+Fetch hosted run status.
+
+Usage:
+  buc runs get <run-id> [--json]
+"#;
 
 fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
@@ -1310,7 +1572,7 @@ mod tests {
     fn manifest_path_uploads_parent_package_directory() {
         let root = temp_dir("manifest_parent");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("manifest.json"), "{}").unwrap();
+        write_minimal_package(&root);
 
         let prepared = prepare_sealed_package_input(&root.join("manifest.json")).unwrap();
 
@@ -1318,6 +1580,115 @@ mod tests {
         assert_eq!(prepared.source_label, root.display().to_string());
         drop(prepared);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sealed_package_directory_preflight_rejects_incomplete_build_output() {
+        let root = temp_dir("incomplete_package");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            r#"{"schema_version":"sealed_run_package_v2","checksums_ref":"checksums.json"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("checksums.json"),
+            r#"{"schema_version":"sealed_package_checksums_v2","files":{}}"#,
+        )
+        .unwrap();
+
+        let err = prepare_sealed_package_input(&root).unwrap_err().to_string();
+
+        assert!(err.contains("missing /package_checks_ref"));
+        assert!(err.contains("complete `bucephalus build` output"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sealed_package_directory_preflight_rejects_authoring_like_manifest() {
+        let root = temp_dir("authoring_manifest");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            r#"{"experiment":{"id":"not_a_package"}}"#,
+        )
+        .unwrap();
+
+        let err = prepare_sealed_package_input(&root).unwrap_err().to_string();
+
+        assert!(err.contains("not a sealed_run_package_v2 manifest"));
+        assert!(err.contains("uploads sealed packages produced by `bucephalus build`"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nested_help_renders_without_api_or_package_args() {
+        let _lock = lock_env();
+        let home = temp_dir("nested_help");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, None),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+
+        run(vec![
+            "experiments".to_string(),
+            "build".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("nested help should not require API config or package path");
+        run(vec!["health".to_string(), "--help".to_string()])
+            .expect("health help should render without API config");
+        run(vec!["runs".to_string()]).expect("command group help should render without API config");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn build_summary_for_failed_import_does_not_suggest_doctor_unknown_digest() {
+        let response = json!({
+            "build_id": "import-1",
+            "status": "failed",
+            "build_kind": "sealed_package_import",
+            "package_digest": null,
+            "import": {
+                "error_message": "checksums.json missing object field 'files'",
+                "diagnostics": [{
+                    "severity": "error",
+                    "code": "missing_checksums_files",
+                    "pointer": "/checksums/files",
+                    "message": "checksums.json must include a files object."
+                }]
+            }
+        });
+
+        let lines = build_summary_lines(&response, "/tmp/package").unwrap();
+        let text = lines.join("\n");
+
+        assert!(text.contains("status: failed"));
+        assert!(text.contains("build_kind: sealed_package_import"));
+        assert!(text.contains("checksums.json must include a files object"));
+        assert!(!text.contains("buc experiments doctor (unknown)"));
+        assert!(text.contains("fix the package diagnostics"));
+    }
+
+    #[test]
+    fn failed_import_status_exits_nonzero_even_after_api_returns_json() {
+        let response = json!({
+            "build_id": "import-1",
+            "status": "failed",
+            "import": {
+                "status": "failed",
+                "error_message": "manifest.json is not a supported sealed_run_package_v2 manifest"
+            }
+        });
+
+        let err = ensure_import_accepted(&response, "hosted build")
+            .expect_err("failed import status should fail the CLI command")
+            .to_string();
+
+        assert!(err.contains("hosted build failed"));
+        assert!(err.contains("manifest.json is not a supported"));
     }
 
     #[test]
@@ -1338,5 +1709,24 @@ mod tests {
         assert_eq!(options["cpu_count"], json!(4));
         assert_eq!(options["smoke_test"], json!(true));
         assert_eq!(options["materialize"], json!("copy"));
+    }
+
+    fn write_minimal_package(root: &Path) {
+        fs::write(
+            root.join("manifest.json"),
+            r#"{"schema_version":"sealed_run_package_v2","checksums_ref":"checksums.json","package_checks_ref":"package_checks.json"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("checksums.json"),
+            r#"{"schema_version":"sealed_package_checksums_v2","files":{}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package_checks.json"),
+            r#"{"schema_version":"package_checks_v1","passed":true,"checks":[],"summary":{"checks":0,"failed":0,"warnings":0}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("resolved_experiment.json"), "{}").unwrap();
     }
 }

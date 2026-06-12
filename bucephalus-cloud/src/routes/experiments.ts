@@ -24,6 +24,11 @@ export async function handleExperimentRoute(
     const job = await importSealedPackageUpload(body, imports, packages, ownerKey);
     return jsonResponse({
       build_id: job.import_id,
+      build_kind: "sealed_package_import",
+      authoring_build: {
+        status: "unavailable",
+        message: "Hosted authoring build from experiment.yaml is not implemented by this API. Upload a sealed package produced by the local Core build.",
+      },
       status: job.status,
       label: optionalString(body.label, "/label"),
       package_digest: job.package_digest,

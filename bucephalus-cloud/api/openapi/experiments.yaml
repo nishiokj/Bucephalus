@@ -19,7 +19,8 @@ paths:
       description: >
         Imports a completed upload as a sealed package artifact and records a
         hosted build identity. This is the hosted workflow noun over the lower
-        level package import primitive; it does not run local Core build logic.
+        level package import primitive; it does not run local Core build logic
+        and does not yet compile authoring YAML in the hosted API.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
       requestBody:
@@ -97,12 +98,31 @@ components:
       additionalProperties: false
       required:
         - build_id
+        - build_kind
+        - authoring_build
         - status
         - import
       properties:
         build_id:
           type: string
           format: uuid
+        build_kind:
+          type: string
+          enum:
+            - sealed_package_import
+        authoring_build:
+          type: object
+          additionalProperties: false
+          required:
+            - status
+            - message
+          properties:
+            status:
+              type: string
+              enum:
+                - unavailable
+            message:
+              type: string
         status:
           type: string
         label:
@@ -110,7 +130,9 @@ components:
             - string
             - 'null'
         package_digest:
-          $ref: './common.yaml#/components/schemas/Digest'
+          anyOf:
+            - $ref: './common.yaml#/components/schemas/Digest'
+            - type: 'null'
         import:
           $ref: './imports.yaml#/components/schemas/ImportJob'
     HostedExperimentDoctor:
