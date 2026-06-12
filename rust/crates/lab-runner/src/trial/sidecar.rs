@@ -3,14 +3,22 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeSidecarReadinessPlan {
+    pub(crate) command: Vec<String>,
+    pub(crate) timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeSidecarPlan {
     pub(crate) id: String,
     pub(crate) image: String,
     pub(crate) lifecycle: String,
+    pub(crate) placement: String,
     pub(crate) command: Vec<String>,
     pub(crate) env: BTreeMap<String, String>,
     pub(crate) workdir: Option<String>,
     pub(crate) expose: BTreeMap<String, String>,
+    pub(crate) readiness: Option<RuntimeSidecarReadinessPlan>,
 }
 
 pub(crate) fn sidecar_stage_ids(experiment: &Value, stage: &str) -> Result<Vec<String>> {
@@ -74,6 +82,31 @@ fn parse_string_array(value: Option<&Value>, context: &str) -> Result<Vec<String
         .collect()
 }
 
+fn parse_readiness(
+    value: Option<&Value>,
+    context: &str,
+) -> Result<Option<RuntimeSidecarReadinessPlan>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{} must be an object", context))?;
+    for key in object.keys() {
+        if !matches!(key.as_str(), "command" | "timeout_ms") {
+            return Err(anyhow!("{}.{} is not supported", context, key));
+        }
+    }
+    let command = parse_string_array(object.get("command"), &format!("{}.command", context))?;
+    if command.is_empty() {
+        return Err(anyhow!("{}.command is required", context));
+    }
+    Ok(Some(RuntimeSidecarReadinessPlan {
+        command,
+        timeout_ms: object.get("timeout_ms").and_then(Value::as_u64),
+    }))
+}
+
 pub(crate) fn sidecar_plan(experiment: &Value, id: &str) -> Result<RuntimeSidecarPlan> {
     let config = experiment
         .pointer("/sidecars")
@@ -86,7 +119,14 @@ pub(crate) fn sidecar_plan(experiment: &Value, id: &str) -> Result<RuntimeSideca
     for key in config.keys() {
         if !matches!(
             key.as_str(),
-            "image" | "lifecycle" | "command" | "env" | "workdir" | "expose"
+            "image"
+                | "lifecycle"
+                | "placement"
+                | "command"
+                | "env"
+                | "workdir"
+                | "expose"
+                | "readiness"
         ) {
             return Err(anyhow!("sidecars.{}.{} is not supported", id, key));
         }
@@ -105,6 +145,11 @@ pub(crate) fn sidecar_plan(experiment: &Value, id: &str) -> Result<RuntimeSideca
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("sidecar '{}' lifecycle is required", id))?
             .to_string(),
+        placement: config
+            .get("placement")
+            .and_then(Value::as_str)
+            .unwrap_or("separate_container")
+            .to_string(),
         command: parse_string_array(config.get("command"), &format!("sidecars.{}.command", id))?,
         env: parse_string_map(config.get("env"), &format!("sidecars.{}.env", id))?,
         workdir: config
@@ -114,6 +159,10 @@ pub(crate) fn sidecar_plan(experiment: &Value, id: &str) -> Result<RuntimeSideca
             .filter(|value| !value.is_empty())
             .map(str::to_string),
         expose: parse_string_map(config.get("expose"), &format!("sidecars.{}.expose", id))?,
+        readiness: parse_readiness(
+            config.get("readiness"),
+            &format!("sidecars.{}.readiness", id),
+        )?,
     })
 }
 

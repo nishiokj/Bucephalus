@@ -1552,6 +1552,10 @@
       "properties": {
         "image": { "type": "string", "minLength": 1 },
         "lifecycle": { "type": "string", "enum": ["per-trial"] },
+        "placement": {
+          "type": "string",
+          "enum": ["separate_container", "same_sandbox"]
+        },
         "command": { "$ref": "#/$defs/argv" },
         "workdir": { "type": "string", "minLength": 1 },
         "expose": {
@@ -1561,6 +1565,15 @@
         "env": {
           "type": "object",
           "additionalProperties": { "type": "string" }
+        },
+        "readiness": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command"],
+          "properties": {
+            "command": { "$ref": "#/$defs/argv" },
+            "timeout_ms": { "type": "integer", "minimum": 1 }
+          }
         }
       }
     }
