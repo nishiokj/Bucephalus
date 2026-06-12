@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use clap::CommandFactory;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -11892,6 +11894,80 @@ mod tests {
         assert_eq!(
             result["env"]["BUCEPHALUS_BASE_URL"],
             "https://example.com/releases"
+        );
+        assert!(
+            result.get("installed_version").is_none(),
+            "dry runs should report requested version only, not claim an installed version"
+        );
+    }
+
+    #[test]
+    fn cli_ux_version_comes_from_package_metadata() {
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_ux_update_installed_version_is_read_from_installed_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("installed_version");
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("bucephalus");
+        fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' 'bucephalus 9.8.7'\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            installed_bucephalus_version(&root).as_deref(),
+            Some("9.8.7")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cli_ux_setup_auth_status_names_result_submission_not_upload() {
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_CLOUD_API_URL", None),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+        let root = temp_dir("setup_auth_status");
+
+        let status = auth_status(&root);
+        let note = status["note"].as_str().unwrap();
+
+        assert_eq!(status["status"], "missing");
+        assert!(note.contains("Cloud-backed benchmark resolution and result submission"));
+        assert!(
+            !note.contains("resolution and upload"),
+            "auth status should not imply the retired Cloud upload workflow is required: {note}"
+        );
+        assert_eq!(status["actions"][0]["command"], "bucephalus login");
+    }
+
+    #[test]
+    fn cli_ux_installer_labels_cloud_binary_as_operator_utility() {
+        let installer = include_str!("../../../../scripts/install.sh");
+
+        assert!(installer.contains(
+            "Installed bucephalus, buc (hosted Cloud CLI), bucephalus-cloud (operator utility), and bucephalus-modal-launcher"
+        ));
+        assert!(
+            !installer.contains("Installed bucephalus, bucephalus-cloud, and"),
+            "installer should not present bucephalus-cloud as a general product CLI"
+        );
+    }
+
+    #[test]
+    fn cli_ux_latch_docs_do_not_claim_cloud_upload_auth_requirement() {
+        let latch_doc = include_str!("../../../../docs/user/latch.md");
+
+        assert!(latch_doc.contains("Cloud benchmark resolution and result submission require"));
+        assert!(
+            !latch_doc.contains("Cloud benchmark resolution and upload require"),
+            "docs should not preserve the retired upload/auth wording"
         );
     }
 

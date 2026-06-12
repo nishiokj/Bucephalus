@@ -41,6 +41,10 @@ path = "src/bin/bucephalus-worker-runner.rs"
 name = "bucephalus-cloud"
 path = "src/bin/bucephalus-cloud.rs"
 
+[[bin]]
+name = "buc"
+path = "src/bin/buc.rs"
+
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true

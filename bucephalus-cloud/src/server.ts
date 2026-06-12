@@ -16,6 +16,7 @@ import { InMemoryRateLimiter, rateLimitResponse } from "./rateLimit";
 import { handleAuthRoute } from "./routes/auth";
 import { handleSecretRoute } from "./routes/secrets";
 import { handleDraftRoute } from "./routes/drafts";
+import { handleExperimentRoute } from "./routes/experiments";
 import { handleImportRoute } from "./routes/imports";
 import { handleLatchRoute } from "./routes/latch";
 import { handleRegistryRoute } from "./routes/registry";
@@ -87,6 +88,11 @@ const server = Bun.serve({
       const draftResponse = await handleDraftRoute(request, url, registry);
       if (draftResponse) {
         return withCors(draftResponse);
+      }
+
+      const experimentResponse = await handleExperimentRoute(request, url, imports, packages, runs, runners, userAuth, secrets);
+      if (experimentResponse) {
+        return withCors(experimentResponse);
       }
 
       const importResponse = await handleImportRoute(request, url, imports, packages, userAuth);

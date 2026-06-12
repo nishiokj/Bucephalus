@@ -9,6 +9,7 @@ const files = [
   "auth.yaml",
   "registry.yaml",
   "drafts.yaml",
+  "experiments.yaml",
   "imports.yaml",
   "runs.yaml",
   "secrets.yaml",

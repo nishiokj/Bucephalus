@@ -63,14 +63,18 @@ fn run(argv: Vec<String>) -> Result<()> {
             Ok(())
         }
         _ if retired_product_cloud_command(group, command) => bail!(
-            "{} is an internal Cloud operator utility and no longer supports product upload/run workflows. Use the installed Bucephalus product client for Cloud package upload and runs.",
+            "{} is an internal Cloud operator utility and no longer supports product upload/run workflows. Use `buc` for hosted Cloud package upload, doctor, and runs.",
             local_command_name(group, command)
+        ),
+        _ if !known_operator_cloud_command(group, command) => bail!(
+            "unknown command: {}",
+            entered_command_name(group, command)
         ),
         _ if context.api_url.is_empty() => bail!(
             "no Cloud API configured; run `bucephalus login --resource <api-url>` once to persist it, or pass --api-url / set {}",
             BUCEPHALUS_CLOUD_API_URL_ENV
         ),
-        (Some("health"), _) => print_json(&cloud_fetch(
+        (Some("health"), None) => print_json(&cloud_fetch(
             &context,
             Method::GET,
             "/readyz",
@@ -103,15 +107,17 @@ fn run(argv: Vec<String>) -> Result<()> {
         (Some("runner-instance"), Some("drain")) => {
             runner_instance_drain(with_args(&context, rest))
         }
-        _ => bail!(
-            "unknown command: {}",
-            [group, command]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
+        _ => bail!("unknown command: {}", entered_command_name(group, command)),
     }
+}
+
+fn known_operator_cloud_command(group: Option<&str>, command: Option<&str>) -> bool {
+    matches!(
+        (group, command),
+        (Some("health"), None)
+            | (Some("runner-pool"), Some("create" | "list"))
+            | (Some("runner-instance"), Some("drain"))
+    )
 }
 
 fn retired_product_cloud_command(group: Option<&str>, command: Option<&str>) -> bool {
@@ -125,6 +131,14 @@ fn retired_product_cloud_command(group: Option<&str>, command: Option<&str>) -> 
             | (Some("package"), _)
             | (Some("run"), _)
     )
+}
+
+fn entered_command_name(group: Option<&str>, command: Option<&str>) -> String {
+    [group, command]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn local_command_name(group: Option<&str>, command: Option<&str>) -> String {
@@ -1373,8 +1387,8 @@ fn print_help() {
         r#"Bucephalus Cloud operator utility
 
 This binary is for internal Cloud service/operator checks. Product Cloud
-upload/run workflows are intentionally not exposed here; use the installed
-Bucephalus product client for package upload and Cloud runs.
+upload/run workflows are intentionally not exposed here; use `buc` for package
+upload, doctor, and Cloud runs.
 
 Usage:
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] health
@@ -1391,7 +1405,7 @@ Environment:
                                  Optional token for runner pool/admin commands
 
 User auth:
-  Product upload/run auth is owned by the installed Bucephalus product client.
+  Product upload/run auth is owned by `buc`.
 "#
     );
 }
@@ -1591,6 +1605,112 @@ mod tests {
             "retired command should fail before asking for an API URL: {message}"
         );
         fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn cli_ux_unknown_commands_report_unknown_before_cloud_configuration() {
+        let _lock = lock_env();
+        let home = temp_dir("unknown_before_api");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, None),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+
+        let err = run(vec!["build".to_string(), "--help".to_string()])
+            .expect_err("unknown command should not ask for Cloud config first");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("unknown command: build --help"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains(BUCEPHALUS_CLOUD_API_URL_ENV),
+            "unknown command should fail before asking for an API URL: {message}"
+        );
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn cli_ux_all_retired_product_commands_explain_retirement_before_api_config() {
+        let _lock = lock_env();
+        let home = temp_dir("retired_matrix");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, None),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+
+        for args in [
+            vec!["registry", "search"],
+            vec!["draft", "validate"],
+            vec!["deploy", "--help"],
+            vec!["build-upload", "experiment.yaml"],
+            vec!["import", "sealed-package"],
+            vec!["package", "get"],
+            vec!["run", "create"],
+        ] {
+            let err = run(args.iter().map(|arg| (*arg).to_string()).collect())
+                .expect_err("retired product commands should be blocked");
+            let message = err.to_string();
+            assert!(
+                message.contains("no longer supports product upload/run workflows"),
+                "unexpected error for {args:?}: {message}"
+            );
+            assert!(
+                !message.contains(BUCEPHALUS_CLOUD_API_URL_ENV),
+                "retired command should fail before asking for an API URL for {args:?}: {message}"
+            );
+        }
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn cli_ux_operator_commands_require_cloud_configuration() {
+        let _lock = lock_env();
+        let home = temp_dir("operator_requires_api");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, None),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+
+        let err = run(vec!["runner-pool".to_string(), "list".to_string()])
+            .expect_err("operator commands need Cloud API config");
+        let message = err.to_string();
+
+        assert!(message.contains("no Cloud API configured"));
+        assert!(message.contains("bucephalus login --resource <api-url>"));
+        assert!(message.contains(BUCEPHALUS_CLOUD_API_URL_ENV));
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn cli_ux_help_does_not_require_cloud_configuration() {
+        let _lock = lock_env();
+        let home = temp_dir("help_no_api");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, None),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+
+        run(vec!["help".to_string()]).expect("help should render without Cloud config");
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn cli_ux_build_is_not_a_cloud_operator_or_retired_product_command() {
+        assert!(!known_operator_cloud_command(Some("build"), Some("--help")));
+        assert!(!retired_product_cloud_command(
+            Some("build"),
+            Some("--help")
+        ));
     }
 
     #[test]

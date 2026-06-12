@@ -206,6 +206,10 @@ if (provenance.artifacts?.core_binary?.path !== "bucephalus") {
   fail("artifacts.core_binary.path must be bucephalus");
 }
 checkSha(provenance.artifacts.core_binary.sha256, "artifacts.core_binary.sha256");
+if (provenance.artifacts?.hosted_cli_binary?.path !== "buc") {
+  fail("artifacts.hosted_cli_binary.path must be buc");
+}
+checkSha(provenance.artifacts.hosted_cli_binary.sha256, "artifacts.hosted_cli_binary.sha256");
 if (provenance.artifacts?.modal_launcher_binary?.path !== "bucephalus-modal-launcher") {
   fail("artifacts.modal_launcher_binary.path must be bucephalus-modal-launcher");
 }
@@ -227,6 +231,9 @@ if (releaseDir) {
   }
   if (JSON.stringify(provenance.artifacts.core_binary) !== JSON.stringify(manifest.artifacts?.core_binary)) {
     fail("artifacts.core_binary does not match release manifest");
+  }
+  if (JSON.stringify(provenance.artifacts.hosted_cli_binary) !== JSON.stringify(manifest.artifacts?.hosted_cli_binary)) {
+    fail("artifacts.hosted_cli_binary does not match release manifest");
   }
   if (JSON.stringify(provenance.artifacts.modal_launcher_binary) !== JSON.stringify(manifest.artifacts?.modal_launcher_binary)) {
     fail("artifacts.modal_launcher_binary does not match release manifest");
