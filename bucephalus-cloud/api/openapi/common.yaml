@@ -10,6 +10,26 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+    workerAttemptBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: bucephalus-worker-attempt-token
+    workerBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: bucephalus-cloud-worker-token
+    workerTokenHeader:
+      type: apiKey
+      in: header
+      name: X-Bucephalus-Worker-Token
+    runnerAdminBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: bucephalus-cloud-runner-admin-token
+    runnerAdminTokenHeader:
+      type: apiKey
+      in: header
+      name: X-Bucephalus-Runner-Admin-Token
   parameters:
     OrgId:
       name: X-Bucephalus-Org
@@ -50,6 +70,12 @@ components:
             $ref: '#/components/schemas/Error'
     Conflict:
       description: The request conflicts with an existing immutable fact or alias.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: The request is missing a valid bearer credential.
       content:
         application/json:
           schema:

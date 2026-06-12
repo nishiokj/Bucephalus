@@ -1,5 +1,5 @@
 import { authOwnerKey, type AuthContext } from "../auth";
-import { HttpError, isRecord, jsonResponse, optionalString, readJsonObject, requireRecord, requireString } from "../http";
+import { HttpError, isRecord, jsonResponse, optionalString, queryInteger, readJsonObject, requireRecord, requireString } from "../http";
 import type { LatchSubmissionRecord, LatchSubmissionRepository } from "../latch/repository";
 import type { JsonObject } from "../primitives";
 import { RegistryRepository } from "../registry/repository";
@@ -274,10 +274,5 @@ function optionalSha256(value: unknown, pointer: string): string | null {
 }
 
 function limitFromUrl(url: URL): number {
-  const raw = url.searchParams.get("limit");
-  if (!raw) {
-    return 50;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : 50;
+  return queryInteger(url, "limit", { defaultValue: 50, min: 1, max: 200 });
 }

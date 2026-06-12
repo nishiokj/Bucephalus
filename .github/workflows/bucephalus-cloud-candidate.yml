@@ -1,0 +1,429 @@
+name: Bucephalus Cloud Candidate
+
+on:
+  workflow_run:
+    workflows:
+      - Bucephalus Cloud CI
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      github_environment:
+        description: "Deployment environment"
+        required: true
+        default: "bucephalus-dev"
+        type: choice
+        options:
+          - bucephalus-dev
+      deploy:
+        description: "Deploy the candidate after images are pushed"
+        required: true
+        default: true
+        type: boolean
+      apply:
+        description: "Apply the generated Terraform plan during deploy"
+        required: true
+        default: true
+        type: boolean
+
+run-name: >-
+  ${{ github.event_name == 'workflow_run'
+      && format('Cloud candidate deploy for {0}', github.event.workflow_run.head_sha)
+      || format('Cloud candidate for {0}', github.ref_name) }}
+
+permissions:
+  contents: read
+  actions: read
+  id-token: none
+
+concurrency:
+  group: bucephalus-cloud-candidate-${{ inputs.github_environment || 'bucephalus-dev' }}
+  cancel-in-progress: true
+
+env:
+  RELEASE_TARGET: x86_64-unknown-linux-gnu
+  BUCEPHALUS_IMAGE_REPOSITORY: ${{ vars.BUCEPHALUS_IMAGE_REPOSITORY }}
+  BUCEPHALUS_BUN_BASE_IMAGE: ${{ vars.BUCEPHALUS_BUN_BASE_IMAGE || 'oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4' }}
+
+jobs:
+  classify:
+    name: Classify Cloud candidate change
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      candidate_sha: ${{ steps.source.outputs.candidate_sha }}
+      base_sha: ${{ steps.source.outputs.base_sha }}
+      change_class: ${{ steps.classify.outputs.change_class }}
+      build_candidate: ${{ steps.classify.outputs.build_candidate }}
+      auto_deploy: ${{ steps.classify.outputs.auto_deploy }}
+      plan_services: ${{ steps.classify.outputs.plan_services }}
+    steps:
+      - name: Download triggering Cloud CI source metadata
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: cloud-candidate-source
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: dist/cloud-candidate-source
+
+      - name: Resolve candidate source
+        id: source
+        run: |
+          candidate_sha="${{ github.sha }}"
+          base_sha=""
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            source_file="dist/cloud-candidate-source/cloud-candidate-source.txt"
+            if [[ ! -f "${source_file}" ]]; then
+              echo "missing cloud-candidate-source artifact from triggering Cloud CI run" >&2
+              exit 1
+            fi
+            read_source_value() {
+              local name="$1"
+              sed -n "s/^${name}=//p" "${source_file}" | tail -n 1
+            }
+            source_event="$(read_source_value event_name)"
+            candidate_sha="$(read_source_value candidate_sha)"
+            base_sha="$(read_source_value base_sha)"
+            if [[ "${candidate_sha}" != "${{ github.event.workflow_run.head_sha }}" ]]; then
+              echo "candidate source artifact SHA '${candidate_sha}' does not match workflow_run head '${{ github.event.workflow_run.head_sha }}'" >&2
+              exit 1
+            fi
+            if [[ "${source_event}" == "push" && -z "${base_sha}" ]]; then
+              echo "push-triggered Cloud candidate is missing a base SHA; refusing to guess a diff range" >&2
+              exit 1
+            fi
+          fi
+          if [[ ! "${candidate_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate_sha is not a full git SHA: ${candidate_sha}" >&2
+            exit 2
+          fi
+          if [[ -n "${base_sha}" && ! "${base_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "base_sha is not a full git SHA: ${base_sha}" >&2
+            exit 2
+          fi
+          echo "candidate_sha=${candidate_sha}" >> "${GITHUB_OUTPUT}"
+          echo "base_sha=${base_sha}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.candidate_sha }}
+          fetch-depth: 0
+
+      - name: Classify changed paths
+        id: classify
+        run: |
+          args=(--head "${{ steps.source.outputs.candidate_sha }}" --github-output "${GITHUB_OUTPUT}")
+          if [[ -n "${{ steps.source.outputs.base_sha }}" ]]; then
+            args+=(--base "${{ steps.source.outputs.base_sha }}")
+          fi
+          scripts/ci/classify-cloud-candidate-change.sh "${args[@]}"
+
+      - name: Record classification summary
+        run: |
+          {
+            echo "### Cloud candidate classification"
+            echo ""
+            echo "- Class: \`${{ steps.classify.outputs.change_class }}\`"
+            echo "- Build candidate: \`${{ steps.classify.outputs.build_candidate }}\`"
+            echo "- Auto deploy: \`${{ steps.classify.outputs.auto_deploy }}\`"
+            echo "- Plan services: \`${{ steps.classify.outputs.plan_services }}\`"
+            echo "- Runtime reasons: \`${{ steps.classify.outputs.runtime_reasons }}\`"
+            echo "- Infra reasons: \`${{ steps.classify.outputs.infra_reasons }}\`"
+            echo "- Pipeline reasons: \`${{ steps.classify.outputs.pipeline_reasons }}\`"
+            echo "- Docs/test reasons: \`${{ steps.classify.outputs.docs_reasons }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  build-cloud-candidate:
+    name: Build and push deployable Cloud candidate
+    needs: classify
+    if: ${{ needs.classify.outputs.build_candidate == 'true' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    outputs:
+      candidate_sha: ${{ steps.source.outputs.candidate_sha }}
+      release_version: ${{ steps.version.outputs.version }}
+      promotion_artifact_name: ${{ steps.candidate.outputs.promotion_artifact_name }}
+    steps:
+      - name: Resolve candidate source
+        id: source
+        run: |
+          candidate_sha="${{ needs.classify.outputs.candidate_sha }}"
+          if [[ -z "${candidate_sha}" ]]; then
+            echo "candidate_sha is required from classify job" >&2
+            exit 1
+          fi
+          echo "candidate_sha=${candidate_sha}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.candidate_sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: modal-launcher/go.sum
+
+      - name: Resolve version
+        id: version
+        run: |
+          scripts/release/resolve-release-version.sh \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Resolve candidate artifact identity
+        id: candidate
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          CANDIDATE_SHA: ${{ steps.source.outputs.candidate_sha }}
+        run: |
+          short_sha="${CANDIDATE_SHA:0:12}"
+          echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
+          echo "promotion_artifact_name=cloud-candidate-promotion-${RELEASE_VERSION}-${short_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build Rust release binaries for Cloud candidate
+        env:
+          RELEASE_TARGET: ${{ env.RELEASE_TARGET }}
+        run: >-
+          cargo build
+          --manifest-path Cargo.toml
+          -p bucephalus-cli
+          --release
+          --bin bucephalus
+          --bin bucephalus-worker-runner
+          --target "${RELEASE_TARGET}"
+
+      - name: Verify worker runner binary
+        run: test -x "target/${RELEASE_TARGET}/release/bucephalus-worker-runner"
+
+      - name: Restore Cloud runtime dist cache
+        id: cloud_runtime_dist_cache
+        uses: actions/cache@v4
+        with:
+          path: dist/release-cache/cloud-runtime-dist
+          key: ${{ runner.os }}-bun-1.3.14-cloud-runtime-dist-${{ hashFiles('scripts/release/build-buc-release.sh', 'bucephalus-cloud/package.runtime.json', 'bucephalus-cloud/bun.runtime.lock', 'bucephalus-cloud/tsconfig.json', 'bucephalus-cloud/src/**') }}
+
+      - name: Build deployable Cloud release bundle
+        env:
+          BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS: "true"
+          RELEASE_TARGET: ${{ env.RELEASE_TARGET }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          scripts/release/build-buc-release.sh
+          --version "${RELEASE_VERSION}"
+          --target "${RELEASE_TARGET}"
+          --core-bin "target/${RELEASE_TARGET}/release/bucephalus"
+          --worker-runner-bin "target/${RELEASE_TARGET}/release/bucephalus-worker-runner"
+          --runtime-dist-cache "dist/release-cache/cloud-runtime-dist"
+
+      - name: Verify deployable Cloud release bundle
+        run: scripts/release/verify-buc-release.sh "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ env.RELEASE_TARGET }}.tar.gz"
+
+      - name: Write release provenance
+        run: >-
+          scripts/release/write-cloud-release-provenance.sh
+          --release "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ env.RELEASE_TARGET }}.tar.gz"
+          --out "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ env.RELEASE_TARGET }}.provenance.json"
+
+      - name: Resolve GCP CI/CD auth secret for image publication
+        id: gcp_publish_auth
+        env:
+          BUC_CI_CD: ${{ secrets.BUC_CI_CD }}
+          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_SERVICE_ACCOUNT }}
+        run: scripts/deploy/resolve-gcp-cicd-secret.sh --mode publish
+
+      - name: Validate image build inputs
+        run: |
+          if [[ -z "${BUCEPHALUS_IMAGE_REPOSITORY}" ]]; then
+            echo "candidate requires repository variable BUCEPHALUS_IMAGE_REPOSITORY" >&2
+            exit 1
+          fi
+          if [[ -z "${BUCEPHALUS_BUN_BASE_IMAGE}" ]]; then
+            echo "candidate requires BUCEPHALUS_BUN_BASE_IMAGE" >&2
+            exit 1
+          fi
+          if [[ "${BUCEPHALUS_BUN_BASE_IMAGE}" != *@sha256:* ]]; then
+            echo "BUCEPHALUS_BUN_BASE_IMAGE must be digest-addressed" >&2
+            exit 1
+          fi
+          args=(
+            --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
+            --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
+            --push
+          )
+          scripts/release/verify-cloud-image-publish-inputs.sh "${args[@]}"
+          scripts/release/verify-cloud-base-image-policy.sh \
+            --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}" \
+            --push
+          scripts/release/verify-cloud-registry-auth-boundary.sh \
+            --repository "${BUCEPHALUS_IMAGE_REPOSITORY}" \
+            --push
+
+      - name: Authenticate to Google Cloud for image publication
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ steps.gcp_publish_auth.outputs.workload_identity_provider }}
+          service_account: ${{ steps.gcp_publish_auth.outputs.service_account }}
+
+      - name: Set up gcloud for image publication
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 363.0.0"
+
+      - name: Configure Artifact Registry Docker auth
+        env:
+          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ steps.gcp_publish_auth.outputs.workload_identity_provider }}
+          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ steps.gcp_publish_auth.outputs.service_account }}
+        run: >-
+          scripts/release/configure-gcp-artifact-registry-auth.sh
+          --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
+
+      - name: Set up Docker Buildx for image cache
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and inspect Cloud images
+        env:
+          RELEASE_TARGET: ${{ env.RELEASE_TARGET }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          BUCEPHALUS_SOURCE_RELEASE_RUN_ID: ${{ github.run_id }}
+          BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME: ${{ steps.candidate.outputs.promotion_artifact_name }}
+        run: |
+          args=(
+            --release "dist/releases/bucephalus-${RELEASE_VERSION}-${RELEASE_TARGET}.tar.gz"
+            --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
+            --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
+            --out "dist/releases/cloud-image-build-${RELEASE_TARGET}"
+            --push
+          )
+          scripts/release/build-cloud-images.sh "${args[@]}"
+
+      - name: Write image build provenance
+        run: >-
+          scripts/release/write-cloud-release-provenance.sh
+          --release "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ env.RELEASE_TARGET }}.tar.gz"
+          --image-manifest "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build-manifest.json"
+          --out "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build.provenance.json"
+
+      - name: Write GCP image tfvars
+        run: >-
+          scripts/release/write-gcp-image-tfvars.sh
+          --image-manifest "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build-manifest.json"
+          --out "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/gcp-image-digests.tfvars"
+
+      - name: Verify GCP image promotion evidence
+        run: >-
+          scripts/release/verify-gcp-image-promotion-evidence.sh
+          --image-manifest "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build-manifest.json"
+          --image-provenance "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build.provenance.json"
+          --tfvars "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/gcp-image-digests.tfvars"
+
+      - name: Write Cloud image promotion evidence index
+        run: >-
+          scripts/release/write-cloud-image-promotion-evidence-index.sh
+          --image-manifest "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build-manifest.json"
+          --image-provenance "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build.provenance.json"
+          --tfvars "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/gcp-image-digests.tfvars"
+          --out "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-promotion-evidence.json"
+
+      - name: Verify Cloud image promotion evidence index
+        run: >-
+          scripts/release/verify-cloud-image-promotion-evidence-index.sh
+          "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-promotion-evidence.json"
+
+      - name: Upload Cloud candidate promotion evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.candidate.outputs.promotion_artifact_name }}
+          path: |
+            dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build-manifest.json
+            dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build.provenance.json
+            dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/gcp-image-digests.tfvars
+            dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-promotion-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record candidate summary
+        run: |
+          {
+            echo "### Bucephalus Cloud candidate"
+            echo ""
+            echo "- Version: \`${{ steps.version.outputs.version }}\`"
+            echo "- Git SHA: \`${{ needs.classify.outputs.candidate_sha }}\`"
+            echo "- Promotion artifact: \`${{ steps.candidate.outputs.promotion_artifact_name }}\`"
+            echo "- Target: \`${RELEASE_TARGET}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  deploy-dev:
+    name: Deploy Cloud candidate
+    needs:
+      - classify
+      - build-cloud-candidate
+    if: ${{ needs.classify.outputs.auto_deploy == 'true' && (github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && inputs.deploy)) }}
+    uses: ./.github/workflows/bucephalus-gcp-deploy.yml
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    with:
+      deployment_stage: services
+      apply: ${{ github.event_name == 'workflow_run' || inputs.apply }}
+      github_environment: ${{ inputs.github_environment || 'bucephalus-dev' }}
+      release_version: ${{ needs.build-cloud-candidate.outputs.release_version }}
+      promotion_run_id: ${{ github.run_id }}
+      promotion_artifact_name: ${{ needs.build-cloud-candidate.outputs.promotion_artifact_name }}
+      checkout_ref: ${{ needs.build-cloud-candidate.outputs.candidate_sha }}
+    secrets: inherit
+
+  plan-candidate-dev:
+    name: Plan Cloud candidate with deploy-boundary changes
+    needs:
+      - classify
+      - build-cloud-candidate
+    if: ${{ needs.classify.outputs.plan_services == 'true' && needs.classify.outputs.build_candidate == 'true' }}
+    uses: ./.github/workflows/bucephalus-gcp-deploy.yml
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    with:
+      deployment_stage: services
+      apply: false
+      github_environment: ${{ inputs.github_environment || 'bucephalus-dev' }}
+      release_version: ${{ needs.build-cloud-candidate.outputs.release_version }}
+      promotion_run_id: ${{ github.run_id }}
+      promotion_artifact_name: ${{ needs.build-cloud-candidate.outputs.promotion_artifact_name }}
+      checkout_ref: ${{ needs.build-cloud-candidate.outputs.candidate_sha }}
+    secrets: inherit
+
+  plan-existing-dev:
+    name: Plan existing Cloud deployment
+    needs: classify
+    if: ${{ needs.classify.outputs.plan_services == 'true' && needs.classify.outputs.build_candidate != 'true' }}
+    uses: ./.github/workflows/bucephalus-gcp-deploy.yml
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    with:
+      deployment_stage: services
+      apply: false
+      github_environment: ${{ inputs.github_environment || 'bucephalus-dev' }}
+      checkout_ref: ${{ needs.classify.outputs.candidate_sha }}
+    secrets: inherit

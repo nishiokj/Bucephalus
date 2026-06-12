@@ -34,6 +34,8 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/PackageArtifact'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
   /v1/packages/{package_digest}:
     get:
       operationId: getPackageArtifact
@@ -52,15 +54,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PackageArtifact'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
   /v1/packages/{package_digest}/content:
     get:
       operationId: downloadPackageArtifact
       summary: Download sealed package artifact bytes by digest.
+      security:
+        - workerAttemptBearerAuth: []
       description: >
-        Workers use this endpoint to materialize package content. Workers must
-        not read API-local storage paths from the database.
+        Workers use this endpoint to materialize package content. The request
+        must present the worker attempt bearer token and X-Bucephalus-Attempt-Id
+        for a running attempt whose run uses this package digest. The API
+        resolves package storage metadata through the run owner's package association
+        so same-digest uploads from another owner cannot redirect a
+        worker onto another storage object. Workers must not read API-local
+        storage paths from the database.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - name: package_digest
@@ -68,6 +79,13 @@ paths:
           required: true
           schema:
             $ref: './common.yaml#/components/schemas/Digest'
+        - name: X-Bucephalus-Attempt-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+          description: Running attempt id bound to the bearer attempt token.
       responses:
         '200':
           description: Package archive bytes.
@@ -88,6 +106,10 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
         '409':
@@ -114,6 +136,8 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/CloudRun'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
     post:
       operationId: createRun
       summary: Create a Cloud run request for an accepted sealed package.
@@ -143,7 +167,15 @@ paths:
                   type: object
                   additionalProperties:
                     type: string
-                  description: Plain environment values supplied for this run.
+                    maxLength: 32768
+                  description: >
+                    Plain non-secret environment values supplied for this run.
+                    Keys must be uppercase shell identifiers matching
+                    [A-Z_][A-Z0-9_]*, must not collide with secret_refs keys,
+                    and must not use reserved Cloud runtime/control-plane names
+                    such as DATABASE_URL, BUCEPHALUS_CLOUD_WORKER_TOKEN, or
+                    provider credential variables. Values must not contain NUL
+                    bytes and are limited to 32768 UTF-8 bytes.
                 secret_refs:
                   type: object
                   additionalProperties:
@@ -157,7 +189,7 @@ paths:
                     gcp-secret-manager://projects/<project>/secrets/<secret>/versions/<version>
                     and aws-secrets-manager://<secret-id>.
                 runtime_options:
-                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                  $ref: '#/components/schemas/CloudRuntimeOptions'
                   description: >
                     Run-time execution options. Cloud backends use `backend`
                     values such as `runner-docker` or `modal`; `runner-docker`
@@ -170,6 +202,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CloudRun'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
         '409':
@@ -224,6 +258,10 @@ paths:
     get:
       operationId: listRunRuntimeEvents
       summary: List live trace events for a Cloud run.
+      description: >
+        One chronological stream combining trial trajectory rows (live-ingested
+        during the run, repaired from worker runtime snapshots after it) and
+        worker harness lifecycle events, distinguished by source.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - name: run_id
@@ -265,6 +303,8 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RuntimeEvent'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
   /v1/runs/{run_id}/runtime/results:
@@ -298,6 +338,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RuntimeResults'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
   /v1/runs/{run_id}/runtime/kv/{key}:
@@ -345,10 +387,14 @@ paths:
     post:
       operationId: claimRun
       summary: Claim the next queued Cloud run for a registered runner instance.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
       description: >
         Uses the Cloud API durable run queue. The API owns database access and
         creates a leased run attempt transactionally; runner VMs do not need
-        direct Postgres credentials to claim work.
+        direct Postgres credentials to claim work. Requires the Cloud worker
+        service token, either as a bearer token or X-Bucephalus-Worker-Token.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
       requestBody:
@@ -372,10 +418,14 @@ paths:
                     properties:
                       claimed:
                         const: false
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/run-attempts/{attempt_id}/heartbeat:
     post:
       operationId: heartbeatRunAttempt
       summary: Extend a worker lease for a run attempt.
+      security:
+        - workerAttemptBearerAuth: []
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - $ref: '#/components/parameters/AttemptId'
@@ -400,10 +450,14 @@ paths:
                     $ref: '#/components/schemas/RunAttempt'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/run-attempts/{attempt_id}/events:
     post:
       operationId: appendRunAttemptEvent
       summary: Append an event for a run attempt.
+      security:
+        - workerAttemptBearerAuth: []
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - $ref: '#/components/parameters/AttemptId'
@@ -440,10 +494,112 @@ paths:
                 properties:
                   event:
                     $ref: '#/components/schemas/RunEvent'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
+  /v1/worker/run-attempts/{attempt_id}/runtime/event-rows:
+    post:
+      operationId: ingestRunAttemptRuntimeEventRows
+      summary: Land a batch of live trial event rows for a run attempt.
+      security:
+        - workerAttemptBearerAuth: []
+      description: >
+        Worker live-evidence ingestion. Batches are idempotent: rows are keyed
+        by (core_run_id, trial_id, schedule_idx, attempt, row_seq) and a replay
+        upserts in place, so at-least-once delivery from the worker pump is
+        safe. Requires the attempt token.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - runner_instance_id
+                - rows
+              properties:
+                runner_instance_id:
+                  type: string
+                  format: uuid
+                  minLength: 1
+                rows:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required:
+                      - core_run_id
+                      - trial_id
+                      - schedule_idx
+                      - attempt
+                      - row_seq
+                      - event_type
+                    properties:
+                      core_run_id:
+                        type: string
+                        pattern: '^run_[A-Za-z0-9_.-]+$'
+                      trial_id:
+                        type: string
+                        minLength: 1
+                      schedule_idx:
+                        type: integer
+                        minimum: 0
+                      attempt:
+                        type: integer
+                        minimum: 0
+                      row_seq:
+                        type: integer
+                        minimum: 0
+                      slot_commit_id:
+                        type: string
+                      variant_id:
+                        type: string
+                      task_id:
+                        type: string
+                      repl_idx:
+                        type: integer
+                        minimum: 0
+                      seq:
+                        type: integer
+                        minimum: 0
+                      event_type:
+                        type: string
+                        minLength: 1
+                      ts:
+                        type:
+                          - string
+                          - 'null'
+                      payload:
+                        $ref: './common.yaml#/components/schemas/AnyJsonObject'
+      responses:
+        '200':
+          description: Batch landed.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - received
+                  - upserted
+                properties:
+                  received:
+                    type: integer
+                  upserted:
+                    type: integer
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/run-attempts/{attempt_id}/complete:
     post:
       operationId: completeRunAttempt
       summary: Mark a run attempt and run completed.
+      security:
+        - workerAttemptBearerAuth: []
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - $ref: '#/components/parameters/AttemptId'
@@ -468,10 +624,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunClaim'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/run-attempts/{attempt_id}/fail:
     post:
       operationId: failRunAttempt
       summary: Mark a run attempt and run failed.
+      security:
+        - workerAttemptBearerAuth: []
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - $ref: '#/components/parameters/AttemptId'
@@ -500,14 +660,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunClaim'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/runs/expire-leases:
     post:
       operationId: expireRunLeases
       summary: Expire stale worker leases and requeue their runs.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
       description: >
         Timer-driven queue maintenance owned by the Cloud API. Runners call this
         endpoint as a worker maintenance action; they do not connect to Postgres
-        for queue wakeups.
+        for queue wakeups. Requires the Cloud worker service token, either as a
+        bearer token or X-Bucephalus-Worker-Token.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
       responses:
@@ -525,10 +691,16 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RunClaim'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-pools:
     post:
       operationId: createRunnerPool
       summary: Create a runner pool.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       requestBody:
         required: true
         content:
@@ -542,9 +714,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerPool'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
     get:
       operationId: listRunnerPools
       summary: List runner pools.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       responses:
         '200':
           description: Runner pools.
@@ -560,10 +738,16 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RunnerPool'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-pools/{runner_pool_id}:
     get:
       operationId: getRunnerPool
       summary: Fetch a runner pool.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerPoolId'
       responses:
@@ -573,10 +757,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerPool'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-pools/{runner_pool_id}/drain:
     post:
       operationId: drainRunnerPool
       summary: Mark a runner pool draining.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerPoolId'
       responses:
@@ -586,10 +776,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerPool'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-pools/{runner_pool_id}/disable:
     post:
       operationId: disableRunnerPool
       summary: Disable an internal runner pool.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerPoolId'
       responses:
@@ -599,10 +795,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerPool'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/register:
     post:
       operationId: registerRunnerInstance
       summary: Register a runner VM daemon instance.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
+      description: Requires the Cloud worker service token, either as a bearer token or X-Bucephalus-Worker-Token.
       requestBody:
         required: true
         content:
@@ -616,10 +818,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances:
     get:
       operationId: listRunnerInstances
       summary: List runner VM daemon instances.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - name: runner_pool_id
           in: query
@@ -643,10 +851,16 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/expire-stale:
     post:
       operationId: expireStaleRunnerInstances
       summary: Mark stale runner instances offline.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       requestBody:
         required: false
         content:
@@ -677,10 +891,16 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-provision-requests:
     get:
       operationId: listRunnerProvisionRequests
       summary: List runner VM provision requests.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - name: runner_pool_id
           in: query
@@ -704,10 +924,16 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RunnerProvisionRequest'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/{runner_instance_id}/heartbeat:
     post:
       operationId: heartbeatRunnerInstance
       summary: Heartbeat a runner VM daemon instance.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
+      description: Requires the Cloud worker service token, either as a bearer token or X-Bucephalus-Worker-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerInstanceId'
       requestBody:
@@ -729,10 +955,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/{runner_instance_id}/drain:
     post:
       operationId: drainRunnerInstance
       summary: Mark a runner instance draining.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerInstanceId'
       responses:
@@ -742,10 +974,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/{runner_instance_id}/unhealthy:
     post:
       operationId: markRunnerInstanceUnhealthy
       summary: Mark a runner instance unhealthy after a host or cleanup failure.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
+      description: Requires the Cloud worker service token, either as a bearer token or X-Bucephalus-Worker-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerInstanceId'
       requestBody:
@@ -761,10 +999,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/{runner_instance_id}/offline:
     post:
       operationId: markRunnerInstanceOffline
       summary: Mark a runner instance offline after daemon shutdown.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
+      description: Requires the Cloud worker service token, either as a bearer token or X-Bucephalus-Worker-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerInstanceId'
       requestBody:
@@ -780,10 +1024,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
 components:
   securitySchemes:
     bearerAuth:
       $ref: './common.yaml#/components/securitySchemes/bearerAuth'
+    workerAttemptBearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/workerAttemptBearerAuth'
+    workerBearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/workerBearerAuth'
+    workerTokenHeader:
+      $ref: './common.yaml#/components/securitySchemes/workerTokenHeader'
+    runnerAdminBearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/runnerAdminBearerAuth'
+    runnerAdminTokenHeader:
+      $ref: './common.yaml#/components/securitySchemes/runnerAdminTokenHeader'
   parameters:
     AttemptId:
       name: attempt_id
@@ -842,6 +1098,7 @@ components:
       required:
         - package_digest
         - status
+        - package_provenance
         - manifest_json
         - resolved_experiment_json
         - diagnostics
@@ -888,6 +1145,8 @@ components:
           items:
             type: string
           description: Task/runtime container image references discovered in the sealed package.
+        package_provenance:
+          $ref: '#/components/schemas/CloudPackageProvenance'
         status:
           type: string
           enum:
@@ -906,6 +1165,7 @@ components:
         - run_id
         - package_digest
         - status
+        - package_provenance
         - env
         - secret_refs
         - runtime_options
@@ -934,6 +1194,11 @@ components:
           type: object
           additionalProperties:
             type: string
+            maxLength: 32768
+          description: >
+            Plain non-secret environment values supplied for this run. Keys
+            obey the same constraints as the create-run request and never
+            overlap with secret_refs keys.
         secret_refs:
           type: object
           additionalProperties:
@@ -947,9 +1212,11 @@ components:
             Manager and AWS Secrets Manager forms; env/file refs require
             explicit local-development opt-in.
         runtime_options:
-          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+          $ref: '#/components/schemas/CloudRuntimeOptions'
         run_requirements:
           $ref: '#/components/schemas/RunRequirements'
+        package_provenance:
+          $ref: '#/components/schemas/CloudPackageProvenance'
         created_at:
           type: string
           format: date-time
@@ -978,6 +1245,45 @@ components:
             so failures are diagnosable without database access.
           items:
             $ref: '#/components/schemas/RunAttempt'
+    CloudPackageProvenance:
+      type: object
+      additionalProperties: true
+      required:
+        - schema_version
+        - status
+        - source
+        - message
+      properties:
+        schema_version:
+          type: string
+          enum:
+            - cloud_package_provenance_v1
+        status:
+          type: string
+          enum:
+            - hosted_attested
+            - external_unattested
+            - unknown_legacy
+        source:
+          type: string
+          enum:
+            - hosted_core
+            - sealed_package_manifest
+            - sealed_package_import
+            - pre_provenance_package_artifact
+            - pre_provenance_package_owner
+            - pre_provenance_run
+        message:
+          type: string
+        input_kind:
+          type: string
+          enum:
+            - authoring_context
+            - sealed_package
+        source_upload_id:
+          type: string
+        source_content_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
     RuntimeSummary:
       type: object
       additionalProperties: false
@@ -1141,6 +1447,22 @@ components:
         - payload
         - row
       properties:
+        source:
+          type: string
+          enum:
+            - trial
+            - worker
+          description: >
+            trial rows come from trial trajectories; worker rows are harness
+            lifecycle markers (materializing, core starting, ...).
+        event_id:
+          type: string
+          description: Stable unique id for the event within the run stream.
+        recorded_at:
+          type:
+            - string
+            - 'null'
+          description: Event timestamp when the producer reported one.
         core_run_id:
           type: string
         trial_id:
@@ -1481,6 +1803,93 @@ components:
             enum:
               - reusable_vm
               - single_use_vm
+    CloudRuntimeOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        backend:
+          type: string
+          enum:
+            - runner-docker
+            - runner_docker
+            - local-docker
+            - local_docker
+            - modal
+        executor:
+          type: string
+          enum:
+            - runner-docker
+            - runner_docker
+            - local-docker
+            - local_docker
+            - modal
+        arch:
+          type: string
+          enum:
+            - x86_64
+            - amd64
+            - arm64
+            - aarch64
+        cpu_count:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        cpu:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        memory_mb:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        disk_mb:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        isolation:
+          type: string
+          enum:
+            - reusable_vm
+            - single_use_vm
+        timeout_ms:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        max_parallel_trials:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        network:
+          type: object
+          additionalProperties: false
+          properties:
+            default:
+              type: string
+              enum:
+                - none
+                - allowlist_enforced
+            task_sandbox:
+              type: string
+              enum:
+                - none
+                - allowlist_enforced
+            agent:
+              type: string
+              enum:
+                - none
+                - allowlist_enforced
+            egress:
+              type: array
+              items:
+                type: string
+                minLength: 1
+        sidecars:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        accelerators:
+          type: array
+          items:
+            type: string
+            minLength: 1
+      description: >
+        Hosted Cloud runtime overrides. Unknown keys are rejected by the API so
+        typos cannot silently fall back to default runner resources.
+    PositiveIntegerLike:
+      anyOf:
+        - type: integer
+          minimum: 1
+        - type: string
+          pattern: '^[1-9][0-9]*$'
     RunRequirements:
       type: object
       additionalProperties: false

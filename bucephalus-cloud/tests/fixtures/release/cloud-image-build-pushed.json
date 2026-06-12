@@ -3,6 +3,7 @@
   "release": {
     "version": "0.0.0-test",
     "target": "x86_64-unknown-linux-gnu",
+    "platform": "linux/amd64",
     "git_sha": "0123456789abcdef0123456789abcdef01234567",
     "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "archive_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
@@ -35,11 +36,23 @@
       "immutable_ref": "us-docker.pkg.dev/project/buc/cloud/api@sha256:1111111111111111111111111111111111111111111111111111111111111111",
       "image_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "platform": "linux/amd64",
       "metadata_file": "api.metadata.json",
       "boundary_verified": true,
       "boundary_image_ref": "us-docker.pkg.dev/project/buc/cloud/api:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab-boundary-check",
       "boundary_image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-      "boundary_metadata_file": "api.boundary.metadata.json"
+      "boundary_metadata_file": "api.boundary.metadata.json",
+      "build_context": {
+        "path": "contexts/api",
+        "file_count": 4,
+        "size_bytes": 4,
+        "files": [
+          { "path": ".dockerignore", "size_bytes": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+          { "path": "bin/bucephalus", "size_bytes": 1, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+          { "path": "bucephalus-cloud/images/Dockerfile.api", "size_bytes": 1, "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+          { "path": "bucephalus-cloud/runtime-dist/server.js", "size_bytes": 1, "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }
+        ]
+      }
     },
     {
       "component": "pool-controller",
@@ -52,11 +65,22 @@
       "immutable_ref": "us-docker.pkg.dev/project/buc/cloud/pool-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222",
       "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "platform": "linux/amd64",
       "metadata_file": "pool-controller.metadata.json",
       "boundary_verified": true,
       "boundary_image_ref": "us-docker.pkg.dev/project/buc/cloud/pool-controller:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab-boundary-check",
       "boundary_image_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-      "boundary_metadata_file": "pool-controller.boundary.metadata.json"
+      "boundary_metadata_file": "pool-controller.boundary.metadata.json",
+      "build_context": {
+        "path": "contexts/pool-controller",
+        "file_count": 3,
+        "size_bytes": 3,
+        "files": [
+          { "path": ".dockerignore", "size_bytes": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+          { "path": "bucephalus-cloud/images/Dockerfile.pool-controller", "size_bytes": 1, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+          { "path": "bucephalus-cloud/runtime-dist/poolController.js", "size_bytes": 1, "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+        ]
+      }
     },
     {
       "component": "migrations",
@@ -69,11 +93,23 @@
       "immutable_ref": "us-docker.pkg.dev/project/buc/cloud/migrations@sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "platform": "linux/amd64",
       "metadata_file": "migrations.metadata.json",
       "boundary_verified": true,
       "boundary_image_ref": "us-docker.pkg.dev/project/buc/cloud/migrations:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab-boundary-check",
       "boundary_image_id": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-      "boundary_metadata_file": "migrations.boundary.metadata.json"
+      "boundary_metadata_file": "migrations.boundary.metadata.json",
+      "build_context": {
+        "path": "contexts/migrations",
+        "file_count": 4,
+        "size_bytes": 4,
+        "files": [
+          { "path": ".dockerignore", "size_bytes": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+          { "path": "bucephalus-cloud/images/Dockerfile.migrations", "size_bytes": 1, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+          { "path": "bucephalus-cloud/runtime-dist/db/migrate.js", "size_bytes": 1, "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+          { "path": "bucephalus-cloud/runtime-dist/db/promoteWorkerImage.js", "size_bytes": 1, "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }
+        ]
+      }
     },
     {
       "component": "worker",
@@ -86,11 +122,26 @@
       "immutable_ref": "us-docker.pkg.dev/project/buc/cloud/worker@sha256:4444444444444444444444444444444444444444444444444444444444444444",
       "image_id": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "platform": "linux/amd64",
       "metadata_file": "worker.metadata.json",
       "boundary_verified": true,
       "boundary_image_ref": "us-docker.pkg.dev/project/buc/cloud/worker:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab-boundary-check",
       "boundary_image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-      "boundary_metadata_file": "worker.boundary.metadata.json"
+      "boundary_metadata_file": "worker.boundary.metadata.json",
+      "build_context": {
+        "path": "contexts/worker",
+        "file_count": 7,
+        "size_bytes": 7,
+        "files": [
+          { "path": ".dockerignore", "size_bytes": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+          { "path": "bin/bucephalus-modal-launcher", "size_bytes": 1, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+          { "path": "bin/bucephalus-worker-runner", "size_bytes": 1, "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+          { "path": "bucephalus-cloud/images/Dockerfile.worker", "size_bytes": 1, "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+          { "path": "bucephalus-cloud/runtime-dist/networkPolicyClient.js", "size_bytes": 1, "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+          { "path": "bucephalus-cloud/runtime-dist/secretResolver.js", "size_bytes": 1, "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" },
+          { "path": "bucephalus-cloud/runtime-dist/worker.js", "size_bytes": 1, "sha256": "9999999999999999999999999999999999999999999999999999999999999999" }
+        ]
+      }
     }
   ]
 }

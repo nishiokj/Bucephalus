@@ -16,6 +16,7 @@ POOL_CONTROLLER_RUNNER_POOL_ID=""
 API_DATABASE_URL_SECRET_VERSION=""
 MIGRATOR_DATABASE_URL_SECRET_VERSION=""
 WORKER_TOKEN_SECRET_VERSION=""
+RUNNER_ADMIN_TOKEN_SECRET_VERSION=""
 POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION=""
 POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION=""
 API_INGRESS="INGRESS_TRAFFIC_ALL"
@@ -49,6 +50,7 @@ Usage: scripts/deploy/write-gcp-deploy-tfvars.sh --out <path> \
   --api-database-url-secret-version <number> \
   --migrator-database-url-secret-version <number> \
   --worker-token-secret-version <number> \
+  [--runner-admin-token-secret-version <number>] \
   --pool-controller-provision-cmd-json-secret-version <number> \
   --pool-controller-reap-cmd-json-secret-version <number> \
   [--resource-prefix <prefix>] \
@@ -144,6 +146,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --worker-token-secret-version)
       WORKER_TOKEN_SECRET_VERSION="${2:-}"
+      shift 2
+      ;;
+    --runner-admin-token-secret-version)
+      RUNNER_ADMIN_TOKEN_SECRET_VERSION="${2:-}"
       shift 2
       ;;
     --pool-controller-provision-cmd-json-secret-version)
@@ -269,6 +275,7 @@ POOL_CONTROLLER_RUNNER_POOL_ID="${POOL_CONTROLLER_RUNNER_POOL_ID}" \
 API_DATABASE_URL_SECRET_VERSION="${API_DATABASE_URL_SECRET_VERSION}" \
 MIGRATOR_DATABASE_URL_SECRET_VERSION="${MIGRATOR_DATABASE_URL_SECRET_VERSION}" \
 WORKER_TOKEN_SECRET_VERSION="${WORKER_TOKEN_SECRET_VERSION}" \
+RUNNER_ADMIN_TOKEN_SECRET_VERSION="${RUNNER_ADMIN_TOKEN_SECRET_VERSION}" \
 POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION="${POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION}" \
 POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION="${POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION}" \
 API_INGRESS="${API_INGRESS}" \
@@ -310,6 +317,7 @@ const values = {
   api_database_url_secret_version: optional(process.env.API_DATABASE_URL_SECRET_VERSION),
   migrator_database_url_secret_version: optional(process.env.MIGRATOR_DATABASE_URL_SECRET_VERSION),
   worker_token_secret_version: optional(process.env.WORKER_TOKEN_SECRET_VERSION),
+  runner_admin_token_secret_version: optional(process.env.RUNNER_ADMIN_TOKEN_SECRET_VERSION),
   pool_controller_provision_cmd_json_secret_version: optional(process.env.POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION),
   pool_controller_reap_cmd_json_secret_version: optional(process.env.POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION),
   api_ingress: process.env.API_INGRESS,
@@ -389,6 +397,9 @@ for (const [name, pattern] of checks) {
     fail(`${name} is invalid for deploy tfvars`);
   }
 }
+if (values.runner_admin_token_secret_version !== null && !/^[1-9][0-9]*$/.test(values.runner_admin_token_secret_version)) {
+  fail("runner_admin_token_secret_version is invalid for deploy tfvars");
+}
 if (values.cloud_gcs_bucket !== null && !/^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/.test(values.cloud_gcs_bucket)) {
   fail("cloud_gcs_bucket is invalid for deploy tfvars");
 }
@@ -455,6 +466,7 @@ const order = [
   "api_database_url_secret_version",
   "migrator_database_url_secret_version",
   "worker_token_secret_version",
+  "runner_admin_token_secret_version",
   "pool_controller_provision_cmd_json_secret_version",
   "pool_controller_reap_cmd_json_secret_version",
   "api_ingress",

@@ -11,9 +11,10 @@ on:
       deployment_stage:
         description: "Deployment stage"
         required: true
-        default: "substrate"
+        default: "services"
         type: choice
         options:
+          - services
           - substrate
           - api
           - pool
@@ -25,12 +26,46 @@ on:
       github_environment:
         description: "Deployment environment"
         required: true
-        default: "bucephalus"
+        default: "bucephalus-dev"
         type: choice
         options:
+          - bucephalus-dev
           - bucephalus
       release_version:
         description: "Optional override; defaults to latest pushed Cloud image promotion evidence"
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      deployment_stage:
+        description: "Deployment stage"
+        required: false
+        default: "services"
+        type: string
+      apply:
+        description: "Apply the generated Terraform plan"
+        required: false
+        default: false
+        type: boolean
+      github_environment:
+        description: "Deployment environment"
+        required: false
+        default: "bucephalus-dev"
+        type: string
+      release_version:
+        description: "Optional release/candidate version label"
+        required: false
+        type: string
+      promotion_run_id:
+        description: "GitHub Actions run ID containing promotion evidence"
+        required: false
+        type: string
+      promotion_artifact_name:
+        description: "Promotion evidence artifact name"
+        required: false
+        type: string
+      checkout_ref:
+        description: "Repository ref to use for deployment scripts and Terraform"
         required: false
         type: string
 
@@ -58,6 +93,8 @@ jobs:
       TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -78,11 +115,17 @@ jobs:
 
       - name: Resolve deployment stage
         env:
-          DEPLOYMENT_STAGE: ${{ inputs.deployment_stage || 'pool' }}
+          DEPLOYMENT_STAGE: ${{ inputs.deployment_stage || 'services' }}
           DRIFT_CHECK: ${{ github.event_name == 'schedule' }}
         run: |
           echo "DRIFT_CHECK=${DRIFT_CHECK}" >> "${GITHUB_ENV}"
           case "${DEPLOYMENT_STAGE}" in
+            services)
+              deploy_api_services="true"
+              deploy_pool_controller="true"
+              needs_api_config="true"
+              needs_pool_config="true"
+              ;;
             substrate)
               deploy_api_services="false"
               deploy_pool_controller="false"
@@ -119,13 +162,14 @@ jobs:
           BUCEPHALUS_TERRAFORM_BACKEND_PREFIX: ${{ vars.BUCEPHALUS_TERRAFORM_BACKEND_PREFIX }}
           BUCEPHALUS_GCP_PROJECT_ID: ${{ vars.BUCEPHALUS_GCP_PROJECT_ID }}
           BUCEPHALUS_GCP_REGION: ${{ vars.BUCEPHALUS_GCP_REGION }}
-          BUCEPHALUS_DEPLOYMENT_ENVIRONMENT: ${{ vars.BUCEPHALUS_DEPLOYMENT_ENVIRONMENT || inputs.github_environment || 'bucephalus' }}
+          BUCEPHALUS_DEPLOYMENT_ENVIRONMENT: ${{ vars.BUCEPHALUS_DEPLOYMENT_ENVIRONMENT || (inputs.github_environment == 'bucephalus-dev' && 'dev' || inputs.github_environment) || 'bucephalus' }}
           BUCEPHALUS_GCP_RESOURCE_PREFIX: ${{ vars.BUCEPHALUS_GCP_RESOURCE_PREFIX }}
           BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID || vars.BUCEPHALUS_OAUTH_USER_CLIENT_ID }}
           BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID: ${{ vars.BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID || secrets.BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID }}
           BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION: ${{ vars.BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION || secrets.BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION }}
           BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION: ${{ vars.BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION || secrets.BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION }}
           BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION: ${{ vars.BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION || secrets.BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION }}
+          BUCEPHALUS_RUNNER_ADMIN_TOKEN_SECRET_VERSION: ${{ vars.BUCEPHALUS_RUNNER_ADMIN_TOKEN_SECRET_VERSION || secrets.BUCEPHALUS_RUNNER_ADMIN_TOKEN_SECRET_VERSION }}
           BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION: ${{ vars.BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION || secrets.BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION }}
           BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION: ${{ vars.BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION || secrets.BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION }}
           BUCEPHALUS_API_INGRESS: ${{ vars.BUCEPHALUS_API_INGRESS || 'INGRESS_TRAFFIC_ALL' }}
@@ -179,6 +223,7 @@ jobs:
             echo "BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION=${BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION}"
             echo "BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION=${BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION}"
             echo "BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION=${BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION}"
+            echo "BUCEPHALUS_RUNNER_ADMIN_TOKEN_SECRET_VERSION=${BUCEPHALUS_RUNNER_ADMIN_TOKEN_SECRET_VERSION}"
             echo "BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION=${BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION}"
             echo "BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION=${BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION}"
             echo "BUCEPHALUS_API_INGRESS=${BUCEPHALUS_API_INGRESS}"
@@ -205,8 +250,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.release_version }}
+          PROMOTION_RUN_ID: ${{ inputs.promotion_run_id }}
+          PROMOTION_ARTIFACT_NAME: ${{ inputs.promotion_artifact_name }}
         run: |
-          if [[ -n "${RELEASE_VERSION}" ]]; then
+          if [[ -n "${PROMOTION_RUN_ID}" || -n "${PROMOTION_ARTIFACT_NAME}" ]]; then
+            if [[ -z "${PROMOTION_RUN_ID}" || -z "${PROMOTION_ARTIFACT_NAME}" ]]; then
+              echo "promotion_run_id and promotion_artifact_name must be provided together" >&2
+              exit 2
+            fi
+            {
+              echo "release_version=${RELEASE_VERSION:-candidate}"
+              echo "promotion_run_id=${PROMOTION_RUN_ID}"
+              echo "promotion_artifact_name=${PROMOTION_ARTIFACT_NAME}"
+            } >> "${GITHUB_OUTPUT}"
+          elif [[ -n "${RELEASE_VERSION}" ]]; then
             scripts/release/resolve-cloud-release-artifacts.sh \
               --version "${RELEASE_VERSION}" \
               --need promotion \
@@ -301,10 +358,44 @@ jobs:
             echo "resolved ${env_name} from ${secret_id} version ${version}"
           }
 
+          resolve_optional_secret_version() {
+            local env_name="$1"
+            local secret_id="$2"
+            local current="${!env_name:-}"
+            if [[ -n "${current}" ]]; then
+              if [[ ! "${current}" =~ ^[1-9][0-9]*$ ]]; then
+                echo "${env_name} must be a numeric Secret Manager version when set; got '${current}'" >&2
+                exit 1
+              fi
+              printf '%s=%s\n' "${env_name}" "${current}" >> "${GITHUB_ENV}"
+              return
+            fi
+            if ! gcloud secrets describe "${secret_id}" --project "${BUCEPHALUS_GCP_PROJECT_ID}" >/dev/null 2>&1; then
+              echo "${secret_id} is not configured; API will use the worker token as the runner-admin compatibility credential"
+              printf '%s=\n' "${env_name}" >> "${GITHUB_ENV}"
+              return
+            fi
+            local version
+            version="$(gcloud secrets versions list "${secret_id}" \
+              --project "${BUCEPHALUS_GCP_PROJECT_ID}" \
+              --filter "state=enabled" \
+              --sort-by "~createTime" \
+              --limit 1 \
+              --format "value(name)")"
+            if [[ ! "${version}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "${secret_id} has no enabled versions; API will use the worker token as the runner-admin compatibility credential"
+              printf '%s=\n' "${env_name}" >> "${GITHUB_ENV}"
+              return
+            fi
+            printf '%s=%s\n' "${env_name}" "${version}" >> "${GITHUB_ENV}"
+            echo "resolved optional ${env_name} from ${secret_id} version ${version}"
+          }
+
           name_prefix="${BUCEPHALUS_GCP_RESOURCE_PREFIX}-${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}"
           resolve_secret_version BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION "${name_prefix}-api-database-url"
           resolve_secret_version BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION "${name_prefix}-migrator-database-url"
           resolve_secret_version BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION "${name_prefix}-worker-token"
+          resolve_optional_secret_version BUCEPHALUS_RUNNER_ADMIN_TOKEN_SECRET_VERSION "${name_prefix}-runner-admin-token"
           if [[ "${NEEDS_POOL_CONFIG}" == "true" ]]; then
             resolve_secret_version BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION "${name_prefix}-pool-provision-cmd-json"
             resolve_secret_version BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION "${name_prefix}-pool-reap-cmd-json"
@@ -323,6 +414,7 @@ jobs:
             --api-database-url-secret-version "${BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION}" \
             --migrator-database-url-secret-version "${BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION}" \
             --worker-token-secret-version "${BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION}" \
+            --runner-admin-token-secret-version "${BUCEPHALUS_RUNNER_ADMIN_TOKEN_SECRET_VERSION}" \
             --pool-controller-provision-cmd-json-secret-version "${BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION}" \
             --pool-controller-reap-cmd-json-secret-version "${BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION}" \
             --api-ingress "${BUCEPHALUS_API_INGRESS}" \
@@ -359,7 +451,7 @@ jobs:
       - name: Terraform plan
         working-directory: bucephalus-cloud/infra/gcp
         env:
-          DEPLOYMENT_STAGE: ${{ inputs.deployment_stage || 'pool' }}
+          DEPLOYMENT_STAGE: ${{ inputs.deployment_stage || 'services' }}
         run: |
           args=(
             -input=false
@@ -426,7 +518,7 @@ jobs:
         run: terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp.tfplan"
 
       - name: Run migration job
-        if: ${{ inputs.apply && inputs.deployment_stage == 'api' }}
+        if: ${{ inputs.apply && inputs.deployment_stage != 'substrate' }}
         run: >-
           gcloud run jobs execute
           "${BUCEPHALUS_GCP_RESOURCE_PREFIX}-${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}-migrations"
@@ -470,11 +562,13 @@ jobs:
         env:
           BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN: ${{ secrets.BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN }}
           BUCEPHALUS_WORKER_SMOKE: ${{ secrets.BUCEPHALUS_WORKER_SMOKE }}
+          BUCEPHALUS_RUNNER_ADMIN_SMOKE: ${{ secrets.BUCEPHALUS_RUNNER_ADMIN_SMOKE }}
         run: |
           if [[ -z "${BUCEPHALUS_WORKER_SMOKE}" ]]; then
             echo "apply deployments require BUCEPHALUS_WORKER_SMOKE for worker-route smoke checks" >&2
             exit 1
           fi
+          runner_admin_smoke="${BUCEPHALUS_RUNNER_ADMIN_SMOKE:-${BUCEPHALUS_WORKER_SMOKE}}"
           terraform -chdir=bucephalus-cloud/infra/gcp output -json control_plane_services > "${RUNNER_TEMP}/control-plane-services.json"
           api_uri="$(bun -e 'const data = JSON.parse(await Bun.file(process.argv[1]).text()); console.log(data.api?.uri ?? "");' "${RUNNER_TEMP}/control-plane-services.json")"
           if [[ -z "${api_uri}" ]]; then
@@ -484,12 +578,21 @@ jobs:
           readyz="$(curl -fsS "${api_uri}/readyz")"
           printf '%s\n' "${readyz}"
           expected_version="$(bun -e 'const m = JSON.parse(await Bun.file(process.argv[1]).text()); console.log(m.release?.version ?? "");' "${PROMOTION_DIR}/cloud-image-build-manifest.json")"
+          expected_git_sha="$(bun -e 'const m = JSON.parse(await Bun.file(process.argv[1]).text()); console.log(m.release?.git_sha ?? "");' "${PROMOTION_DIR}/cloud-image-build-manifest.json")"
           deployed_version="$(printf '%s' "${readyz}" | bun -e 'const data = JSON.parse(await Bun.stdin.text()); console.log(data.release?.version ?? "");')"
+          deployed_git_sha="$(printf '%s' "${readyz}" | bun -e 'const data = JSON.parse(await Bun.stdin.text()); console.log(data.release?.git_sha ?? "");')"
           if [[ -n "${expected_version}" && "${deployed_version}" != "${expected_version}" ]]; then
             echo "deployed API reports release '${deployed_version}' but this deploy promoted '${expected_version}' — version skew" >&2
             exit 1
           fi
-          curl -fsS -H "authorization: Bearer ${BUCEPHALUS_WORKER_SMOKE}" "${api_uri}/v1/runner-pools"
+          if [[ -n "${expected_git_sha}" && "${deployed_git_sha}" != "${expected_git_sha}" ]]; then
+            echo "deployed API reports git SHA '${deployed_git_sha}' but this deploy promoted '${expected_git_sha}' — candidate skew" >&2
+            exit 1
+          fi
+          curl -fsS -H "authorization: Bearer ${runner_admin_smoke}" "${api_uri}/v1/runner-pools" || {
+            echo "runner-pool smoke failed; set BUCEPHALUS_RUNNER_ADMIN_SMOKE when BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN is configured" >&2
+            exit 1
+          }
           if [[ -n "${BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN}" ]]; then
             curl -fsS -H "authorization: Bearer ${BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN}" "${api_uri}/v1/packages"
           else
@@ -498,11 +601,11 @@ jobs:
 
       - name: Record deployment summary
         env:
-          DEPLOYMENT_STAGE: ${{ inputs.deployment_stage || 'pool (drift check)' }}
+          DEPLOYMENT_STAGE: ${{ inputs.deployment_stage || 'services (drift check)' }}
           DEPLOY_APPLY: ${{ inputs.apply || false }}
           RELEASE_ARTIFACT: ${{ steps.resolved_release.outputs.promotion_artifact_name }}
           RELEASE_RUN_ID: ${{ steps.resolved_release.outputs.promotion_run_id }}
-          RELEASE_VERSION_SUMMARY: ${{ inputs.release_version || 'latest' }}
+          RELEASE_VERSION_SUMMARY: ${{ steps.resolved_release.outputs.release_version || inputs.release_version || 'latest' }}
         run: |
           {
             echo "### Bucephalus GCP deploy"

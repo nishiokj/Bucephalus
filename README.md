@@ -7,7 +7,7 @@ Experiments are controlled executions where we aim to extract measurable outcome
 - Sandboxing agents with your product + documentation and measuring the frequency of successful onboarding / bootstrapping
 - Regression testing your agent system on a new model release
 
-[User Docs](docs/user/index.md) · [Cookbook](cookbook/README.md) · [Concepts](docs/user/concepts.md) · [YAML Reference](docs/user/experiment-yaml-reference.md) · [Distribution](docs/distribution.md)
+[User Docs](docs/user/index.md) · [Cookbook](cookbook/README.md) · [Concepts](docs/user/concepts.md) · [YAML Reference](docs/user/experiment-yaml-reference.md) · [Hosted Cloud CLI](docs/user/cloud-cli.md) · [Distribution](docs/distribution.md)
 
 **Built with:** Rust · Tokio · Docker · SQLite
 
@@ -111,6 +111,33 @@ bucephalus preflight <package_dir> --json
 bucephalus run <package_dir> --smoke-test --materialize full --json
 bucephalus run <package_dir> --materialize full --json
 ```
+
+For hosted Cloud runs, use `buc` against the hosted API:
+
+```bash
+bucephalus login --resource <api-url>
+buc build experiment.yaml
+buc secrets put NAME --from-env NAME
+buc doctor <package-digest> --secret-ref NAME=bucephalus://NAME
+buc run <package-digest> --secret-ref NAME=bucephalus://NAME
+```
+
+`buc build experiment.yaml` uploads the YAML directory as an authoring context,
+runs the bundled Core builder in Cloud, imports the produced sealed package, and
+reports hosted Cloud readiness. Existing sealed packages can still be uploaded
+with `buc build <package-dir>`, but Cloud treats that path as an externally
+authored sealed-package import: it verifies package integrity and hosted
+readiness without claiming the local authoring environment, Core version,
+platform, or target. YAML builds are the hosted-attested Cloud authoring path.
+For nested experiments that reference shared repo files, use
+`buc build path/to/experiment.yaml --context-root .` so the Cloud build receives
+the intended authoring tree. Local generated and credential material such as
+`.env`, `.npmrc`, `.ssh`, `.aws`, `node_modules`, and `target` is excluded from
+YAML context uploads and rejected by the hosted API. Hosted secrets are
+write-only:
+`buc secrets put` stores the value in Cloud and returns a stable
+`bucephalus://NAME` ref for doctor/run. See
+[Hosted Cloud CLI](docs/user/cloud-cli.md).
 
 ## What Bucephalus Does
 

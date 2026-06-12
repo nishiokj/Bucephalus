@@ -41,7 +41,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
-      DATABASE_URL: postgres://bucephalus:bucephalus_dev@localhost:55432/bucephalus_cloud
+      DATABASE_URL: postgres://bucephalus:bucephalus_dev@127.0.0.1:55432/bucephalus_cloud
     steps:
       - uses: actions/checkout@v4
 

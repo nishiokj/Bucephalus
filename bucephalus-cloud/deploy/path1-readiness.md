@@ -104,17 +104,18 @@ Terraform status:
 - Cloud Run services/jobs remain intentionally disabled with
   `deploy_control_plane_services=false` until real image digests and secret
   value revisions exist.
-- Service promotion is split into API and pool-controller phases. The API phase
-  uses `deploy_api_services=true` and `deploy_pool_controller=false`, creates
-  the migration job plus API service, and does not require a runner pool ID. The
-  pool phase uses `deploy_api_services=true` and `deploy_pool_controller=true`
-  after an API-created runner pool ID exists.
+- Normal service promotion now uses one combined services stage with
+  `deploy_api_services=true` and `deploy_pool_controller=true`, creates or
+  updates the migration job, API service, pool-controller service, and active
+  worker image promotion path from one verified promotion evidence bundle. The
+  old API/pool split remains a compatibility shape for older runbooks.
 - `gcp-image-digests.tfvars` now includes API, pool-controller, migrations, and
   worker image digest refs. The worker digest is injected into the pool
   controller as the GCE runner image; it is not copied by hand into metadata or
   Secret Manager.
 - `.github/workflows/bucephalus-gcp-deploy.yml` now exposes
-  `deployment_stage=substrate|api|pool` plus an explicit `apply` switch.
+  `deployment_stage=services|substrate|api|pool` plus an explicit `apply`
+  switch, and is reusable by the Cloud candidate workflow.
 - `.github/workflows/bucephalus-gcp-cleanup.yml` now exposes explicit
   `cleanup_target=pool-controller|control-plane-services` service teardown.
 - `scripts/deploy/bootstrap-gcp-github-oidc.sh` now reconciles the non-secret

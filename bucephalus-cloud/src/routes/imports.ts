@@ -1,12 +1,12 @@
 import { join } from "node:path";
 import { authOwnerKey, type AuthContext } from "../auth";
 import { loadConfig } from "../config";
-import { HttpError, jsonResponse, optionalString, readJsonObject, requireString } from "../http";
+import { HttpError, jsonResponse, optionalString, queryInteger, readJsonObject, requireString } from "../http";
 import { ImportJobRecord, ImportRepository, UploadRecord } from "../imports/repository";
 import { inspectSealedPackageArchive, SealedPackageInspectionError } from "../imports/sealedPackage";
 import { materializeStoredObject, putUploadObject } from "../objectStorage";
 import { PackageRepository } from "../packages/repository";
-import { sha256Digest } from "../primitives";
+import { sha256Digest, type JsonObject } from "../primitives";
 
 const DEFAULT_MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
 const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
@@ -53,12 +53,7 @@ export async function handleImportRoute(
 }
 
 function limitFromUrl(url: URL): number {
-  const raw = url.searchParams.get("limit");
-  if (!raw) {
-    return 50;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : 50;
+  return queryInteger(url, "limit", { defaultValue: 50, min: 1, max: 200 });
 }
 
 async function createUpload(request: Request, imports: ImportRepository, ownerKey?: string): Promise<Response> {
@@ -244,6 +239,9 @@ export async function importSealedPackageUpload(
   imports: ImportRepository,
   packages: PackageRepository,
   ownerKey?: string,
+  options?: {
+    packageProvenance?: JsonObject;
+  },
 ): Promise<ImportJobRecord> {
   const uploadId = requireString(body.upload_id, "/upload_id");
   const upload = await imports.getUpload(uploadId, ownerKey);
@@ -287,6 +285,7 @@ export async function importSealedPackageUpload(
         target: inspection.target,
         imageRefs: inspection.imageRefs,
         diagnostics: inspection.diagnostics,
+        packageProvenance: options?.packageProvenance ?? externalSealedPackageProvenance(),
         ownerKey,
       });
     }
@@ -304,6 +303,15 @@ export async function importSealedPackageUpload(
     throw new HttpError(500, "import_missing_after_create", "Import missing after creation");
   }
   return job;
+}
+
+export function externalSealedPackageProvenance(): JsonObject {
+  return {
+    schema_version: "cloud_package_provenance_v1",
+    status: "external_unattested",
+    source: "sealed_package_import",
+    message: "Cloud verified sealed package integrity and hosted readiness, but did not author this package.",
+  };
 }
 
 function uploadToWire(upload: UploadRecord) {

@@ -89,7 +89,8 @@ workflow downloads the `cloud-image-promotion-evidence-<target>` artifact from a
 release workflow run, verifies `cloud-image-promotion-evidence.json`, and passes
 the generated `gcp-image-digests.tfvars` as a separate Terraform var-file.
 
-The deployment sequence is intentionally staged:
+The deployment sequence is optimized around a fast development promotion and a
+single service-stage production promotion:
 
 0. Bootstrap GitHub/GCP OIDC wiring once with
    `scripts/deploy/bootstrap-gcp-github-oidc.sh --apply`. Review the dry-run
@@ -105,13 +106,36 @@ The deployment sequence is intentionally staged:
    stages should be runnable now.
 1. Run `.github/workflows/bucephalus-gcp-deploy.yml` with
    `deployment_stage=substrate` and `apply=true`.
-2. Run `.github/workflows/bucephalus-release.yml` with
-   `version_override=<version>` against the created Artifact Registry repository.
-3. Run `.github/workflows/bucephalus-gcp-deploy.yml` with
-   `deployment_stage=api` and `apply=true`; it resolves the latest promotion
-   evidence from the release workflow.
-4. After the API-created runner pool ID is configured in the GitHub Environment,
-   run the workflow with `deployment_stage=pool` and `apply=true`.
+2. For normal development, merge to `main`. After `Bucephalus Cloud CI` passes,
+   `.github/workflows/bucephalus-cloud-candidate.yml` classifies the change. A
+   runtime-only change builds and pushes the deployable x86_64 Cloud images,
+   writes promotion evidence, and deploys that exact evidence to the
+   `bucephalus-dev` GitHub Environment with `deployment_stage=services`.
+   Deploy-boundary-only changes run plan-only against the latest evidence, and
+   mixed runtime/deploy-boundary changes build images but stop at a plan against
+   that candidate evidence. Runtime changes bundled with candidate/CI policy
+   changes also stop at plan-only. Unless that environment overrides
+   `BUCEPHALUS_DEPLOYMENT_ENVIRONMENT`, the deploy workflow maps it to the
+   Terraform-safe environment label `dev`.
+3. For production-style releases, run `.github/workflows/bucephalus-release.yml`
+   with `version_override=<version>` against the created Artifact Registry
+   repository. Production promotion uses `.github/workflows/bucephalus-gcp-deploy.yml`
+   with `deployment_stage=services` and `apply=true`; the production GitHub
+   Environment should provide the single human approval gate.
+4. `deployment_stage=api` and `deployment_stage=pool` remain accepted for older
+   runbooks, but new deployments should not require separate API and pool
+   dispatches.
+
+For a separate development substrate, bootstrap with an explicit short
+deployment label, for example:
+
+```bash
+scripts/deploy/bootstrap-gcp-github-oidc.sh \
+  --project-id <project> \
+  --github-environment bucephalus-dev \
+  --environment dev \
+  --apply
+```
 
 Service cleanup is explicit. Use `.github/workflows/bucephalus-gcp-cleanup.yml`
 with `cleanup_target=pool-controller` to remove only the pool-controller, or
@@ -144,6 +168,7 @@ Terraform creates these Secret Manager containers:
 - API database URL
 - migrator database URL
 - worker token
+- runner admin token
 - Modal token ID
 - Modal token secret
 - Modal S3-compatible access key ID
@@ -158,6 +183,13 @@ startup scripts, image layers, or checked-in examples.
 Cloud Run references explicit numeric secret versions. Rotation is a controlled
 promotion: create a new Secret Manager version, update the corresponding
 Terraform input, apply, smoke, and record the result.
+
+`runner_admin_token_secret_version` is optional for compatibility. When unset,
+the API uses the worker token for runner-pool administration. When set,
+Terraform injects `BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN` into the API service
+only; the pool controller and runner VMs continue to receive only the worker
+token needed for worker registration, queue claims, package downloads, and
+attempt updates.
 
 The pool controller command JSON secrets are an interim accommodation for the
 current application interface, which accepts provider commands through

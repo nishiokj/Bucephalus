@@ -59,6 +59,9 @@ const releaseWorkflow = YAML.parse(releaseWorkflowText);
 const deployWorkflowPath = ".github/workflows/bucephalus-gcp-deploy.yml";
 const deployWorkflowText = read(deployWorkflowPath);
 const deployWorkflow = YAML.parse(deployWorkflowText);
+const candidateWorkflowPath = ".github/workflows/bucephalus-cloud-candidate.yml";
+const candidateWorkflowText = read(candidateWorkflowPath);
+const candidateWorkflow = YAML.parse(candidateWorkflowText);
 const cleanupWorkflowPath = ".github/workflows/bucephalus-gcp-cleanup.yml";
 const cleanupWorkflowText = read(cleanupWorkflowPath);
 const cleanupWorkflow = YAML.parse(cleanupWorkflowText);
@@ -70,10 +73,15 @@ const rustQualityWorkflowText = read(rustQualityWorkflowPath);
 const rustQualityWorkflow = YAML.parse(rustQualityWorkflowText);
 const cloudGatesPath = "scripts/ci/cloud-gates.sh";
 const cloudGatesText = read(cloudGatesPath);
+const candidateClassifierPath = "scripts/ci/classify-cloud-candidate-change.sh";
+const candidateClassifierText = read(candidateClassifierPath);
+const deployTfvarsWriterPath = "scripts/deploy/write-gcp-deploy-tfvars.sh";
+const deployTfvarsWriterText = read(deployTfvarsWriterPath);
 const installScriptPath = "scripts/install.sh";
 const installScriptText = read(installScriptPath);
 const cloudImageBuildPath = "scripts/release/build-cloud-images.sh";
 const cloudImageBuildText = read(cloudImageBuildPath);
+const cloudPackageJson = JSON.parse(read("bucephalus-cloud/package.json"));
 const gcpInfraPath = "bucephalus-cloud/infra/gcp/main.tf";
 const gcpInfraText = read(gcpInfraPath);
 const gcpVariablesPath = "bucephalus-cloud/infra/gcp/variables.tf";
@@ -93,6 +101,9 @@ for (const forbidden of [
   }
   if (forbidden.test(deployWorkflowText)) {
     fail(`${deployWorkflowPath} contains retired deployment surface matching ${forbidden}`);
+  }
+  if (forbidden.test(candidateWorkflowText)) {
+    fail(`${candidateWorkflowPath} contains retired deployment surface matching ${forbidden}`);
   }
 }
 
@@ -191,13 +202,22 @@ if (!deployWorkflowText.includes("actions/download-artifact@v4")) {
 }
 const deployWorkflowInputs = deployWorkflow.on?.workflow_dispatch?.inputs ?? {};
 const deployStageInput = deployWorkflowInputs.deployment_stage;
-if (deployStageInput?.type !== "choice" || deployStageInput?.default !== "substrate") {
-  fail(`${deployWorkflowPath} must expose a substrate/api/pool deployment_stage dropdown`);
+if (deployStageInput?.type !== "choice" || deployStageInput?.default !== "services") {
+  fail(`${deployWorkflowPath} must expose a services-first deployment_stage dropdown`);
 }
-for (const stage of ["substrate", "api", "pool"]) {
+for (const stage of ["services", "substrate", "api", "pool"]) {
   if (!Array.isArray(deployStageInput?.options) || !deployStageInput.options.includes(stage)) {
     fail(`${deployWorkflowPath} deployment_stage dropdown must include ${stage}`);
   }
+}
+if (deployWorkflowInputs.github_environment?.default !== "bucephalus-dev") {
+  fail(`${deployWorkflowPath} must default manual service deploys to the unprotected bucephalus-dev environment`);
+}
+if (!Array.isArray(deployWorkflowInputs.github_environment?.options) || !deployWorkflowInputs.github_environment.options.includes("bucephalus-dev") || !deployWorkflowInputs.github_environment.options.includes("bucephalus")) {
+  fail(`${deployWorkflowPath} must expose both bucephalus-dev and bucephalus deployment environments`);
+}
+if (!deployWorkflowText.includes("inputs.github_environment == 'bucephalus-dev' && 'dev'")) {
+  fail(`${deployWorkflowPath} must map the bucephalus-dev GitHub Environment to the Terraform-safe dev environment by default`);
 }
 if (deployWorkflowInputs.apply?.type !== "boolean" || deployWorkflowInputs.apply?.default !== false) {
   fail(`${deployWorkflowPath} must expose an explicit boolean apply switch that defaults to plan-only`);
@@ -207,6 +227,18 @@ if (deployWorkflow.on?.workflow_dispatch?.inputs?.release_version?.type !== "str
 }
 if (deployWorkflowInputs.release_artifact) {
   fail(`${deployWorkflowPath} must not ask operators to choose a promotion artifact flavor`);
+}
+const deployWorkflowCallInputs = deployWorkflow.on?.workflow_call?.inputs ?? {};
+for (const callInput of ["promotion_run_id", "promotion_artifact_name", "checkout_ref"]) {
+  if (deployWorkflowInputs[callInput]) {
+    fail(`${deployWorkflowPath} must not expose ${callInput} as a manual workflow_dispatch input`);
+  }
+  if (!deployWorkflowCallInputs[callInput] || deployWorkflowCallInputs[callInput].type !== "string") {
+    fail(`${deployWorkflowPath} must accept ${callInput} only through workflow_call automation`);
+  }
+}
+if (deployWorkflowCallInputs.deployment_stage?.default !== "services" || deployWorkflowCallInputs.github_environment?.default !== "bucephalus-dev") {
+  fail(`${deployWorkflowPath} workflow_call defaults must target services in bucephalus-dev`);
 }
 for (const inputName of Object.keys(deployWorkflowInputs)) {
   if (/archive.*(url|sha|checksum)|artifact.*(url|sha|checksum)|sha256/i.test(inputName)) {
@@ -248,6 +280,7 @@ for (const inputName of [
   "api_database_url_secret_version",
   "migrator_database_url_secret_version",
   "worker_token_secret_version",
+  "runner_admin_token_secret_version",
   "pool_controller_provision_cmd_json_secret_version",
   "pool_controller_reap_cmd_json_secret_version",
   "api_ingress",
@@ -267,6 +300,7 @@ for (const requiredEnv of [
   "BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION",
   "BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION",
   "BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION",
+  "BUCEPHALUS_RUNNER_ADMIN_TOKEN_SECRET_VERSION",
 ]) {
   if (!deployWorkflowText.includes(requiredEnv)) {
     fail(`${deployWorkflowPath} must read ${requiredEnv} from GitHub environment configuration`);
@@ -303,11 +337,40 @@ if (deployWorkflowText.includes("terraform_action") || deployWorkflowText.includ
 if (!deployWorkflowText.includes("BUCEPHALUS_WORKER_SMOKE")) {
   fail(`${deployWorkflowPath} must require a worker smoke identity after apply`);
 }
+if (
+  !deployWorkflowText.includes("resolve_optional_secret_version BUCEPHALUS_RUNNER_ADMIN_TOKEN_SECRET_VERSION")
+  || !deployWorkflowText.includes("${name_prefix}-runner-admin-token")
+  || !deployWorkflowText.includes("--runner-admin-token-secret-version")
+  || !deployWorkflowText.includes("has no enabled versions; API will use the worker token as the runner-admin compatibility credential")
+) {
+  fail(`${deployWorkflowPath} must carry the optional runner-admin token Secret Manager version into deploy tfvars`);
+}
+for (const required of [
+  "RUNNER_ADMIN_TOKEN_SECRET_VERSION",
+  "--runner-admin-token-secret-version",
+  "runner_admin_token_secret_version: optional(process.env.RUNNER_ADMIN_TOKEN_SECRET_VERSION)",
+  "runner_admin_token_secret_version is invalid for deploy tfvars",
+  "\"runner_admin_token_secret_version\"",
+]) {
+  if (!deployTfvarsWriterText.includes(required)) {
+    fail(`${deployTfvarsWriterPath} must validate and emit optional runner-admin token secret versions: ${required}`);
+  }
+}
+if (
+  !deployWorkflowText.includes("BUCEPHALUS_RUNNER_ADMIN_SMOKE")
+  || !deployWorkflowText.includes("runner_admin_smoke=\"${BUCEPHALUS_RUNNER_ADMIN_SMOKE:-${BUCEPHALUS_WORKER_SMOKE}}\"")
+  || !deployWorkflowText.includes("set BUCEPHALUS_RUNNER_ADMIN_SMOKE when BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN is configured")
+) {
+  fail(`${deployWorkflowPath} must use a runner admin smoke credential for runner-pool admin route checks`);
+}
 if (!deployWorkflowText.includes("BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN") || !deployWorkflowText.includes("skipping user-route smoke check")) {
   fail(`${deployWorkflowPath} must support optional user smoke identity after apply`);
 }
 if (!deployWorkflowText.includes("/v1/packages") || !deployWorkflowText.includes("/v1/runner-pools")) {
   fail(`${deployWorkflowPath} must smoke both user and worker API authentication paths`);
+}
+if (!deployWorkflowText.includes("expected_git_sha") || !deployWorkflowText.includes("deployed_git_sha") || !deployWorkflowText.includes("candidate skew")) {
+  fail(`${deployWorkflowPath} must verify deployed /readyz git_sha against the promoted image manifest`);
 }
 
 const cleanupWorkflowInputs = cleanupWorkflow.on?.workflow_dispatch?.inputs ?? {};
@@ -347,9 +410,14 @@ if (deployPermissions.contents !== "read" || deployPermissions.actions !== "read
 }
 const releaseJobs = releaseWorkflow.jobs ?? {};
 const deployJobs = deployWorkflow.jobs ?? {};
+const candidateJobs = candidateWorkflow.jobs ?? {};
 const cleanupJobs = cleanupWorkflow.jobs ?? {};
 function artifactUploadSteps(job) {
   return (job?.steps ?? []).filter((step) => step.uses === "actions/upload-artifact@v4");
+}
+function jobNeeds(job) {
+  const needs = job?.needs;
+  return Array.isArray(needs) ? needs : [needs].filter(Boolean);
 }
 
 const deployGcp = deployJobs["deploy-gcp"];
@@ -397,6 +465,275 @@ if (!deployGcp) {
   const gcloudIf = String(gcloudDeployStep?.if ?? "");
   if (!gcloudIf.includes("inputs.deployment_stage != 'substrate'")) {
     fail(`${deployWorkflowPath} must install gcloud for API and pool secret-version discovery`);
+  }
+}
+
+const candidatePermissions = candidateWorkflow.permissions ?? {};
+if (candidatePermissions.contents !== "read" || candidatePermissions.actions !== "read" || candidatePermissions["id-token"] !== "none") {
+  fail(`${candidateWorkflowPath} top-level permissions must default to contents/actions read and id-token: none`);
+}
+const candidateWorkflowRun = candidateWorkflow.on?.workflow_run ?? {};
+const candidateWorkflowRunWorkflows = candidateWorkflowRun.workflows ?? [];
+if (!Array.isArray(candidateWorkflowRunWorkflows) || !candidateWorkflowRunWorkflows.includes("Bucephalus Cloud CI")) {
+  fail(`${candidateWorkflowPath} must build candidates only after Bucephalus Cloud CI completes on main`);
+}
+if (!Array.isArray(candidateWorkflowRun.types) || !candidateWorkflowRun.types.includes("completed")) {
+  fail(`${candidateWorkflowPath} workflow_run trigger must wait for completed Cloud CI runs`);
+}
+if (!Array.isArray(candidateWorkflowRun.branches) || !candidateWorkflowRun.branches.includes("main")) {
+  fail(`${candidateWorkflowPath} workflow_run trigger must be scoped to main`);
+}
+const candidateDispatchInputs = candidateWorkflow.on?.workflow_dispatch?.inputs ?? {};
+if (candidateDispatchInputs.github_environment?.default !== "bucephalus-dev") {
+  fail(`${candidateWorkflowPath} manual candidate dispatch must default to bucephalus-dev`);
+}
+if (candidateDispatchInputs.github_environment?.options?.some((option) => option !== "bucephalus-dev")) {
+  fail(`${candidateWorkflowPath} manual candidate dispatch must not target production environments`);
+}
+if (candidateDispatchInputs.deploy?.type !== "boolean" || candidateDispatchInputs.deploy?.default !== true) {
+  fail(`${candidateWorkflowPath} manual candidate dispatch must expose a boolean deploy toggle defaulting to true`);
+}
+if (candidateDispatchInputs.apply?.type !== "boolean" || candidateDispatchInputs.apply?.default !== true) {
+  fail(`${candidateWorkflowPath} manual candidate dispatch must expose a boolean apply toggle defaulting to true for dev ergonomics`);
+}
+if (/docker\s+(?:push|login)\b/.test(candidateWorkflowText)) {
+  fail(`${candidateWorkflowPath} must not call docker push/login directly; use release scripts and Artifact Registry auth helper`);
+}
+if (!candidateWorkflowText.includes(candidateClassifierPath)) {
+  fail(`${candidateWorkflowPath} must classify changed paths before deciding whether to build, plan, or deploy`);
+}
+for (const required of [
+  "build_candidate=\"true\"",
+  "auto_deploy=\"true\"",
+  "plan_services=\"true\"",
+  "mixed-runtime-infra",
+  "mixed-runtime-pipeline",
+  "infra-pipeline",
+  "Unknown files are treated as runtime-affecting",
+  "bucephalus-cloud/deploy/*.md|bucephalus-cloud/infra/gcp/*.md|bucephalus-cloud/infra/gcp/environments/*.example",
+  "bucephalus-cloud/infra/gcp/*|scripts/deploy/*|.github/workflows/bucephalus-gcp-deploy.yml|.github/workflows/bucephalus-gcp-cleanup.yml",
+  ".github/workflows/*|scripts/ci/*",
+]) {
+  if (!candidateClassifierText.includes(required)) {
+    fail(`${candidateClassifierPath} must encode the Cloud candidate change-classification policy: ${required}`);
+  }
+}
+
+const candidateClassify = candidateJobs["classify"];
+if (!candidateClassify) {
+  fail(`${candidateWorkflowPath} must classify changes before build/deploy jobs`);
+} else {
+  const classifyIf = String(candidateClassify.if ?? "");
+  if (!classifyIf.includes("workflow_dispatch") || !classifyIf.includes("github.event.workflow_run.conclusion == 'success'")) {
+    fail(`${candidateWorkflowPath} classify job must run only for manual dispatches or successful Cloud CI workflow_run events`);
+  }
+  const classifyOutputs = candidateClassify.outputs ?? {};
+  for (const outputName of ["candidate_sha", "base_sha", "change_class", "build_candidate", "auto_deploy", "plan_services"]) {
+    if (!classifyOutputs[outputName]) {
+      fail(`${candidateWorkflowPath} classify job must expose ${outputName}`);
+    }
+  }
+  const steps = candidateClassify.steps ?? [];
+  const stepNames = steps.map((step) => step.name).filter(Boolean);
+  for (const required of ["Download triggering Cloud CI source metadata", "Resolve candidate source", "Classify changed paths", "Record classification summary"]) {
+    if (!stepNames.includes(required)) {
+      fail(`${candidateWorkflowPath} classify job missing step: ${required}`);
+    }
+  }
+  const downloadSourceStep = steps.find((step) => step.name === "Download triggering Cloud CI source metadata");
+  if (
+    downloadSourceStep?.uses !== "actions/download-artifact@v4"
+    || downloadSourceStep?.with?.name !== "cloud-candidate-source"
+    || downloadSourceStep?.with?.["run-id"] !== "${{ github.event.workflow_run.id }}"
+    || downloadSourceStep?.with?.["github-token"] !== "${{ github.token }}"
+    || !String(downloadSourceStep?.if ?? "").includes("github.event_name == 'workflow_run'")
+  ) {
+    fail(`${candidateWorkflowPath} classify job must download the exact source metadata artifact from the triggering Cloud CI run`);
+  }
+  const sourceStep = steps.find((step) => step.name === "Resolve candidate source");
+  const sourceRun = String(sourceStep?.run ?? "");
+  if (
+    !sourceRun.includes("cloud-candidate-source.txt")
+    || !sourceRun.includes("refusing to guess a diff range")
+    || !sourceRun.includes("candidate source artifact SHA")
+    || sourceRun.includes("base_sha=\"${candidate_sha}^\"")
+  ) {
+    fail(`${candidateWorkflowPath} classify job must resolve base/head from the triggering Cloud CI source artifact and must not guess candidate_sha^`);
+  }
+  const checkoutStep = steps.find((step) => step.uses === "actions/checkout@v4");
+  if (!String(checkoutStep?.with?.ref ?? "").includes("steps.source.outputs.candidate_sha") || checkoutStep?.with?.["fetch-depth"] !== 0) {
+    fail(`${candidateWorkflowPath} classify job must check out full history at the exact candidate SHA`);
+  }
+  const classifyStep = steps.find((step) => step.name === "Classify changed paths");
+  const classifyRun = String(classifyStep?.run ?? "");
+  if (!classifyRun.includes(candidateClassifierPath) || !classifyRun.includes("--head") || !classifyRun.includes("--base") || !classifyRun.includes("--github-output")) {
+    fail(`${candidateWorkflowPath} classify job must run ${candidateClassifierPath} with explicit base/head outputs`);
+  }
+}
+
+const candidateBuild = candidateJobs["build-cloud-candidate"];
+if (!candidateBuild) {
+  fail(`${candidateWorkflowPath} must contain build-cloud-candidate job`);
+} else {
+  if (candidateBuild.permissions?.contents !== "read" || candidateBuild.permissions?.actions !== "read" || candidateBuild.permissions?.["id-token"] !== "write") {
+    fail(`${candidateWorkflowPath} build-cloud-candidate must receive contents/actions read and OIDC token write permissions`);
+  }
+  if (!jobNeeds(candidateBuild).includes("classify")) {
+    fail(`${candidateWorkflowPath} build-cloud-candidate must depend on the classifier`);
+  }
+  if (!String(candidateBuild.if ?? "").includes("needs.classify.outputs.build_candidate == 'true'")) {
+    fail(`${candidateWorkflowPath} build-cloud-candidate must run only when the classifier requests a candidate image rebuild`);
+  }
+  const steps = candidateBuild.steps ?? [];
+  const stepNames = steps.map((step) => step.name).filter(Boolean);
+  if (stepNames.includes("Restore worker runner binary cache") || stepNames.includes("Resolve Rust compiler cache key")) {
+    fail(`${candidateWorkflowPath} build-cloud-candidate must not carry unused binary cache steps that do not skip work`);
+  }
+  for (const required of [
+    "Resolve candidate source",
+    "Resolve version",
+    "Build Rust release binaries for Cloud candidate",
+    "Build deployable Cloud release bundle",
+    "Verify deployable Cloud release bundle",
+    "Write release provenance",
+    "Resolve GCP CI/CD auth secret for image publication",
+    "Validate image build inputs",
+    "Authenticate to Google Cloud for image publication",
+    "Set up gcloud for image publication",
+    "Configure Artifact Registry Docker auth",
+    "Set up Docker Buildx for image cache",
+    "Build and inspect Cloud images",
+    "Write image build provenance",
+    "Write GCP image tfvars",
+    "Verify GCP image promotion evidence",
+    "Write Cloud image promotion evidence index",
+    "Verify Cloud image promotion evidence index",
+    "Upload Cloud candidate promotion evidence",
+  ]) {
+    if (!stepNames.includes(required)) {
+      fail(`${candidateWorkflowPath} build-cloud-candidate missing step: ${required}`);
+    }
+  }
+  const sourceStep = steps.find((step) => step.name === "Resolve candidate source");
+  if (!String(sourceStep?.run ?? "").includes("needs.classify.outputs.candidate_sha")) {
+    fail(`${candidateWorkflowPath} build-cloud-candidate must source candidate_sha from the classifier output`);
+  }
+  const checkoutStep = steps.find((step) => step.uses === "actions/checkout@v4");
+  if (!String(checkoutStep?.with?.ref ?? "").includes("steps.source.outputs.candidate_sha")) {
+    fail(`${candidateWorkflowPath} must check out the exact candidate SHA from the triggering Cloud CI run`);
+  }
+  const buildBundleStep = steps.find((step) => step.name === "Build deployable Cloud release bundle");
+  if (!String(buildBundleStep?.run ?? "").includes("build-buc-release.sh") || !String(buildBundleStep?.run ?? "").includes("--core-bin") || !String(buildBundleStep?.run ?? "").includes("--worker-runner-bin")) {
+    fail(`${candidateWorkflowPath} must assemble the deployable bundle from prebuilt Rust candidate binaries`);
+  }
+  if (buildBundleStep?.env?.BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS !== "true") {
+    fail(`${candidateWorkflowPath} candidate bundle build must trust the triggering Cloud CI gates instead of rerunning them`);
+  }
+  const imageBuildStep = steps.find((step) => step.name === "Build and inspect Cloud images");
+  if (!String(imageBuildStep?.run ?? "").includes("build-cloud-images.sh") || !String(imageBuildStep?.run ?? "").includes("--push")) {
+    fail(`${candidateWorkflowPath} must push deployable images through build-cloud-images.sh`);
+  }
+  const authStep = steps.find((step) => step.name === "Authenticate to Google Cloud for image publication");
+  if (authStep?.uses !== "google-github-actions/auth@v3" || authStep?.with?.workload_identity_provider !== "${{ steps.gcp_publish_auth.outputs.workload_identity_provider }}" || authStep?.with?.service_account !== "${{ steps.gcp_publish_auth.outputs.service_account }}") {
+    fail(`${candidateWorkflowPath} image publication must use resolved Google Workload Identity credentials`);
+  }
+  const dockerAuthStep = steps.find((step) => step.name === "Configure Artifact Registry Docker auth");
+  if (!String(dockerAuthStep?.run ?? "").includes("configure-gcp-artifact-registry-auth.sh")) {
+    fail(`${candidateWorkflowPath} must configure Artifact Registry Docker auth through the checked helper script`);
+  }
+  const uploadStep = steps.find((step) => step.name === "Upload Cloud candidate promotion evidence");
+  if (!String(uploadStep?.with?.name ?? "").includes("steps.candidate.outputs.promotion_artifact_name")) {
+    fail(`${candidateWorkflowPath} candidate promotion evidence artifact must be named from version plus git SHA`);
+  }
+  if (uploadStep?.with?.["if-no-files-found"] !== "error" || uploadStep?.with?.["retention-days"] !== 30) {
+    fail(`${candidateWorkflowPath} candidate promotion evidence upload must fail on missing files and retain handoff evidence for 30 days`);
+  }
+  const uploadPaths = String(uploadStep?.with?.path ?? "");
+  for (const requiredPath of [
+    "cloud-image-build-manifest.json",
+    "cloud-image-build.provenance.json",
+    "gcp-image-digests.tfvars",
+    "cloud-image-promotion-evidence.json",
+  ]) {
+    if (!uploadPaths.includes(requiredPath)) {
+      fail(`${candidateWorkflowPath} candidate promotion evidence upload is missing ${requiredPath}`);
+    }
+  }
+}
+const candidateDeploy = candidateJobs["deploy-dev"];
+if (!candidateDeploy) {
+  fail(`${candidateWorkflowPath} must contain deploy-dev reusable deploy job`);
+} else {
+  const deployNeeds = jobNeeds(candidateDeploy);
+  if (!deployNeeds.includes("classify") || !deployNeeds.includes("build-cloud-candidate")) {
+    fail(`${candidateWorkflowPath} deploy-dev must depend on classify and build-cloud-candidate`);
+  }
+  const deployIf = String(candidateDeploy.if ?? "");
+  if (!deployIf.includes("needs.classify.outputs.auto_deploy == 'true'") || !deployIf.includes("inputs.deploy") || !deployIf.includes("workflow_run")) {
+    fail(`${candidateWorkflowPath} deploy-dev must auto-apply only for classifier-approved runtime changes or explicit manual dispatch`);
+  }
+  if (candidateDeploy.uses !== "./.github/workflows/bucephalus-gcp-deploy.yml") {
+    fail(`${candidateWorkflowPath} deploy-dev must call the canonical GCP deploy workflow`);
+  }
+  if (candidateDeploy.with?.deployment_stage !== "services") {
+    fail(`${candidateWorkflowPath} deploy-dev must use the combined services deployment stage`);
+  }
+  if (!String(candidateDeploy.with?.apply ?? "").includes("github.event_name == 'workflow_run' || inputs.apply")) {
+    fail(`${candidateWorkflowPath} deploy-dev must apply automatically for workflow_run dev candidates and obey the manual apply toggle for dispatches`);
+  }
+  if (!String(candidateDeploy.with?.github_environment ?? "").includes("bucephalus-dev")) {
+    fail(`${candidateWorkflowPath} deploy-dev must default to bucephalus-dev`);
+  }
+  if (candidateDeploy.with?.promotion_run_id !== "${{ github.run_id }}" || !String(candidateDeploy.with?.promotion_artifact_name ?? "").includes("needs.build-cloud-candidate.outputs.promotion_artifact_name")) {
+    fail(`${candidateWorkflowPath} deploy-dev must pass exact same-run promotion evidence to the deploy workflow`);
+  }
+  if (!String(candidateDeploy.with?.checkout_ref ?? "").includes("needs.build-cloud-candidate.outputs.candidate_sha")) {
+    fail(`${candidateWorkflowPath} deploy-dev must run deploy scripts from the candidate SHA`);
+  }
+}
+
+const planCandidateDev = candidateJobs["plan-candidate-dev"];
+if (!planCandidateDev) {
+  fail(`${candidateWorkflowPath} must contain plan-candidate-dev for mixed runtime+deploy-boundary changes`);
+} else {
+  const planNeeds = jobNeeds(planCandidateDev);
+  if (!planNeeds.includes("classify") || !planNeeds.includes("build-cloud-candidate")) {
+    fail(`${candidateWorkflowPath} plan-candidate-dev must depend on classify and build-cloud-candidate`);
+  }
+  const planIf = String(planCandidateDev.if ?? "");
+  if (!planIf.includes("needs.classify.outputs.plan_services == 'true'") || !planIf.includes("needs.classify.outputs.build_candidate == 'true'")) {
+    fail(`${candidateWorkflowPath} plan-candidate-dev must run only for classifier-approved mixed runtime/deploy-boundary changes`);
+  }
+  if (planCandidateDev.uses !== "./.github/workflows/bucephalus-gcp-deploy.yml" || planCandidateDev.with?.deployment_stage !== "services" || planCandidateDev.with?.apply !== false) {
+    fail(`${candidateWorkflowPath} plan-candidate-dev must call the canonical services deploy workflow in plan-only mode`);
+  }
+  if (planCandidateDev.with?.promotion_run_id !== "${{ github.run_id }}" || !String(planCandidateDev.with?.promotion_artifact_name ?? "").includes("needs.build-cloud-candidate.outputs.promotion_artifact_name")) {
+    fail(`${candidateWorkflowPath} plan-candidate-dev must plan against same-run candidate promotion evidence`);
+  }
+  if (!String(planCandidateDev.with?.checkout_ref ?? "").includes("needs.build-cloud-candidate.outputs.candidate_sha")) {
+    fail(`${candidateWorkflowPath} plan-candidate-dev must run deploy scripts from the candidate SHA`);
+  }
+}
+
+const planExistingDev = candidateJobs["plan-existing-dev"];
+if (!planExistingDev) {
+  fail(`${candidateWorkflowPath} must contain plan-existing-dev for deploy-boundary-only changes`);
+} else {
+  if (!jobNeeds(planExistingDev).includes("classify")) {
+    fail(`${candidateWorkflowPath} plan-existing-dev must depend on classify`);
+  }
+  const planIf = String(planExistingDev.if ?? "");
+  if (!planIf.includes("needs.classify.outputs.plan_services == 'true'") || !planIf.includes("needs.classify.outputs.build_candidate != 'true'")) {
+    fail(`${candidateWorkflowPath} plan-existing-dev must run only for classifier-approved deploy-boundary-only changes`);
+  }
+  if (planExistingDev.uses !== "./.github/workflows/bucephalus-gcp-deploy.yml" || planExistingDev.with?.deployment_stage !== "services" || planExistingDev.with?.apply !== false) {
+    fail(`${candidateWorkflowPath} plan-existing-dev must call the canonical services deploy workflow in plan-only mode`);
+  }
+  if (planExistingDev.with?.promotion_run_id || planExistingDev.with?.promotion_artifact_name) {
+    fail(`${candidateWorkflowPath} plan-existing-dev must use latest promotion evidence instead of pretending deploy-boundary-only changes rebuilt images`);
+  }
+  if (!String(planExistingDev.with?.checkout_ref ?? "").includes("needs.classify.outputs.candidate_sha")) {
+    fail(`${candidateWorkflowPath} plan-existing-dev must run deploy scripts from the classified candidate SHA`);
   }
 }
 
@@ -728,6 +1065,64 @@ if (/docker\s+(?:push|login)\b/.test(deployWorkflowText)) {
 if (!cloudGatesText.includes("scripts/release/verify-cloud-signing-policy.sh")) {
   fail(`${cloudGatesPath} must run the Path 2 signing policy verifier`);
 }
+if (!cloudGatesText.includes("== Hosted product CLI Rust tests ==") || !cloudGatesText.includes("--bin buc")) {
+  fail(`${cloudGatesPath} must run hosted product CLI Rust tests before broad workspace tests`);
+}
+if (!cloudGatesText.includes("scripts/ci/smoke-hosted-authoring-real-core.sh")) {
+  fail(`${cloudGatesPath} must run the real-Core hosted authoring smoke`);
+}
+if (!cloudGatesText.includes("scripts/ci/smoke-buc-hosted-workflow.sh")) {
+  fail(`${cloudGatesPath} must run the hosted buc workflow HTTP smoke`);
+}
+const cloudPackageScripts = cloudPackageJson.scripts ?? {};
+if (cloudPackageScripts["test:smoke:real-core"] !== "../scripts/ci/smoke-hosted-authoring-real-core.sh") {
+  fail("bucephalus-cloud/package.json must expose test:smoke:real-core for the hosted real-Core smoke");
+}
+if (cloudPackageScripts["test:smoke:hosted-workflow"] !== "../scripts/ci/smoke-buc-hosted-workflow.sh") {
+  fail("bucephalus-cloud/package.json must expose test:smoke:hosted-workflow for the DB-backed hosted buc workflow smoke");
+}
+if (!read("scripts/ci/smoke-buc-hosted-workflow.sh").includes("bun run check:postgres")) {
+  fail("scripts/ci/smoke-buc-hosted-workflow.sh must preflight Postgres readiness before building/running the hosted workflow smoke");
+}
+const hostedWorkflowSmokeTest = read("bucephalus-cloud/tests/bucHostedWorkflowSmoke.test.ts");
+for (const requiredFragment of [
+  "\"build\"",
+  "--context-root",
+  "hosted_authoring_build",
+  "/authoring_build/source_upload_id",
+  "/build_environment/source/upload_id",
+  "/build_environment/source/entrypoint",
+  ".env leaked into hosted context",
+  ".npmrc leaked into hosted context",
+  ".ssh leaked into hosted context",
+  ".aws leaked into hosted context",
+  "node_modules leaked into hosted context",
+  "target leaked into hosted context",
+  "DATABASE_URL leaked into hosted Core",
+  "worker token leaked into hosted Core",
+]) {
+  if (!hostedWorkflowSmokeTest.includes(requiredFragment)) {
+    fail(`bucephalus-cloud/tests/bucHostedWorkflowSmoke.test.ts must keep the DB-backed smoke on the hosted authoring build path and assert ${requiredFragment}`);
+  }
+}
+if (!cloudGatesText.includes("== Cloud Postgres readiness ==") || !cloudGatesText.includes("bun run check:postgres")) {
+  fail(`${cloudGatesPath} must preflight Postgres readiness before DB-backed migration and hosted workflow tests`);
+}
+if (!cloudGatesText.includes("run_with_timeout \"Rust workspace tests\" cargo test --workspace")) {
+  fail(`${cloudGatesPath} must bound the broad Rust workspace tests so Cloud gates cannot hang indefinitely on local Docker state`);
+}
+if (!cloudGatesText.includes("DATABASE_URL is required for Cloud migration integration tests in CI")) {
+  fail(`${cloudGatesPath} must fail in CI when DATABASE_URL is absent so migration tests are not silently skipped`);
+}
+for (const userDocPath of [
+  "README.md",
+  "docs/user/cloud-cli.md",
+  "docs/user/cloud-authoring-api.md",
+]) {
+  if (read(userDocPath).includes("provider://ref")) {
+    fail(`${userDocPath} must not document fake provider://ref placeholders; use hosted bucephalus:// refs or concrete provider schemes`);
+  }
+}
 
 if (!cloudImageBuildText.includes("prepare_image_context")) {
   fail(`${cloudImageBuildPath} must build from generated per-component image contexts`);
@@ -786,7 +1181,7 @@ for (const dockerfilePath of listFiles("bucephalus-cloud/images").filter((file) 
   }
 }
 const componentRuntimeEntries = new Map([
-  ["bucephalus-cloud/images/Dockerfile.api", ["runtime-dist/server.js"]],
+  ["bucephalus-cloud/images/Dockerfile.api", ["runtime-dist/server.js", "bin/bucephalus"]],
   ["bucephalus-cloud/images/Dockerfile.migrations", ["runtime-dist/db/migrate.js", "runtime-dist/db/promoteWorkerImage.js"]],
   ["bucephalus-cloud/images/Dockerfile.pool-controller", ["runtime-dist/poolController.js"]],
   ["bucephalus-cloud/images/Dockerfile.worker", ["runtime-dist/worker.js", "runtime-dist/secretResolver.js", "runtime-dist/networkPolicyClient.js", "bin/bucephalus"]],
@@ -838,6 +1233,8 @@ for (const eventName of ["pull_request", "push"]) {
     "bucephalus-cloud/infra/gcp/**",
     "scripts/install.sh",
     "scripts/ci/verify-cloud-release-boundary.sh",
+    "scripts/ci/smoke-buc-hosted-workflow.sh",
+    "scripts/ci/smoke-hosted-authoring-real-core.sh",
     "scripts/deploy/**",
     "scripts/release/configure-gcp-artifact-registry-auth.sh",
     "scripts/release/verify-cloud-image-promotion-evidence-index.sh",
@@ -871,6 +1268,45 @@ for (const requiredPackageCommand of [
 }
 
 const cloudCiJobs = cloudCiWorkflow.jobs ?? {};
+const cloudCandidateSourceJob = cloudCiJobs["cloud-candidate-source"];
+if (!cloudCandidateSourceJob) {
+  fail(`${cloudCiWorkflowPath} must contain cloud-candidate-source job for exact candidate diff metadata`);
+} else {
+  if (cloudCandidateSourceJob.permissions?.contents !== "read") {
+    fail(`${cloudCiWorkflowPath} cloud-candidate-source must need only contents: read`);
+  }
+  const steps = cloudCandidateSourceJob.steps ?? [];
+  const stepNames = steps.map((step) => step.name).filter(Boolean);
+  for (const required of ["Write Cloud candidate source metadata", "Upload Cloud candidate source metadata"]) {
+    if (!stepNames.includes(required)) {
+      fail(`${cloudCiWorkflowPath} cloud-candidate-source missing step: ${required}`);
+    }
+  }
+  const writeStep = steps.find((step) => step.name === "Write Cloud candidate source metadata");
+  const writeRun = String(writeStep?.run ?? "");
+  for (const required of [
+    "PUSH_BEFORE_SHA",
+    "PR_BASE_SHA",
+    "cloud-candidate-source.txt",
+    "base_sha=${base_sha}",
+    "candidate_sha=${candidate_sha}",
+  ]) {
+    if (!writeRun.includes(required) && !Object.values(writeStep?.env ?? {}).some((value) => String(value).includes(required))) {
+      fail(`${cloudCiWorkflowPath} cloud-candidate-source must write ${required}`);
+    }
+  }
+  const uploadStep = steps.find((step) => step.name === "Upload Cloud candidate source metadata");
+  if (
+    uploadStep?.uses !== "actions/upload-artifact@v4"
+    || uploadStep?.with?.name !== "cloud-candidate-source"
+    || !String(uploadStep?.with?.path ?? "").includes("cloud-candidate-source.txt")
+    || uploadStep?.with?.["if-no-files-found"] !== "error"
+    || uploadStep?.with?.["retention-days"] !== 7
+  ) {
+    fail(`${cloudCiWorkflowPath} cloud-candidate-source must upload exact source metadata as a short-lived artifact`);
+  }
+}
+
 const releaseBoundaryPolicyJob = cloudCiJobs["release-boundary-policy"];
 if (!releaseBoundaryPolicyJob) {
   fail(`${cloudCiWorkflowPath} must contain release-boundary-policy job`);
@@ -886,8 +1322,42 @@ if (!releaseBoundaryPolicyJob) {
   }
 }
 
+const cloudGatesJob = cloudCiJobs["cloud-gates"];
+if (!cloudGatesJob) {
+  fail(`${cloudCiWorkflowPath} must contain cloud-gates job`);
+} else {
+  const postgresService = cloudGatesJob.services?.postgres;
+  if (!postgresService) {
+    fail(`${cloudCiWorkflowPath} cloud-gates job must provide a postgres service for migration integration tests`);
+  } else {
+    if (postgresService.image !== "pgvector/pgvector:pg16") {
+      fail(`${cloudCiWorkflowPath} cloud-gates postgres service must use pgvector/pgvector:pg16`);
+    }
+    const ports = postgresService.ports ?? [];
+    if (!ports.includes("55432:5432")) {
+      fail(`${cloudCiWorkflowPath} cloud-gates postgres service must expose 55432:5432 for DATABASE_URL`);
+    }
+    if (!String(postgresService.options ?? "").includes("pg_isready")) {
+      fail(`${cloudCiWorkflowPath} cloud-gates postgres service must have a pg_isready health check`);
+    }
+  }
+  const databaseUrl = cloudGatesJob.env?.DATABASE_URL ?? "";
+  if (databaseUrl !== "postgres://bucephalus:bucephalus_dev@127.0.0.1:55432/bucephalus_cloud") {
+    fail(`${cloudCiWorkflowPath} cloud-gates job must set DATABASE_URL so migration tests cannot be skipped in CI`);
+  }
+  const cloudGateCommands = (cloudGatesJob.steps ?? [])
+    .map((step) => String(step.run ?? ""))
+    .join("\n");
+  if (!cloudGateCommands.includes("scripts/ci/cloud-gates.sh")) {
+    fail(`${cloudCiWorkflowPath} cloud-gates job must run scripts/ci/cloud-gates.sh`);
+  }
+}
+
 for (const script of [
   "scripts/ci/cloud-gates.sh",
+  "scripts/ci/classify-cloud-candidate-change.sh",
+  "scripts/ci/smoke-buc-hosted-workflow.sh",
+  "scripts/ci/smoke-hosted-authoring-real-core.sh",
   "scripts/ci/verify-cloud-release-boundary.sh",
   ...listFiles("scripts/deploy").filter((file) => file.endsWith(".sh")),
   ...listFiles("scripts/release").filter((file) => file.endsWith(".sh")),
@@ -1137,6 +1607,12 @@ for (const script of [
   if (/image_id must be a sha256 image id/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must require Docker sha256 image IDs`);
   }
+  if (/release\.platform must match the platform derived from release\.target/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must require target-derived image platform evidence`);
+  }
+  if (/\.platform must match release\.platform/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must require each image platform to match the release platform`);
+  }
   if (/metadata_file must be/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must reject local filesystem paths in image metadata evidence`);
   }
@@ -1164,11 +1640,14 @@ for (const script of [
   if (/build_context\.files must match file_count/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must verify per-component build context file inventories`);
   }
-  if (/must not include the Rust core binary/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
-    fail(`${script} must keep the Rust core binary out of non-worker images`);
+  if (/build_context is required/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must require per-component build context inventories`);
   }
-  if (/must not include the full Rust CLI binary/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
-    fail(`${script} must keep the full Rust CLI binary out of worker image contexts`);
+  if (/bin\/bucephalus-modal-launcher/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must require the worker image context to include the Modal launcher`);
+  }
+  if (/API includes it for hosted authoring builds/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must allow the API image, and only the API image, to carry the Rust core binary for hosted authoring builds`);
   }
   if (/image_size_bytes must be absent, null, or a positive integer/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must validate image size evidence`);
@@ -1412,6 +1891,162 @@ for (const dockerfile of listFiles("bucephalus-cloud/images")) {
   }
 }
 
+const experimentRouteText = read("bucephalus-cloud/src/routes/experiments.ts");
+const hostedCliText = read("rust/crates/lab-cli/src/bin/buc.rs");
+const packageRepositoryText = read("bucephalus-cloud/src/packages/repository.ts");
+const packageProvenanceMigrationText = read("bucephalus-cloud/db/migrations/0021_package_provenance.sql");
+const readmeText = read("README.md");
+const runsOpenApiText = read("bucephalus-cloud/api/openapi/runs.yaml");
+const cloudConfigText = read("bucephalus-cloud/src/config.ts");
+for (const required of [
+  "BUCEPHALUS_RELEASE_GIT_SHA",
+  "BUCEPHALUS_CLOUD_API_IMAGE_DIGEST",
+  "hosted_build_environment_v1",
+  "hosted_authoring_builder",
+  "sealed_package_importer",
+  "hosted_core_not_run_for_sealed_package",
+  "authoring_compiler: input.inputKind === \"authoring_context\" ? \"core_universal_v1\" : null",
+  "packageAuthoringProvenance",
+  "packageProvenanceFromBuildEnvironment",
+  "external_unattested",
+  "hosted_attested",
+  "imports.getUpload(sourceUploadId, ownerKey)",
+  "imports.getUpload(uploadId, ownerKey)",
+  "buildEnvironmentEvidence",
+  "builder_image_digest_missing",
+  "withBuildEnvironmentEvidence",
+  "complete_build_environment_evidence",
+]) {
+  if (!experimentRouteText.includes(required)) {
+    fail(`hosted experiment build route must report deployed build environment provenance: ${required}`);
+  }
+}
+for (const required of [
+  "ensure_build_execution_environment_matches",
+  "ensure_authoring_provenance_contract",
+  "package_provenance_summary_lines",
+  "authoring_provenance=external_unattested/sealed_package_manifest",
+  "authoring_context builds must report builder.kind=hosted_authoring_builder",
+  "sealed_package imports must report core.executed=false",
+]) {
+  if (!hostedCliText.includes(required)) {
+    fail(`hosted product CLI must reject mismatched build execution evidence: ${required}`);
+  }
+}
+for (const required of [
+  "package_artifact_owners",
+  "package_provenance",
+  "coalesce(owner.package_provenance, artifact.package_provenance)",
+  "coalesce(owner.upload_id, artifact.upload_id)",
+  "coalesce(owner.storage_path, artifact.storage_path)",
+  "coalesce(owner.byte_size, artifact.byte_size)",
+  "coalesce(owner.media_type, artifact.media_type)",
+  "coalesce(owner.updated_at, artifact.updated_at)",
+  "persistedPackageByteSize(record.byte_size)",
+  "invalid_persisted_package_artifact",
+]) {
+  if (!packageRepositoryText.includes(required)) {
+    fail(`package repository must return owner-scoped package provenance without cross-owner clobbering: ${required}`);
+  }
+}
+for (const required of [
+  "ALTER TABLE cloud.package_artifact_owners",
+  "ADD COLUMN storage_path text",
+  "ADD COLUMN byte_size bigint",
+  "ADD COLUMN media_type text",
+  "package_artifact_owners_package_provenance_is_object",
+  "pre_provenance_package_owner",
+]) {
+  if (!packageProvenanceMigrationText.includes(required)) {
+    fail(`package provenance migration must persist owner-scoped provenance: ${required}`);
+  }
+}
+const cloudCliDocText = read("docs/user/cloud-cli.md");
+for (const required of [
+  "authenticated",
+  "knowing another user's upload id is not a",
+  "package_contract.authoring_provenance.status=hosted_attested",
+  "package_contract.authoring_provenance.status=external_unattested",
+  "package_provenance.status=hosted_attested",
+  "package_provenance.status=external_unattested",
+  "status=unknown_legacy",
+  "one user's sealed",
+  "Worker package downloads also resolve storage metadata through",
+  "attest the package's original local authoring environment",
+  "BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN",
+  "X-Bucephalus-Runner-Admin-Token",
+  "worker-token headers no longer",
+  "authorize runner-pool administration",
+]) {
+  if (!cloudCliDocText.includes(required)) {
+    fail(`Cloud CLI docs must distinguish hosted authoring from sealed package import provenance: ${required}`);
+  }
+}
+for (const required of [
+  "externally",
+  "authored sealed-package import",
+  "YAML builds are the hosted-attested Cloud authoring path",
+  "without claiming the local authoring environment",
+]) {
+  if (!readmeText.includes(required)) {
+    fail(`README hosted workflow must distinguish hosted authoring from sealed package import provenance: ${required}`);
+  }
+}
+for (const required of [
+  "workerAttemptBearerAuth",
+  "workerBearerAuth",
+  "workerTokenHeader",
+  "runnerAdminBearerAuth",
+  "runnerAdminTokenHeader",
+  "X-Bucephalus-Worker-Token",
+  "X-Bucephalus-Runner-Admin-Token",
+  "X-Bucephalus-Attempt-Id",
+  "attempt bearer token",
+  "Cloud worker service token",
+  "runner admin token",
+  "run owner's package association",
+  "same-digest uploads from another owner cannot redirect",
+  "./common.yaml#/components/responses/Unauthorized",
+]) {
+  if (!runsOpenApiText.includes(required)) {
+    fail(`runs OpenAPI must document attempt-scoped owner-resolved package content downloads: ${required}`);
+  }
+}
+for (const required of [
+  "BUCEPHALUS_CLOUD_BUILD_EVIDENCE_POLICY",
+  "warn",
+  "enforce",
+]) {
+  if (!cloudConfigText.includes(required)) {
+    fail(`Cloud config must parse hosted build evidence policy: ${required}`);
+  }
+}
+
+const gcpMainText = read("bucephalus-cloud/infra/gcp/main.tf");
+if (!/name\s+=\s+"BUCEPHALUS_CLOUD_API_IMAGE_DIGEST"[\s\S]*?value\s+=\s+regex\("sha256:\[a-f0-9\]\{64\}\$", var\.api_image_digest\)/.test(gcpMainText)) {
+  fail("GCP API service must pass the deployed API image digest into BUCEPHALUS_CLOUD_API_IMAGE_DIGEST");
+}
+if (!/name\s+=\s+"BUCEPHALUS_CLOUD_BUILD_EVIDENCE_POLICY"[\s\S]*?value\s+=\s+"enforce"/.test(gcpMainText)) {
+  fail("GCP API service must enforce complete hosted build environment evidence");
+}
+for (const required of [
+  "runner_admin_token                  = \"${local.name_prefix}-runner-admin-token\"",
+  "runner_admin_token_api",
+  "runner_admin_secret      = var.runner_admin_token_secret_version",
+  "var.runner_admin_token_secret_version == null ? [] : [var.runner_admin_token_secret_version]",
+  "BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN",
+]) {
+  if (!gcpMainText.includes(required)) {
+    fail(`GCP Terraform must wire the optional runner-admin secret to the API service only: ${required}`);
+  }
+}
+if (/runner_admin_token_(pool_controller|runner)/.test(gcpMainText)) {
+  fail("GCP Terraform must not grant the runner-admin secret to pool-controller or runner service accounts");
+}
+if (/BUCEPHALUS_GCP_RUNNER_ADMIN|BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN_SECRET/.test(gcpMainText)) {
+  fail("GCP Terraform must not pass runner-admin secret metadata to pool-controller or runner VMs");
+}
+
 const baseImagePolicy = JSON.parse(read("bucephalus-cloud/images/base-image-policy.json"));
 if (baseImagePolicy.schema_version !== "bucephalus_cloud_base_image_policy_v1") {
   fail("bucephalus-cloud/images/base-image-policy.json must use bucephalus_cloud_base_image_policy_v1");
@@ -1514,6 +2149,9 @@ if (!provisionRunnerVmText.includes("USER=bucephalus") || !provisionRunnerVmText
 if (!provisionRunnerVmText.includes("DOCKER_CONFIG=/var/lib/bucephalus/docker-config")) {
   fail("GCE runner workers must receive the writable Docker config for registry pre-pulls");
 }
+if (!provisionRunnerVmText.includes("BUCEPHALUS_WORKER_IMAGE_REF=\\${WORKER_IMAGE}")) {
+  fail("GCE runner workers must report the exact promoted worker image ref they booted from");
+}
 if (provisionRunnerVmText.includes("BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD") || provisionRunnerVmText.includes("/usr/local/bin/gcloud:ro")) {
   fail("GCE runner workers must not depend on a bind-mounted gcloud executable for secret resolution");
 }
@@ -1528,6 +2166,17 @@ if (provisionRunnerVmText.includes("getent ahostsv4") && !provisionRunnerVmText.
 }
 if (!provisionRunnerVmText.includes("https://dns.google/resolve?name=$host&type=A")) {
   fail("GCE runner network policy daemon must include a curl-based DNS fallback for COS");
+}
+
+for (const required of [
+  "pool.active_worker_image_id is not null",
+  "image.image_ref as active_worker_image_ref",
+  "instance.metadata->>'worker_image_ref'",
+  "Runner instance is not online in an active pool with the current promoted worker image",
+]) {
+  if (!packageRepositoryText.includes(required)) {
+    fail(`run claim leasing must require the current promoted worker image: ${required}`);
+  }
 }
 if (provisionRunnerVmText.includes("(\\\\.[0-9]+){3}")) {
   fail("GCE runner network policy daemon must avoid awk interval regex syntax on COS");

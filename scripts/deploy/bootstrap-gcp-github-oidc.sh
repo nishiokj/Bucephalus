@@ -421,8 +421,7 @@ cloudflare_worker_name=${CLOUDFLARE_WORKER_NAME}
 Next:
 1. Run scripts/deploy/verify-gcp-cicd-readiness.sh with the same project/environment inputs.
 2. Run the GCP deploy workflow with deployment_stage=substrate and apply=true.
-3. Run the release workflow with version_override=<version> after approving a Bun base digest.
-4. Run the GCP deploy workflow with deployment_stage=api and apply=true; it resolves the latest promotion evidence by default.
-5. Configure the API-created runner pool ID, then run deployment_stage=pool with apply=true.
-6. Use deployment_stage=substrate when you want Terraform to clean up Cloud Run services/jobs while retaining durable substrate resources.
+3. For development, let the Cloud candidate workflow deploy successful main commits with deployment_stage=services.
+4. For production, run the release workflow with version_override=<version>, then run the GCP deploy workflow with deployment_stage=services and apply=true.
+5. Use the cleanup workflow, not deployment_stage=substrate, when you want to remove Cloud Run services/jobs while retaining durable substrate resources.
 SUMMARY

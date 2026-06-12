@@ -27,21 +27,53 @@ The first Path 1 replacement surface is:
 - `contracts/path1-gcp-promotion.md`: digest promotion, migration, smoke,
   observation, and rollback contract.
 - `path1-readiness.md`: remaining end-to-end readiness blockers.
+- `.github/workflows/bucephalus-cloud-candidate.yml`: fast Cloud candidate
+  workflow that builds deployable x86_64 images after `main` Cloud CI succeeds
+  and classifies the change before deciding whether to deploy, plan, or stop.
 - `.github/workflows/bucephalus-gcp-deploy.yml`: manual GCP deploy workflow
-  that consumes verified pushed-image promotion evidence instead of handwritten
-  image digests.
+  and reusable deployment backend that consumes verified pushed-image promotion
+  evidence instead of handwritten image digests.
 
-The deploy workflow is intentionally staged:
+The candidate workflow separates changes into four high-level lanes:
 
-- `deployment_stage=substrate`: declared GCP substrate, no app images.
-- `deployment_stage=api`: migration job plus API service. This phase needs image
-  digests and DB/worker secret versions, but not a runner pool ID.
-- `deployment_stage=pool`: pool-controller service. This phase runs after the
-  API has created or confirmed a runner pool ID.
+- Runtime/release-bundle changes build pushed candidate images and auto-apply
+  `deployment_stage=services` to `bucephalus-dev`.
+- Deploy/Terraform boundary changes run a plan-only services deploy against the
+  latest promotion evidence.
+- Mixed runtime plus deploy-boundary changes build the candidate images, then
+  run plan-only against that same candidate evidence.
+- Runtime changes bundled with candidate/CI policy changes build the candidate
+  images, then run plan-only.
+- Docs, tests, examples, and CI-policy-only changes stop after Cloud CI and the
+  classifier summary; unknown new paths are treated as runtime-affecting.
+
+The normal deploy workflow is a single service promotion:
+
+- `deployment_stage=services`: API, migration job, pool-controller, active
+  worker image promotion, and smoke checks from one verified promotion evidence
+  bundle.
+- `deployment_stage=substrate`: rare bootstrap/substrate-only changes, no app
+  images.
+- `deployment_stage=api` and `deployment_stage=pool`: compatibility aliases for
+  older manual runbooks; new promotions should use `services`.
+
+The `bucephalus-dev` GitHub Environment is the default development target. The
+deploy workflow maps it to the shorter Terraform environment label `dev` unless
+`BUCEPHALUS_DEPLOYMENT_ENVIRONMENT` is set explicitly in that GitHub
+Environment.
 
 Every run creates a Terraform plan. Set `apply=true` only when that same run
-should apply the generated plan file. API applies execute the Cloud Run migration
-job after Terraform has applied the selected API-stage changes.
+should apply the generated plan file. Service applies execute the Cloud Run
+migration job, promote the active worker image, and smoke the deployed API after
+Terraform has applied the selected image digests.
+
+Runner-pool administration can be split from worker authentication by creating
+`${resource_prefix}-${environment}-runner-admin-token` in Secret Manager and
+setting, or allowing CI to auto-resolve,
+`BUCEPHALUS_RUNNER_ADMIN_TOKEN_SECRET_VERSION`. When that secret is configured,
+set the GitHub environment secret `BUCEPHALUS_RUNNER_ADMIN_SMOKE` for the
+post-deploy runner-pool smoke check. Without it, deploy keeps compatibility mode
+where the API uses the worker token for runner-pool administration.
 
 Cleanup is a separate workflow:
 

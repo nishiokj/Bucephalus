@@ -1,9 +1,14 @@
 import { authOwnerKey, type AuthContext } from "../auth";
-import { HttpError, jsonResponse, optionalString, readJsonObject, requireBearerToken, requireString } from "../http";
+import { HttpError, jsonResponse, optionalQueryInteger, optionalString, queryInteger, readJsonObject, requireBearerToken, requireString } from "../http";
 import { logError, newTraceContext } from "../logging";
 import { readStoredObject } from "../objectStorage";
 import type { JsonObject, JsonValue } from "../primitives";
-import { RuntimeRepository } from "../runtime/repository";
+import {
+  RuntimeRepository,
+  type RuntimeEventRecord,
+  type RuntimeEventRowInsert,
+  type WorkerLifecycleEventRecord,
+} from "../runtime/repository";
 import { RunnerRepository, type RunnerPoolRecord } from "../runners/repository";
 import {
   optionalJsonObject,
@@ -20,6 +25,7 @@ import {
 } from "../packages/repository";
 import {
   allowsControlPlaneSecretRefs,
+  controlPlaneEnvNameViolation,
   controlPlaneSecretIdViolation,
   controlPlaneSecretRefViolation,
 } from "../secrets/policy";
@@ -27,6 +33,7 @@ import type { CloudSecretRepository } from "../secrets/repository";
 import { SECRET_NAME_PATTERN } from "../secrets/store";
 
 const HOSTED_SECRET_REF_PREFIX = "bucephalus://";
+const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
 
 interface CloudSecretRequirement {
   id: string;
@@ -59,6 +66,10 @@ export async function handleRunRoute(
     return appendRunEvent(request, url, runs);
   }
 
+  if (request.method === "POST" && workerAttemptPath(url.pathname, "/runtime/event-rows")) {
+    return ingestRuntimeEventRows(request, url, runs, runtime);
+  }
+
   if (request.method === "POST" && workerAttemptPath(url.pathname, "/complete")) {
     return completeAttempt(request, url, runs);
   }
@@ -73,12 +84,12 @@ export async function handleRunRoute(
   }
 
   if (request.method === "GET" && packageContentPath(url.pathname)) {
-    const digest = packageDigestFromContentPath(url.pathname);
-    await requireAttemptToken(request, runs, {
+    const digest = requirePackageDigest(packageDigestFromContentPath(url.pathname), "/package_digest");
+    const attempt = await requireAttemptToken(request, runs, {
       attemptId: requireHeader(request, "x-bucephalus-attempt-id", "package content download"),
       packageDigest: digest,
     });
-    const artifact = await packages.getArtifact(digest);
+    const artifact = await packages.getArtifact(digest, attempt.ownerKey ?? undefined);
     if (!artifact) {
       throw new HttpError(404, "package_not_found", "Package artifact not found");
     }
@@ -102,7 +113,10 @@ export async function handleRunRoute(
   }
 
   if (request.method === "GET" && packagePath(url.pathname)) {
-    const digest = decodeURIComponent(url.pathname.slice("/v1/packages/".length));
+    const digest = requirePackageDigest(
+      decodeURIComponent(url.pathname.slice("/v1/packages/".length)),
+      "/package_digest",
+    );
     const artifact = await packages.getArtifact(digest, ownerKey);
     if (!artifact) {
       throw new HttpError(404, "package_not_found", "Package artifact not found");
@@ -130,12 +144,17 @@ export async function handleRunRoute(
       return jsonResponse(await runtime.getSummary(runtimeRoute.runId));
     }
     if (runtimeRoute.kind === "events") {
-      return jsonResponse({
-        cloud_run_id: runtimeRoute.runId,
-        events: await runtime.eventRows(runtimeRoute.runId, {
-          limit: limitFromUrl(url),
+      const limit = limitFromUrl(url);
+      const [trialRows, workerEvents] = await Promise.all([
+        runtime.eventRows(runtimeRoute.runId, {
+          limit,
           afterRowSeq: optionalIntFromUrl(url, "after_row_seq"),
         }),
+        runtime.workerLifecycleEvents(runtimeRoute.runId, { limit }),
+      ]);
+      return jsonResponse({
+        cloud_run_id: runtimeRoute.runId,
+        events: runtimeEventStreamToWire(trialRows, workerEvents, limit),
       });
     }
     if (runtimeRoute.kind === "results") {
@@ -167,21 +186,11 @@ export async function handleRunRoute(
 }
 
 function limitFromUrl(url: URL): number {
-  const raw = url.searchParams.get("limit");
-  if (!raw) {
-    return 50;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : 50;
+  return queryInteger(url, "limit", { defaultValue: 50, min: 1, max: 1000 });
 }
 
 function optionalIntFromUrl(url: URL, key: string): number | undefined {
-  const raw = url.searchParams.get(key);
-  if (!raw) {
-    return undefined;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  return optionalQueryInteger(url, key, { min: 0 });
 }
 
 function runtimePath(pathname: string):
@@ -253,6 +262,128 @@ async function appendRunEvent(
   return jsonResponse({ event: eventToWire(event) }, { status: 201 });
 }
 
+const INGEST_MAX_ROWS_PER_BATCH = 500;
+const INGEST_MAX_ROW_PAYLOAD_BYTES = 64 * 1024;
+const CORE_RUN_ID_PATTERN = /^run_[A-Za-z0-9_.-]+$/;
+
+async function ingestRuntimeEventRows(
+  request: Request,
+  url: URL,
+  runs: RunRepository,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const body = await readJsonObject(request);
+  const attemptId = attemptIdFromWorkerPath(url.pathname, "/runtime/event-rows");
+  const runnerInstanceId = requireString(body.runner_instance_id, "/runner_instance_id");
+  const { runId } = await requireAttemptToken(request, runs, { attemptId, runnerInstanceId });
+  if (!Array.isArray(body.rows) || body.rows.length === 0) {
+    throw new HttpError(400, "invalid_rows", "/rows must be a non-empty array");
+  }
+  if (body.rows.length > INGEST_MAX_ROWS_PER_BATCH) {
+    throw new HttpError(
+      400,
+      "too_many_rows",
+      `/rows must contain at most ${INGEST_MAX_ROWS_PER_BATCH} rows per batch`,
+    );
+  }
+  const rows = body.rows.map((row, index) =>
+    runtimeEventRowFromWire(row, `/rows/${index}`, { cloudRunId: runId, attemptId }),
+  );
+  const upserted = await runtime.upsertEventRows(rows);
+  return jsonResponse({ received: rows.length, upserted });
+}
+
+function runtimeEventRowFromWire(
+  value: unknown,
+  pointer: string,
+  provenance: { cloudRunId: string; attemptId: string },
+): RuntimeEventRowInsert {
+  if (!isRecord(value)) {
+    throw new HttpError(400, "invalid_row", `${pointer} must be an object`);
+  }
+  const coreRunId = requireString(value.core_run_id, `${pointer}/core_run_id`);
+  if (!CORE_RUN_ID_PATTERN.test(coreRunId)) {
+    throw new HttpError(400, "invalid_core_run_id", `${pointer}/core_run_id is not a Core run id`);
+  }
+  const payload = optionalJsonObject(value.payload as JsonValue | undefined, `${pointer}/payload`);
+  if (JSON.stringify(payload).length > INGEST_MAX_ROW_PAYLOAD_BYTES) {
+    throw new HttpError(
+      400,
+      "payload_too_large",
+      `${pointer}/payload exceeds ${INGEST_MAX_ROW_PAYLOAD_BYTES} bytes`,
+    );
+  }
+  return {
+    core_run_id: coreRunId,
+    trial_id: requireString(value.trial_id, `${pointer}/trial_id`),
+    schedule_idx: nonNegativeInt(value.schedule_idx, `${pointer}/schedule_idx`),
+    attempt: nonNegativeInt(value.attempt, `${pointer}/attempt`),
+    row_seq: nonNegativeInt(value.row_seq, `${pointer}/row_seq`),
+    slot_commit_id: optionalString(value.slot_commit_id, `${pointer}/slot_commit_id`) ?? "",
+    variant_id: optionalString(value.variant_id, `${pointer}/variant_id`) ?? "unknown",
+    task_id: optionalString(value.task_id, `${pointer}/task_id`) ?? "unknown",
+    repl_idx: nonNegativeInt(value.repl_idx ?? 0, `${pointer}/repl_idx`),
+    seq: nonNegativeInt(value.seq ?? 0, `${pointer}/seq`),
+    event_type: requireString(value.event_type, `${pointer}/event_type`),
+    ts: optionalString(value.ts, `${pointer}/ts`) ?? null,
+    payload,
+    row: {
+      source: "worker_live_ingest",
+      cloud_run_id: provenance.cloudRunId,
+      attempt_id: provenance.attemptId,
+    },
+  };
+}
+
+function nonNegativeInt(value: unknown, pointer: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new HttpError(400, "invalid_integer", `${pointer} must be a non-negative integer`);
+  }
+  return value;
+}
+
+/**
+ * One chronological stream for the run: trial telemetry plus the worker's
+ * own lifecycle markers, distinguished by `source` so consumers can filter.
+ */
+function runtimeEventStreamToWire(
+  trialRows: RuntimeEventRecord[],
+  workerEvents: WorkerLifecycleEventRecord[],
+  limit: number,
+): JsonObject[] {
+  const trialWire = trialRows.map((row) => ({
+    ...row,
+    source: "trial",
+    event_id: `trial:${row.core_run_id}:${row.trial_id}:${row.schedule_idx}:${row.attempt}:${row.row_seq}`,
+    recorded_at: row.ts,
+  }));
+  const workerWire = workerEvents.map((event) => ({
+    source: "worker",
+    event_id: `worker:${event.event_id}`,
+    core_run_id: "",
+    trial_id: "",
+    schedule_idx: 0,
+    attempt: 0,
+    row_seq: event.seq,
+    slot_commit_id: "",
+    variant_id: "worker",
+    task_id: "",
+    repl_idx: 0,
+    seq: event.seq,
+    event_type: event.event_type,
+    ts: event.created_at,
+    recorded_at: event.created_at,
+    payload: event.payload,
+    row: { source: "worker_lifecycle" },
+  }));
+  // Rows without a timestamp sort to the end rather than masquerading as the
+  // oldest events in the stream.
+  const sortKey = (row: { recorded_at: string | null }) => row.recorded_at ?? "￿";
+  return [...workerWire, ...trialWire]
+    .sort((a, b) => sortKey(a).localeCompare(sortKey(b)))
+    .slice(0, limit) as JsonObject[];
+}
+
 async function completeAttempt(
   request: Request,
   url: URL,
@@ -311,6 +442,7 @@ async function createRun(
   secrets?: CloudSecretRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
+  const env = cloudRunEnv(requireStringMap(body.env, "/env"));
   const diagnosis = await diagnoseCloudRunRequest({
     body,
     packages,
@@ -319,17 +451,64 @@ async function createRun(
     secrets,
     requireHostedSecretRefs: true,
   });
+  rejectEnvSecretCollisions(env, diagnosis.secretRefs);
 
   const run = await runs.createRun({
     packageDigest: diagnosis.artifact.package_digest,
     runLabel: optionalString(body.run_label, "/run_label"),
-    env: requireStringMap(body.env, "/env"),
+    env,
     secretRefs: await resolveHostedSecretRefs(diagnosis.secretRefs, secrets, ownerKey),
     runtimeOptions: diagnosis.runtimeOptions,
     ownerKey,
     runRequirements: diagnosis.runRequirements,
+    packageProvenance: diagnosis.artifact.package_provenance,
   });
   return jsonResponse(runToWire(run), { status: 201 });
+}
+
+const CLOUD_RUN_ENV_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
+const CLOUD_RUN_ENV_VALUE_MAX_BYTES = 32 * 1024;
+const textEncoder = new TextEncoder();
+
+function cloudRunEnv(env: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (!CLOUD_RUN_ENV_NAME_PATTERN.test(name)) {
+      throw new HttpError(
+        400,
+        "invalid_run_env",
+        `/env contains invalid environment variable name '${name}'. Use uppercase shell identifiers matching ${CLOUD_RUN_ENV_NAME_PATTERN.source}`,
+      );
+    }
+    const reserved = controlPlaneEnvNameViolation(name);
+    if (reserved) {
+      throw new HttpError(400, "reserved_run_env", reserved);
+    }
+    if (value.includes("\0")) {
+      throw new HttpError(400, "invalid_run_env", `/env/${name} must not contain NUL bytes`);
+    }
+    if (textEncoder.encode(value).byteLength > CLOUD_RUN_ENV_VALUE_MAX_BYTES) {
+      throw new HttpError(
+        400,
+        "invalid_run_env",
+        `/env/${name} exceeds ${CLOUD_RUN_ENV_VALUE_MAX_BYTES} bytes`,
+      );
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
+function rejectEnvSecretCollisions(env: Record<string, string>, secretRefs: Record<string, string>): void {
+  for (const name of Object.keys(env)) {
+    if (Object.prototype.hasOwnProperty.call(secretRefs, name)) {
+      throw new HttpError(
+        400,
+        "run_env_secret_collision",
+        `/env/${name} cannot also be supplied in /secret_refs. Use --env for plain config or --secret-ref for secrets, not both.`,
+      );
+    }
+  }
 }
 
 export interface CloudRunDiagnosis {
@@ -347,7 +526,7 @@ export async function diagnoseCloudRunRequest(input: {
   secrets?: CloudSecretRepository | undefined;
   requireHostedSecretRefs?: boolean;
 }): Promise<CloudRunDiagnosis> {
-  const packageDigest = requireString(input.body.package_digest, "/package_digest");
+  const packageDigest = requirePackageDigest(input.body.package_digest, "/package_digest");
   const artifact = await input.packages.getArtifact(packageDigest, input.ownerKey);
   if (!artifact) {
     throw new HttpError(404, "package_not_found", "Package artifact not found");
@@ -441,6 +620,7 @@ export function runRequirementsForArtifact(
   runtimeOptions: JsonObject,
   secretRefs: Record<string, string> = {},
 ): RunRequirements {
+  validateCloudRuntimeOptions(runtimeOptions);
   const requestedBackend = optionalString(runtimeOptions.backend, "/runtime_options/backend")
     ?? optionalString(runtimeOptions.executor, "/runtime_options/executor")
     ?? packageComputeBackend(artifact);
@@ -522,6 +702,117 @@ export function runRequirementsForArtifact(
       ?? positiveInt(packageRuntimeValue(artifact, "max_parallel_trials"))
       ?? 1,
   };
+}
+
+const CLOUD_RUNTIME_OPTION_KEYS = new Set([
+  "backend",
+  "executor",
+  "arch",
+  "cpu_count",
+  "cpu",
+  "memory_mb",
+  "disk_mb",
+  "isolation",
+  "timeout_ms",
+  "max_parallel_trials",
+  "network",
+  "sidecars",
+  "accelerators",
+]);
+
+const CLOUD_RUNTIME_NETWORK_KEYS = new Set([
+  "default",
+  "task_sandbox",
+  "agent",
+  "egress",
+]);
+
+function validateCloudRuntimeOptions(runtimeOptions: JsonObject): void {
+  for (const [key, value] of Object.entries(runtimeOptions)) {
+    if (!CLOUD_RUNTIME_OPTION_KEYS.has(key)) {
+      throw new HttpError(
+        400,
+        "unknown_cloud_runtime_option",
+        `/runtime_options/${escapeJsonPointer(key)} is not supported for hosted Cloud runs`,
+        {
+          option: key,
+          supported_options: [...CLOUD_RUNTIME_OPTION_KEYS].sort(),
+        },
+      );
+    }
+    validateCloudRuntimeOptionValue(key, value);
+  }
+  rejectAmbiguousCloudRuntimeOptions(runtimeOptions);
+}
+
+function rejectAmbiguousCloudRuntimeOptions(runtimeOptions: JsonObject): void {
+  if (
+    Object.prototype.hasOwnProperty.call(runtimeOptions, "backend")
+    && Object.prototype.hasOwnProperty.call(runtimeOptions, "executor")
+  ) {
+    throw new HttpError(
+      400,
+      "ambiguous_cloud_runtime_option",
+      "/runtime_options/backend and /runtime_options/executor cannot both be provided; use /runtime_options/backend",
+    );
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(runtimeOptions, "cpu_count")
+    && Object.prototype.hasOwnProperty.call(runtimeOptions, "cpu")
+  ) {
+    throw new HttpError(
+      400,
+      "ambiguous_cloud_runtime_option",
+      "/runtime_options/cpu_count and /runtime_options/cpu cannot both be provided; use /runtime_options/cpu_count",
+    );
+  }
+}
+
+function validateCloudRuntimeOptionValue(key: string, value: unknown): void {
+  const pointer = `/runtime_options/${escapeJsonPointer(key)}`;
+  if (["backend", "executor", "arch", "isolation"].includes(key)) {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new HttpError(400, "invalid_cloud_runtime_option", `${pointer} must be a non-empty string`);
+    }
+    return;
+  }
+  if (["cpu_count", "cpu", "memory_mb", "disk_mb", "timeout_ms", "max_parallel_trials"].includes(key)) {
+    if (positiveInt(value) === null) {
+      throw new HttpError(400, "invalid_cloud_runtime_option", `${pointer} must be a positive integer`);
+    }
+    return;
+  }
+  if (key === "sidecars" || key === "accelerators") {
+    cloudStringList(value, pointer);
+    return;
+  }
+  if (key === "network") {
+    validateCloudRuntimeNetworkOption(value, pointer);
+  }
+}
+
+function validateCloudRuntimeNetworkOption(value: unknown, pointer: string): void {
+  if (!isRecord(value)) {
+    throw new HttpError(400, "invalid_cloud_runtime_option", `${pointer} must be an object`);
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (!CLOUD_RUNTIME_NETWORK_KEYS.has(key)) {
+      throw new HttpError(
+        400,
+        "unknown_cloud_runtime_option",
+        `${pointer}/${escapeJsonPointer(key)} is not supported for hosted Cloud network options`,
+        {
+          option: `network.${key}`,
+          supported_options: [...CLOUD_RUNTIME_NETWORK_KEYS].map((item) => `network.${item}`).sort(),
+        },
+      );
+    }
+    if (key === "egress") {
+      cloudEgressHosts(item);
+    } else if (typeof item !== "string" || item.trim().length === 0) {
+      throw new HttpError(400, "invalid_cloud_runtime_option", `${pointer}/${escapeJsonPointer(key)} must be a non-empty string`);
+    }
+  }
 }
 
 function cloudNetworkPerimeter(
@@ -693,9 +984,10 @@ async function resolveHostedSecretRefs(
     }
     const record = await secrets.getSecret(ownerKey, name);
     if (!record) {
-      throw new HttpError(400, "unknown_hosted_secret", `No hosted secret named '${name}'. Upload it with PUT /v1/secrets/${name} first.`, {
+      throw new HttpError(400, "unknown_hosted_secret", `No hosted secret named '${name}'. Upload it with \`buc secrets put ${name} --from-env ${name}\` first.`, {
         secret_id: id,
         secret_name: name,
+        next: `buc secrets put ${name} --from-env ${name}`,
       });
     }
     out[id] = record.backing_ref;
@@ -890,6 +1182,10 @@ function isRecord(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function escapeJsonPointer(value: string): string {
+  return value.replaceAll("~", "~0").replaceAll("/", "~1");
+}
+
 function packageToWire(artifact: PackageArtifactRecord) {
   return {
     package_digest: artifact.package_digest,
@@ -901,6 +1197,7 @@ function packageToWire(artifact: PackageArtifactRecord) {
     resolved_experiment_json: artifact.resolved_experiment_json,
     target: artifact.target,
     image_refs: artifact.image_refs,
+    package_provenance: artifact.package_provenance,
     secret_requirements: packageSecretRequirements(artifact),
     diagnostics: artifact.diagnostics,
     status: artifact.status,
@@ -941,6 +1238,18 @@ function validatePackageSecretRefs(
       missing_secret_ids: missing,
       unknown_secret_ids: unknown,
       required_secret_ids: [...requiredIds].sort(),
+      required_actions: missing.map((id) => ({
+        action: "upload_hosted_secret",
+        stage: "before_run",
+        requirement_id: id,
+        description: `Upload hosted secret '${id}' before creating a run, then pass --secret-ref ${id}=bucephalus://${id}.`,
+        command: `buc secrets put ${id} --from-env ${id}`,
+        blocking: true,
+      })),
+      next_commands: [
+        ...missing.map((id) => `buc secrets put ${id} --from-env ${id}`),
+        ...missing.map((id) => `buc run <package-digest> --secret-ref ${id}=bucephalus://${id}`),
+      ],
     });
   }
 }
@@ -1017,6 +1326,7 @@ function runToWire(run: CloudRunRecord) {
     secret_ids: secretIds,
     runtime_options: run.runtime_options,
     run_requirements: run.run_requirements,
+    package_provenance: run.package_provenance,
     created_at: run.created_at,
     updated_at: run.updated_at,
     started_at: run.started_at,
@@ -1085,8 +1395,8 @@ async function requireAttemptToken(
   request: Request,
   runs: RunRepository,
   input: { attemptId: string; runnerInstanceId?: string | null; packageDigest?: string | null },
-): Promise<void> {
-  await runs.verifyAttemptToken({
+): Promise<{ runId: string; ownerKey: string | null; packageDigest: string }> {
+  return await runs.verifyAttemptToken({
     ...input,
     token: requireBearer(request, "worker attempt"),
   });
@@ -1134,4 +1444,12 @@ function packagePath(pathname: string): boolean {
 
 function packageDigestFromContentPath(pathname: string): string {
   return decodeURIComponent(pathname.slice("/v1/packages/".length, -"/content".length));
+}
+
+function requirePackageDigest(value: unknown, pointer: string): string {
+  const digest = requireString(value, pointer);
+  if (!SHA256_DIGEST_PATTERN.test(digest)) {
+    throw new HttpError(400, "invalid_request", `${pointer} must be sha256:<64 lowercase hex chars>`);
+  }
+  return digest;
 }

@@ -15,10 +15,35 @@ export interface PackageArtifactRecord {
   target: JsonObject | null;
   image_refs: string[];
   diagnostics: ImportDiagnostic[];
+  package_provenance: JsonObject;
   status: string;
   created_at: string;
   updated_at: string;
   owner_key?: string | null;
+}
+
+function packageArtifactRecord(row: unknown): PackageArtifactRecord {
+  const record = row as PackageArtifactRecord & { byte_size?: number | string | null };
+  return {
+    ...record,
+    byte_size: persistedPackageByteSize(record.byte_size),
+  };
+}
+
+function persistedPackageByteSize(value: unknown): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value === "string" && /^[0-9]+$/.test(value)) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isSafeInteger(parsed)) {
+      return parsed;
+    }
+  }
+  throw new HttpError(500, "invalid_persisted_package_artifact", "Persisted package artifact byte_size is invalid");
 }
 
 export class PackageRepository {
@@ -35,6 +60,7 @@ export class PackageRepository {
     target?: JsonObject | null;
     imageRefs: string[];
     diagnostics: ImportDiagnostic[];
+    packageProvenance: JsonObject;
     ownerKey?: string | null | undefined;
   }): Promise<PackageArtifactRecord> {
     return await this.sql.begin(async (tx) => {
@@ -50,6 +76,7 @@ export class PackageRepository {
           target,
           image_refs,
           diagnostics,
+          package_provenance,
           status
         )
         values (
@@ -63,6 +90,7 @@ export class PackageRepository {
           ${input.target ? this.sql.json(input.target) : null},
           ${this.sql.json(input.imageRefs as unknown as JsonValue[])},
           ${this.sql.json(input.diagnostics as unknown as JsonObject)},
+          ${this.sql.json(input.packageProvenance)},
           'accepted'
         )
         on conflict (package_digest) do update
@@ -75,58 +103,100 @@ export class PackageRepository {
             target = excluded.target,
             image_refs = excluded.image_refs,
             diagnostics = excluded.diagnostics,
+            package_provenance = case
+              when ${input.ownerKey ?? null}::text is null then excluded.package_provenance
+              else cloud.package_artifacts.package_provenance
+            end,
             status = excluded.status,
             updated_at = now()
         returning *
       `;
       if (input.ownerKey) {
         await tx`
-          insert into cloud.package_artifact_owners (package_digest, owner_key, upload_id)
-          values (${input.packageDigest}, ${input.ownerKey}, ${input.uploadId})
+          insert into cloud.package_artifact_owners (
+            package_digest,
+            owner_key,
+            upload_id,
+            storage_path,
+            byte_size,
+            media_type,
+            package_provenance
+          )
+          values (
+            ${input.packageDigest},
+            ${input.ownerKey},
+            ${input.uploadId},
+            ${input.storagePath},
+            ${input.byteSize},
+            ${input.mediaType},
+            ${this.sql.json(input.packageProvenance)}
+          )
           on conflict (package_digest, owner_key) do update
-          set upload_id = excluded.upload_id
+          set upload_id = excluded.upload_id,
+              storage_path = excluded.storage_path,
+              byte_size = excluded.byte_size,
+              media_type = excluded.media_type,
+              package_provenance = excluded.package_provenance,
+              updated_at = now()
         `;
+        return packageArtifactRecord({
+          ...rows[0],
+          upload_id: input.uploadId,
+          storage_path: input.storagePath,
+          byte_size: input.byteSize,
+          media_type: input.mediaType,
+          package_provenance: input.packageProvenance,
+          owner_key: input.ownerKey,
+        });
       }
-      return rows[0] as PackageArtifactRecord;
+      return packageArtifactRecord(rows[0]);
     });
   }
 
   async getArtifact(packageDigest: string, ownerKey?: string): Promise<PackageArtifactRecord | null> {
     const rows = await this.sql`
-      select artifact.*
+      select artifact.*,
+             coalesce(owner.upload_id, artifact.upload_id) as upload_id,
+             coalesce(owner.storage_path, artifact.storage_path) as storage_path,
+             coalesce(owner.byte_size, artifact.byte_size) as byte_size,
+             coalesce(owner.media_type, artifact.media_type) as media_type,
+             coalesce(owner.package_provenance, artifact.package_provenance) as package_provenance,
+             owner.owner_key
       from cloud.package_artifacts artifact
+      left join cloud.package_artifact_owners owner
+        on owner.package_digest = artifact.package_digest
+       and owner.owner_key = ${ownerKey ?? null}
       where artifact.package_digest = ${packageDigest}
         and (
           ${ownerKey ?? null}::text is null
-          or exists (
-            select 1
-            from cloud.package_artifact_owners owner
-            where owner.package_digest = artifact.package_digest
-              and owner.owner_key = ${ownerKey ?? null}
-          )
+          or owner.owner_key is not null
         )
       limit 1
     `;
-    return (rows[0] as PackageArtifactRecord | undefined) ?? null;
+    return rows[0] ? packageArtifactRecord(rows[0]) : null;
   }
 
   async listArtifacts(input?: { limit?: number; ownerKey?: string | undefined }): Promise<PackageArtifactRecord[]> {
     const rows = await this.sql`
-      select artifact.*
+      select artifact.*,
+             coalesce(owner.upload_id, artifact.upload_id) as upload_id,
+             coalesce(owner.storage_path, artifact.storage_path) as storage_path,
+             coalesce(owner.byte_size, artifact.byte_size) as byte_size,
+             coalesce(owner.media_type, artifact.media_type) as media_type,
+             coalesce(owner.package_provenance, artifact.package_provenance) as package_provenance,
+             owner.owner_key
       from cloud.package_artifacts artifact
+      left join cloud.package_artifact_owners owner
+        on owner.package_digest = artifact.package_digest
+       and owner.owner_key = ${input?.ownerKey ?? null}
       where (
         ${input?.ownerKey ?? null}::text is null
-        or exists (
-          select 1
-          from cloud.package_artifact_owners owner
-          where owner.package_digest = artifact.package_digest
-            and owner.owner_key = ${input?.ownerKey ?? null}
-        )
+        or owner.owner_key is not null
       )
-      order by updated_at desc
+      order by coalesce(owner.updated_at, artifact.updated_at) desc
       limit ${Math.max(1, Math.min(input?.limit ?? 50, 200))}
     `;
-    return rows as unknown as PackageArtifactRecord[];
+    return rows.map(packageArtifactRecord);
   }
 }
 
@@ -139,6 +209,7 @@ export interface CloudRunRecord {
   secret_refs: Record<string, string>;
   runtime_options: JsonObject;
   run_requirements: RunRequirements;
+  package_provenance: JsonObject;
   created_at: string;
   updated_at: string;
   started_at: string | null;
@@ -219,6 +290,7 @@ export class RunRepository {
     secretRefs: Record<string, string>;
     runtimeOptions: JsonObject;
     runRequirements: RunRequirements;
+    packageProvenance: JsonObject;
     ownerKey?: string | null | undefined;
   }): Promise<CloudRunRecord> {
     return await this.sql.begin(async (tx) => {
@@ -230,6 +302,7 @@ export class RunRepository {
           secret_refs,
           runtime_options,
           run_requirements,
+          package_provenance,
           status,
           owner_key
         )
@@ -240,6 +313,7 @@ export class RunRepository {
           ${this.sql.json(input.secretRefs as unknown as JsonObject)},
           ${this.sql.json(input.runtimeOptions)},
           ${this.sql.json(input.runRequirements as unknown as JsonObject)},
+          ${this.sql.json(input.packageProvenance)},
           'created',
           ${input.ownerKey ?? null}
         )
@@ -282,19 +356,33 @@ export class RunRepository {
   }): Promise<{ run: CloudRunRecord; attempt: RunAttemptRecord } | null> {
     return await this.sql.begin(async (tx) => {
       const instances = await tx`
-        select instance.*, pool.status as runner_pool_status
+        select instance.*,
+               pool.status as runner_pool_status,
+               pool.active_worker_image_id,
+               image.image_ref as active_worker_image_ref
         from cloud.runner_instances instance
         join cloud.runner_pools pool using (runner_pool_id)
+        join cloud.runner_worker_images image
+          on image.runner_worker_image_id = pool.active_worker_image_id
         where instance.runner_instance_id = ${input.runnerInstanceId}
           and instance.status = 'online'
           and pool.status = 'active'
+          and pool.active_worker_image_id is not null
+          and (
+            instance.metadata->>'worker_image_ref' is null
+            or image.image_ref = instance.metadata->>'worker_image_ref'
+          )
           and instance.last_heartbeat_at >= now() - (${Math.max(input.leaseSeconds * 2, 30).toString()} || ' seconds')::interval
         for update
         limit 1
       `;
       const instance = instances[0] as { capabilities?: WorkerCapabilities } | undefined;
       if (!instance) {
-        throw new HttpError(404, "runner_instance_not_claimable", "Runner instance is not online in an active pool");
+        throw new HttpError(
+          404,
+          "runner_instance_not_claimable",
+          "Runner instance is not online in an active pool with the current promoted worker image",
+        );
       }
       const capabilities = normalizeCapabilities(instance.capabilities);
       const capabilityIsolation = capabilities.isolation ?? [];
@@ -574,9 +662,9 @@ export class RunRepository {
     token: string;
     runnerInstanceId?: string | null;
     packageDigest?: string | null;
-  }): Promise<void> {
+  }): Promise<{ runId: string; ownerKey: string | null; packageDigest: string }> {
     const rows = await this.sql`
-      select attempt.attempt_id
+      select attempt.attempt_id, attempt.run_id, run.owner_key, run.package_digest
       from cloud.run_attempts attempt
       join cloud.runs run using (run_id)
       where attempt.attempt_id = ${input.attemptId}
@@ -587,15 +675,24 @@ export class RunRepository {
         and (${input.packageDigest ?? null}::text is null or run.package_digest = ${input.packageDigest ?? null})
       limit 1
     `;
-    if (rows.length === 0) {
+    const attempt = rows[0];
+    if (!attempt) {
       throw new HttpError(401, "unauthorized", "worker attempt requires a valid attempt token");
     }
+    return {
+      runId: String(attempt.run_id),
+      ownerKey: attempt.owner_key === null ? null : String(attempt.owner_key),
+      packageDigest: String(attempt.package_digest),
+    };
   }
 }
 
 export function requireStringMap(value: unknown, pointer: string): Record<string, string> {
-  if (!isRecord(value)) {
+  if (value === undefined || value === null) {
     return {};
+  }
+  if (!isRecord(value)) {
+    throw new HttpError(400, "invalid_string_map", `${pointer} must be an object`);
   }
   const out: Record<string, string> = {};
   for (const [key, item] of Object.entries(value)) {

@@ -257,6 +257,50 @@ describe("Cloud run requirements", () => {
       .toThrow("Unsupported Cloud runner architecture");
   });
 
+  test("rejects unknown runtime option keys instead of silently ignoring typos", () => {
+    expect(() => runRequirementsForArtifact(artifact(), { memory_mbb: 8192 }))
+      .toThrow("/runtime_options/memory_mbb is not supported");
+
+    try {
+      runRequirementsForArtifact(artifact(), { materialize: "copy" });
+      throw new Error("materialize should not be accepted as a hosted Cloud runtime option");
+    } catch (error) {
+      expect(String(error)).toContain("/runtime_options/materialize is not supported");
+      expect((error as { detail?: Record<string, unknown> }).detail?.supported_options)
+        .toContain("memory_mb");
+    }
+  });
+
+  test("rejects malformed runtime option values before defaulting resources", () => {
+    expect(() => runRequirementsForArtifact(artifact(), { memory_mb: "large" }))
+      .toThrow("/runtime_options/memory_mb must be a positive integer");
+    expect(() => runRequirementsForArtifact(artifact(), { isolation: "" }))
+      .toThrow("/runtime_options/isolation must be a non-empty string");
+    expect(() => runRequirementsForArtifact(artifact(), { sidecars: "redis" }))
+      .toThrow("/runtime_options/sidecars must be an array of strings");
+  });
+
+  test("rejects ambiguous runtime option aliases instead of choosing precedence", () => {
+    expect(() => runRequirementsForArtifact(artifact(), {
+      backend: "runner-docker",
+      executor: "modal",
+    })).toThrow("/runtime_options/backend and /runtime_options/executor cannot both be provided");
+
+    expect(() => runRequirementsForArtifact(artifact(), {
+      cpu_count: 4,
+      cpu: 2,
+    })).toThrow("/runtime_options/cpu_count and /runtime_options/cpu cannot both be provided");
+  });
+
+  test("rejects unknown nested network runtime option keys", () => {
+    expect(() => runRequirementsForArtifact(artifact(), {
+      network: {
+        default: "none",
+        egress_policy: "full",
+      },
+    })).toThrow("/runtime_options/network/egress_policy is not supported");
+  });
+
   test("rejects ambient Cloud network modes", () => {
     expect(() => runRequirementsForArtifact(artifact({
       resolved_experiment_json: {
@@ -309,6 +353,12 @@ function artifact(overrides: Partial<PackageArtifactRecord> = {}): PackageArtifa
     target: null,
     image_refs: ["ghcr.io/acme/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
     diagnostics: [],
+    package_provenance: {
+      schema_version: "cloud_package_provenance_v1",
+      status: "hosted_attested",
+      source: "hosted_core",
+      message: "test package provenance",
+    },
     status: "accepted",
     created_at: "2026-05-29T00:00:00Z",
     updated_at: "2026-05-29T00:00:00Z",

@@ -1,9 +1,29 @@
 const CONTROL_PLANE_ENV_NAMES = new Set([
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "BUCEPHALUS_CLOUD_ALLOW_CONTROL_PLANE_SECRET_REFS",
+  "BUCEPHALUS_CLOUD_ALLOW_LOCAL_IMAGE_REFS",
+  "BUCEPHALUS_CLOUD_API_URL",
   "BUCEPHALUS_CLOUD_WORKER_TOKEN",
-  "BUCEPHALUS_WORKER_DATABASE_URL",
-  "DATABASE_URL",
   "BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON",
   "BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON",
+  "BUCEPHALUS_RUN_STORE",
+  "BUCEPHALUS_RUN_STORE_SCHEMA",
+  "BUCEPHALUS_RUN_STORE_URL",
+  "BUCEPHALUS_RUNNER_INSTANCE_ID",
+  "BUCEPHALUS_RUNNER_POOL_ID",
+  "BUCEPHALUS_RUNNER_PROVIDER_INSTANCE_ID",
+  "BUCEPHALUS_RUNNER_PROVISION_REQUEST_ID",
+  "BUCEPHALUS_SECRET_RESOLVER_ALLOW_CONTROL_PLANE_REFS",
+  "BUCEPHALUS_SECRET_RESOLVER_ALLOW_ENV",
+  "BUCEPHALUS_SECRET_RESOLVER_AWS_CMD",
+  "BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD",
+  "BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH",
+  "BUCEPHALUS_WORKER_DATABASE_URL",
+  "BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON",
+  "DATABASE_URL",
+  "GOOGLE_APPLICATION_CREDENTIALS",
 ]);
 
 const CONTROL_PLANE_SECRET_PATTERNS = [
@@ -23,6 +43,14 @@ export function controlPlaneSecretIdViolation(id: string): string | null {
   const normalized = id.trim().toUpperCase();
   if (CONTROL_PLANE_ENV_NAMES.has(normalized)) {
     return `Secret id '${id}' is reserved for Cloud control-plane credentials`;
+  }
+  return null;
+}
+
+export function controlPlaneEnvNameViolation(name: string): string | null {
+  const normalized = name.trim().toUpperCase();
+  if (CONTROL_PLANE_ENV_NAMES.has(normalized)) {
+    return `Environment variable '${name}' is reserved for Cloud runtime/control-plane state`;
   }
   return null;
 }

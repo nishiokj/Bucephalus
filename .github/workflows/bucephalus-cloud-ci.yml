@@ -6,6 +6,7 @@ on:
       - ".github/workflows/bucephalus-cloud-ci.yml"
       - ".github/workflows/bucephalus-gcp-cleanup.yml"
       - ".github/workflows/bucephalus-gcp-deploy.yml"
+      - ".github/workflows/bucephalus-cloud-candidate.yml"
       - ".github/workflows/bucephalus-release.yml"
       - "Cargo.lock"
       - "Cargo.toml"
@@ -18,6 +19,9 @@ on:
       - "bucephalus-cloud/**"
       - "bucephalus-cloud/infra/gcp/**"
       - "scripts/ci/cloud-gates.sh"
+      - "scripts/ci/classify-cloud-candidate-change.sh"
+      - "scripts/ci/smoke-buc-hosted-workflow.sh"
+      - "scripts/ci/smoke-hosted-authoring-real-core.sh"
       - "scripts/ci/verify-cloud-release-boundary.sh"
       - "scripts/deploy/**"
       - "scripts/release/build-buc-release.sh"
@@ -50,6 +54,7 @@ on:
       - ".github/workflows/bucephalus-cloud-ci.yml"
       - ".github/workflows/bucephalus-gcp-cleanup.yml"
       - ".github/workflows/bucephalus-gcp-deploy.yml"
+      - ".github/workflows/bucephalus-cloud-candidate.yml"
       - ".github/workflows/bucephalus-release.yml"
       - "Cargo.lock"
       - "Cargo.toml"
@@ -62,6 +67,9 @@ on:
       - "bucephalus-cloud/**"
       - "bucephalus-cloud/infra/gcp/**"
       - "scripts/ci/cloud-gates.sh"
+      - "scripts/ci/classify-cloud-candidate-change.sh"
+      - "scripts/ci/smoke-buc-hosted-workflow.sh"
+      - "scripts/ci/smoke-hosted-authoring-real-core.sh"
       - "scripts/ci/verify-cloud-release-boundary.sh"
       - "scripts/deploy/**"
       - "scripts/release/build-buc-release.sh"
@@ -91,6 +99,59 @@ on:
   workflow_dispatch:
 
 jobs:
+  cloud-candidate-source:
+    name: Cloud candidate source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Write Cloud candidate source metadata
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before || '' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+        run: |
+          candidate_sha="${GITHUB_SHA_VALUE}"
+          base_sha=""
+
+          case "${EVENT_NAME}" in
+            push)
+              if [[ -n "${PUSH_BEFORE_SHA}" && ! "${PUSH_BEFORE_SHA}" =~ ^0{40}$ ]]; then
+                base_sha="${PUSH_BEFORE_SHA}"
+              fi
+              ;;
+            pull_request)
+              candidate_sha="${PR_HEAD_SHA:-${GITHUB_SHA_VALUE}}"
+              base_sha="${PR_BASE_SHA}"
+              ;;
+          esac
+
+          if [[ ! "${candidate_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate_sha is not a full git SHA: ${candidate_sha}" >&2
+            exit 2
+          fi
+          if [[ -n "${base_sha}" && ! "${base_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "base_sha is not a full git SHA: ${base_sha}" >&2
+            exit 2
+          fi
+
+          mkdir -p dist/cloud-candidate-source
+          {
+            echo "event_name=${EVENT_NAME}"
+            echo "candidate_sha=${candidate_sha}"
+            echo "base_sha=${base_sha}"
+          } > dist/cloud-candidate-source/cloud-candidate-source.txt
+
+      - name: Upload Cloud candidate source metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-candidate-source
+          path: dist/cloud-candidate-source/cloud-candidate-source.txt
+          if-no-files-found: error
+          retention-days: 7
+
   release-boundary-policy:
     name: Release boundary policy
     runs-on: ubuntu-latest
@@ -129,7 +190,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
-      DATABASE_URL: postgres://bucephalus:bucephalus_dev@localhost:55432/bucephalus_cloud
+      DATABASE_URL: postgres://bucephalus:bucephalus_dev@127.0.0.1:55432/bucephalus_cloud
     steps:
       - uses: actions/checkout@v4
 

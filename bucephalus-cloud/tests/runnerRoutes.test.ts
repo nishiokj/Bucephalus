@@ -22,7 +22,45 @@ describe("runner management routes", () => {
         workerToken: "worker-token",
         adminToken: "admin-token",
       },
-    )).rejects.toThrow("runner pool management requires a valid worker token");
+    )).rejects.toMatchObject({
+      status: 401,
+      code: "unauthorized",
+      message: "runner pool management requires a valid runner admin token",
+    });
+
+    await expect(handleRunnerRoute(
+      new Request("https://cloud.example/v1/runner-pools", {
+        headers: {
+          "x-bucephalus-worker-token": "admin-token",
+        },
+      }),
+      new URL("https://cloud.example/v1/runner-pools"),
+      runners as unknown as RunnerRepository,
+      {
+        workerToken: "worker-token",
+        adminToken: "admin-token",
+      },
+    )).rejects.toMatchObject({
+      status: 401,
+      code: "unauthorized",
+      message: "runner pool management requires a valid runner admin token",
+    });
+
+    const headerResponse = await handleRunnerRoute(
+      new Request("https://cloud.example/v1/runner-pools", {
+        headers: {
+          "x-bucephalus-runner-admin-token": "admin-token",
+        },
+      }),
+      new URL("https://cloud.example/v1/runner-pools"),
+      runners as unknown as RunnerRepository,
+      {
+        workerToken: "worker-token",
+        adminToken: "admin-token",
+      },
+    );
+
+    expect(await headerResponse!.json()).toEqual({ runner_pools: [] });
 
     const response = await handleRunnerRoute(
       new Request("https://cloud.example/v1/runner-pools", {
@@ -35,6 +73,30 @@ describe("runner management routes", () => {
       {
         workerToken: "worker-token",
         adminToken: "admin-token",
+      },
+    );
+
+    expect(response).not.toBeNull();
+    expect(await response!.json()).toEqual({ runner_pools: [] });
+  });
+
+  test("legacy worker-token header remains valid for runner admin only without a separate admin token", async () => {
+    const runners = {
+      async listPools() {
+        return [];
+      },
+    };
+
+    const response = await handleRunnerRoute(
+      new Request("https://cloud.example/v1/runner-pools", {
+        headers: {
+          "x-bucephalus-worker-token": "worker-token",
+        },
+      }),
+      new URL("https://cloud.example/v1/runner-pools"),
+      runners as unknown as RunnerRepository,
+      {
+        workerToken: "worker-token",
       },
     );
 

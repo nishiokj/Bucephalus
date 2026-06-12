@@ -1,9 +1,11 @@
 import { spawnSync } from "node:child_process";
 import {
+  canonicalJsonStringify,
   canonicalizeEntity,
   normalizationHints,
   resolveRegistryRef,
   type EntityKind,
+  type JsonValue,
   type JsonObject,
   type RegistryResolverRepository,
 } from "../primitives";
@@ -25,6 +27,9 @@ export interface DraftIssue {
   relatedDigest?: string | null;
 }
 
+export const DRAFT_VALIDATION_LEVELS = ["authoring", "package", "launch_hint"] as const;
+export type DraftValidationLevel = typeof DRAFT_VALIDATION_LEVELS[number];
+
 export interface DraftResolveResult {
   resolvedDraft: JsonObject;
   bindings: DraftDigestBinding[];
@@ -38,8 +43,13 @@ export interface DraftResolveResult {
 
 export interface DraftValidationResult {
   valid: boolean;
+  validationLevel: DraftValidationLevel;
   issues: DraftIssue[];
   resolvedRefs: DraftDigestBinding[];
+}
+
+export interface DraftValidationOptions {
+  validationLevel?: DraftValidationLevel;
 }
 
 export interface SchedulePreview {
@@ -51,6 +61,14 @@ export interface SchedulePreview {
   max_concurrency: number | null;
   unresolved_refs: string[];
   warnings: DraftIssue[];
+}
+
+export interface DraftDiffChange {
+  op: "add" | "remove" | "replace";
+  pointer: string;
+  left?: JsonValue;
+  right?: JsonValue;
+  significance: "identity" | "behavior" | "metadata" | "presentation" | "unknown";
 }
 
 export async function canonicalizeDraft(draft: JsonObject): Promise<{
@@ -180,9 +198,11 @@ export async function resolveDraftRefs(
 export async function validateDraft(
   draft: JsonObject,
   repository: RegistryResolverRepository = memoryRepository(),
+  options: DraftValidationOptions = {},
 ): Promise<DraftValidationResult> {
+  const validationLevel = options.validationLevel ?? "authoring";
   const resolved = await resolveDraftRefs(draft, repository);
-  const issues = validationIssues(draft).concat(resolved.issues);
+  const issues = validationIssues(draft, validationLevel).concat(resolved.issues);
   for (const unresolvedRef of resolved.unresolved) {
     issues.push({
       severity: "warning",
@@ -193,6 +213,7 @@ export async function validateDraft(
   }
   return {
     valid: !issues.some((issue) => issue.severity === "error"),
+    validationLevel,
     issues,
     resolvedRefs: resolved.bindings,
   };
@@ -245,7 +266,13 @@ export function exportDraftYaml(draft: JsonObject): string {
   return result.stdout;
 }
 
-function validationIssues(draft: JsonObject): DraftIssue[] {
+export function diffDraftJson(left: JsonValue, right: JsonValue): DraftDiffChange[] {
+  const changes: DraftDiffChange[] = [];
+  collectDiffChanges(left, right, "", changes);
+  return changes;
+}
+
+function validationIssues(draft: JsonObject, validationLevel: DraftValidationLevel = "authoring"): DraftIssue[] {
   const issues: DraftIssue[] = [];
   const requiredObjects = [
     ["/experiment", "missing_experiment"],
@@ -313,7 +340,260 @@ function validationIssues(draft: JsonObject): DraftIssue[] {
       pointer: "/matrix/repeats",
     });
   }
+  if (validationLevel === "package" || validationLevel === "launch_hint") {
+    issues.push(...packageValidationIssues(draft));
+  }
+  if (validationLevel === "launch_hint") {
+    issues.push(...launchHintIssues(draft));
+  }
   return issues;
+}
+
+function packageValidationIssues(draft: JsonObject): DraftIssue[] {
+  const issues: DraftIssue[] = [];
+  const cases = valueAt(draft, "/matrix/cases");
+  if (isJsonObject(cases)) {
+    const count = numberAt(draft, "/matrix/cases/count");
+    const path = stringAt(draft, "/matrix/cases/path");
+    if (count === null && !path) {
+      issues.push({
+        severity: "error",
+        code: "missing_cases_source",
+        message: "/matrix/cases must declare count or path before a Cloud package can be built",
+        pointer: "/matrix/cases",
+      });
+    }
+    if (path && isAbsolutePath(path)) {
+      issues.push({
+        severity: "error",
+        code: "absolute_cases_path",
+        message: "/matrix/cases/path must be relative to the uploaded authoring context for hosted Cloud builds",
+        pointer: "/matrix/cases/path",
+      });
+    }
+  }
+
+  const variants = arrayAt(draft, "/matrix/variants");
+  for (let index = 0; index < variants.length; index += 1) {
+    const variant = variants[index];
+    const pointer = `/matrix/variants/${index}`;
+    if (!isJsonObject(variant)) {
+      issues.push({
+        severity: "error",
+        code: "invalid_variant",
+        message: `${pointer} must be an object`,
+        pointer,
+      });
+      continue;
+    }
+    if (!stringAt(draft, `${pointer}/id`) && !isJsonObject(valueAt(draft, `${pointer}/registry`))) {
+      issues.push({
+        severity: "error",
+        code: "missing_variant_identity",
+        message: `${pointer} must declare id or registry before a Cloud package can be built`,
+        pointer,
+      });
+    }
+  }
+
+  const secrets = valueAt(draft, "/runtime/secrets");
+  if (secrets !== undefined && !Array.isArray(secrets)) {
+    issues.push({
+      severity: "error",
+      code: "invalid_runtime_secrets",
+      message: "/runtime/secrets must be an array when present",
+      pointer: "/runtime/secrets",
+    });
+  }
+  if (Array.isArray(secrets)) {
+    for (let index = 0; index < secrets.length; index += 1) {
+      const secret = secrets[index];
+      const pointer = `/runtime/secrets/${index}`;
+      if (!isJsonObject(secret)) {
+        issues.push({
+          severity: "error",
+          code: "invalid_runtime_secret",
+          message: `${pointer} must be an object`,
+          pointer,
+        });
+        continue;
+      }
+      if (!stringAt(draft, `${pointer}/name`)) {
+        issues.push({
+          severity: "error",
+          code: "missing_runtime_secret_name",
+          message: `${pointer}/name is required so Cloud can match a run-time secret ref`,
+          pointer: `${pointer}/name`,
+        });
+      }
+      const mountTarget = stringAt(draft, `${pointer}/mount/target`);
+      if (mountTarget && !mountTarget.startsWith("/")) {
+        issues.push({
+          severity: "error",
+          code: "relative_secret_mount_target",
+          message: `${pointer}/mount/target must be an absolute runtime path`,
+          pointer: `${pointer}/mount/target`,
+        });
+      }
+    }
+  }
+
+  return issues;
+}
+
+function launchHintIssues(draft: JsonObject): DraftIssue[] {
+  const issues: DraftIssue[] = [];
+  const backend = stringAt(draft, "/runtime/compute/backend");
+  if (backend === "local-docker") {
+    issues.push({
+      severity: "warning",
+      code: "local_compute_backend",
+      message: "/runtime/compute/backend is local-docker; hosted launch will use Cloud runtime options or a Cloud-backed backend such as modal",
+      pointer: "/runtime/compute/backend",
+    });
+  }
+
+  const secrets = arrayAt(draft, "/runtime/secrets");
+  for (let index = 0; index < secrets.length; index += 1) {
+    const pointer = `/runtime/secrets/${index}`;
+    const name = stringAt(draft, `${pointer}/name`);
+    if (name) {
+      issues.push({
+        severity: "info",
+        code: "cloud_secret_ref_required",
+        message: `Hosted runs must provide --secret-ref ${name}=bucephalus://${name} or another supported Cloud secret ref`,
+        pointer,
+      });
+    }
+  }
+
+  const network = valueAt(draft, "/runtime/network");
+  if (isJsonObject(network)) {
+    issues.push({
+      severity: "info",
+      code: "cloud_network_requirements",
+      message: "/runtime/network may require an active runner pool with matching network perimeter capabilities",
+      pointer: "/runtime/network",
+    });
+  }
+
+  const imageRewrites = arrayAt(draft, "/runtime/registry/image_rewrites");
+  const rewritePrefixes = imageRewrites
+    .filter(isJsonObject)
+    .map((rewrite) => typeof rewrite.match_prefix === "string" ? rewrite.match_prefix : null)
+    .filter((value): value is string => value !== null);
+  const ephemerals = valueAt(draft, "/ephemerals");
+  if (isJsonObject(ephemerals)) {
+    for (const [name, value] of Object.entries(ephemerals)) {
+      if (!isJsonObject(value)) {
+        continue;
+      }
+      const image = typeof value.image === "string" ? value.image : null;
+      if (image && isLocalImageReference(image) && !rewritePrefixes.some((prefix) => image.startsWith(prefix))) {
+        issues.push({
+          severity: "warning",
+          code: "local_image_without_rewrite",
+          message: `Ephemeral '${name}' uses local image '${image}' without a matching /runtime/registry/image_rewrites entry`,
+          pointer: `/ephemerals/${escapeJsonPointer(name)}/image`,
+        });
+      }
+    }
+  }
+
+  return issues;
+}
+
+function isAbsolutePath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+function isLocalImageReference(value: string): boolean {
+  if (value.includes("@sha256:")) {
+    return false;
+  }
+  const parts = value.split("/");
+  if (parts.length === 1) {
+    return true;
+  }
+  const first = parts[0] ?? "";
+  return first !== "localhost" && !first.includes(".") && !first.includes(":");
+}
+
+function collectDiffChanges(
+  left: JsonValue | undefined,
+  right: JsonValue | undefined,
+  pointer: string,
+  changes: DraftDiffChange[],
+): void {
+  if (left === undefined && right === undefined) {
+    return;
+  }
+  if (left === undefined) {
+    changes.push({
+      op: "add",
+      pointer,
+      right: right as JsonValue,
+      significance: pointerSignificance(pointer),
+    });
+    return;
+  }
+  if (right === undefined) {
+    changes.push({
+      op: "remove",
+      pointer,
+      left,
+      significance: pointerSignificance(pointer),
+    });
+    return;
+  }
+  if (isJsonObject(left) && isJsonObject(right)) {
+    const keys = Array.from(new Set([...Object.keys(left), ...Object.keys(right)])).sort();
+    for (const key of keys) {
+      collectDiffChanges(
+        left[key],
+        right[key],
+        `${pointer}/${escapeJsonPointer(key)}`,
+        changes,
+      );
+    }
+    return;
+  }
+  if (Array.isArray(left) && Array.isArray(right)) {
+    const length = Math.max(left.length, right.length);
+    for (let index = 0; index < length; index += 1) {
+      collectDiffChanges(left[index], right[index], `${pointer}/${index}`, changes);
+    }
+    return;
+  }
+  if (canonicalJsonStringify(left) !== canonicalJsonStringify(right)) {
+    changes.push({
+      op: "replace",
+      pointer,
+      left,
+      right,
+      significance: pointerSignificance(pointer),
+    });
+  }
+}
+
+function pointerSignificance(pointer: string): DraftDiffChange["significance"] {
+  if (pointer === "/experiment/id" || pointer.endsWith("/__cloud/digest")) {
+    return "identity";
+  }
+  if (pointer.endsWith("/name") || pointer.endsWith("/display_name") || pointer === "/experiment/name") {
+    return "presentation";
+  }
+  if (pointer.includes("/metadata") || pointer.includes("/__cloud")) {
+    return "metadata";
+  }
+  if (pointer === "") {
+    return "unknown";
+  }
+  return "behavior";
+}
+
+function escapeJsonPointer(value: string): string {
+  return value.replace(/~/g, "~0").replace(/\//g, "~1");
 }
 
 function registryRefFromDraftEntity(kind: EntityKind, value: JsonObject) {

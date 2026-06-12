@@ -33,6 +33,45 @@ export async function readJsonObject(request: Request): Promise<Record<string, u
   return value;
 }
 
+export function queryInteger(
+  url: URL,
+  key: string,
+  options: { defaultValue?: number; min?: number; max?: number } = {},
+): number {
+  const raw = url.searchParams.get(key);
+  if (raw === null || raw === "") {
+    if (options.defaultValue !== undefined) {
+      return options.defaultValue;
+    }
+    throw new HttpError(400, "invalid_query", `/${key} is required`);
+  }
+  if (!/^[0-9]+$/.test(raw)) {
+    throw new HttpError(400, "invalid_query", `/${key} must be an integer`);
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new HttpError(400, "invalid_query", `/${key} must be a safe integer`);
+  }
+  if (options.min !== undefined && parsed < options.min) {
+    throw new HttpError(400, "invalid_query", `/${key} must be >= ${options.min}`);
+  }
+  if (options.max !== undefined && parsed > options.max) {
+    throw new HttpError(400, "invalid_query", `/${key} must be <= ${options.max}`);
+  }
+  return parsed;
+}
+
+export function optionalQueryInteger(
+  url: URL,
+  key: string,
+  options: { min?: number; max?: number } = {},
+): number | undefined {
+  if (!url.searchParams.has(key)) {
+    return undefined;
+  }
+  return queryInteger(url, key, options);
+}
+
 async function readBoundedRequestText(request: Request, maxBytes: number): Promise<string> {
   const contentLength = request.headers.get("content-length");
   if (contentLength !== null) {
@@ -153,12 +192,26 @@ export function requireRecord(value: unknown, pointer: string): Record<string, u
 }
 
 export function requireBearerToken(request: Request, expectedToken: string, scope: string): void {
+  requireStaticToken(request, expectedToken, {
+    scope,
+    credentialName: "worker token",
+    headerNames: ["x-bucephalus-worker-token"],
+  });
+}
+
+export function requireStaticToken(
+  request: Request,
+  expectedToken: string,
+  options: { scope: string; credentialName: string; headerNames?: string[] },
+): void {
   const authorization = request.headers.get("authorization");
   const bearer = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : null;
-  const headerToken = request.headers.get("x-bucephalus-worker-token");
+  const headerToken = (options.headerNames ?? [])
+    .map((name) => request.headers.get(name))
+    .find((token): token is string => typeof token === "string" && token.length > 0);
   const providedToken = bearer ?? headerToken;
   if (!providedToken || !secureEqual(providedToken, expectedToken)) {
-    throw new HttpError(401, "unauthorized", `${scope} requires a valid worker token`);
+    throw new HttpError(401, "unauthorized", `${options.scope} requires a valid ${options.credentialName}`);
   }
 }
 

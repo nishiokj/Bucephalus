@@ -1415,6 +1415,104 @@ mod tests {
     }
 
     #[test]
+    fn modal_launch_spec_carries_same_sandbox_ephemerals() {
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_modal_same_sandbox_ephemeral");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({
+            "sidecars": {
+                "pg-data-api": {
+                    "image": "python:3.11-slim",
+                    "lifecycle": "per-trial",
+                    "placement": "same_sandbox",
+                    "command": ["python3", "/svc.py"],
+                    "workdir": "/workspace/task",
+                    "env": {"SERVICE_MODE": "test"},
+                    "expose": {"PG_DATA_API_URL": "http://127.0.0.1:9757"},
+                    "readiness": {
+                        "command": ["python3", "-c", "print('ready')"],
+                        "timeout_ms": 5000
+                    }
+                }
+            },
+            "trial_runtime": {
+                "agent": {
+                    "sidecars": ["pg-data-api"]
+                }
+            }
+        });
+        let request = TrialRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "full",
+            grader: None,
+            grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let backend = ModalExecutionBackend::for_test("bucephalus-test", Some("dev"));
+        let sync = modal_runtime_sync_fixture(true);
+        let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "full");
+
+        let spec = modal_launch_spec_for_test(
+            &backend,
+            &sync,
+            &request,
+            &paths.trial_dir,
+            &plan,
+            vec!["python".to_string(), "/agent.py".to_string()],
+        )
+        .expect("modal launch spec");
+
+        assert_eq!(
+            spec.pointer("/execs/0/env/PG_DATA_API_URL"),
+            Some(&json!("http://127.0.0.1:9757"))
+        );
+        assert_eq!(
+            spec.pointer("/ephemerals/0/id"),
+            Some(&json!("pg-data-api"))
+        );
+        assert_eq!(
+            spec.pointer("/ephemerals/0/placement"),
+            Some(&json!("same_sandbox"))
+        );
+        assert_eq!(
+            spec.pointer("/ephemerals/0/command"),
+            Some(&json!(["python3", "/svc.py"]))
+        );
+        assert_eq!(
+            spec.pointer("/ephemerals/0/env/SERVICE_MODE"),
+            Some(&json!("test"))
+        );
+        assert_eq!(
+            spec.pointer("/ephemerals/0/readiness/timeout_seconds"),
+            Some(&json!(5))
+        );
+        assert_eq!(
+            spec.pointer("/ephemerals/0/stdout/remote_path"),
+            Some(&json!("/bucephalus/out/ephemerals/pg-data-api.stdout.log"))
+        );
+    }
+
+    #[test]
     fn modal_launch_spec_omits_agent_transfer_when_runtime_image_is_prepared() {
         let (root, paths) = create_trial_paths_fixture("bucephalus_modal_prepared_runtime_image");
         let mut runtime = legacy_contract_runtime_fixture();
@@ -2413,7 +2511,7 @@ mod tests {
     }
 
     #[test]
-    fn modal_executor_rejects_sidecars_before_requiring_sync_config() {
+    fn modal_executor_rejects_non_same_sandbox_sidecars_before_requiring_sync_config() {
         let _lock = lock_modal_env_tests();
         let _guard = EnvVarGuard::set(&[
             ("BUCEPHALUS_MODAL_S3_BUCKET", None),

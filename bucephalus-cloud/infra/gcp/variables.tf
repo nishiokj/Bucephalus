@@ -74,19 +74,19 @@ variable "worker_image_digest" {
 }
 
 variable "deploy_control_plane_services" {
-  description = "Compatibility switch for deploying all Cloud Run services/jobs. Prefer deploy_api_services and deploy_pool_controller for phased promotion."
+  description = "Compatibility switch for deploying all Cloud Run services/jobs. Normal promotion should set deploy_api_services and deploy_pool_controller together through deployment_stage=services."
   type        = bool
   default     = false
 }
 
 variable "deploy_api_services" {
-  description = "Whether to deploy the API service and migration job. This phase does not require a runner pool ID."
+  description = "Whether to deploy the API service and migration job. Normal service promotion enables this together with deploy_pool_controller."
   type        = bool
   default     = false
 }
 
 variable "deploy_pool_controller" {
-  description = "Whether to deploy the pool controller after an API-owned runner pool ID exists."
+  description = "Whether to deploy the pool controller after an API-owned runner pool ID exists. Normal service promotion enables this together with deploy_api_services."
   type        = bool
   default     = false
 }
@@ -175,6 +175,17 @@ variable "worker_token_secret_version" {
   validation {
     condition     = var.worker_token_secret_version == null || can(regex("^[1-9][0-9]*$", var.worker_token_secret_version))
     error_message = "worker_token_secret_version must be an explicit numeric Secret Manager version when set."
+  }
+}
+
+variable "runner_admin_token_secret_version" {
+  description = "Optional numeric Secret Manager version for the runner-pool admin token. When unset, the API falls back to the worker token for compatibility."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.runner_admin_token_secret_version == null || can(regex("^[1-9][0-9]*$", var.runner_admin_token_secret_version))
+    error_message = "runner_admin_token_secret_version must be an explicit numeric Secret Manager version when set."
   }
 }
 

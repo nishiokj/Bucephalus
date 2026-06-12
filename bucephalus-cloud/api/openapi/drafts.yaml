@@ -137,10 +137,17 @@ paths:
                 additionalProperties: false
                 required:
                   - valid
+                  - validation_level
                   - issues
                 properties:
                   valid:
                     type: boolean
+                  validation_level:
+                    type: string
+                    enum:
+                      - authoring
+                      - package
+                      - launch_hint
                   issues:
                     type: array
                     items:
@@ -387,6 +394,8 @@ components:
           type: string
           enum:
             - inline
+            - inline_existing
+            - inline_unregistered
             - alias
             - digest
             - inferred
@@ -439,4 +448,3 @@ components:
           properties:
             ref:
               $ref: './common.yaml#/components/schemas/RegistryRef'
-

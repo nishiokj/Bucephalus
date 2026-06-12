@@ -165,6 +165,7 @@ prepare_image_context() {
   case "${component}" in
     api)
       copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/server.js" "${context_dir}/bucephalus-cloud/runtime-dist/server.js"
+      copy_context_path "${RELEASE_DIR}/bin/bucephalus" "${context_dir}/bin/bucephalus"
       ;;
     migrations)
       copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/db/migrate.js" "${context_dir}/bucephalus-cloud/runtime-dist/db/migrate.js"

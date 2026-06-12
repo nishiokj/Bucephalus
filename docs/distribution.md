@@ -13,8 +13,9 @@ curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/in
 
 It detects macOS/Linux plus arm64/x86_64, downloads the matching GitHub Release
 archive, verifies the archive checksum, rejects unexpected or unsafe archive
-entries before extraction, and installs `bucephalus`, `bucephalus-cloud`, and
-`bucephalus-modal-launcher` into `$HOME/.local/bin` unless
+entries before extraction, and installs `bucephalus`, `buc`,
+`bucephalus-cloud` (operator utility), and `bucephalus-modal-launcher` into
+`$HOME/.local/bin` unless
 `BUCEPHALUS_INSTALL_DIR` is set.
 The sibling checksum file must contain exactly one record in the release format:
 `<lowercase-sha256>  <archive-name>`.
@@ -45,8 +46,9 @@ cargo install --path rust/crates/lab-cli
 
 The legacy `lab` executable is still installed as a compatibility alias when
 installing from Cargo. Public release archives ship the user-facing
-`bucephalus` CLI plus its `bucephalus-cloud` and `bucephalus-modal-launcher`
-runtime helpers, not the provider deployment bundle.
+`bucephalus` local CLI, the `buc` hosted Cloud product CLI, the
+`bucephalus-cloud` operator utility, and the `bucephalus-modal-launcher`
+runtime helper, not the provider deployment bundle.
 
 ## Build from source
 
@@ -74,6 +76,7 @@ library crates:
 ```text
 cli package: bucephalus-cli
 binary:  bucephalus
+cloud:   buc
 alias:   lab
 formula: bucephalus
 ```
@@ -98,7 +101,7 @@ bucephalus-aarch64-unknown-linux-gnu.tar.gz
 <archive>.sha256
 ```
 
-Each archive contains `bucephalus`, `bucephalus-cloud`, the packaged
+Each archive contains `bucephalus`, `buc`, `bucephalus-cloud`, the packaged
 `bucephalus-modal-launcher` helper used by the Modal backend, `README.md`,
 `LICENSE`, `release-manifest.json`, and `SHA256SUMS`. Build one locally with:
 
@@ -119,7 +122,7 @@ scripts/release/verify-core-release-provenance.sh \
 ```
 
 The Homebrew formula can consume the same archive for its target, verify SHA256,
-and install `bucephalus`, `bucephalus-cloud`, and
+and install `bucephalus`, `buc`, `bucephalus-cloud`, and
 `bucephalus-modal-launcher` into the same bin directory.
 
 In GitHub Actions these archives are uploaded as `cli-installer-<target>` so
@@ -250,7 +253,9 @@ by `package.runtime.json` and `bun.runtime.lock`. Backend images do not run
 data files that component needs. The worker image copies
 `bin/bucephalus-worker-runner` and routes `/usr/local/bin/bucephalus` to that
 narrow run-only binary instead of shipping the full interactive CLI into the
-runtime image.
+runtime image. The API image is the only Cloud image that carries the full
+`bin/bucephalus` binary, because hosted authoring builds execute Core inside
+the API builder boundary.
 
 Without `--push`, the images are loaded into the local Docker daemon and
 inspected for release labels and forbidden baked runtime configuration. Local
@@ -264,8 +269,10 @@ exact component image has passed the no-runtime-config/no-secret metadata check.
 The manifest also records each component's staged build-context file inventory,
 the local Docker image size reported after boundary inspection, and
 per-component build, boundary verification, push, and total seconds. Non-worker
-image contexts are verified to exclude the Rust core binary, and non-migration
-contexts are verified to exclude database migration files.
+image entries record the target-derived platform. Non-API image contexts are
+verified to exclude the Rust core binary, worker contexts are verified to
+include both `bin/bucephalus-worker-runner` and `bin/bucephalus-modal-launcher`,
+and non-migration contexts are verified to exclude database migration files.
 
 Base image approval is tracked in
 `bucephalus-cloud/images/base-image-policy.json` and verified with:
@@ -373,8 +380,10 @@ input. Every manifest entry must record
 `boundary_verified: true` and the local inspection image evidence used before
 publication. The manifest also records the release-root `.dockerignore` digest
 and each component Dockerfile digest so a promoted image digest can be traced
-back to the exact image build materials. Generated per-component contexts are an
-optimization only; they must be reproducible from the verified release artifact.
+back to the exact image build materials. It also records the target-derived
+image platform and per-component build-context inventories. Generated
+per-component contexts are an optimization only; they must be reproducible from
+the verified release artifact.
 Image metadata evidence uses
 artifact-local filenames and Docker `sha256:<digest>` image IDs, not local
 runner filesystem paths. The component repository, mutable tag used for the
@@ -521,10 +530,14 @@ apply=true
 That mode writes `deploy_control_plane_services = false`, applies the durable
 substrate through a remote GCS backend, and creates prerequisites such as
 Artifact Registry without accepting placeholder image digests. After the release
-workflow pushes real images and uploads promotion evidence, run the deploy
-workflow with `deployment_stage=api`, then later `deployment_stage=pool` after
-the API-created runner pool ID is configured. The workflow resolves the version
-to the pushed-image handoff, downloads it, verifies
+or candidate workflow pushes real images and uploads promotion evidence, run the
+deploy workflow with `deployment_stage=services` for the normal app promotion.
+The candidate workflow does this automatically only for runtime-only main
+changes; deploy-boundary changes stop at plan-only, and mixed runtime plus
+deploy-boundary changes build images but still stop at a plan. Runtime changes
+bundled with candidate/CI policy changes also stop at plan-only. The workflow
+resolves the version to the pushed-image handoff, or receives exact same-run
+candidate evidence from automation, downloads it, verifies
 `cloud-image-promotion-evidence.json`, writes non-secret deploy tfvars with
 `scripts/deploy/write-gcp-deploy-tfvars.sh`, and runs Terraform with a remote
 GCS backend.
@@ -621,15 +634,34 @@ The Cloud/Core CI gate is:
 scripts/ci/cloud-gates.sh
 ```
 
-It checks Rust formatting and tests, Cloud typecheck and tests, OpenAPI YAML
-parseability plus local `$ref` targets, and the Cloud migration integration
-test when `DATABASE_URL` is set. In CI, a missing `DATABASE_URL` fails the gate
-instead of silently skipping migration coverage. The migration test creates a
-scratch database, applies every SQL migration from empty, verifies the ledger
-and required schema objects, writes a representative Cloud row, and reruns the
-migrations to prove idempotency. GitHub branch protection or rulesets for
-`main` must require the `Cloud/Core gates` check so SQL migration regressions
-cannot merge. It also runs
+It checks Rust formatting, runs the hosted product CLI Rust tests, runs Cloud
+typecheck and tests, runs a hosted-authoring smoke that exercises the Cloud
+build route with the real Core binary, then runs the broader Rust workspace
+tests under a bounded timeout so local Docker executor state cannot hang the
+Cloud gate indefinitely. It also validates OpenAPI YAML parseability plus local
+`$ref` targets, and runs the Cloud migration integration test when
+`DATABASE_URL` is set. With database coverage enabled it also runs
+`scripts/ci/smoke-buc-hosted-workflow.sh`, which starts a real HTTP route
+harness backed by a scratch Postgres database and drives the actual `buc`
+binary through `buc build <nested experiment.yaml> --context-root <root>`,
+hosted Core authoring, package import, Cloud readiness, hosted secret upload,
+doctor, run creation, worker claim, runtime evidence ingest, run readback, and
+package inspection. The smoke fixture checks that shared context files are
+present, local credential/generated material such as `.env`, `.npmrc`, `.ssh`,
+`.aws`, `node_modules`, and `target` is excluded from authoring uploads or
+rejected by the hosted API, and control-plane secrets such as `DATABASE_URL`
+and `BUCEPHALUS_CLOUD_WORKER_TOKEN` are not forwarded into hosted Core. In CI,
+a missing `DATABASE_URL` fails the gate instead of silently
+skipping migration coverage.
+Before DB-backed tests run, `bun run check:postgres` performs a bounded
+credential-redacted readiness check. If the TCP port is open but does not
+complete a Postgres handshake/query, the gate reports that state explicitly so
+local OrbStack/Docker port conflicts do not look like a hung Cloud CLI.
+The migration test creates a scratch database, applies every SQL migration from
+empty, verifies the ledger and required schema objects, writes a representative
+Cloud row, and reruns the migrations to prove idempotency. GitHub branch
+protection or rulesets for `main` must require the `Cloud/Core gates` check so
+SQL migration regressions cannot merge. It also runs
 `scripts/ci/verify-cloud-release-boundary.sh`, which fails if the release
 workflow or image definitions drift back toward retired deploy payloads,
 mutable `latest` inputs, direct Docker push/login commands, unchecked image

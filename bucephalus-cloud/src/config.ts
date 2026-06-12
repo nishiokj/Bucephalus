@@ -5,11 +5,14 @@ export interface AppConfig {
   port: number;
   workerToken: string | null;
   runnerAdminToken: string | null;
+  buildEvidencePolicy: BuildEvidencePolicy;
   auth: AuthConfig;
   rateLimit: RateLimitConfig;
   storage: StorageConfig;
   secrets: SecretsStoreConfig;
 }
+
+export type BuildEvidencePolicy = "warn" | "enforce";
 
 export type SecretsStoreConfig =
   | {
@@ -71,12 +74,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     databaseUrl:
       env.DATABASE_URL ??
-      "postgres://bucephalus:bucephalus_dev@localhost:55432/bucephalus_cloud",
+      "postgres://bucephalus:bucephalus_dev@127.0.0.1:55432/bucephalus_cloud",
     dataDir: env.BUCEPHALUS_CLOUD_DATA_DIR ?? ".data",
     host: env.BUCEPHALUS_CLOUD_HOST ?? "127.0.0.1",
     port: Number.parseInt(env.PORT ?? "8080", 10),
     workerToken: env.BUCEPHALUS_CLOUD_WORKER_TOKEN?.trim() || null,
     runnerAdminToken: env.BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN?.trim() || null,
+    buildEvidencePolicy: loadBuildEvidencePolicy(env),
     auth: {
       required,
       issuer,
@@ -87,6 +91,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     storage: loadStorageConfig(env),
     secrets: loadSecretsStoreConfig(env),
   };
+}
+
+function loadBuildEvidencePolicy(env: NodeJS.ProcessEnv): BuildEvidencePolicy {
+  const value = env.BUCEPHALUS_CLOUD_BUILD_EVIDENCE_POLICY?.trim().toLowerCase() || "warn";
+  if (value === "warn" || value === "enforce") {
+    return value;
+  }
+  throw new Error("BUCEPHALUS_CLOUD_BUILD_EVIDENCE_POLICY must be 'warn' or 'enforce'");
 }
 
 function loadRateLimitConfig(env: NodeJS.ProcessEnv): RateLimitConfig {

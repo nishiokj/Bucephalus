@@ -17,6 +17,9 @@
     "worker": "bun run src/worker.ts",
     "test": "bun test",
     "test:migrations": "bun test ./tests/migrations.integration.ts",
+    "test:smoke:hosted-workflow": "../scripts/ci/smoke-buc-hosted-workflow.sh",
+    "test:smoke:real-core": "../scripts/ci/smoke-hosted-authoring-real-core.sh",
+    "check:postgres": "bun run scripts/check-postgres-ready.ts",
     "typecheck": "tsc --noEmit",
     "validate:openapi": "bun run scripts/validate-openapi.ts"
   },
