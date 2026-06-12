@@ -256,6 +256,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RegisterObjectResponse'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '409':
           $ref: './common.yaml#/components/responses/Conflict'
   /v1/registry/objects/{digest}:
@@ -287,6 +289,8 @@ paths:
                     type: array
                     items:
                       $ref: './common.yaml#/components/schemas/EntityAlias'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
   /v1/registry/resolve:
@@ -343,6 +347,8 @@ paths:
                     type: array
                     items:
                       $ref: './common.yaml#/components/schemas/EntityAlias'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
   /v1/registry/aliases:
@@ -387,6 +393,8 @@ paths:
             application/json:
               schema:
                 $ref: './common.yaml#/components/schemas/EntityAlias'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '409':
           $ref: './common.yaml#/components/responses/Conflict'
   /v1/registry/diffs:

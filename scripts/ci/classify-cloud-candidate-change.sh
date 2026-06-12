@@ -21,6 +21,7 @@ High-level policy:
   - runtime-only changes auto-deploy to dev
   - infra/deploy-boundary changes run plan-only
   - mixed runtime+infra changes build images, then run plan-only with candidate evidence
+  - runtime changes bundled with pipeline changes build images, then run plan-only
   - docs/tests/pipeline-only changes do not deploy
 USAGE
 }
@@ -149,16 +150,26 @@ change_class="none"
 
 if [[ "${runtime_changed}" == "true" ]]; then
   build_candidate="true"
-  if [[ "${infra_changed}" == "true" ]]; then
+  if [[ "${infra_changed}" == "true" && "${pipeline_changed}" == "true" ]]; then
+    plan_services="true"
+    change_class="mixed-runtime-infra-pipeline"
+  elif [[ "${infra_changed}" == "true" ]]; then
     plan_services="true"
     change_class="mixed-runtime-infra"
+  elif [[ "${pipeline_changed}" == "true" ]]; then
+    plan_services="true"
+    change_class="mixed-runtime-pipeline"
   else
     auto_deploy="true"
     change_class="runtime"
   fi
 elif [[ "${infra_changed}" == "true" ]]; then
   plan_services="true"
-  change_class="infra"
+  if [[ "${pipeline_changed}" == "true" ]]; then
+    change_class="infra-pipeline"
+  else
+    change_class="infra"
+  fi
 elif [[ "${pipeline_changed}" == "true" ]]; then
   change_class="pipeline"
 elif [[ "${docs_or_tests_changed}" == "true" ]]; then

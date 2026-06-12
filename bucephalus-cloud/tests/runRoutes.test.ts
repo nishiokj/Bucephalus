@@ -443,6 +443,38 @@ describe("Cloud run routes", () => {
     expect(packageLookups).toBe(0);
   });
 
+  test("package content download rejects malformed package digests before auth binding or artifact lookup", async () => {
+    const packages = {
+      async getArtifact() {
+        throw new Error("getArtifact should not be called");
+      },
+    };
+    const runs = {
+      async verifyAttemptToken() {
+        throw new Error("verifyAttemptToken should not be called for malformed package digests");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/packages/sha256:short/content", {
+        headers: {
+          authorization: "Bearer attempt-token",
+          "x-bucephalus-attempt-id": "attempt-1",
+        },
+      }),
+      new URL("https://cloud.example/v1/packages/sha256:short/content"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    )).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_request",
+      message: "/package_digest must be sha256:<64 lowercase hex chars>",
+    });
+  });
+
   test("package content download can stream an artifact stored in R2", async () => {
     const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const previousFetch = globalThis.fetch;
@@ -636,6 +668,29 @@ describe("Cloud run routes", () => {
     expect(body.name).toBe("Peter Gregory v2 State-Only Cloud Demo (pg_024)");
   });
 
+  test("package inspection rejects malformed package digests before artifact lookup", async () => {
+    const packages = {
+      async getArtifact() {
+        throw new Error("getArtifact should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/packages/sha256:NOTHEX"),
+      new URL("https://cloud.example/v1/packages/sha256:NOTHEX"),
+      packages as unknown as PackageRepository,
+      {} as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    )).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_request",
+      message: "/package_digest must be sha256:<64 lowercase hex chars>",
+    });
+  });
+
   test("package responses expose declared secret requirements without values", async () => {
     const packages = {
       async getArtifact() {
@@ -695,6 +750,40 @@ describe("Cloud run routes", () => {
       "worker-token",
       authContext("user-a"),
     )).rejects.toThrow("Run secret refs must match");
+  });
+
+  test("run creation rejects malformed package digests before package lookup", async () => {
+    const packages = {
+      async getArtifact() {
+        throw new Error("getArtifact should not be called");
+      },
+    };
+    const runs = {
+      async createRun() {
+        throw new Error("createRun should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:short",
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    )).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_request",
+      message: "/package_digest must be sha256:<64 lowercase hex chars>",
+    });
   });
 
   test("run creation accepts env-only package secret refs", async () => {

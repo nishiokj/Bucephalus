@@ -17,6 +17,8 @@ import {
 } from "../primitives";
 import { RegistryRepository, type AliasReview, type RegistrySearchHit } from "../registry/repository";
 
+const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
 export async function handleRegistryRoute(
   request: Request,
   url: URL,
@@ -35,7 +37,10 @@ export async function handleRegistryRoute(
   }
 
   if (request.method === "GET" && url.pathname.startsWith("/v1/registry/objects/")) {
-    const digest = decodeURIComponent(url.pathname.slice("/v1/registry/objects/".length));
+    const digest = requireDigest(
+      decodeURIComponent(url.pathname.slice("/v1/registry/objects/".length)),
+      "/digest",
+    );
     const object = await repository.getContentObject(digest);
     if (!object) {
       throw new HttpError(404, "not_found", "Content object not found");
@@ -76,7 +81,7 @@ export async function handleRegistryRoute(
 
 async function canonicalize(request: Request): Promise<Response> {
   const body = await readJsonObject(request);
-  const kind = requireString(body.kind, "/kind") as EntityKind;
+  const kind = requireEntityKind(body.kind, "/kind");
   const schemaVersion = optionalString(body.schema_version, "/schema_version") ?? "v1";
   const object = requireRecord(body.object, "/object") as JsonObject;
   const canonical = canonicalizeEntity({ kind, schemaVersion, object });
@@ -96,10 +101,10 @@ async function reviewObject(
   repository: RegistryRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
-  const kind = requireString(body.kind, "/kind") as EntityKind;
+  const kind = requireEntityKind(body.kind, "/kind");
   const schemaVersion = optionalString(body.schema_version, "/schema_version") ?? "v1";
   const aliases = parseAliasReviews(body.aliases);
-  const providedDigest = optionalString(body.content_digest, "/content_digest");
+  const providedDigest = optionalDigest(body.content_digest, "/content_digest");
   const inlineObject = body.object === undefined
     ? null
     : (requireRecord(body.object, "/object") as JsonObject);
@@ -190,10 +195,10 @@ async function registerObject(
   repository: RegistryRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
-  const kind = requireString(body.kind, "/kind") as EntityKind;
+  const kind = requireEntityKind(body.kind, "/kind");
   const schemaVersion = requireString(body.schema_version, "/schema_version");
   const object = requireRecord(body.canonical_json, "/canonical_json") as JsonObject;
-  const expectedDigest = optionalString(body.expected_digest, "/expected_digest");
+  const expectedDigest = optionalDigest(body.expected_digest, "/expected_digest");
   const sourceUri = optionalString(body.source_uri, "/source_uri");
   const canonical = canonicalizeEntity({ kind, schemaVersion, object });
 
@@ -337,10 +342,30 @@ function optionalEntityKind(value: string | null, pointer: string): EntityKind |
   if (value === null || value.trim() === "") {
     return undefined;
   }
-  if (!ENTITY_KINDS.includes(value as EntityKind)) {
+  return requireEntityKind(value, pointer);
+}
+
+function requireEntityKind(value: unknown, pointer: string): EntityKind {
+  const kind = requireString(value, pointer);
+  if (!ENTITY_KINDS.includes(kind as EntityKind)) {
     throw new HttpError(400, "invalid_request", `${pointer} must be a valid entity kind`);
   }
-  return value as EntityKind;
+  return kind as EntityKind;
+}
+
+function optionalDigest(value: unknown, pointer: string): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return requireDigest(value, pointer);
+}
+
+function requireDigest(value: unknown, pointer: string): string {
+  const digest = requireString(value, pointer);
+  if (!SHA256_DIGEST_PATTERN.test(digest)) {
+    throw new HttpError(400, "invalid_request", `${pointer} must be sha256:<64 lowercase hex chars>`);
+  }
+  return digest;
 }
 
 function isNonemptyString(value: string | null): value is string {
@@ -354,12 +379,12 @@ function isJsonObject(value: unknown): value is JsonObject {
 async function resolveRef(request: Request, repository: RegistryRepository): Promise<Response> {
   const body = await readJsonObject(request);
   const rawRef = requireRecord(body.ref, "/ref");
-  const kind = requireString(rawRef.kind, "/ref/kind") as EntityKind;
+  const kind = requireEntityKind(rawRef.kind, "/ref/kind");
   const inline =
     rawRef.inline === undefined
       ? undefined
       : (requireRecord(rawRef.inline, "/ref/inline") as JsonObject);
-  const digest = optionalString(rawRef.digest, "/ref/digest");
+  const digest = optionalDigest(rawRef.digest, "/ref/digest");
   const alias = optionalString(rawRef.alias, "/ref/alias");
   const schemaVersion =
     optionalString(rawRef.schema_version, "/ref/schema_version") ??
@@ -409,9 +434,9 @@ async function resolveRef(request: Request, repository: RegistryRepository): Pro
 async function createAlias(request: Request, repository: RegistryRepository): Promise<Response> {
   const body = await readJsonObject(request);
   const alias = await repository.createAlias({
-    kind: requireString(body.kind, "/kind") as EntityKind,
+    kind: requireEntityKind(body.kind, "/kind"),
     alias: requireString(body.alias, "/alias"),
-    contentDigest: requireString(body.content_digest, "/content_digest"),
+    contentDigest: requireDigest(body.content_digest, "/content_digest"),
     scopeType: optionalString(body.scope_type, "/scope_type") ?? "global",
     scopeId: optionalString(body.scope_id, "/scope_id"),
     replaceExisting: body.replace_existing === true,

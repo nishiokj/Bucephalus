@@ -511,10 +511,7 @@ fn package_list(context: CliContext) -> Result<()> {
     let packages = cloud_fetch(
         &context,
         Method::GET,
-        &path_with_query(
-            "/v1/packages",
-            &[("limit", limit)],
-        ),
+        &path_with_query("/v1/packages", &[("limit", limit)]),
         None,
         None,
     )?;
@@ -532,13 +529,13 @@ fn experiment_build(context: CliContext) -> Result<()> {
     let label = option_value(&context.args, "--label")?;
     let json_output = json_requested(&context.args);
     let expected_runtime_options = Value::Object(runtime_options_from_args(&context.args)?);
-    ensure_api_configured(&context)?;
     let path = Path::new(&path);
     let (build, source_label, expected_build_kind, expected_source_kind, expected_entrypoint) =
         if is_authoring_yaml_path(path) {
             let prepared =
                 prepare_authoring_context_input(path, context_root.as_deref().map(Path::new))?;
             let entrypoint = prepared.entrypoint.clone();
+            ensure_api_configured(&context)?;
             (
                 upload_sealed_package_artifact(
                     &context,
@@ -558,6 +555,7 @@ fn experiment_build(context: CliContext) -> Result<()> {
             )
         } else {
             let prepared = prepare_sealed_package_input(path)?;
+            ensure_api_configured(&context)?;
             (
                 upload_sealed_package_artifact(
                     &context,
@@ -695,10 +693,7 @@ fn run_list(context: CliContext) -> Result<()> {
     let runs = cloud_fetch(
         &context,
         Method::GET,
-        &path_with_query(
-            "/v1/runs",
-            &[("limit", limit)],
-        ),
+        &path_with_query("/v1/runs", &[("limit", limit)]),
         None,
         None,
     )?;
@@ -762,10 +757,7 @@ fn run_events(context: CliContext) -> Result<()> {
         Method::GET,
         &path_with_query(
             &format!("/v1/runs/{}/runtime/events", encode_path_segment(&run_id)),
-            &[
-                ("limit", limit),
-                ("after_row_seq", after_row_seq),
-            ],
+            &[("limit", limit), ("after_row_seq", after_row_seq)],
         ),
         None,
         None,
@@ -968,8 +960,8 @@ fn draft_suggest(context: CliContext) -> Result<()> {
         &["--json"],
     )?;
     let limit = bounded_number_option(&context.args, "--limit", 100)?;
-    let draft = draft_from_args(&context.args)?;
     let target = required_option(&context.args, "--target")?;
+    let draft = draft_from_args(&context.args)?;
     let mut body = Map::new();
     body.insert("draft".to_string(), draft);
     body.insert("target".to_string(), json!(target));
@@ -1090,7 +1082,21 @@ fn build_input_path_arg(args: &[String]) -> Result<String> {
 }
 
 fn package_digest_arg(args: &[String]) -> Result<String> {
-    single_positional_or_option(args, "--package-digest", "package digest")
+    let digest = single_positional_or_option(args, "--package-digest", "package digest")?;
+    if !is_sha256_digest(&digest) {
+        bail!("package digest must be sha256:<64 lowercase hex chars>");
+    }
+    Ok(digest)
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn prepare_sealed_package_input(path: &Path) -> Result<PreparedPackageInput> {
@@ -3117,9 +3123,7 @@ fn validation_level_option(args: &[String]) -> Result<Option<String>> {
     };
     match value.as_str() {
         "authoring" | "package" | "launch_hint" => Ok(Some(value)),
-        _ => bail!(
-            "--validation-level must be one of authoring, package, launch_hint"
-        ),
+        _ => bail!("--validation-level must be one of authoring, package, launch_hint"),
     }
 }
 
@@ -4800,6 +4804,12 @@ mod tests {
     fn hosted_authoring_yaml_uses_build_command_and_requires_api_config() {
         let _lock = lock_env();
         let home = temp_dir("authoring_api_config");
+        let root = temp_dir("authoring_api_config_project");
+        fs::create_dir_all(&root).unwrap();
+        let experiment = root.join("experiment.yaml");
+        fs::write(&experiment, "experiment: {}\n").unwrap();
+        let modal_experiment = root.join("experiment.modal.yaml");
+        fs::write(&modal_experiment, "experiment: {}\n").unwrap();
         let home_s = home.display().to_string();
         let _env = EnvVarGuard::set(&[
             ("BUCEPHALUS_HOME", Some(home_s.as_str())),
@@ -4810,7 +4820,7 @@ mod tests {
         let err = run(vec![
             "experiments".to_string(),
             "build".to_string(),
-            "experiment.yaml".to_string(),
+            experiment.display().to_string(),
         ])
         .unwrap_err()
         .to_string();
@@ -4820,7 +4830,7 @@ mod tests {
 
         let natural_err = run(vec![
             "build".to_string(),
-            "experiment.modal.yaml".to_string(),
+            modal_experiment.display().to_string(),
         ])
         .unwrap_err()
         .to_string();
@@ -4829,6 +4839,42 @@ mod tests {
             !natural_err.contains("unknown hosted command"),
             "natural build command should be recognized before failing: {natural_err}"
         );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn build_rejects_missing_local_inputs_before_api_config() {
+        let _lock = lock_env();
+        let home = temp_dir("build_missing_input_home");
+        let root = temp_dir("build_missing_input_project");
+        fs::create_dir_all(&root).unwrap();
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, None),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+
+        let missing_yaml_err = run(vec![
+            "build".to_string(),
+            root.join("missing.yaml").display().to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(missing_yaml_err.contains("authoring YAML path does not exist"));
+        assert!(!missing_yaml_err.contains("hosted API URL"));
+
+        let missing_package_err = run(vec![
+            "build".to_string(),
+            root.join("missing-package.tgz").display().to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(missing_package_err.contains("sealed package path does not exist"));
+        assert!(!missing_package_err.contains("hosted API URL"));
+
+        let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(home);
     }
 
@@ -6125,6 +6171,16 @@ mod tests {
         assert!(suggest_limit_err.contains("--limit must be <= 100"));
         assert!(!suggest_limit_err.contains("failed to read"));
 
+        let suggest_missing_target_err = run(vec![
+            "author".to_string(),
+            "suggest".to_string(),
+            "missing-draft.yaml".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(suggest_missing_target_err.contains("--target is required"));
+        assert!(!suggest_missing_target_err.contains("failed to read"));
+
         let validate_err = run(vec![
             "author".to_string(),
             "validate".to_string(),
@@ -6186,6 +6242,55 @@ mod tests {
         assert!(duplicate_draft_source_err
             .contains("draft JSON/YAML path must be provided either positionally or with --file"));
         assert!(!duplicate_draft_source_err.contains("failed to read"));
+    }
+
+    #[test]
+    fn author_commands_reject_bad_local_drafts_before_api_config() {
+        let _lock = lock_env();
+        let home = temp_dir("author_bad_draft_home");
+        let root = temp_dir("author_bad_draft_project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("invalid.yaml"), "experiment: [\n").unwrap();
+        fs::write(root.join("array.json"), "[]").unwrap();
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, None),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+
+        let missing_err = run(vec![
+            "author".to_string(),
+            "validate".to_string(),
+            root.join("missing.yaml").display().to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(missing_err.contains("failed to read"));
+        assert!(!missing_err.contains("hosted API URL"));
+
+        let invalid_yaml_err = run(vec![
+            "drafts".to_string(),
+            "resolve".to_string(),
+            root.join("invalid.yaml").display().to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(invalid_yaml_err.contains("draft YAML is invalid"));
+        assert!(!invalid_yaml_err.contains("hosted API URL"));
+
+        let non_object_err = run(vec![
+            "author".to_string(),
+            "canonicalize".to_string(),
+            root.join("array.json").display().to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(non_object_err.contains("draft file must contain a JSON/YAML object"));
+        assert!(!non_object_err.contains("hosted API URL"));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -7476,6 +7581,24 @@ mod tests {
         assert!(
             extra_doctor_arg_err.contains("package digest accepts exactly one positional argument")
         );
+
+        for args in [
+            vec!["inspect", "sha256:short"],
+            vec![
+                "doctor",
+                "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ],
+            vec!["run", "not-a-digest"],
+            vec!["packages", "inspect", "sha256:short"],
+            vec!["experiments", "doctor", "sha256:short"],
+            vec!["runs", "create", "sha256:short"],
+        ] {
+            let err = run(args.into_iter().map(String::from).collect())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("package digest must be sha256:<64 lowercase hex chars>"));
+            assert!(!err.contains("hosted API URL"));
+        }
 
         let run_value_extra_arg_err = run(vec![
             "runs".to_string(),

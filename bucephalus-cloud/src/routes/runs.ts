@@ -33,6 +33,7 @@ import type { CloudSecretRepository } from "../secrets/repository";
 import { SECRET_NAME_PATTERN } from "../secrets/store";
 
 const HOSTED_SECRET_REF_PREFIX = "bucephalus://";
+const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
 
 interface CloudSecretRequirement {
   id: string;
@@ -83,7 +84,7 @@ export async function handleRunRoute(
   }
 
   if (request.method === "GET" && packageContentPath(url.pathname)) {
-    const digest = packageDigestFromContentPath(url.pathname);
+    const digest = requirePackageDigest(packageDigestFromContentPath(url.pathname), "/package_digest");
     const attempt = await requireAttemptToken(request, runs, {
       attemptId: requireHeader(request, "x-bucephalus-attempt-id", "package content download"),
       packageDigest: digest,
@@ -112,7 +113,10 @@ export async function handleRunRoute(
   }
 
   if (request.method === "GET" && packagePath(url.pathname)) {
-    const digest = decodeURIComponent(url.pathname.slice("/v1/packages/".length));
+    const digest = requirePackageDigest(
+      decodeURIComponent(url.pathname.slice("/v1/packages/".length)),
+      "/package_digest",
+    );
     const artifact = await packages.getArtifact(digest, ownerKey);
     if (!artifact) {
       throw new HttpError(404, "package_not_found", "Package artifact not found");
@@ -522,7 +526,7 @@ export async function diagnoseCloudRunRequest(input: {
   secrets?: CloudSecretRepository | undefined;
   requireHostedSecretRefs?: boolean;
 }): Promise<CloudRunDiagnosis> {
-  const packageDigest = requireString(input.body.package_digest, "/package_digest");
+  const packageDigest = requirePackageDigest(input.body.package_digest, "/package_digest");
   const artifact = await input.packages.getArtifact(packageDigest, input.ownerKey);
   if (!artifact) {
     throw new HttpError(404, "package_not_found", "Package artifact not found");
@@ -1440,4 +1444,12 @@ function packagePath(pathname: string): boolean {
 
 function packageDigestFromContentPath(pathname: string): string {
   return decodeURIComponent(pathname.slice("/v1/packages/".length, -"/content".length));
+}
+
+function requirePackageDigest(value: unknown, pointer: string): string {
+  const digest = requireString(value, pointer);
+  if (!SHA256_DIGEST_PATTERN.test(digest)) {
+    throw new HttpError(400, "invalid_request", `${pointer} must be sha256:<64 lowercase hex chars>`);
+  }
+  return digest;
 }

@@ -534,7 +534,8 @@ or candidate workflow pushes real images and uploads promotion evidence, run the
 deploy workflow with `deployment_stage=services` for the normal app promotion.
 The candidate workflow does this automatically only for runtime-only main
 changes; deploy-boundary changes stop at plan-only, and mixed runtime plus
-deploy-boundary changes build images but still stop at a plan. The workflow
+deploy-boundary changes build images but still stop at a plan. Runtime changes
+bundled with candidate/CI policy changes also stop at plan-only. The workflow
 resolves the version to the pushed-image handoff, or receives exact same-run
 candidate evidence from automation, downloads it, verifies
 `cloud-image-promotion-evidence.json`, writes non-secret deploy tfvars with

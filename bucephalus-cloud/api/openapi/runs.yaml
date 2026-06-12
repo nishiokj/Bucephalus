@@ -54,6 +54,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PackageArtifact'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
   /v1/packages/{package_digest}/content:
@@ -200,6 +202,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CloudRun'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
         '409':

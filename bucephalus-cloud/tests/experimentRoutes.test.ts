@@ -1388,6 +1388,35 @@ describe("Hosted experiment routes", () => {
     )).rejects.toThrow("not digest-pinned remote registry refs");
   });
 
+  test("doctor rejects malformed package digests before package lookup", async () => {
+    const packages = {
+      async getArtifact() {
+        throw new Error("getArtifact should not be called");
+      },
+    };
+
+    await expect(handleExperimentRoute(
+      new Request("https://cloud.example/v1/experiments/doctor", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:short",
+        }),
+      }),
+      new URL("https://cloud.example/v1/experiments/doctor"),
+      {} as ImportRepository,
+      packages as unknown as PackageRepository,
+      {} as RunRepository,
+      runnersWithDockerPool() as unknown as RunnerRepository,
+      authContext("user-a"),
+      {} as CloudSecretRepository,
+    )).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_request",
+      message: "/package_digest must be sha256:<64 lowercase hex chars>",
+    });
+  });
+
   test("doctor rejects unknown runtime options with an actionable pointer", async () => {
     await expect(handleExperimentRoute(
       new Request("https://cloud.example/v1/experiments/doctor", {

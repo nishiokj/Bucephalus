@@ -224,7 +224,8 @@ user-secret policy.
   SHA, and call the GCP deploy workflow for `bucephalus-dev`. Deploy-boundary
   changes run services plan-only, using either the latest promotion evidence or,
   for mixed runtime/deploy-boundary changes, the same-run candidate evidence.
-  Full public GitHub Release asset publication remains in
+  Runtime changes bundled with candidate/CI policy changes also stop at
+  plan-only. Full public GitHub Release asset publication remains in
   `.github/workflows/bucephalus-release.yml`.
 - `scripts/deploy/bootstrap-gcp-github-oidc.sh` is the audited one-time
   bootstrap for release/deploy Workload Identity: it is dry-run by default and

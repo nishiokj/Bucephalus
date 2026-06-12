@@ -487,6 +487,9 @@ const candidateDispatchInputs = candidateWorkflow.on?.workflow_dispatch?.inputs 
 if (candidateDispatchInputs.github_environment?.default !== "bucephalus-dev") {
   fail(`${candidateWorkflowPath} manual candidate dispatch must default to bucephalus-dev`);
 }
+if (candidateDispatchInputs.github_environment?.options?.some((option) => option !== "bucephalus-dev")) {
+  fail(`${candidateWorkflowPath} manual candidate dispatch must not target production environments`);
+}
 if (candidateDispatchInputs.deploy?.type !== "boolean" || candidateDispatchInputs.deploy?.default !== true) {
   fail(`${candidateWorkflowPath} manual candidate dispatch must expose a boolean deploy toggle defaulting to true`);
 }
@@ -504,6 +507,8 @@ for (const required of [
   "auto_deploy=\"true\"",
   "plan_services=\"true\"",
   "mixed-runtime-infra",
+  "mixed-runtime-pipeline",
+  "infra-pipeline",
   "Unknown files are treated as runtime-affecting",
   "bucephalus-cloud/deploy/*.md|bucephalus-cloud/infra/gcp/*.md|bucephalus-cloud/infra/gcp/environments/*.example",
   "bucephalus-cloud/infra/gcp/*|scripts/deploy/*|.github/workflows/bucephalus-gcp-deploy.yml|.github/workflows/bucephalus-gcp-cleanup.yml",
@@ -530,14 +535,30 @@ if (!candidateClassify) {
   }
   const steps = candidateClassify.steps ?? [];
   const stepNames = steps.map((step) => step.name).filter(Boolean);
-  for (const required of ["Resolve candidate source", "Classify changed paths", "Record classification summary"]) {
+  for (const required of ["Download triggering Cloud CI source metadata", "Resolve candidate source", "Classify changed paths", "Record classification summary"]) {
     if (!stepNames.includes(required)) {
       fail(`${candidateWorkflowPath} classify job missing step: ${required}`);
     }
   }
+  const downloadSourceStep = steps.find((step) => step.name === "Download triggering Cloud CI source metadata");
+  if (
+    downloadSourceStep?.uses !== "actions/download-artifact@v4"
+    || downloadSourceStep?.with?.name !== "cloud-candidate-source"
+    || downloadSourceStep?.with?.["run-id"] !== "${{ github.event.workflow_run.id }}"
+    || downloadSourceStep?.with?.["github-token"] !== "${{ github.token }}"
+    || !String(downloadSourceStep?.if ?? "").includes("github.event_name == 'workflow_run'")
+  ) {
+    fail(`${candidateWorkflowPath} classify job must download the exact source metadata artifact from the triggering Cloud CI run`);
+  }
   const sourceStep = steps.find((step) => step.name === "Resolve candidate source");
-  if (!String(sourceStep?.run ?? "").includes("github.event.workflow_run.head_sha || github.sha") || !String(sourceStep?.run ?? "").includes("base_sha=\"${candidate_sha}^\"")) {
-    fail(`${candidateWorkflowPath} classify job must resolve the exact candidate SHA and compare workflow_run candidates against their first parent`);
+  const sourceRun = String(sourceStep?.run ?? "");
+  if (
+    !sourceRun.includes("cloud-candidate-source.txt")
+    || !sourceRun.includes("refusing to guess a diff range")
+    || !sourceRun.includes("candidate source artifact SHA")
+    || sourceRun.includes("base_sha=\"${candidate_sha}^\"")
+  ) {
+    fail(`${candidateWorkflowPath} classify job must resolve base/head from the triggering Cloud CI source artifact and must not guess candidate_sha^`);
   }
   const checkoutStep = steps.find((step) => step.uses === "actions/checkout@v4");
   if (!String(checkoutStep?.with?.ref ?? "").includes("steps.source.outputs.candidate_sha") || checkoutStep?.with?.["fetch-depth"] !== 0) {
@@ -565,6 +586,9 @@ if (!candidateBuild) {
   }
   const steps = candidateBuild.steps ?? [];
   const stepNames = steps.map((step) => step.name).filter(Boolean);
+  if (stepNames.includes("Restore worker runner binary cache") || stepNames.includes("Resolve Rust compiler cache key")) {
+    fail(`${candidateWorkflowPath} build-cloud-candidate must not carry unused binary cache steps that do not skip work`);
+  }
   for (const required of [
     "Resolve candidate source",
     "Resolve version",
@@ -1244,6 +1268,45 @@ for (const requiredPackageCommand of [
 }
 
 const cloudCiJobs = cloudCiWorkflow.jobs ?? {};
+const cloudCandidateSourceJob = cloudCiJobs["cloud-candidate-source"];
+if (!cloudCandidateSourceJob) {
+  fail(`${cloudCiWorkflowPath} must contain cloud-candidate-source job for exact candidate diff metadata`);
+} else {
+  if (cloudCandidateSourceJob.permissions?.contents !== "read") {
+    fail(`${cloudCiWorkflowPath} cloud-candidate-source must need only contents: read`);
+  }
+  const steps = cloudCandidateSourceJob.steps ?? [];
+  const stepNames = steps.map((step) => step.name).filter(Boolean);
+  for (const required of ["Write Cloud candidate source metadata", "Upload Cloud candidate source metadata"]) {
+    if (!stepNames.includes(required)) {
+      fail(`${cloudCiWorkflowPath} cloud-candidate-source missing step: ${required}`);
+    }
+  }
+  const writeStep = steps.find((step) => step.name === "Write Cloud candidate source metadata");
+  const writeRun = String(writeStep?.run ?? "");
+  for (const required of [
+    "PUSH_BEFORE_SHA",
+    "PR_BASE_SHA",
+    "cloud-candidate-source.txt",
+    "base_sha=${base_sha}",
+    "candidate_sha=${candidate_sha}",
+  ]) {
+    if (!writeRun.includes(required) && !Object.values(writeStep?.env ?? {}).some((value) => String(value).includes(required))) {
+      fail(`${cloudCiWorkflowPath} cloud-candidate-source must write ${required}`);
+    }
+  }
+  const uploadStep = steps.find((step) => step.name === "Upload Cloud candidate source metadata");
+  if (
+    uploadStep?.uses !== "actions/upload-artifact@v4"
+    || uploadStep?.with?.name !== "cloud-candidate-source"
+    || !String(uploadStep?.with?.path ?? "").includes("cloud-candidate-source.txt")
+    || uploadStep?.with?.["if-no-files-found"] !== "error"
+    || uploadStep?.with?.["retention-days"] !== 7
+  ) {
+    fail(`${cloudCiWorkflowPath} cloud-candidate-source must upload exact source metadata as a short-lived artifact`);
+  }
+}
+
 const releaseBoundaryPolicyJob = cloudCiJobs["release-boundary-policy"];
 if (!releaseBoundaryPolicyJob) {
   fail(`${cloudCiWorkflowPath} must contain release-boundary-policy job`);
@@ -1292,6 +1355,7 @@ if (!cloudGatesJob) {
 
 for (const script of [
   "scripts/ci/cloud-gates.sh",
+  "scripts/ci/classify-cloud-candidate-change.sh",
   "scripts/ci/smoke-buc-hosted-workflow.sh",
   "scripts/ci/smoke-hosted-authoring-real-core.sh",
   "scripts/ci/verify-cloud-release-boundary.sh",

@@ -42,6 +42,8 @@ The candidate workflow separates changes into four high-level lanes:
   latest promotion evidence.
 - Mixed runtime plus deploy-boundary changes build the candidate images, then
   run plan-only against that same candidate evidence.
+- Runtime changes bundled with candidate/CI policy changes build the candidate
+  images, then run plan-only.
 - Docs, tests, examples, and CI-policy-only changes stop after Cloud CI and the
   classifier summary; unknown new paths are treated as runtime-affecting.
 

@@ -113,7 +113,8 @@ single service-stage production promotion:
    `bucephalus-dev` GitHub Environment with `deployment_stage=services`.
    Deploy-boundary-only changes run plan-only against the latest evidence, and
    mixed runtime/deploy-boundary changes build images but stop at a plan against
-   that candidate evidence. Unless that environment overrides
+   that candidate evidence. Runtime changes bundled with candidate/CI policy
+   changes also stop at plan-only. Unless that environment overrides
    `BUCEPHALUS_DEPLOYMENT_ENVIRONMENT`, the deploy workflow maps it to the
    Terraform-safe environment label `dev`.
 3. For production-style releases, run `.github/workflows/bucephalus-release.yml`

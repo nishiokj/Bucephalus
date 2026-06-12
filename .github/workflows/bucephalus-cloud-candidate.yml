@@ -17,7 +17,6 @@ on:
         type: choice
         options:
           - bucephalus-dev
-          - bucephalus
       deploy:
         description: "Deploy the candidate after images are pushed"
         required: true
@@ -61,13 +60,49 @@ jobs:
       auto_deploy: ${{ steps.classify.outputs.auto_deploy }}
       plan_services: ${{ steps.classify.outputs.plan_services }}
     steps:
+      - name: Download triggering Cloud CI source metadata
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: cloud-candidate-source
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: dist/cloud-candidate-source
+
       - name: Resolve candidate source
         id: source
         run: |
-          candidate_sha="${{ github.event.workflow_run.head_sha || github.sha }}"
+          candidate_sha="${{ github.sha }}"
           base_sha=""
           if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            base_sha="${candidate_sha}^"
+            source_file="dist/cloud-candidate-source/cloud-candidate-source.txt"
+            if [[ ! -f "${source_file}" ]]; then
+              echo "missing cloud-candidate-source artifact from triggering Cloud CI run" >&2
+              exit 1
+            fi
+            read_source_value() {
+              local name="$1"
+              sed -n "s/^${name}=//p" "${source_file}" | tail -n 1
+            }
+            source_event="$(read_source_value event_name)"
+            candidate_sha="$(read_source_value candidate_sha)"
+            base_sha="$(read_source_value base_sha)"
+            if [[ "${candidate_sha}" != "${{ github.event.workflow_run.head_sha }}" ]]; then
+              echo "candidate source artifact SHA '${candidate_sha}' does not match workflow_run head '${{ github.event.workflow_run.head_sha }}'" >&2
+              exit 1
+            fi
+            if [[ "${source_event}" == "push" && -z "${base_sha}" ]]; then
+              echo "push-triggered Cloud candidate is missing a base SHA; refusing to guess a diff range" >&2
+              exit 1
+            fi
+          fi
+          if [[ ! "${candidate_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate_sha is not a full git SHA: ${candidate_sha}" >&2
+            exit 2
+          fi
+          if [[ -n "${base_sha}" && ! "${base_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "base_sha is not a full git SHA: ${base_sha}" >&2
+            exit 2
           fi
           echo "candidate_sha=${candidate_sha}" >> "${GITHUB_OUTPUT}"
           echo "base_sha=${base_sha}" >> "${GITHUB_OUTPUT}"
@@ -133,11 +168,6 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
-      - name: Resolve Rust compiler cache key
-        id: rustc
-        run: |
-          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "${GITHUB_OUTPUT}"
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -166,13 +196,6 @@ jobs:
           short_sha="${CANDIDATE_SHA:0:12}"
           echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
           echo "promotion_artifact_name=cloud-candidate-promotion-${RELEASE_VERSION}-${short_sha}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore worker runner binary cache
-        id: worker_runner_cache
-        uses: actions/cache@v4
-        with:
-          path: target/${{ env.RELEASE_TARGET }}/release/bucephalus-worker-runner
-          key: ${{ runner.os }}-${{ steps.rustc.outputs.version }}-worker-runner-${{ env.RELEASE_TARGET }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust/.cargo/config.toml', 'rust/crates/**/Cargo.toml', 'rust/crates/**/*.rs', 'rust/crates/**/*.sql', 'schemas/**') }}
 
       - name: Build Rust release binaries for Cloud candidate
         env:
