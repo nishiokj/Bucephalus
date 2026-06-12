@@ -1516,11 +1516,24 @@ for (const dockerfile of listFiles("bucephalus-cloud/images")) {
 }
 
 const experimentRouteText = read("bucephalus-cloud/src/routes/experiments.ts");
+const hostedCliText = read("rust/crates/lab-cli/src/bin/buc.rs");
+const packageRepositoryText = read("bucephalus-cloud/src/packages/repository.ts");
+const packageProvenanceMigrationText = read("bucephalus-cloud/db/migrations/0021_package_provenance.sql");
+const readmeText = read("README.md");
+const runsOpenApiText = read("bucephalus-cloud/api/openapi/runs.yaml");
 const cloudConfigText = read("bucephalus-cloud/src/config.ts");
 for (const required of [
   "BUCEPHALUS_RELEASE_GIT_SHA",
   "BUCEPHALUS_CLOUD_API_IMAGE_DIGEST",
   "hosted_build_environment_v1",
+  "hosted_authoring_builder",
+  "sealed_package_importer",
+  "hosted_core_not_run_for_sealed_package",
+  "authoring_compiler: input.inputKind === \"authoring_context\" ? \"core_universal_v1\" : null",
+  "packageAuthoringProvenance",
+  "packageProvenanceFromBuildEnvironment",
+  "external_unattested",
+  "hosted_attested",
   "buildEnvironmentEvidence",
   "builder_image_digest_missing",
   "withBuildEnvironmentEvidence",
@@ -1528,6 +1541,87 @@ for (const required of [
 ]) {
   if (!experimentRouteText.includes(required)) {
     fail(`hosted experiment build route must report deployed build environment provenance: ${required}`);
+  }
+}
+for (const required of [
+  "ensure_build_execution_environment_matches",
+  "ensure_authoring_provenance_contract",
+  "package_provenance_summary_lines",
+  "authoring_provenance=external_unattested/sealed_package_manifest",
+  "authoring_context builds must report builder.kind=hosted_authoring_builder",
+  "sealed_package imports must report core.executed=false",
+]) {
+  if (!hostedCliText.includes(required)) {
+    fail(`hosted product CLI must reject mismatched build execution evidence: ${required}`);
+  }
+}
+for (const required of [
+  "package_artifact_owners",
+  "package_provenance",
+  "coalesce(owner.package_provenance, artifact.package_provenance)",
+  "coalesce(owner.upload_id, artifact.upload_id)",
+  "coalesce(owner.storage_path, artifact.storage_path)",
+  "coalesce(owner.byte_size, artifact.byte_size)",
+  "coalesce(owner.media_type, artifact.media_type)",
+  "coalesce(owner.updated_at, artifact.updated_at)",
+  "persistedPackageByteSize(record.byte_size)",
+  "invalid_persisted_package_artifact",
+]) {
+  if (!packageRepositoryText.includes(required)) {
+    fail(`package repository must return owner-scoped package provenance without cross-owner clobbering: ${required}`);
+  }
+}
+for (const required of [
+  "ALTER TABLE cloud.package_artifact_owners",
+  "ADD COLUMN storage_path text",
+  "ADD COLUMN byte_size bigint",
+  "ADD COLUMN media_type text",
+  "package_artifact_owners_package_provenance_is_object",
+  "pre_provenance_package_owner",
+]) {
+  if (!packageProvenanceMigrationText.includes(required)) {
+    fail(`package provenance migration must persist owner-scoped provenance: ${required}`);
+  }
+}
+const cloudCliDocText = read("docs/user/cloud-cli.md");
+for (const required of [
+  "package_contract.authoring_provenance.status=hosted_attested",
+  "package_contract.authoring_provenance.status=external_unattested",
+  "package_provenance.status=hosted_attested",
+  "package_provenance.status=external_unattested",
+  "status=unknown_legacy",
+  "one user's sealed",
+  "Worker package downloads also resolve storage metadata through",
+  "attest the package's original local authoring environment",
+]) {
+  if (!cloudCliDocText.includes(required)) {
+    fail(`Cloud CLI docs must distinguish hosted authoring from sealed package import provenance: ${required}`);
+  }
+}
+for (const required of [
+  "externally",
+  "authored sealed-package import",
+  "YAML builds are the hosted-attested Cloud authoring path",
+  "without claiming the local authoring environment",
+]) {
+  if (!readmeText.includes(required)) {
+    fail(`README hosted workflow must distinguish hosted authoring from sealed package import provenance: ${required}`);
+  }
+}
+for (const required of [
+  "workerAttemptBearerAuth",
+  "workerBearerAuth",
+  "workerTokenHeader",
+  "X-Bucephalus-Worker-Token",
+  "X-Bucephalus-Attempt-Id",
+  "attempt bearer token",
+  "Cloud worker service token",
+  "run owner's package association",
+  "same-digest uploads from another owner cannot redirect",
+  "./common.yaml#/components/responses/Unauthorized",
+]) {
+  if (!runsOpenApiText.includes(required)) {
+    fail(`runs OpenAPI must document attempt-scoped owner-resolved package content downloads: ${required}`);
   }
 }
 for (const required of [

@@ -84,11 +84,11 @@ export async function handleRunRoute(
 
   if (request.method === "GET" && packageContentPath(url.pathname)) {
     const digest = packageDigestFromContentPath(url.pathname);
-    await requireAttemptToken(request, runs, {
+    const attempt = await requireAttemptToken(request, runs, {
       attemptId: requireHeader(request, "x-bucephalus-attempt-id", "package content download"),
       packageDigest: digest,
     });
-    const artifact = await packages.getArtifact(digest);
+    const artifact = await packages.getArtifact(digest, attempt.ownerKey ?? undefined);
     if (!artifact) {
       throw new HttpError(404, "package_not_found", "Package artifact not found");
     }
@@ -467,6 +467,7 @@ async function createRun(
     runtimeOptions: diagnosis.runtimeOptions,
     ownerKey,
     runRequirements: diagnosis.runRequirements,
+    packageProvenance: diagnosis.artifact.package_provenance,
   });
   return jsonResponse(runToWire(run), { status: 201 });
 }
@@ -1202,6 +1203,7 @@ function packageToWire(artifact: PackageArtifactRecord) {
     resolved_experiment_json: artifact.resolved_experiment_json,
     target: artifact.target,
     image_refs: artifact.image_refs,
+    package_provenance: artifact.package_provenance,
     secret_requirements: packageSecretRequirements(artifact),
     diagnostics: artifact.diagnostics,
     status: artifact.status,
@@ -1330,6 +1332,7 @@ function runToWire(run: CloudRunRecord) {
     secret_ids: secretIds,
     runtime_options: run.runtime_options,
     run_requirements: run.run_requirements,
+    package_provenance: run.package_provenance,
     created_at: run.created_at,
     updated_at: run.updated_at,
     started_at: run.started_at,
@@ -1398,7 +1401,7 @@ async function requireAttemptToken(
   request: Request,
   runs: RunRepository,
   input: { attemptId: string; runnerInstanceId?: string | null; packageDigest?: string | null },
-): Promise<{ runId: string }> {
+): Promise<{ runId: string; ownerKey: string | null; packageDigest: string }> {
   return await runs.verifyAttemptToken({
     ...input,
     token: requireBearer(request, "worker attempt"),

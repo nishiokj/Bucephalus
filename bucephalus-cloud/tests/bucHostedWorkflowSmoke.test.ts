@@ -92,6 +92,9 @@ describeSmoke("buc hosted workflow smoke", () => {
       expect(pointer(build, "/authoring_build/source_upload_id")).toBe(pointer(build, "/build_environment/source/upload_id"));
       expect(pointer(build, "/build_environment/source/input_kind")).toBe("authoring_context");
       expect(pointer(build, "/build_environment/source/entrypoint")).toBe("experiments/peter/experiment.yaml");
+      expect(pointer(build, "/build_environment/package_contract/authoring_compiler")).toBe("core_universal_v1");
+      expect(pointer(build, "/build_environment/package_contract/authoring_provenance/status")).toBe("hosted_attested");
+      expect(pointer(build, "/build_environment/package_contract/authoring_provenance/source")).toBe("hosted_core");
       expect(pointer(build, "/cloud_readiness/status")).toBe("cloud_runnable");
       expect(pointer(build, "/build_environment/package_contract/cloud_readiness_required")).toBe(true);
       expect(pointer(build, "/cloud_readiness/run_requirements/requires")).toEqual([
@@ -121,12 +124,16 @@ describeSmoke("buc hosted workflow smoke", () => {
       const doctor = await runBucJson(buc, apiUrl, ["doctor", packageDigest, ...secretArgs, "--json"]);
       expect(doctor.status).toBe("runnable");
       expect(pointer(doctor, "/run_requirements/executor")).toBe("runner-docker");
+      expect(pointer(doctor, "/package_provenance/status")).toBe("hosted_attested");
+      expect(pointer(doctor, "/package_provenance/source")).toBe("hosted_core");
       expect(pointer(doctor, "/supplied_secret_ids")).toEqual(["GEMINI_API_KEY"]);
 
       const run = await runBucJson(buc, apiUrl, ["run", packageDigest, ...secretArgs, "--label", "smoke", "--json"]);
       expect(typeof run.run_id).toBe("string");
       expect(run.package_digest).toBe(packageDigest);
       expect(run.run_label).toBe("smoke");
+      expect(pointer(run, "/package_provenance/status")).toBe("hosted_attested");
+      expect(pointer(run, "/package_provenance/source")).toBe("hosted_core");
       expect(pointer(run, "/run_requirements/requires")).toEqual([
         "core_runner",
         "docker_daemon",
@@ -240,6 +247,8 @@ describeSmoke("buc hosted workflow smoke", () => {
       const inspectedPackage = await runBucJson(buc, apiUrl, ["packages", "inspect", packageDigest, "--json"]);
       expect(inspectedPackage.package_digest).toBe(packageDigest);
       expect(inspectedPackage.name).toBe("Hosted Workflow Smoke");
+      expect(pointer(inspectedPackage, "/package_provenance/status")).toBe("hosted_attested");
+      expect(pointer(inspectedPackage, "/package_provenance/source")).toBe("hosted_core");
     } finally {
       server?.stop(true);
       if (sql) {

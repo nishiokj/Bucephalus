@@ -278,7 +278,13 @@ components:
             kind:
               type: string
               enum:
-                - api_embedded_core
+                - hosted_authoring_builder
+                - sealed_package_importer
+              description: >
+                hosted_authoring_builder means the hosted API ran bundled Core
+                against an authoring context. sealed_package_importer means the
+                API imported an already-sealed package and only performed Cloud
+                readiness checks.
             image_digest:
               anyOf:
                 - $ref: './common.yaml#/components/schemas/Digest'
@@ -299,30 +305,46 @@ components:
           type: object
           additionalProperties: false
           required:
+            - executed
             - command
             - path
             - version
             - timeout_ms
           properties:
+            executed:
+              type: boolean
+              description: >
+                True only when Cloud ran hosted Core authoring for an
+                authoring_context input. False for sealed_package imports.
             command:
-              type: string
-              enum:
-                - bucephalus build
+              oneOf:
+                - type: string
+                  enum:
+                    - bucephalus build
+                - type: 'null'
             path:
-              type: string
+              type:
+                - string
+                - 'null'
             version:
               type:
                 - string
                 - 'null'
             timeout_ms:
-              type: integer
-              minimum: 1
+              oneOf:
+                - type: integer
+                  minimum: 1
+                - type: 'null'
+            reason:
+              type: string
+              description: Present when executed=false to explain why hosted Core did not run.
         package_contract:
           type: object
           additionalProperties: false
           required:
             - input_kind
             - authoring_compiler
+            - authoring_provenance
             - sealed_schema_version
             - readiness_schema_version
             - cloud_readiness_required
@@ -333,9 +355,42 @@ components:
                 - sealed_package
                 - authoring_context
             authoring_compiler:
-              type: string
-              enum:
-                - core_universal_v1
+              oneOf:
+                - type: string
+                  enum:
+                    - core_universal_v1
+                - type: 'null'
+              description: >
+                The hosted authoring compiler used by Cloud. core_universal_v1
+                is reported for authoring_context builds. null is reported for
+                sealed_package imports because Cloud did not author the package.
+            authoring_provenance:
+              type: object
+              additionalProperties: false
+              required:
+                - status
+                - source
+                - message
+              properties:
+                status:
+                  type: string
+                  enum:
+                    - hosted_attested
+                    - external_unattested
+                  description: >
+                    hosted_attested means Cloud ran hosted Core authoring and
+                    recorded the builder/core environment. external_unattested
+                    means Cloud imported an already sealed package; integrity
+                    and hosted readiness were checked, but the package's
+                    original authoring environment is not attested by
+                    sealed_run_package_v2.
+                source:
+                  type: string
+                  enum:
+                    - hosted_core
+                    - sealed_package_manifest
+                message:
+                  type: string
             sealed_schema_version:
               type: string
               enum:
@@ -399,6 +454,7 @@ components:
         - target
         - runtime_options
         - package_digest
+        - package_provenance
         - package_status
         - run_requirements
         - secret_requirements
@@ -432,6 +488,8 @@ components:
           anyOf:
             - $ref: './common.yaml#/components/schemas/Digest'
             - type: 'null'
+        package_provenance:
+          $ref: './runs.yaml#/components/schemas/CloudPackageProvenance'
         package_status:
           type:
             - string
@@ -525,6 +583,7 @@ components:
         - status
         - package_digest
         - package_status
+        - package_provenance
         - image_refs
         - secret_requirements
         - supplied_secret_ids
@@ -541,6 +600,8 @@ components:
           $ref: './common.yaml#/components/schemas/Digest'
         package_status:
           type: string
+        package_provenance:
+          $ref: './runs.yaml#/components/schemas/CloudPackageProvenance'
         name:
           type:
             - string

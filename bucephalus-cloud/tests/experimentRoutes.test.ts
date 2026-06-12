@@ -76,12 +76,13 @@ describe("Hosted experiment routes", () => {
         },
         runtime_options: {},
         builder: expect.objectContaining({
-          kind: "api_embedded_core",
+          kind: "hosted_authoring_builder",
           image_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
           release_version: "0.3.37",
           git_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         }),
         core: expect.objectContaining({
+          executed: true,
           command: "bucephalus build",
           path: corePath,
           version: "0.3.37",
@@ -90,6 +91,11 @@ describe("Hosted experiment routes", () => {
         package_contract: {
           input_kind: "authoring_context",
           authoring_compiler: "core_universal_v1",
+          authoring_provenance: {
+            status: "hosted_attested",
+            source: "hosted_core",
+            message: "Cloud ran hosted Core authoring for this package and recorded the builder/core environment.",
+          },
           sealed_schema_version: "sealed_run_package_v2",
           readiness_schema_version: "hosted_cloud_readiness_v1",
           cloud_readiness_required: true,
@@ -112,6 +118,12 @@ describe("Hosted experiment routes", () => {
       expect(body.package_digest).toBe(packageDigest);
       expect(body.import.status).toBe("accepted");
       expect(body.cloud_readiness.status).toBe("cloud_runnable");
+      expect(body.cloud_readiness.package_provenance).toEqual(expect.objectContaining({
+        status: "hosted_attested",
+        source: "hosted_core",
+        input_kind: "authoring_context",
+        source_upload_id: "source-upload",
+      }));
     } finally {
       restoreEnv("BUCEPHALUS_CLOUD_CORE_CLI", previousCore);
       restoreEnv("BUCEPHALUS_CLOUD_DATA_DIR", previousDataDir);
@@ -766,6 +778,12 @@ describe("Hosted experiment routes", () => {
       expect(body.build_id).toBe("import-1");
       expect(body.build_kind).toBe("sealed_package_import");
       expect(body.build_environment.package_contract.input_kind).toBe("sealed_package");
+      expect(body.build_environment.package_contract.authoring_compiler).toBeNull();
+      expect(body.build_environment.package_contract.authoring_provenance).toEqual({
+        status: "external_unattested",
+        source: "sealed_package_manifest",
+        message: "Cloud verified sealed package integrity and hosted readiness, but sealed_run_package_v2 does not attest the package's original authoring environment.",
+      });
       expect(body.build_environment.target).toEqual({ kind: "hosted_cloud", name: "default" });
       expect(body.build_environment.source).toEqual({
         input_kind: "sealed_package",
@@ -776,7 +794,15 @@ describe("Hosted experiment routes", () => {
         byte_size: 1,
       });
       expect(body.build_environment.runtime_options).toEqual({});
-      expect(body.build_environment.core.command).toBe("bucephalus build");
+      expect(body.build_environment.builder.kind).toBe("sealed_package_importer");
+      expect(body.build_environment.core).toEqual({
+        executed: false,
+        command: null,
+        path: null,
+        version: null,
+        timeout_ms: null,
+        reason: "Sealed package input was imported directly; Cloud did not run hosted Core authoring.",
+      });
       expect(body.authoring_build.status).toBe("unavailable");
       expect(body.authoring_build.message).toContain("Sealed package input was imported directly");
       expect(body.authoring_build.source_upload_id).toBeUndefined();
@@ -784,6 +810,12 @@ describe("Hosted experiment routes", () => {
       expect(body.status).toBe("cloud_runnable");
       expect(body.package_digest).toBe(packageDigest);
       expect(body.cloud_readiness.status).toBe("cloud_runnable");
+      expect(body.cloud_readiness.package_provenance).toEqual(expect.objectContaining({
+        status: "external_unattested",
+        source: "sealed_package_manifest",
+        input_kind: "sealed_package",
+        source_upload_id: "upload-1",
+      }));
       expect(body.cloud_readiness.target).toEqual({ kind: "hosted_cloud", name: "default" });
       expect(body.cloud_readiness.secret_requirements).toEqual([
         {
@@ -978,7 +1010,6 @@ describe("Hosted experiment routes", () => {
         "builder_image_digest",
         "builder_release_version",
         "builder_git_sha",
-        "core_version",
       ]);
       expect(body.cloud_readiness.checks).toContainEqual(expect.objectContaining({
         name: "build_environment",
@@ -1048,6 +1079,7 @@ describe("Hosted experiment routes", () => {
       expect(body.import.status).toBe("accepted");
       expect(body.build_environment.evidence.policy).toBe("enforce");
       expect(body.build_environment.evidence.status).toBe("partial");
+      expect(body.build_environment.evidence.missing).not.toContain("core_version");
       expect(body.status).toBe("cloud_blocked");
       expect(body.cloud_readiness.status).toBe("cloud_blocked");
       expect(body.cloud_readiness.checks).toContainEqual(expect.objectContaining({
@@ -1242,6 +1274,7 @@ describe("Hosted experiment routes", () => {
     expect(body.ok).toBe(true);
     expect(body.status).toBe("runnable");
     expect(body.package_digest).toBe(digest());
+    expect(body.package_provenance).toEqual(cloudReadyPackage().package_provenance);
     expect(body.secret_requirements).toEqual([
       {
         id: "GEMINI_API_KEY",
@@ -1571,11 +1604,12 @@ function packagesRecordingArtifact(
 ): Pick<PackageRepository, "upsertArtifact" | "getArtifact"> {
   let artifact: Record<string, unknown> | null = null;
   return {
-    async upsertArtifact(input: { packageDigest: string }) {
+    async upsertArtifact(input: { packageDigest: string; packageProvenance: Record<string, unknown> }) {
       expect(input.packageDigest).toBe(packageDigest);
       artifact = {
         ...cloudReadyPackage(),
         package_digest: packageDigest,
+        package_provenance: input.packageProvenance,
         ...overrides,
       };
       return artifact as never;
@@ -1742,6 +1776,12 @@ function cloudReadyPackage() {
       "us-central1-docker.pkg.dev/acme/buc/peter-gregory-v2-nova@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     ],
     diagnostics: [],
+    package_provenance: {
+      schema_version: "cloud_package_provenance_v1",
+      status: "hosted_attested",
+      source: "hosted_core",
+      message: "Cloud ran hosted Core authoring for this package and recorded the builder/core environment.",
+    },
     status: "accepted",
     created_at: "2026-06-04T00:00:00Z",
     updated_at: "2026-06-04T00:00:00Z",

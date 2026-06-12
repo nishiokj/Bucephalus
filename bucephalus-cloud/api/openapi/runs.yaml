@@ -58,9 +58,16 @@ paths:
     get:
       operationId: downloadPackageArtifact
       summary: Download sealed package artifact bytes by digest.
+      security:
+        - workerAttemptBearerAuth: []
       description: >
-        Workers use this endpoint to materialize package content. Workers must
-        not read API-local storage paths from the database.
+        Workers use this endpoint to materialize package content. The request
+        must present the worker attempt bearer token and X-Bucephalus-Attempt-Id
+        for a running attempt whose run uses this package digest. The API
+        resolves package storage metadata through the run owner's package association
+        so same-digest uploads from another owner cannot redirect a
+        worker onto another storage object. Workers must not read API-local
+        storage paths from the database.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - name: package_digest
@@ -68,6 +75,13 @@ paths:
           required: true
           schema:
             $ref: './common.yaml#/components/schemas/Digest'
+        - name: X-Bucephalus-Attempt-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+          description: Running attempt id bound to the bearer attempt token.
       responses:
         '200':
           description: Package archive bytes.
@@ -88,6 +102,10 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
         '409':
@@ -357,10 +375,14 @@ paths:
     post:
       operationId: claimRun
       summary: Claim the next queued Cloud run for a registered runner instance.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
       description: >
         Uses the Cloud API durable run queue. The API owns database access and
         creates a leased run attempt transactionally; runner VMs do not need
-        direct Postgres credentials to claim work.
+        direct Postgres credentials to claim work. Requires the Cloud worker
+        service token, either as a bearer token or X-Bucephalus-Worker-Token.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
       requestBody:
@@ -384,10 +406,14 @@ paths:
                     properties:
                       claimed:
                         const: false
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/run-attempts/{attempt_id}/heartbeat:
     post:
       operationId: heartbeatRunAttempt
       summary: Extend a worker lease for a run attempt.
+      security:
+        - workerAttemptBearerAuth: []
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - $ref: '#/components/parameters/AttemptId'
@@ -412,10 +438,14 @@ paths:
                     $ref: '#/components/schemas/RunAttempt'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/run-attempts/{attempt_id}/events:
     post:
       operationId: appendRunAttemptEvent
       summary: Append an event for a run attempt.
+      security:
+        - workerAttemptBearerAuth: []
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - $ref: '#/components/parameters/AttemptId'
@@ -452,10 +482,14 @@ paths:
                 properties:
                   event:
                     $ref: '#/components/schemas/RunEvent'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/run-attempts/{attempt_id}/runtime/event-rows:
     post:
       operationId: ingestRunAttemptRuntimeEventRows
       summary: Land a batch of live trial event rows for a run attempt.
+      security:
+        - workerAttemptBearerAuth: []
       description: >
         Worker live-evidence ingestion. Batches are idempotent: rows are keyed
         by (core_run_id, trial_id, schedule_idx, attempt, row_seq) and a replay
@@ -546,10 +580,14 @@ paths:
                     type: integer
                   upserted:
                     type: integer
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/run-attempts/{attempt_id}/complete:
     post:
       operationId: completeRunAttempt
       summary: Mark a run attempt and run completed.
+      security:
+        - workerAttemptBearerAuth: []
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - $ref: '#/components/parameters/AttemptId'
@@ -574,10 +612,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunClaim'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/run-attempts/{attempt_id}/fail:
     post:
       operationId: failRunAttempt
       summary: Mark a run attempt and run failed.
+      security:
+        - workerAttemptBearerAuth: []
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - $ref: '#/components/parameters/AttemptId'
@@ -606,14 +648,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunClaim'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/runs/expire-leases:
     post:
       operationId: expireRunLeases
       summary: Expire stale worker leases and requeue their runs.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
       description: >
         Timer-driven queue maintenance owned by the Cloud API. Runners call this
         endpoint as a worker maintenance action; they do not connect to Postgres
-        for queue wakeups.
+        for queue wakeups. Requires the Cloud worker service token, either as a
+        bearer token or X-Bucephalus-Worker-Token.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
       responses:
@@ -631,6 +679,8 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RunClaim'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-pools:
     post:
       operationId: createRunnerPool
@@ -890,6 +940,12 @@ components:
   securitySchemes:
     bearerAuth:
       $ref: './common.yaml#/components/securitySchemes/bearerAuth'
+    workerAttemptBearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/workerAttemptBearerAuth'
+    workerBearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/workerBearerAuth'
+    workerTokenHeader:
+      $ref: './common.yaml#/components/securitySchemes/workerTokenHeader'
   parameters:
     AttemptId:
       name: attempt_id
@@ -948,6 +1004,7 @@ components:
       required:
         - package_digest
         - status
+        - package_provenance
         - manifest_json
         - resolved_experiment_json
         - diagnostics
@@ -994,6 +1051,8 @@ components:
           items:
             type: string
           description: Task/runtime container image references discovered in the sealed package.
+        package_provenance:
+          $ref: '#/components/schemas/CloudPackageProvenance'
         status:
           type: string
           enum:
@@ -1012,6 +1071,7 @@ components:
         - run_id
         - package_digest
         - status
+        - package_provenance
         - env
         - secret_refs
         - runtime_options
@@ -1061,6 +1121,8 @@ components:
           $ref: '#/components/schemas/CloudRuntimeOptions'
         run_requirements:
           $ref: '#/components/schemas/RunRequirements'
+        package_provenance:
+          $ref: '#/components/schemas/CloudPackageProvenance'
         created_at:
           type: string
           format: date-time
@@ -1089,6 +1151,45 @@ components:
             so failures are diagnosable without database access.
           items:
             $ref: '#/components/schemas/RunAttempt'
+    CloudPackageProvenance:
+      type: object
+      additionalProperties: true
+      required:
+        - schema_version
+        - status
+        - source
+        - message
+      properties:
+        schema_version:
+          type: string
+          enum:
+            - cloud_package_provenance_v1
+        status:
+          type: string
+          enum:
+            - hosted_attested
+            - external_unattested
+            - unknown_legacy
+        source:
+          type: string
+          enum:
+            - hosted_core
+            - sealed_package_manifest
+            - sealed_package_import
+            - pre_provenance_package_artifact
+            - pre_provenance_package_owner
+            - pre_provenance_run
+        message:
+          type: string
+        input_kind:
+          type: string
+          enum:
+            - authoring_context
+            - sealed_package
+        source_upload_id:
+          type: string
+        source_content_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
     RuntimeSummary:
       type: object
       additionalProperties: false

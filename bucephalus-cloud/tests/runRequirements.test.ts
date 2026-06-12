@@ -353,6 +353,12 @@ function artifact(overrides: Partial<PackageArtifactRecord> = {}): PackageArtifa
     target: null,
     image_refs: ["ghcr.io/acme/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
     diagnostics: [],
+    package_provenance: {
+      schema_version: "cloud_package_provenance_v1",
+      status: "hosted_attested",
+      source: "hosted_core",
+      message: "test package provenance",
+    },
     status: "accepted",
     created_at: "2026-05-29T00:00:00Z",
     updated_at: "2026-05-29T00:00:00Z",

@@ -297,14 +297,19 @@ The API response includes `build_kind: hosted_authoring_build` for YAML inputs
 and `build_kind: sealed_package_import` for package inputs. It also includes
 `build_environment` and `cloud_readiness`.
 
-`build_environment` is the provenance/contract for the hosted build. It reports
-the hosted target, immutable source upload evidence (`input_kind`, `upload_id`,
-source archive/package `content_digest`, byte size, and authoring entrypoint
-when applicable), the runtime option object checked for readiness, the bundled
-Core command/version/path used by the API, timeout, builder image digest when
-the deployment provides one, release/git metadata when available, and the
-package/readiness schema contract. If this object is absent, the response is not
-a complete hosted build result. The CLI also checks that the hosted response is
+`build_environment` is the provenance/contract for the hosted build/import. It
+reports the hosted target, immutable source upload evidence (`input_kind`,
+`upload_id`, source archive/package `content_digest`, byte size, and authoring
+entrypoint when applicable), the runtime option object checked for readiness,
+builder/importer image digest when the deployment provides one, release/git
+metadata when available, and the package/readiness schema contract. For YAML
+authoring inputs, `builder.kind` is `hosted_authoring_builder` and
+`core.executed` is `true` with the bundled Core command/version/path and
+timeout used by the API. For sealed package inputs, `builder.kind` is
+`sealed_package_importer` and `core.executed` is `false`; Cloud imported an
+already-built package and checked hosted readiness without claiming hosted Core
+authored it. If this object is absent, the response is not a complete hosted
+build result. The CLI also checks that the hosted response is
 about the source it just uploaded: `build_environment.source.upload_id`,
 `content_digest`, and `byte_size` must be present and match the upload created
 by the command and the local archive bytes. For authoring YAML inputs,
@@ -312,15 +317,38 @@ by the command and the local archive bytes. For authoring YAML inputs,
 entrypoint sent by the command. `build_environment.runtime_options` and
 `cloud_readiness.runtime_options` must also match the runtime options requested
 by the command. The hosted target must be `hosted_cloud/default`, and the
-package contract must match the requested input kind, `core_universal_v1`,
-`sealed_run_package_v2`, and `hosted_cloud_readiness_v1` with Cloud readiness
-required. For successful hosted authoring builds, `authoring_build.source_upload_id`
-and `authoring_build.entrypoint` must also match the upload and entrypoint sent
-by the CLI. For sealed package imports, `authoring_build.status` must be
-`unavailable`, because the Cloud API imported an already sealed package instead
-of compiling authoring YAML. When an import object is present, its `import_id`
+package contract must match the requested input kind, `sealed_run_package_v2`,
+and `hosted_cloud_readiness_v1` with Cloud readiness required. For successful
+hosted authoring builds, `package_contract.authoring_compiler` is
+`core_universal_v1`, and `authoring_build.source_upload_id` plus
+`authoring_build.entrypoint` must also match the upload and entrypoint sent by
+the CLI. The same contract reports
+`package_contract.authoring_provenance.status=hosted_attested` and
+`source=hosted_core`.
+
+For sealed package imports, `package_contract.authoring_compiler` is `null`,
+`package_contract.authoring_provenance.status=external_unattested`, and
+`source=sealed_package_manifest`. That means Cloud verified the sealed package's
+integrity and checked hosted readiness, but `sealed_run_package_v2` does not
+attest the package's original local authoring environment, Core version,
+platform, or target. `authoring_build.status` must be `unavailable`, because the
+Cloud API imported an already sealed package instead of compiling authoring YAML.
+When an import object is present, its `import_id`
 must match `build_id`, and its `package_digest` must agree with the build-level
 package digest.
+
+Cloud also persists package-level provenance on the accepted package artifact.
+`buc inspect`, `buc doctor`, `buc run`, and `buc runs get` surface this as
+`package_provenance`. Hosted YAML builds keep
+`package_provenance.status=hosted_attested`; sealed package imports keep
+`package_provenance.status=external_unattested`. Existing rows created before
+this contract use `status=unknown_legacy` instead of being silently upgraded.
+Because package digests are content identities shared across users and uploads,
+Cloud stores provenance on the owner/package association too; one user's sealed
+package import cannot overwrite another user's hosted-attested provenance for
+the same digest. Worker package downloads also resolve storage metadata through
+the run owner's package association, so a later same-digest upload cannot move a
+runner onto another owner's storage pointer.
 The nested `evidence` object says which policy was applied and whether those
 provenance fields are `complete` or `partial`. Local development defaults to
 `policy: warn`: partial evidence does not by itself mean the package cannot run,
@@ -330,8 +358,8 @@ deployments set `BUCEPHALUS_CLOUD_BUILD_EVIDENCE_POLICY=enforce`; under that
 policy, partial evidence turns an otherwise runnable package into
 `cloud_blocked` with an operator action to complete build-environment evidence.
 A production deployment should report complete evidence: immutable builder/API
-image digest, release version, release git SHA, and hosted Core version. The
-managed GCP deployment injects the API image digest into this object from the
+image digest, release version, release git SHA, and, for hosted authoring
+builds, hosted Core version. The managed GCP deployment injects the API image digest into this object from the
 immutable Cloud Run image ref used for the service.
 
 The current hosted authoring compiler is `core_universal_v1`: the API runs the

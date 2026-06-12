@@ -109,6 +109,66 @@ describe("Cloud run routes", () => {
     expect(body.run.secret_refs.OPENAI_API_KEY).toBe("gcp-secret-manager://projects/acme/secrets/openai/versions/1");
   });
 
+  test("worker run claim rejects missing worker token before queue access", async () => {
+    let claimCalls = 0;
+    const runs = {
+      async claimNextRun() {
+        claimCalls += 1;
+        return null;
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/worker/runs/claim", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          runner_instance_id: "runner-instance-1",
+        }),
+      }),
+      new URL("https://cloud.example/v1/worker/runs/claim"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    )).rejects.toMatchObject({
+      status: 401,
+      code: "unauthorized",
+      message: "worker run claim requires a valid worker token",
+    });
+    expect(claimCalls).toBe(0);
+  });
+
+  test("worker lease expiration rejects missing worker token before queue access", async () => {
+    let expireCalls = 0;
+    const runs = {
+      async expireLeases() {
+        expireCalls += 1;
+        return [];
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/worker/runs/expire-leases", {
+        method: "POST",
+      }),
+      new URL("https://cloud.example/v1/worker/runs/expire-leases"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    )).rejects.toMatchObject({
+      status: 401,
+      code: "unauthorized",
+      message: "worker lease expiration requires a valid worker token",
+    });
+    expect(expireCalls).toBe(0);
+  });
+
   test("worker attempt heartbeat requires the attempt token", async () => {
     const observed: { token?: string; attemptId?: string; runnerInstanceId?: string | null | undefined } = {};
     const runs = {
@@ -155,9 +215,17 @@ describe("Cloud run routes", () => {
       const packagePath = join(root, "package.tgz");
       await writeFile(packagePath, "package bytes");
       const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-      const observed: { token?: string; attemptId?: string; packageDigest?: string | null | undefined } = {};
+      const observed: {
+        token?: string;
+        attemptId?: string;
+        packageDigest?: string | null | undefined;
+        artifactDigest?: string;
+        artifactOwnerKey: string | undefined;
+      } = { artifactOwnerKey: undefined };
       const packages = {
-        async getArtifact() {
+        async getArtifact(packageDigest: string, ownerKey?: string) {
+          observed.artifactDigest = packageDigest;
+          observed.artifactOwnerKey = ownerKey;
           return {
             package_digest: digest,
             upload_id: "upload-1",
@@ -169,6 +237,7 @@ describe("Cloud run routes", () => {
             target: null,
             image_refs: [],
             diagnostics: [],
+            package_provenance: packageProvenance(),
             status: "accepted",
             created_at: "2026-06-04T00:00:00Z",
             updated_at: "2026-06-04T00:00:00Z",
@@ -180,6 +249,7 @@ describe("Cloud run routes", () => {
           observed.token = input.token;
           observed.attemptId = input.attemptId;
           observed.packageDigest = input.packageDigest;
+          return { runId: "run-1", ownerKey: "issuer:user-a", packageDigest: digest };
         },
       };
 
@@ -204,10 +274,82 @@ describe("Cloud run routes", () => {
         token: "attempt-token",
         attemptId: "attempt-1",
         packageDigest: digest,
+        artifactDigest: digest,
+        artifactOwnerKey: "issuer:user-a",
       });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  test("package content download rejects missing attempt auth before package lookup", async () => {
+    const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let packageLookups = 0;
+    const packages = {
+      async getArtifact() {
+        packageLookups += 1;
+        return null;
+      },
+    };
+    const runs = {
+      async verifyAttemptToken() {
+        throw new Error("verifyAttemptToken should not run without a bearer token");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request(`https://cloud.example/v1/packages/${digest}/content`, {
+        headers: {
+          "x-bucephalus-attempt-id": "attempt-1",
+        },
+      }),
+      new URL(`https://cloud.example/v1/packages/${digest}/content`),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    )).rejects.toMatchObject({
+      status: 401,
+      code: "unauthorized",
+      message: "worker attempt requires a valid attempt token",
+    });
+    expect(packageLookups).toBe(0);
+  });
+
+  test("package content download rejects missing attempt id before package lookup", async () => {
+    const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let packageLookups = 0;
+    const packages = {
+      async getArtifact() {
+        packageLookups += 1;
+        return null;
+      },
+    };
+    const runs = {
+      async verifyAttemptToken() {
+        throw new Error("verifyAttemptToken should not run without an attempt id");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request(`https://cloud.example/v1/packages/${digest}/content`, {
+        headers: {
+          authorization: "Bearer attempt-token",
+        },
+      }),
+      new URL(`https://cloud.example/v1/packages/${digest}/content`),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    )).rejects.toMatchObject({
+      status: 400,
+      code: "missing_header",
+      message: "package content download requires x-bucephalus-attempt-id",
+    });
+    expect(packageLookups).toBe(0);
   });
 
   test("package content download can stream an artifact stored in R2", async () => {
@@ -231,8 +373,13 @@ describe("Cloud run routes", () => {
     process.env.BUCEPHALUS_CLOUD_R2_ACCESS_KEY_ID = "access-key";
     process.env.BUCEPHALUS_CLOUD_R2_SECRET_ACCESS_KEY = "secret-key";
     try {
+      const observed: { artifactDigest?: string; artifactOwnerKey: string | undefined } = {
+        artifactOwnerKey: undefined,
+      };
       const packages = {
-        async getArtifact() {
+        async getArtifact(packageDigest: string, ownerKey?: string) {
+          observed.artifactDigest = packageDigest;
+          observed.artifactOwnerKey = ownerKey;
           return {
             package_digest: digest,
             upload_id: "upload-1",
@@ -244,6 +391,7 @@ describe("Cloud run routes", () => {
             target: null,
             image_refs: [],
             diagnostics: [],
+            package_provenance: packageProvenance(),
             status: "accepted",
             created_at: "2026-06-04T00:00:00Z",
             updated_at: "2026-06-04T00:00:00Z",
@@ -251,7 +399,9 @@ describe("Cloud run routes", () => {
         },
       };
       const runs = {
-        async verifyAttemptToken() {},
+        async verifyAttemptToken() {
+          return { runId: "run-1", ownerKey: "issuer:user-a", packageDigest: digest };
+        },
       };
 
       const response = await handleRunRoute(
@@ -273,6 +423,10 @@ describe("Cloud run routes", () => {
       expect(requests).toEqual([
         "https://account-id.r2.cloudflarestorage.com/buc-artifacts/uploads/upload-1/content.blob",
       ]);
+      expect(observed).toEqual({
+        artifactDigest: digest,
+        artifactOwnerKey: "issuer:user-a",
+      });
     } finally {
       globalThis.fetch = previousFetch;
       restoreEnv(previousEnv);
@@ -326,6 +480,7 @@ describe("Cloud run routes", () => {
           target: null,
           image_refs: [],
           diagnostics: [],
+          package_provenance: packageProvenance(),
           status: "accepted",
           created_at: "2026-06-04T00:00:00Z",
           updated_at: "2026-06-04T00:00:00Z",
@@ -417,6 +572,7 @@ describe("Cloud run routes", () => {
         required_for_variants: [],
       },
     ]);
+    expect(body.package_provenance).toEqual(packageProvenance());
     expect(JSON.stringify(body)).not.toContain("sk-");
   });
 
@@ -456,11 +612,12 @@ describe("Cloud run routes", () => {
         return packageRecordWithEnvSecret();
       },
     };
-    const observed: { secretRefs?: Record<string, string>; secretIds?: string[] } = {};
+    const observed: { secretRefs?: Record<string, string>; secretIds?: string[]; packageProvenance?: unknown } = {};
     const runs = {
-      async createRun(input: { secretRefs: Record<string, string>; runRequirements: { secret_ids: string[] } }) {
+      async createRun(input: { secretRefs: Record<string, string>; runRequirements: { secret_ids: string[] }; packageProvenance: unknown }) {
         observed.secretRefs = input.secretRefs;
         observed.secretIds = input.runRequirements.secret_ids;
+        observed.packageProvenance = input.packageProvenance;
         return runRecord();
       },
     };
@@ -491,6 +648,8 @@ describe("Cloud run routes", () => {
       OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/latest",
     });
     expect(observed.secretIds).toEqual(["OPENAI_API_KEY"]);
+    expect(observed.packageProvenance).toEqual(packageProvenance());
+    expect((await response!.json()).package_provenance).toEqual(packageProvenance());
   });
 
   test("run creation translates hosted bucephalus:// refs to backing provider refs", async () => {
@@ -957,6 +1116,7 @@ function runRecord() {
       timeout_ms: null,
       max_parallel_trials: 1,
     },
+    package_provenance: packageProvenance(),
     created_at: "2026-06-04T00:00:00Z",
     updated_at: "2026-06-04T00:00:00Z",
     started_at: null,
@@ -1006,6 +1166,7 @@ function packageRecordWithSecrets() {
     target: null,
     image_refs: [],
     diagnostics: [],
+    package_provenance: packageProvenance(),
     status: "accepted",
     created_at: "2026-06-04T00:00:00Z",
     updated_at: "2026-06-04T00:00:00Z",
@@ -1033,9 +1194,19 @@ function packageRecordWithEnvSecret() {
     target: null,
     image_refs: [],
     diagnostics: [],
+    package_provenance: packageProvenance(),
     status: "accepted",
     created_at: "2026-06-04T00:00:00Z",
     updated_at: "2026-06-04T00:00:00Z",
+  };
+}
+
+function packageProvenance() {
+  return {
+    schema_version: "cloud_package_provenance_v1",
+    status: "hosted_attested",
+    source: "hosted_core",
+    message: "Cloud ran hosted Core authoring for this package and recorded the builder/core environment.",
   };
 }
 

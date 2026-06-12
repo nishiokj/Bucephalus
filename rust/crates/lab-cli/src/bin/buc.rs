@@ -586,6 +586,7 @@ fn experiment_build(context: CliContext) -> Result<()> {
     ensure_build_target_matches(&build.response)?;
     ensure_cloud_readiness_target_matches(&build.response)?;
     ensure_build_package_contract_matches(&build.response, expected_source_kind)?;
+    ensure_build_execution_environment_matches(&build.response, expected_source_kind)?;
     ensure_build_import_identity(&build.response)?;
     ensure_authoring_build_identity(
         &build.response,
@@ -1702,6 +1703,97 @@ fn ensure_build_response_matches_input(
     Ok(())
 }
 
+fn ensure_build_execution_environment_matches(
+    value: &Value,
+    expected_source_kind: &str,
+) -> Result<()> {
+    let environment = value
+        .get("build_environment")
+        .ok_or_else(|| anyhow!("hosted build response is missing build_environment"))?;
+    let builder_kind = environment
+        .get("builder")
+        .and_then(|builder| builder.get("kind"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!("hosted build response is missing build_environment.builder.kind")
+        })?;
+    let core = environment
+        .get("core")
+        .ok_or_else(|| anyhow!("hosted build response is missing build_environment.core"))?;
+    let core_executed = core
+        .get("executed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            anyhow!("hosted build response is missing build_environment.core.executed")
+        })?;
+
+    match expected_source_kind {
+        "authoring_context" => {
+            if builder_kind != "hosted_authoring_builder" {
+                bail!(
+                    "hosted build builder mismatch: authoring_context builds must report builder.kind=hosted_authoring_builder, got {builder_kind}"
+                );
+            }
+            if !core_executed {
+                bail!(
+                    "hosted build core execution mismatch: authoring_context builds must report core.executed=true"
+                );
+            }
+            let command = core.get("command").and_then(Value::as_str).ok_or_else(|| {
+                anyhow!("hosted build response is missing build_environment.core.command")
+            })?;
+            if command != "bucephalus build" {
+                bail!(
+                    "hosted build core command mismatch: authoring_context builds must run bucephalus build, got {command}"
+                );
+            }
+            let path = core
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow!("hosted build response is missing build_environment.core.path")
+                })?;
+            if path.contains('\0') {
+                bail!("hosted build response has invalid build_environment.core.path");
+            }
+            let timeout_ms = core
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    anyhow!("hosted build response is missing build_environment.core.timeout_ms")
+                })?;
+            if timeout_ms == 0 {
+                bail!("hosted build response has invalid build_environment.core.timeout_ms");
+            }
+        }
+        "sealed_package" => {
+            if builder_kind != "sealed_package_importer" {
+                bail!(
+                    "hosted build builder mismatch: sealed_package imports must report builder.kind=sealed_package_importer, got {builder_kind}"
+                );
+            }
+            if core_executed {
+                bail!(
+                    "hosted build core execution mismatch: sealed_package imports must report core.executed=false because Cloud did not author the package"
+                );
+            }
+            for field in ["command", "path", "timeout_ms"] {
+                if core.get(field).is_some_and(|value| !value.is_null()) {
+                    bail!(
+                        "hosted build core execution mismatch: sealed_package imports must report build_environment.core.{field}=null"
+                    );
+                }
+            }
+        }
+        _ => bail!(
+            "hosted build source kind mismatch: unsupported input_kind {expected_source_kind}"
+        ),
+    }
+
+    Ok(())
+}
+
 fn ensure_build_source_upload_id_matches(value: &Value, expected_upload_id: &str) -> Result<()> {
     let upload_id = value
         .get("build_environment")
@@ -1888,7 +1980,8 @@ fn ensure_build_package_contract_matches(value: &Value, expected_source_kind: &s
             "hosted build package contract input mismatch: requested {expected_source_kind}, contract reports {input_kind}"
         );
     }
-    ensure_contract_string(contract, "authoring_compiler", "core_universal_v1")?;
+    ensure_authoring_compiler_contract(contract, expected_source_kind)?;
+    ensure_authoring_provenance_contract(contract, expected_source_kind)?;
     ensure_contract_string(contract, "sealed_schema_version", "sealed_run_package_v2")?;
     ensure_contract_string(
         contract,
@@ -1914,6 +2007,74 @@ fn ensure_contract_string(contract: &Value, field: &str, expected: &str) -> Resu
         .ok_or_else(|| anyhow!("hosted build package contract is missing {field}"))?;
     if actual != expected {
         bail!("hosted build package contract mismatch: {field} must be {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+fn ensure_authoring_compiler_contract(contract: &Value, expected_source_kind: &str) -> Result<()> {
+    let compiler = contract
+        .get("authoring_compiler")
+        .ok_or_else(|| anyhow!("hosted build package contract is missing authoring_compiler"))?;
+    match expected_source_kind {
+        "authoring_context" => {
+            let compiler = compiler.as_str().ok_or_else(|| {
+                anyhow!("hosted build package contract has invalid authoring_compiler")
+            })?;
+            if compiler != "core_universal_v1" {
+                bail!(
+                    "hosted build package contract mismatch: authoring_compiler must be core_universal_v1, got {compiler}"
+                );
+            }
+        }
+        "sealed_package" => {
+            if !compiler.is_null() {
+                bail!(
+                    "hosted build package contract mismatch: sealed package imports must report authoring_compiler=null because Cloud did not author the package"
+                );
+            }
+        }
+        _ => bail!("hosted build package contract input mismatch: unsupported input_kind {expected_source_kind}"),
+    }
+    Ok(())
+}
+
+fn ensure_authoring_provenance_contract(
+    contract: &Value,
+    expected_source_kind: &str,
+) -> Result<()> {
+    let provenance = contract
+        .get("authoring_provenance")
+        .ok_or_else(|| anyhow!("hosted build package contract is missing authoring_provenance"))?;
+    let status = provenance
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!("hosted build package contract has invalid authoring_provenance.status")
+        })?;
+    let source = provenance
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!("hosted build package contract has invalid authoring_provenance.source")
+        })?;
+    match expected_source_kind {
+        "authoring_context" => {
+            if status != "hosted_attested" || source != "hosted_core" {
+                bail!(
+                    "hosted build package contract mismatch: authoring_context builds must report authoring_provenance=hosted_attested/hosted_core, got {status}/{source}"
+                );
+            }
+        }
+        "sealed_package" => {
+            if status != "external_unattested" || source != "sealed_package_manifest" {
+                bail!(
+                    "hosted build package contract mismatch: sealed package imports must report authoring_provenance=external_unattested/sealed_package_manifest because Cloud did not author the package, got {status}/{source}"
+                );
+            }
+        }
+        _ => bail!(
+            "hosted build package contract input mismatch: unsupported input_kind {expected_source_kind}"
+        ),
     }
     Ok(())
 }
@@ -3225,6 +3386,18 @@ fn build_environment_summary_lines(environment: &Value) -> Vec<String> {
         if let Some(compiler) = contract.get("authoring_compiler").and_then(Value::as_str) {
             lines.push(format!("authoring_compiler: {compiler}"));
         }
+        if let Some(provenance) = contract.get("authoring_provenance") {
+            if let Some(status) = provenance.get("status").and_then(Value::as_str) {
+                let source = provenance
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(unknown)");
+                lines.push(format!("authoring_provenance: {status}/{source}"));
+            }
+            if let Some(message) = provenance.get("message").and_then(Value::as_str) {
+                lines.push(format!("authoring_provenance_detail: {message}"));
+            }
+        }
         if let Some(schema) = contract
             .get("sealed_schema_version")
             .and_then(Value::as_str)
@@ -3239,17 +3412,25 @@ fn build_environment_summary_lines(environment: &Value) -> Vec<String> {
         }
     }
     if let Some(core) = environment.get("core") {
-        let command = core
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or("bucephalus build");
-        let version = core
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or("(unknown)");
-        lines.push(format!("builder_core: {command} version={version}"));
-        if let Some(timeout_ms) = core.get("timeout_ms").and_then(Value::as_u64) {
-            lines.push(format!("builder_timeout_ms: {timeout_ms}"));
+        if core.get("executed").and_then(Value::as_bool) == Some(false) {
+            let reason = core
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("sealed package input was imported directly");
+            lines.push(format!("builder_core: not_run ({reason})"));
+        } else {
+            let command = core
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("bucephalus build");
+            let version = core
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("(unknown)");
+            lines.push(format!("builder_core: {command} version={version}"));
+            if let Some(timeout_ms) = core.get("timeout_ms").and_then(Value::as_u64) {
+                lines.push(format!("builder_timeout_ms: {timeout_ms}"));
+            }
         }
     }
     if let Some(builder) = environment.get("builder") {
@@ -3496,6 +3677,7 @@ fn print_package_summary(value: &Value) -> Result<()> {
         format!("status: {status}"),
         format!("name: {name}"),
     ];
+    lines.extend(package_provenance_summary_lines(value));
     if requirements.is_empty() {
         lines.push("secret_requirements: none".to_string());
     } else {
@@ -3569,6 +3751,7 @@ fn print_doctor_summary(value: &Value) -> Result<()> {
                 .unwrap_or("(unknown)")
         ),
     ];
+    lines.extend(package_provenance_summary_lines(value));
     if let Some(requirements) = value.get("run_requirements") {
         lines.push(format!("run_requirements: {}", compact_json(requirements)?));
     }
@@ -3588,8 +3771,33 @@ fn print_run_summary(value: &Value) -> Result<()> {
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("(unknown)");
-    println!("run_id: {run_id}\nstatus: {status}\nnext: buc runs get {run_id}");
+    let mut lines = vec![format!("run_id: {run_id}"), format!("status: {status}")];
+    lines.extend(package_provenance_summary_lines(value));
+    lines.push(format!("next: buc runs get {run_id}"));
+    println!("{}", lines.join("\n"));
     Ok(())
+}
+
+fn package_provenance_summary_lines(value: &Value) -> Vec<String> {
+    let Some(provenance) = value.get("package_provenance") else {
+        return Vec::new();
+    };
+    let status = provenance
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("(unknown)");
+    let source = provenance
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("(unknown)");
+    let mut lines = vec![format!("package_provenance: {status}/{source}")];
+    if let Some(input_kind) = provenance.get("input_kind").and_then(Value::as_str) {
+        lines.push(format!("package_input_kind: {input_kind}"));
+    }
+    if let Some(message) = provenance.get("message").and_then(Value::as_str) {
+        lines.push(format!("package_provenance_detail: {message}"));
+    }
+    lines
 }
 
 fn print_run_list_summary(value: &Value) -> Result<()> {
@@ -5640,6 +5848,10 @@ mod tests {
                         "package_contract": {
                             "input_kind": "authoring_context",
                             "authoring_compiler": "core_universal_v1",
+                            "authoring_provenance": {
+                                "status": "hosted_attested",
+                                "source": "hosted_core"
+                            },
                             "sealed_schema_version": "sealed_run_package_v2",
                             "readiness_schema_version": "hosted_cloud_readiness_v1",
                             "cloud_readiness_required": true
@@ -5726,6 +5938,10 @@ mod tests {
                         "package_contract": {
                             "input_kind": "sealed_package",
                             "authoring_compiler": "core_universal_v1",
+                            "authoring_provenance": {
+                                "status": "external_unattested",
+                                "source": "sealed_package_manifest"
+                            },
                             "sealed_schema_version": "sealed_run_package_v2",
                             "readiness_schema_version": "hosted_cloud_readiness_v1",
                             "cloud_readiness_required": true
@@ -7457,7 +7673,7 @@ mod tests {
                     "memory_mb": 131072
                 },
                 "builder": {
-                    "kind": "api_embedded_core",
+                    "kind": "sealed_package_importer",
                     "image_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "release_version": "0.3.37",
                     "git_sha": "abc123",
@@ -7465,14 +7681,21 @@ mod tests {
                     "arch": "x64"
                 },
                 "core": {
-                    "command": "bucephalus build",
-                    "path": "/app/bin/bucephalus",
-                    "version": "0.3.37",
-                    "timeout_ms": 600000
+                    "executed": false,
+                    "command": null,
+                    "path": null,
+                    "version": null,
+                    "timeout_ms": null,
+                    "reason": "Sealed package input was imported directly; Cloud did not run hosted Core authoring."
                 },
                 "package_contract": {
                     "input_kind": "sealed_package",
-                    "authoring_compiler": "core_universal_v1",
+                    "authoring_compiler": null,
+                    "authoring_provenance": {
+                        "status": "external_unattested",
+                        "source": "sealed_package_manifest",
+                        "message": "Cloud verified sealed package integrity and hosted readiness, but sealed_run_package_v2 does not attest the package's original authoring environment."
+                    },
                     "sealed_schema_version": "sealed_run_package_v2",
                     "readiness_schema_version": "hosted_cloud_readiness_v1",
                     "cloud_readiness_required": true
@@ -7522,17 +7745,39 @@ mod tests {
         assert!(text.contains("build_runtime_options:"));
         assert!(text.contains("\"memory_mb\":131072"));
         assert!(text.contains("build_input_kind: sealed_package"));
-        assert!(text.contains("authoring_compiler: core_universal_v1"));
+        assert!(!text.contains("authoring_compiler: core_universal_v1"));
+        assert!(text.contains("authoring_provenance: external_unattested/sealed_package_manifest"));
+        assert!(text.contains("sealed_run_package_v2 does not attest"));
         assert!(text.contains("package_contract: sealed_run_package_v2"));
         assert!(text.contains("cloud_readiness_required: true"));
-        assert!(text.contains("builder_core: bucephalus build version=0.3.37"));
-        assert!(text.contains("builder_timeout_ms: 600000"));
+        assert!(text.contains("builder_core: not_run"));
+        assert!(text.contains("Cloud did not run hosted Core authoring"));
+        assert!(!text.contains("builder_core: bucephalus build version=0.3.37"));
+        assert!(!text.contains("builder_timeout_ms: 600000"));
         assert!(text.contains("builder_image_digest: sha256:bbbb"));
         assert!(text.contains("build_environment_evidence_policy: warn"));
         assert!(text.contains("build_environment_evidence: partial"));
         assert!(text.contains("missing_build_evidence: builder_git_sha"));
         assert!(text.contains("cloud_run_requirements:"));
         assert!(text.contains("runner_capacity/run_unschedulable"));
+    }
+
+    #[test]
+    fn package_provenance_summary_surfaces_authoring_status() {
+        let lines = package_provenance_summary_lines(&json!({
+            "package_provenance": {
+                "schema_version": "cloud_package_provenance_v1",
+                "status": "external_unattested",
+                "source": "sealed_package_manifest",
+                "input_kind": "sealed_package",
+                "message": "Cloud verified readiness but did not author this package."
+            }
+        }));
+        let text = lines.join("\n");
+
+        assert!(text.contains("package_provenance: external_unattested/sealed_package_manifest"));
+        assert!(text.contains("package_input_kind: sealed_package"));
+        assert!(text.contains("did not author this package"));
     }
 
     #[test]
@@ -7983,6 +8228,179 @@ mod tests {
         .to_string();
         assert!(wrong_status.contains("sealed package imports"));
         assert!(wrong_status.contains("authoring_build.status=unavailable"));
+    }
+
+    #[test]
+    fn sealed_package_contract_must_not_claim_authoring_compiler() {
+        ensure_build_package_contract_matches(
+            &json!({
+                "build_environment": {
+                    "package_contract": {
+                        "input_kind": "sealed_package",
+                        "authoring_compiler": null,
+                        "authoring_provenance": {
+                            "status": "external_unattested",
+                            "source": "sealed_package_manifest"
+                        },
+                        "sealed_schema_version": "sealed_run_package_v2",
+                        "readiness_schema_version": "hosted_cloud_readiness_v1",
+                        "cloud_readiness_required": true
+                    }
+                }
+            }),
+            "sealed_package",
+        )
+        .expect("sealed package import contract should not claim hosted authoring");
+
+        let claimed_compiler = ensure_build_package_contract_matches(
+            &json!({
+                "build_environment": {
+                    "package_contract": {
+                        "input_kind": "sealed_package",
+                        "authoring_compiler": "core_universal_v1",
+                        "authoring_provenance": {
+                            "status": "external_unattested",
+                            "source": "sealed_package_manifest"
+                        },
+                        "sealed_schema_version": "sealed_run_package_v2",
+                        "readiness_schema_version": "hosted_cloud_readiness_v1",
+                        "cloud_readiness_required": true
+                    }
+                }
+            }),
+            "sealed_package",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            claimed_compiler.contains("sealed package imports must report authoring_compiler=null")
+        );
+
+        let claimed_hosted_provenance = ensure_build_package_contract_matches(
+            &json!({
+                "build_environment": {
+                    "package_contract": {
+                        "input_kind": "sealed_package",
+                        "authoring_compiler": null,
+                        "authoring_provenance": {
+                            "status": "hosted_attested",
+                            "source": "hosted_core"
+                        },
+                        "sealed_schema_version": "sealed_run_package_v2",
+                        "readiness_schema_version": "hosted_cloud_readiness_v1",
+                        "cloud_readiness_required": true
+                    }
+                }
+            }),
+            "sealed_package",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(claimed_hosted_provenance.contains(
+            "sealed package imports must report authoring_provenance=external_unattested"
+        ));
+
+        ensure_build_package_contract_matches(
+            &json!({
+                "build_environment": {
+                    "package_contract": {
+                        "input_kind": "authoring_context",
+                        "authoring_compiler": "core_universal_v1",
+                        "authoring_provenance": {
+                            "status": "hosted_attested",
+                            "source": "hosted_core"
+                        },
+                        "sealed_schema_version": "sealed_run_package_v2",
+                        "readiness_schema_version": "hosted_cloud_readiness_v1",
+                        "cloud_readiness_required": true
+                    }
+                }
+            }),
+            "authoring_context",
+        )
+        .expect("hosted authoring contract should report the compiler Cloud used");
+    }
+
+    #[test]
+    fn build_execution_environment_must_match_source_kind() {
+        ensure_build_execution_environment_matches(
+            &json!({
+                "build_environment": {
+                    "builder": {
+                        "kind": "hosted_authoring_builder"
+                    },
+                    "core": {
+                        "executed": true,
+                        "command": "bucephalus build",
+                        "path": "/app/bin/bucephalus",
+                        "timeout_ms": 600000
+                    }
+                }
+            }),
+            "authoring_context",
+        )
+        .expect("hosted authoring builds should prove Core execution");
+
+        ensure_build_execution_environment_matches(
+            &json!({
+                "build_environment": {
+                    "builder": {
+                        "kind": "sealed_package_importer"
+                    },
+                    "core": {
+                        "executed": false,
+                        "command": null,
+                        "path": null,
+                        "version": null,
+                        "timeout_ms": null
+                    }
+                }
+            }),
+            "sealed_package",
+        )
+        .expect("sealed package imports should prove Core did not execute");
+
+        let authoring_importer = ensure_build_execution_environment_matches(
+            &json!({
+                "build_environment": {
+                    "builder": {
+                        "kind": "sealed_package_importer"
+                    },
+                    "core": {
+                        "executed": false,
+                        "command": null,
+                        "path": null,
+                        "timeout_ms": null
+                    }
+                }
+            }),
+            "authoring_context",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(authoring_importer.contains(
+            "authoring_context builds must report builder.kind=hosted_authoring_builder"
+        ));
+
+        let sealed_executed = ensure_build_execution_environment_matches(
+            &json!({
+                "build_environment": {
+                    "builder": {
+                        "kind": "sealed_package_importer"
+                    },
+                    "core": {
+                        "executed": true,
+                        "command": "bucephalus build",
+                        "path": "/app/bin/bucephalus",
+                        "timeout_ms": 600000
+                    }
+                }
+            }),
+            "sealed_package",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(sealed_executed.contains("sealed_package imports must report core.executed=false"));
     }
 
     #[test]
@@ -8534,7 +8952,7 @@ mod tests {
                         },
                         "runtime_options": runtime_options,
                         "builder": {
-                            "kind": "api_embedded_core",
+                            "kind": "hosted_authoring_builder",
                             "image_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                             "release_version": "0.3.37",
                             "git_sha": "abc123",
@@ -8542,6 +8960,7 @@ mod tests {
                             "arch": "x64"
                         },
                         "core": {
+                            "executed": true,
                             "command": "bucephalus build",
                             "path": "/app/bin/bucephalus",
                             "version": "0.3.37",
@@ -8550,6 +8969,10 @@ mod tests {
                         "package_contract": {
                             "input_kind": "authoring_context",
                             "authoring_compiler": "core_universal_v1",
+                            "authoring_provenance": {
+                                "status": "hosted_attested",
+                                "source": "hosted_core"
+                            },
                             "sealed_schema_version": "sealed_run_package_v2",
                             "readiness_schema_version": "hosted_cloud_readiness_v1",
                             "cloud_readiness_required": true

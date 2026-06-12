@@ -57,7 +57,9 @@ export async function handleExperimentRoute(
       evidencePolicy: config.buildEvidencePolicy,
       source,
     });
-    const job = await importSealedPackageUpload(body, imports, packages, ownerKey);
+    const job = await importSealedPackageUpload(body, imports, packages, ownerKey, {
+      packageProvenance: packageProvenanceFromBuildEnvironment(buildEnvironment),
+    });
     const cloudReadiness = await hostedCloudReadiness({
       jobPackageDigest: job.package_digest,
       importStatus: job.status,
@@ -100,6 +102,7 @@ export async function handleExperimentRoute(
       package_status: diagnosis.artifact.status,
       name: packageName(diagnosis.artifact.resolved_experiment_json),
       image_refs: diagnosis.artifact.image_refs,
+      package_provenance: diagnosis.artifact.package_provenance,
       secret_requirements: packageSecretRequirements(diagnosis.artifact),
       supplied_secret_ids: Object.keys(diagnosis.secretRefs).sort(),
       runtime_options: diagnosis.runtimeOptions,
@@ -203,6 +206,9 @@ async function hostedAuthoringBuildUpload(
       imports,
       packages,
       ownerKey,
+      {
+        packageProvenance: packageProvenanceFromBuildEnvironment(buildEnvironment),
+      },
     );
     cloudReadiness = await hostedCloudReadiness({
       jobPackageDigest: job.package_digest,
@@ -235,6 +241,7 @@ async function hostedAuthoringBuildUpload(
       target: { kind: "hosted_cloud", name: "default" },
       runtime_options: runtimeOptions,
       package_digest: null,
+      package_provenance: packageProvenanceFromBuildEnvironment(buildEnvironment),
       package_status: null,
       run_requirements: null,
       secret_requirements: [],
@@ -321,6 +328,22 @@ function uploadByteSizeForSourceVerification(value: UploadRecord["byte_size"]): 
     return Number.isSafeInteger(parsed) ? parsed : null;
   }
   return null;
+}
+
+function packageProvenanceFromBuildEnvironment(environment: HostedBuildEnvironment): JsonObject {
+  const provenance = environment.package_contract.authoring_provenance;
+  return {
+    schema_version: "cloud_package_provenance_v1",
+    status: provenance.status,
+    source: provenance.source,
+    message: provenance.message,
+    build_target: environment.target,
+    input_kind: environment.source.input_kind,
+    source_upload_id: environment.source.upload_id,
+    source_content_digest: environment.source.content_digest,
+    builder: environment.builder,
+    core: environment.core,
+  };
 }
 
 async function runCoreAuthoringBuild(input: {
@@ -505,7 +528,9 @@ function hostedBuildEnvironment(input: {
     "BUCEPHALUS_RELEASE_VERSION",
   ]);
   const builder = {
-    kind: "api_embedded_core" as const,
+    kind: input.inputKind === "authoring_context"
+      ? "hosted_authoring_builder" as const
+      : "sealed_package_importer" as const,
     image_digest: firstNonEmptyEnv([
       "BUCEPHALUS_CLOUD_BUILDER_IMAGE_DIGEST",
       "BUCEPHALUS_CLOUD_API_IMAGE_DIGEST",
@@ -520,15 +545,25 @@ function hostedBuildEnvironment(input: {
     os: process.platform,
     arch: process.arch,
   };
-  const core = {
-    command: "bucephalus build" as const,
-    path: coreCliPath(),
-    version: firstNonEmptyEnv([
-      "BUCEPHALUS_CLOUD_CORE_VERSION",
-      "BUCEPHALUS_CORE_VERSION",
-    ]) ?? releaseVersion,
-    timeout_ms: hostedAuthoringBuildTimeoutMs(),
-  };
+  const core = input.inputKind === "authoring_context"
+    ? {
+      executed: true as const,
+      command: "bucephalus build" as const,
+      path: coreCliPath(),
+      version: firstNonEmptyEnv([
+        "BUCEPHALUS_CLOUD_CORE_VERSION",
+        "BUCEPHALUS_CORE_VERSION",
+      ]) ?? releaseVersion,
+      timeout_ms: hostedAuthoringBuildTimeoutMs(),
+    }
+    : {
+      executed: false as const,
+      command: null,
+      path: null,
+      version: null,
+      timeout_ms: null,
+      reason: "Sealed package input was imported directly; Cloud did not run hosted Core authoring.",
+    };
   return {
     schema_version: "hosted_build_environment_v1",
     target: {
@@ -541,13 +576,30 @@ function hostedBuildEnvironment(input: {
     core,
     package_contract: {
       input_kind: input.inputKind,
-      authoring_compiler: "core_universal_v1",
+      authoring_compiler: input.inputKind === "authoring_context" ? "core_universal_v1" : null,
+      authoring_provenance: packageAuthoringProvenance(input.inputKind),
       sealed_schema_version: "sealed_run_package_v2",
       readiness_schema_version: "hosted_cloud_readiness_v1",
       cloud_readiness_required: true,
     },
     evidence: buildEnvironmentEvidence(builder, core, input.evidencePolicy),
   };
+}
+
+function packageAuthoringProvenance(
+  inputKind: "sealed_package" | "authoring_context",
+): HostedBuildEnvironment["package_contract"]["authoring_provenance"] {
+  return inputKind === "authoring_context"
+    ? {
+      status: "hosted_attested",
+      source: "hosted_core",
+      message: "Cloud ran hosted Core authoring for this package and recorded the builder/core environment.",
+    }
+    : {
+      status: "external_unattested",
+      source: "sealed_package_manifest",
+      message: "Cloud verified sealed package integrity and hosted readiness, but sealed_run_package_v2 does not attest the package's original authoring environment.",
+    };
 }
 
 function hostedBuildSource(
@@ -634,20 +686,31 @@ function buildEnvironmentEvidence(
         code: "builder_git_sha_missing",
         message: "Build environment does not include a hosted release git SHA.",
       },
-    core.version
-      ? {
-        name: "core_version",
-        status: "passed",
-        code: "core_version_recorded",
-        message: "Build environment records the hosted Core version.",
-      }
-      : {
-        name: "core_version",
-        status: "warning",
-        code: "core_version_missing",
-        message: "Build environment does not include the hosted Core version.",
-      },
   ];
+  if (core.executed) {
+    checks.push(
+      core.version
+        ? {
+          name: "core_version",
+          status: "passed",
+          code: "core_version_recorded",
+          message: "Build environment records the hosted Core version.",
+        }
+        : {
+          name: "core_version",
+          status: "warning",
+          code: "core_version_missing",
+          message: "Build environment does not include the hosted Core version.",
+        },
+    );
+  } else {
+    checks.push({
+      name: "hosted_core_authoring",
+      status: "passed",
+      code: "hosted_core_not_run_for_sealed_package",
+      message: "Sealed package input was imported directly; Cloud readiness was checked without claiming hosted Core authored the package.",
+    });
+  }
   const missing = checks
     .filter((check) => check.status === "warning")
     .map((check) => check.name);
@@ -687,6 +750,7 @@ interface HostedCloudReadiness {
   };
   runtime_options: JsonObject;
   package_digest: string | null;
+  package_provenance: JsonObject;
   package_status: string | null;
   run_requirements: RunRequirements | null;
   secret_requirements: ReturnType<typeof packageSecretRequirements>;
@@ -711,22 +775,43 @@ interface HostedBuildEnvironment {
   };
   runtime_options: JsonObject;
   builder: {
-    kind: "api_embedded_core";
+    kind: "hosted_authoring_builder" | "sealed_package_importer";
     image_digest: string | null;
     release_version: string | null;
     git_sha: string | null;
     os: NodeJS.Platform;
     arch: string;
   };
-  core: {
-    command: "bucephalus build";
-    path: string;
-    version: string | null;
-    timeout_ms: number;
-  };
+  core:
+    | {
+      executed: true;
+      command: "bucephalus build";
+      path: string;
+      version: string | null;
+      timeout_ms: number;
+    }
+    | {
+      executed: false;
+      command: null;
+      path: null;
+      version: null;
+      timeout_ms: null;
+      reason: string;
+    };
   package_contract: {
     input_kind: "sealed_package" | "authoring_context";
-    authoring_compiler: "core_universal_v1";
+    authoring_compiler: "core_universal_v1" | null;
+    authoring_provenance:
+      | {
+        status: "hosted_attested";
+        source: "hosted_core";
+        message: string;
+      }
+      | {
+        status: "external_unattested";
+        source: "sealed_package_manifest";
+        message: string;
+      };
     sealed_schema_version: "sealed_run_package_v2";
     readiness_schema_version: "hosted_cloud_readiness_v1";
     cloud_readiness_required: boolean;
@@ -779,6 +864,7 @@ async function hostedCloudReadiness(input: {
     },
     runtime_options: input.runtimeOptions,
     package_digest: input.jobPackageDigest,
+    package_provenance: packageProvenanceFromBuildEnvironment(input.buildEnvironment),
   };
 
   if (input.importStatus !== "accepted") {
@@ -894,6 +980,7 @@ async function hostedCloudReadinessForArtifact(input: {
       target: { kind: "hosted_cloud", name: "default" },
       runtime_options: input.runtimeOptions,
       package_digest: input.artifact.package_digest,
+      package_provenance: input.artifact.package_provenance,
       package_status: input.artifact.status,
       run_requirements: null,
       secret_requirements: secretRequirements,
@@ -939,6 +1026,7 @@ async function hostedCloudReadinessForArtifact(input: {
       target: { kind: "hosted_cloud", name: "default" },
       runtime_options: input.runtimeOptions,
       package_digest: input.artifact.package_digest,
+      package_provenance: input.artifact.package_provenance,
       package_status: input.artifact.status,
       run_requirements: runRequirements,
       secret_requirements: secretRequirements,
@@ -955,6 +1043,7 @@ async function hostedCloudReadinessForArtifact(input: {
     target: { kind: "hosted_cloud", name: "default" },
     runtime_options: input.runtimeOptions,
     package_digest: input.artifact.package_digest,
+    package_provenance: input.artifact.package_provenance,
     package_status: input.artifact.status,
     run_requirements: runRequirements,
     secret_requirements: secretRequirements,

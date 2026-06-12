@@ -125,12 +125,16 @@ buc run <package-digest> --secret-ref NAME=bucephalus://NAME
 `buc build experiment.yaml` uploads the YAML directory as an authoring context,
 runs the bundled Core builder in Cloud, imports the produced sealed package, and
 reports hosted Cloud readiness. Existing sealed packages can still be uploaded
-with `buc build <package-dir>`. For nested experiments that reference shared
-repo files, use `buc build path/to/experiment.yaml --context-root .` so the
-Cloud build receives the intended authoring tree. Local generated and credential
-material such as `.env`, `.npmrc`, `.ssh`, `.aws`, `node_modules`, and `target`
-is excluded from YAML context uploads and rejected by the hosted API. Hosted
-secrets are write-only:
+with `buc build <package-dir>`, but Cloud treats that path as an externally
+authored sealed-package import: it verifies package integrity and hosted
+readiness without claiming the local authoring environment, Core version,
+platform, or target. YAML builds are the hosted-attested Cloud authoring path.
+For nested experiments that reference shared repo files, use
+`buc build path/to/experiment.yaml --context-root .` so the Cloud build receives
+the intended authoring tree. Local generated and credential material such as
+`.env`, `.npmrc`, `.ssh`, `.aws`, `node_modules`, and `target` is excluded from
+YAML context uploads and rejected by the hosted API. Hosted secrets are
+write-only:
 `buc secrets put` stores the value in Cloud and returns a stable
 `bucephalus://NAME` ref for doctor/run. See
 [Hosted Cloud CLI](docs/user/cloud-cli.md).

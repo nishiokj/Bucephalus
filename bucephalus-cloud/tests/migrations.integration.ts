@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createSql } from "../src/db/client";
 import type { Sql } from "../src/db/client";
 import { migrationFiles, runMigrations } from "../src/db/migrate";
+import { PackageRepository } from "../src/packages/repository";
 
 const defaultDatabaseUrl = "postgres://bucephalus:bucephalus_dev@127.0.0.1:55432/bucephalus_cloud";
 
@@ -153,6 +154,94 @@ describe("cloud SQL migrations", () => {
           insert into cloud.runs (package_digest, run_label)
           values (${packageDigest}, 'migration-gate')
         `;
+
+        const packageRepository = new PackageRepository(sql);
+        const ownerScopedDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const [hostedUpload] = await sql<{ upload_id: string }[]>`
+          insert into ingest.uploads (filename, media_type, owner_key, status)
+          values ('hosted.tgz', 'application/gzip', 'issuer:hosted-user', 'completed')
+          returning upload_id
+        `;
+        const [importedUpload] = await sql<{ upload_id: string }[]>`
+          insert into ingest.uploads (filename, media_type, owner_key, status)
+          values ('imported.tgz', 'application/gzip', 'issuer:import-user', 'completed')
+          returning upload_id
+        `;
+        await packageRepository.upsertArtifact({
+          packageDigest: ownerScopedDigest,
+          uploadId: hostedUpload!.upload_id,
+          storagePath: "object://hosted",
+          byteSize: 1,
+          mediaType: "application/gzip",
+          manifestJson: { schema_version: "sealed_run_package_v2" },
+          resolvedExperimentJson: { experiment: { name: "Owner scoped provenance" } },
+          target: null,
+          imageRefs: [],
+          diagnostics: [],
+          packageProvenance: {
+            schema_version: "cloud_package_provenance_v1",
+            status: "hosted_attested",
+            source: "hosted_core",
+            message: "hosted owner provenance",
+          },
+          ownerKey: "issuer:hosted-user",
+        });
+        await packageRepository.upsertArtifact({
+          packageDigest: ownerScopedDigest,
+          uploadId: importedUpload!.upload_id,
+          storagePath: "object://imported",
+          byteSize: 1,
+          mediaType: "application/gzip",
+          manifestJson: { schema_version: "sealed_run_package_v2" },
+          resolvedExperimentJson: { experiment: { name: "Owner scoped provenance" } },
+          target: null,
+          imageRefs: [],
+          diagnostics: [],
+          packageProvenance: {
+            schema_version: "cloud_package_provenance_v1",
+            status: "external_unattested",
+            source: "sealed_package_import",
+            message: "import owner provenance",
+          },
+          ownerKey: "issuer:import-user",
+        });
+
+        const hostedOwnerArtifact = await packageRepository.getArtifact(ownerScopedDigest, "issuer:hosted-user");
+        const importOwnerArtifact = await packageRepository.getArtifact(ownerScopedDigest, "issuer:import-user");
+        expect(hostedOwnerArtifact?.package_provenance.status).toBe("hosted_attested");
+        expect(hostedOwnerArtifact?.upload_id).toBe(hostedUpload!.upload_id);
+        expect(hostedOwnerArtifact?.storage_path).toBe("object://hosted");
+        expect(hostedOwnerArtifact?.byte_size).toBe(1);
+        expect(hostedOwnerArtifact?.media_type).toBe("application/gzip");
+        expect(importOwnerArtifact?.package_provenance.status).toBe("external_unattested");
+        expect(importOwnerArtifact?.upload_id).toBe(importedUpload!.upload_id);
+        expect(importOwnerArtifact?.storage_path).toBe("object://imported");
+        expect(importOwnerArtifact?.byte_size).toBe(1);
+        expect(importOwnerArtifact?.media_type).toBe("application/gzip");
+
+        const hostedOwnerList = await packageRepository.listArtifacts({ ownerKey: "issuer:hosted-user" });
+        const importOwnerList = await packageRepository.listArtifacts({ ownerKey: "issuer:import-user" });
+        expect(hostedOwnerList.find((artifact) => artifact.package_digest === ownerScopedDigest)?.storage_path).toBe("object://hosted");
+        expect(hostedOwnerList.find((artifact) => artifact.package_digest === ownerScopedDigest)?.package_provenance.status).toBe("hosted_attested");
+        expect(importOwnerList.find((artifact) => artifact.package_digest === ownerScopedDigest)?.storage_path).toBe("object://imported");
+        expect(importOwnerList.find((artifact) => artifact.package_digest === ownerScopedDigest)?.package_provenance.status).toBe("external_unattested");
+
+        const oversizedDigest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        await sql`
+          insert into cloud.package_artifacts (
+            package_digest,
+            byte_size,
+            manifest_json,
+            resolved_experiment_json
+          )
+          values (
+            ${oversizedDigest},
+            9007199254740993,
+            ${sql.json({ schema_version: "sealed_run_package_v2" })},
+            ${sql.json({ experiment: { name: "Unsafe byte size" } })}
+          )
+        `;
+        await expect(packageRepository.getArtifact(oversizedDigest)).rejects.toThrow("Persisted package artifact byte_size is invalid");
 
         await runMigrations({ databaseUrl: scratch.databaseUrl, runtimeRoleName: null });
 
