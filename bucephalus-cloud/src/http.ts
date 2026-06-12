@@ -153,12 +153,26 @@ export function requireRecord(value: unknown, pointer: string): Record<string, u
 }
 
 export function requireBearerToken(request: Request, expectedToken: string, scope: string): void {
+  requireStaticToken(request, expectedToken, {
+    scope,
+    credentialName: "worker token",
+    headerNames: ["x-bucephalus-worker-token"],
+  });
+}
+
+export function requireStaticToken(
+  request: Request,
+  expectedToken: string,
+  options: { scope: string; credentialName: string; headerNames?: string[] },
+): void {
   const authorization = request.headers.get("authorization");
   const bearer = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : null;
-  const headerToken = request.headers.get("x-bucephalus-worker-token");
+  const headerToken = (options.headerNames ?? [])
+    .map((name) => request.headers.get(name))
+    .find((token): token is string => typeof token === "string" && token.length > 0);
   const providedToken = bearer ?? headerToken;
   if (!providedToken || !secureEqual(providedToken, expectedToken)) {
-    throw new HttpError(401, "unauthorized", `${scope} requires a valid worker token`);
+    throw new HttpError(401, "unauthorized", `${options.scope} requires a valid ${options.credentialName}`);
   }
 }
 

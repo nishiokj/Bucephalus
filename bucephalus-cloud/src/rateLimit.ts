@@ -143,7 +143,8 @@ function credentialKey(request: Request): string[] {
   const authorization = request.headers.get("authorization");
   const bearer = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
   const workerToken = request.headers.get("x-bucephalus-worker-token")?.trim() ?? "";
-  const credential = bearer || workerToken;
+  const runnerAdminToken = request.headers.get("x-bucephalus-runner-admin-token")?.trim() ?? "";
+  const credential = bearer || workerToken || runnerAdminToken;
   return credential.length > 0 ? [stableHash(credential)] : [];
 }
 

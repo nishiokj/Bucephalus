@@ -22,6 +22,14 @@ components:
       type: apiKey
       in: header
       name: X-Bucephalus-Worker-Token
+    runnerAdminBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: bucephalus-cloud-runner-admin-token
+    runnerAdminTokenHeader:
+      type: apiKey
+      in: header
+      name: X-Bucephalus-Runner-Admin-Token
   parameters:
     OrgId:
       name: X-Bucephalus-Org

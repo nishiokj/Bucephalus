@@ -60,6 +60,29 @@ describe("API rate limiting", () => {
     expect(decision?.bucket.kind).toBe("credential");
   });
 
+  test("keys runner admin header credentials the same way as bearer credentials", () => {
+    const limiter = testLimiter({ ipMax: 100, credentialMax: 2 });
+    const first = apiRequest({
+      "x-bucephalus-runner-admin-token": "runner-admin-token",
+      "x-forwarded-for": "203.0.113.16",
+    });
+    const second = apiRequest({
+      "x-bucephalus-runner-admin-token": "runner-admin-token",
+      "x-forwarded-for": "203.0.113.17",
+    });
+    const third = apiRequest({
+      "x-bucephalus-runner-admin-token": "runner-admin-token",
+      "x-forwarded-for": "203.0.113.18",
+    });
+
+    expect(limiter.check(first, new URL(first.url), 1_000)?.allowed).toBe(true);
+    expect(limiter.check(second, new URL(second.url), 1_001)?.allowed).toBe(true);
+    const decision = limiter.check(third, new URL(third.url), 1_002);
+
+    expect(decision?.allowed).toBe(false);
+    expect(decision?.bucket.kind).toBe("credential");
+  });
+
   test("still limits one IP when callers rotate bearer values", () => {
     const limiter = testLimiter({ ipMax: 2, credentialMax: 100 });
 

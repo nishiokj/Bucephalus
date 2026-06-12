@@ -1,4 +1,4 @@
-import { HttpError, jsonResponse, readJsonObject, requireBearerToken, requireString } from "../http";
+import { HttpError, jsonResponse, readJsonObject, requireBearerToken, requireStaticToken, requireString } from "../http";
 import { logWarn, newTraceContext } from "../logging";
 import type { JsonObject, JsonValue } from "../primitives";
 import { releaseIdentity } from "../release";
@@ -18,8 +18,13 @@ export async function handleRunnerRoute(
 ): Promise<Response | null> {
   const workerToken = tokens.workerToken;
   const adminToken = tokens.adminToken ?? workerToken;
+  const requireRunnerAdmin = (scope: string) => requireRunnerAdminToken(request, {
+    adminToken,
+    acceptsLegacyWorkerHeader: adminToken === workerToken,
+    scope,
+  });
   if (request.method === "POST" && url.pathname === "/v1/runner-pools") {
-    requireBearerToken(request, adminToken, "runner pool management");
+    requireRunnerAdmin("runner pool management");
     const body = await readJsonObject(request);
     const pool = await runners.createPool({
       name: requireString(body.name, "/name"),
@@ -30,13 +35,13 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "GET" && url.pathname === "/v1/runner-pools") {
-    requireBearerToken(request, adminToken, "runner pool management");
+    requireRunnerAdmin("runner pool management");
     const pools = await runners.listPools();
     return jsonResponse({ runner_pools: pools.map(poolToWire) });
   }
 
   if (request.method === "GET" && url.pathname === "/v1/runner-instances") {
-    requireBearerToken(request, adminToken, "runner instance management");
+    requireRunnerAdmin("runner instance management");
     const runnerPoolId = url.searchParams.get("runner_pool_id");
     const instances = await runners.listInstances({
       ...(runnerPoolId ? { runnerPoolId } : {}),
@@ -46,7 +51,7 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "POST" && url.pathname === "/v1/runner-instances/expire-stale") {
-    requireBearerToken(request, adminToken, "runner instance management");
+    requireRunnerAdmin("runner instance management");
     const body = await readJsonObject(request).catch(() => ({}));
     const staleAfterSeconds = positiveInt((body as Record<string, unknown>).stale_after_seconds) ?? 90;
     const runnerPoolId = (body as Record<string, unknown>).runner_pool_id;
@@ -58,7 +63,7 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "GET" && url.pathname === "/v1/runner-provision-requests") {
-    requireBearerToken(request, adminToken, "runner provision request management");
+    requireRunnerAdmin("runner provision request management");
     const runnerPoolId = url.searchParams.get("runner_pool_id");
     const requests = await runners.listProvisionRequests({
       ...(runnerPoolId ? { runnerPoolId } : {}),
@@ -68,7 +73,7 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "GET" && url.pathname.startsWith("/v1/runner-pools/")) {
-    requireBearerToken(request, adminToken, "runner pool management");
+    requireRunnerAdmin("runner pool management");
     const poolId = decodeURIComponent(url.pathname.slice("/v1/runner-pools/".length));
     const pool = await runners.getPool(poolId);
     if (!pool) {
@@ -78,14 +83,14 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "POST" && url.pathname.startsWith("/v1/runner-pools/") && url.pathname.endsWith("/drain")) {
-    requireBearerToken(request, adminToken, "runner pool management");
+    requireRunnerAdmin("runner pool management");
     const poolId = decodeURIComponent(url.pathname.slice("/v1/runner-pools/".length, -"/drain".length));
     const pool = await runners.setPoolStatus({ poolId, status: "draining" });
     return jsonResponse(poolToWire(pool));
   }
 
   if (request.method === "POST" && url.pathname.startsWith("/v1/runner-pools/") && url.pathname.endsWith("/disable")) {
-    requireBearerToken(request, adminToken, "runner pool management");
+    requireRunnerAdmin("runner pool management");
     const poolId = decodeURIComponent(url.pathname.slice("/v1/runner-pools/".length, -"/disable".length));
     const pool = await runners.setPoolStatus({ poolId, status: "disabled" });
     return jsonResponse(poolToWire(pool));
@@ -126,7 +131,7 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "POST" && runnerInstancePath(url.pathname, "/drain")) {
-    requireBearerToken(request, adminToken, "runner instance management");
+    requireRunnerAdmin("runner instance management");
     const instance = await runners.setInstanceStatus({
       runnerInstanceId: runnerInstanceIdFromPath(url.pathname, "/drain"),
       status: "draining",
@@ -170,6 +175,19 @@ export async function handleRunnerRoute(
   }
 
   return null;
+}
+
+function requireRunnerAdminToken(
+  request: Request,
+  input: { adminToken: string; acceptsLegacyWorkerHeader: boolean; scope: string },
+): void {
+  requireStaticToken(request, input.adminToken, {
+    scope: input.scope,
+    credentialName: "runner admin token",
+    headerNames: input.acceptsLegacyWorkerHeader
+      ? ["x-bucephalus-runner-admin-token", "x-bucephalus-worker-token"]
+      : ["x-bucephalus-runner-admin-token"],
+  });
 }
 
 function poolToWire(pool: RunnerPoolRecord): JsonObject {
