@@ -1,4 +1,4 @@
-name: Bucephalus GCP Deploy
+name: Bucephalus GCP Deploy Backend
 
 on:
   # Scheduled runs are drift checks: plan-only against the latest promotion

@@ -30,9 +30,12 @@ The first Path 1 replacement surface is:
 - `.github/workflows/bucephalus-cloud-candidate.yml`: fast Cloud candidate
   workflow that builds deployable x86_64 images after `main` Cloud CI succeeds
   and classifies the change before deciding whether to deploy, plan, or stop.
-- `.github/workflows/bucephalus-gcp-deploy.yml`: manual GCP deploy workflow
-  and reusable deployment backend that consumes verified pushed-image promotion
-  evidence instead of handwritten image digests.
+- `.github/workflows/bucephalus-cloud-promote.yml`: operator-facing release
+  promotion workflow. Pick a released version, pick `preview` or `promote`, and
+  let it consume the verified pushed-image promotion evidence.
+- `.github/workflows/bucephalus-gcp-deploy.yml`: reusable GCP deployment
+  backend for promotion, substrate setup, drift checks, and advanced recovery.
+  The normal hot path should use Cloud Promote instead of this workflow.
 
 The candidate workflow separates changes into four high-level lanes:
 
@@ -47,7 +50,17 @@ The candidate workflow separates changes into four high-level lanes:
 - Docs, tests, examples, and CI-policy-only changes stop after Cloud CI and the
   classifier summary; unknown new paths are treated as runtime-affecting.
 
-The normal deploy workflow is a single service promotion:
+The normal production hot path is:
+
+1. `Bucephalus Auto Release Tag` creates `v<version>` when `Cargo.toml` changes
+   on `main`.
+2. `Bucephalus Release Artifact` builds archives, pushed Cloud images, and the
+   `cloud-release-promotion-<version>` evidence artifact.
+3. `Bucephalus Cloud Promote` promotes that exact version. Use `mode=preview`
+   to inspect the generated change and `mode=promote` to apply it through the
+   production GitHub Environment approval gate.
+
+Internally, a normal app promotion is a single service promotion:
 
 - `deployment_stage=services`: API, migration job, pool-controller, active
   worker image promotion, and smoke checks from one verified promotion evidence
@@ -55,7 +68,7 @@ The normal deploy workflow is a single service promotion:
 - `deployment_stage=substrate`: rare bootstrap/substrate-only changes, no app
   images.
 - `deployment_stage=api` and `deployment_stage=pool`: compatibility aliases for
-  older manual runbooks; new promotions should use `services`.
+  older manual runbooks; the Cloud Promote workflow uses `services` internally.
 
 The `bucephalus-dev` GitHub Environment is the default development target. The
 deploy workflow maps it to the shorter Terraform environment label `dev` unless

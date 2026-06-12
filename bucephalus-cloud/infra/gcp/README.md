@@ -117,11 +117,14 @@ single service-stage production promotion:
    changes also stop at plan-only. Unless that environment overrides
    `BUCEPHALUS_DEPLOYMENT_ENVIRONMENT`, the deploy workflow maps it to the
    Terraform-safe environment label `dev`.
-3. For production-style releases, run `.github/workflows/bucephalus-release.yml`
-   with `version_override=<version>` against the created Artifact Registry
-   repository. Production promotion uses `.github/workflows/bucephalus-gcp-deploy.yml`
-   with `deployment_stage=services` and `apply=true`; the production GitHub
-   Environment should provide the single human approval gate.
+3. For production-style releases, let `.github/workflows/bucephalus-auto-release.yml`
+   tag a `Cargo.toml` version bump or manually run
+   `.github/workflows/bucephalus-release.yml` with `version_override=<version>`.
+   After the release workflow publishes `cloud-release-promotion-<version>`, use
+   `.github/workflows/bucephalus-cloud-promote.yml`: `mode=preview` inspects the
+   promotion, and `mode=promote` applies it through the production GitHub
+   Environment approval gate. The lower-level GCP deploy workflow remains the
+   reusable backend.
 4. `deployment_stage=api` and `deployment_stage=pool` remain accepted for older
    runbooks, but new deployments should not require separate API and pool
    dispatches.

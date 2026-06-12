@@ -13,12 +13,24 @@ describe("registry routes", () => {
         observed.limit = options.limit;
         return [
           {
-            kind: "agent",
+            kind: "variant",
             content_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            display_name: "Codex",
-            aliases: ["codex"],
+            display_name: "Baseline",
+            aliases: ["baseline"],
             score: 0,
             metadata: {},
+            used_by_runs: 3,
+            last_used_at: "2026-06-12T14:30:00.000Z",
+          },
+          {
+            kind: "metric",
+            content_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            display_name: "Accuracy",
+            aliases: [],
+            score: 0,
+            metadata: {},
+            used_by_runs: 0,
+            last_used_at: null,
           },
         ];
       },
@@ -34,7 +46,18 @@ describe("registry routes", () => {
     expect(response!.status).toBe(200);
     expect(observed).toEqual({ q: "", limit: 100 });
     const body = await response!.json();
-    expect(body.hits).toHaveLength(1);
+    expect(body.hits).toEqual([
+      expect.objectContaining({
+        content_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        used_by_runs: 3,
+        last_used_at: "2026-06-12T14:30:00.000Z",
+      }),
+      expect.objectContaining({
+        content_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        used_by_runs: 0,
+        last_used_at: null,
+      }),
+    ]);
   });
 
   test("registry search trims blank q into inventory search", async () => {
@@ -118,6 +141,95 @@ describe("registry routes", () => {
       new URL("https://cloud.example/v1/registry/objects/sha256%3ANOTHEX"),
       repository as unknown as RegistryRepository,
     )).rejects.toThrow("/digest must be sha256:<64 lowercase hex chars>");
+  });
+
+  test("registry object lookup includes usage for runs by owner", async () => {
+    const observed: { digest?: string; usageOwnerKey: string | undefined } = { usageOwnerKey: undefined };
+    const repository = {
+      async getContentObject(digest: string) {
+        observed.digest = digest;
+        return {
+          content_digest: digest,
+          kind: "variant",
+          schema_version: "v1",
+          canonical_json: { display_name: "Baseline" },
+          canonical_size_bytes: 28,
+          created_at: "2026-06-01T00:00:00.000Z",
+          created_by: null,
+          source_uri: null,
+        };
+      },
+      async aliasesForDigest() {
+        return [];
+      },
+      async usageForDigest(_digest: string, ownerKey?: string) {
+        observed.usageOwnerKey = ownerKey;
+        return {
+          used_by_runs: 2,
+          last_used_at: "2026-06-12T14:30:00.000Z",
+        };
+      },
+    };
+
+    const response = await handleRegistryRoute(
+      new Request(`https://cloud.example/v1/registry/objects/${encodeURIComponent(validDigest)}`),
+      new URL(`https://cloud.example/v1/registry/objects/${encodeURIComponent(validDigest)}`),
+      repository as unknown as RegistryRepository,
+      {
+        issuer: "https://issuer.example",
+        subject: "user-1",
+        audience: "cloud",
+        claims: {},
+      },
+    );
+
+    expect(response).not.toBeNull();
+    expect(response!.status).toBe(200);
+    expect(observed).toEqual({
+      digest: validDigest,
+      usageOwnerKey: "https://issuer.example:user-1",
+    });
+    const body = await response!.json();
+    expect(body.used_by_runs).toBe(2);
+    expect(body.last_used_at).toBe("2026-06-12T14:30:00.000Z");
+  });
+
+  test("registry object lookup includes empty usage for resources never used by runs", async () => {
+    const repository = {
+      async getContentObject(digest: string) {
+        return {
+          content_digest: digest,
+          kind: "metric",
+          schema_version: "v1",
+          canonical_json: { display_name: "Accuracy" },
+          canonical_size_bytes: 28,
+          created_at: "2026-06-01T00:00:00.000Z",
+          created_by: null,
+          source_uri: null,
+        };
+      },
+      async aliasesForDigest() {
+        return [];
+      },
+      async usageForDigest() {
+        return {
+          used_by_runs: 0,
+          last_used_at: null,
+        };
+      },
+    };
+
+    const response = await handleRegistryRoute(
+      new Request(`https://cloud.example/v1/registry/objects/${encodeURIComponent(validDigest)}`),
+      new URL(`https://cloud.example/v1/registry/objects/${encodeURIComponent(validDigest)}`),
+      repository as unknown as RegistryRepository,
+    );
+
+    expect(response).not.toBeNull();
+    expect(response!.status).toBe(200);
+    const body = await response!.json();
+    expect(body.used_by_runs).toBe(0);
+    expect(body.last_used_at).toBeNull();
   });
 
   test("registry mutation routes reject invalid kinds before repository calls", async () => {

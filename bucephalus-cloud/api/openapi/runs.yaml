@@ -1164,7 +1164,11 @@ components:
       required:
         - run_id
         - package_digest
+        - experiment_name
         - status
+        - pending_reason
+        - trials_completed
+        - trials_total
         - package_provenance
         - env
         - secret_refs
@@ -1177,6 +1181,14 @@ components:
           format: uuid
         package_digest:
           $ref: './common.yaml#/components/schemas/Digest'
+        experiment_name:
+          type:
+            - string
+            - 'null'
+          description: >
+            Stable human-readable experiment grouping key sealed in the
+            package's resolved experiment. Null when the package artifact is no
+            longer visible to the caller.
         run_label:
           type:
             - string
@@ -1190,6 +1202,34 @@ components:
             - completed
             - failed
             - cancelled
+        pending_reason:
+          type:
+            - string
+            - 'null'
+          enum:
+            - no_matching_runner
+            - waiting_for_capacity
+            - null
+          description: >
+            Queue diagnosis for created or waiting_for_runner runs. Null for
+            non-queued runs.
+        trials_completed:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+          description: >
+            Count of completed trial schedule slots observed in runtime
+            conclusion rows. Null when runtime progress is not yet known.
+        trials_total:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+          description: >
+            Total trial schedule slots observed from runtime
+            schedule_progress_v2.total_slots. Null before the run emits its
+            first schedule progress snapshot.
         env:
           type: object
           additionalProperties:

@@ -4260,6 +4260,12 @@ Authoring context:
   credential material such as .env, .npmrc, .ssh, .aws, node_modules, and
   target is excluded before upload; the hosted API rejects those paths too.
 
+Auth:
+  Sign in with `bucephalus login --resource <api-url>`. buc reuses the shared
+  Bucephalus Cloud profile and cached tokens from BUCEPHALUS_HOME, refreshing
+  cached OAuth tokens when a refresh token is present. You can also pass
+  --api-url and --user-token per command.
+
 Runtime options:
   --backend VALUE --arch VALUE --isolation VALUE --cpu-count N --memory-mb N
   --disk-mb N --timeout-ms N --max-parallel-trials N
@@ -7586,7 +7592,7 @@ mod tests {
             vec!["inspect", "sha256:short"],
             vec![
                 "doctor",
-                "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaA",
             ],
             vec!["run", "not-a-digest"],
             vec!["packages", "inspect", "sha256:short"],
@@ -7657,6 +7663,9 @@ mod tests {
             "buc [--api-url URL] [--user-token TOKEN] build <experiment.yaml|package-dir|package.tgz> [--context-root DIR]"
         ));
         assert!(help.contains("Authoring context:"));
+        assert!(help.contains("Auth:"));
+        assert!(help.contains("bucephalus login --resource <api-url>"));
+        assert!(help.contains("refreshing"));
         assert!(help.contains("--context-root DIR"));
         assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] run <package-digest>"));
         assert!(help.contains("Long-form nouns:"));
@@ -8149,6 +8158,36 @@ mod tests {
         ));
         assert!(message.contains("actions:"));
         assert!(message.contains("[before_run] upload_hosted_secret"));
+    }
+
+    #[test]
+    fn cloud_unauthorized_message_points_to_login_and_cached_state() {
+        let _lock = lock_env();
+        let home = temp_dir("cloud_unauthorized_auth_hint_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+        let context = CliContext {
+            api_url: "https://api.example".to_string(),
+            user_token: None,
+            args: vec![],
+            client: Client::new(),
+        };
+
+        let message = append_user_auth_hint(
+            &context,
+            "Bucephalus Cloud requires OAuth bearer authentication".to_string(),
+        );
+
+        assert!(message.contains("Cloud auth required"));
+        assert!(message.contains("The CLI did not find a user bearer token"));
+        assert!(message.contains("bucephalus login --resource <hosted-api-url>"));
+        assert!(message.contains("BUCEPHALUS_CLOUD_USER_TOKEN"));
+        assert!(message.contains("auth/cloud_user_token"));
+        assert!(message.contains("bucephalus setup status --json"));
+        assert!(message.contains("buc health"));
     }
 
     #[test]

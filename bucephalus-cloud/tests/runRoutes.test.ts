@@ -26,13 +26,15 @@ describe("Cloud run routes", () => {
         return [failedAttempt];
       },
     };
+    const packages = packagesByDigest([packageRecordWithSecrets()]);
+    const runtime = runtimeProgress([]);
 
     const response = await handleRunRoute(
       new Request("https://cloud.example/v1/runs/run-1"),
       new URL("https://cloud.example/v1/runs/run-1"),
-      {} as PackageRepository,
+      packages as unknown as PackageRepository,
       runs as unknown as RunRepository,
-      {} as RuntimeRepository,
+      runtime as unknown as RuntimeRepository,
       runnersWithDockerPool() as any,
       "worker-token",
     );
@@ -53,13 +55,15 @@ describe("Cloud run routes", () => {
         return [runRecord()];
       },
     };
+    const packages = packagesByDigest([packageRecordWithSecrets()]);
+    const runtime = runtimeProgress([]);
 
     const response = await handleRunRoute(
       new Request("https://cloud.example/v1/runs"),
       new URL("https://cloud.example/v1/runs"),
-      {} as PackageRepository,
+      packages as unknown as PackageRepository,
       runs as unknown as RunRepository,
-      {} as RuntimeRepository,
+      runtime as unknown as RuntimeRepository,
       runnersWithDockerPool() as any,
       "worker-token",
     );
@@ -72,6 +76,154 @@ describe("Cloud run routes", () => {
     expect(body.runs[0].secret_ids).toEqual(["OPENAI_API_KEY"]);
     expect(JSON.stringify(body)).not.toContain("secret-env-value");
     expect(JSON.stringify(body)).not.toContain("projects/acme/secrets/openai");
+  });
+
+  test("run list includes experiment grouping and trial progress from batched enrichment", async () => {
+    const first = {
+      ...runRecord(),
+      run_id: "run-1",
+      package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    const second = {
+      ...runRecord(),
+      run_id: "run-2",
+      package_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      status: "running",
+    };
+    const observed: { packageDigests?: string[]; progressRunIds?: string[] } = {};
+    const packages = {
+      async listArtifactsByDigests(packageDigests: string[]) {
+        observed.packageDigests = packageDigests;
+        return [
+          {
+            ...packageRecordWithSecrets(),
+            package_digest: first.package_digest,
+            resolved_experiment_json: {
+              experiment: { name: "Batchable Experiment" },
+              matrix: {
+                variants: [{ id: "a" }],
+                tasks: { source: "file", path: "tasks.jsonl", limit: 8 },
+                repeats: 1,
+              },
+            },
+          },
+          {
+            ...packageRecordWithSecrets(),
+            package_digest: second.package_digest,
+            resolved_experiment_json: {
+              experiment: { name: "Matrix Experiment" },
+              matrix: {
+                variants: [{ id: "a" }, { id: "b" }],
+                tasks: { source: "file", path: "tasks.jsonl", limit: 3 },
+                repeats: 2,
+              },
+            },
+          },
+        ];
+      },
+    };
+    const runtime = {
+      async trialProgressForCloudRuns(runIds: string[]) {
+        observed.progressRunIds = runIds;
+        return [
+          {
+            cloud_run_id: "run-1",
+            trials_completed: 3,
+            trials_total: 8,
+            schedule_progress_v2: { schema_version: "schedule_progress_v2", total_slots: 8 },
+          },
+          {
+            cloud_run_id: "run-2",
+            trials_completed: 1,
+            trials_total: 12,
+            schedule_progress_v2: { schema_version: "schedule_progress_v2", total_slots: 12 },
+          },
+        ];
+      },
+    };
+    const runs = {
+      async listRuns() {
+        return [first, second];
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs"),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(observed.packageDigests).toEqual([first.package_digest, second.package_digest]);
+    expect(observed.progressRunIds).toEqual(["run-1", "run-2"]);
+    expect(body.runs[0].experiment_name).toBe("Batchable Experiment");
+    expect(body.runs[0].trials_completed).toBe(3);
+    expect(body.runs[0].trials_total).toBe(8);
+    expect(body.runs[1].experiment_name).toBe("Matrix Experiment");
+    expect(body.runs[1].trials_completed).toBe(1);
+    expect(body.runs[1].trials_total).toBe(12);
+  });
+
+  test("run detail includes pending reason for queued runs", async () => {
+    const runs = {
+      async getRun() {
+        return { ...runRecord(), status: "waiting_for_runner" };
+      },
+      async listAttempts() {
+        return [];
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1"),
+      new URL("https://cloud.example/v1/runs/run-1"),
+      packagesByDigest([packageRecordWithSecrets()]) as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      runtimeProgress([{ cloud_run_id: "run-1", trials_completed: 0, trials_total: null }]) as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(body.pending_reason).toBe("waiting_for_capacity");
+  });
+
+  test("run list marks queued runs with no matching runner separately from busy capacity", async () => {
+    const modalRun = {
+      ...runRecord(),
+      run_id: "run-modal",
+      run_requirements: {
+        ...runRecord().run_requirements,
+        executor: "modal" as const,
+      },
+    };
+    const dockerRun = {
+      ...runRecord(),
+      run_id: "run-docker",
+    };
+    const runs = {
+      async listRuns() {
+        return [modalRun, dockerRun];
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs"),
+      new URL("https://cloud.example/v1/runs"),
+      packagesByDigest([packageRecordWithSecrets()]) as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      runtimeProgress([]) as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(body.runs[0].pending_reason).toBe("no_matching_runner");
+    expect(body.runs[1].pending_reason).toBe("waiting_for_capacity");
   });
 
   test("rejects malformed pagination query values instead of silently defaulting", async () => {
@@ -564,13 +716,23 @@ describe("Cloud run routes", () => {
         return [];
       },
     };
+    const packages = {
+      async listArtifactsByDigests() {
+        throw new Error("listArtifactsByDigests should not be called for empty run lists");
+      },
+    };
+    const runtime = {
+      async trialProgressForCloudRuns() {
+        throw new Error("trialProgressForCloudRuns should not be called for empty run lists");
+      },
+    };
 
     const response = await handleRunRoute(
       new Request("https://cloud.example/v1/runs"),
       new URL("https://cloud.example/v1/runs"),
-      {} as PackageRepository,
+      packages as unknown as PackageRepository,
       runs as unknown as RunRepository,
-      {} as RuntimeRepository,
+      runtime as unknown as RuntimeRepository,
       runnersWithDockerPool() as any,
       "worker-token",
       authContext("user-a"),
@@ -1225,7 +1387,7 @@ describe("Cloud run routes", () => {
   });
 });
 
-function runnersWithDockerPool(): Pick<RunnerRepository, "listPools"> {
+function runnersWithDockerPool(): Pick<RunnerRepository, "listPools" | "listInstances"> {
   return {
     async listPools() {
       return [
@@ -1244,6 +1406,29 @@ function runnersWithDockerPool(): Pick<RunnerRepository, "listPools"> {
             isolation: ["reusable_vm"],
           },
           metadata: {},
+          created_at: "2026-06-04T00:00:00Z",
+          updated_at: "2026-06-04T00:00:00Z",
+        },
+      ];
+    },
+    async listInstances() {
+      return [
+        {
+          runner_instance_id: "runner-instance-1",
+          runner_pool_id: "pool-1",
+          instance_name: "runner-1",
+          status: "online",
+          capabilities: {
+            executors: ["runner-docker"],
+            resources: ["core_runner", "docker_daemon", "registry_pull", "secret_resolver"],
+            arch: "x86_64",
+            cpu_count: 4,
+            memory_mb: 8192,
+            disk_mb: 65536,
+            isolation: ["reusable_vm"],
+          },
+          metadata: {},
+          last_heartbeat_at: "2026-06-04T00:00:00Z",
           created_at: "2026-06-04T00:00:00Z",
           updated_at: "2026-06-04T00:00:00Z",
         },
@@ -1387,6 +1572,31 @@ function packageProvenance() {
     status: "hosted_attested",
     source: "hosted_core",
     message: "Cloud ran hosted Core authoring for this package and recorded the builder/core environment.",
+  };
+}
+
+function packagesByDigest(artifacts: Array<ReturnType<typeof packageRecordWithSecrets>>) {
+  return {
+    async listArtifactsByDigests(packageDigests: string[], ownerKey?: string) {
+      expect(ownerKey).toBeUndefined();
+      const requested = new Set(packageDigests);
+      return artifacts.filter((artifact) => requested.has(artifact.package_digest));
+    },
+  };
+}
+
+function runtimeProgress(progress: Array<{ cloud_run_id: string; trials_completed: number | null; trials_total?: number | null }>) {
+  return {
+    async trialProgressForCloudRuns(runIds: string[]) {
+      const requested = new Set(runIds);
+      return progress
+        .filter((item) => requested.has(item.cloud_run_id))
+        .map((item) => ({
+          cloud_run_id: item.cloud_run_id,
+          trials_completed: item.trials_completed,
+          trials_total: item.trials_total ?? null,
+        }));
+    },
   };
 }
 

@@ -1,0 +1,51 @@
+name: Bucephalus Cloud Promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Released version to promote, for example 0.3.37"
+        required: true
+        type: string
+      target:
+        description: "Cloud environment"
+        required: true
+        default: "bucephalus"
+        type: choice
+        options:
+          - bucephalus
+      mode:
+        description: "Promotion mode"
+        required: true
+        default: "preview"
+        type: choice
+        options:
+          - preview
+          - promote
+
+run-name: >-
+  Cloud ${{ inputs.mode }} ${{ inputs.release_version }} to ${{ inputs.target }}
+
+permissions:
+  contents: read
+  actions: read
+  id-token: none
+
+concurrency:
+  group: bucephalus-cloud-promote-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  promote-release:
+    name: ${{ inputs.mode == 'promote' && 'Promote' || 'Preview' }} Cloud release ${{ inputs.release_version }}
+    uses: ./.github/workflows/bucephalus-gcp-deploy.yml
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    with:
+      deployment_stage: services
+      apply: ${{ inputs.mode == 'promote' }}
+      github_environment: ${{ inputs.target }}
+      release_version: ${{ inputs.release_version }}
+    secrets: inherit

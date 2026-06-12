@@ -69,7 +69,7 @@ paths:
                   hits:
                     type: array
                     items:
-                      $ref: './common.yaml#/components/schemas/SearchHit'
+                      $ref: '#/components/schemas/RegistrySearchHit'
                   page:
                     $ref: './common.yaml#/components/schemas/PageInfo'
         '400':
@@ -282,6 +282,8 @@ paths:
                 required:
                   - object
                   - aliases
+                  - used_by_runs
+                  - last_used_at
                 properties:
                   object:
                     $ref: './common.yaml#/components/schemas/ContentObject'
@@ -289,6 +291,16 @@ paths:
                     type: array
                     items:
                       $ref: './common.yaml#/components/schemas/EntityAlias'
+                  used_by_runs:
+                    type: integer
+                    minimum: 0
+                    description: Count of Cloud runs owned by the requester whose package consumed this resource.
+                  last_used_at:
+                    type:
+                      - string
+                      - 'null'
+                    format: date-time
+                    description: Creation timestamp of the most recent matching Cloud run, or null if never used.
         '400':
           $ref: './common.yaml#/components/responses/BadRequest'
         '404':
@@ -499,7 +511,7 @@ components:
         similar:
           type: array
           items:
-            $ref: './common.yaml#/components/schemas/SearchHit'
+            $ref: '#/components/schemas/RegistrySearchHit'
         suggestions:
           type: array
           items:
@@ -537,6 +549,42 @@ components:
           oneOf:
             - $ref: './common.yaml#/components/schemas/Digest'
             - type: 'null'
+    RegistrySearchHit:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - content_digest
+        - display_name
+        - score
+        - used_by_runs
+        - last_used_at
+      properties:
+        kind:
+          $ref: './common.yaml#/components/schemas/EntityKind'
+        content_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        display_name:
+          type: string
+        aliases:
+          type: array
+          items:
+            type: string
+        score:
+          type: number
+          minimum: 0
+        metadata:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        used_by_runs:
+          type: integer
+          minimum: 0
+          description: Count of Cloud runs owned by the requester whose package consumed this resource.
+        last_used_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Creation timestamp of the most recent matching Cloud run, or null if never used.
     ReviewSuggestedAction:
       type: object
       additionalProperties: true

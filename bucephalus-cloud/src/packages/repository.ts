@@ -176,6 +176,33 @@ export class PackageRepository {
     return rows[0] ? packageArtifactRecord(rows[0]) : null;
   }
 
+  async listArtifactsByDigests(packageDigests: string[], ownerKey?: string): Promise<PackageArtifactRecord[]> {
+    const digests = [...new Set(packageDigests)].sort();
+    if (digests.length === 0) {
+      return [];
+    }
+    const rows = await this.sql`
+      select artifact.*,
+             coalesce(owner.upload_id, artifact.upload_id) as upload_id,
+             coalesce(owner.storage_path, artifact.storage_path) as storage_path,
+             coalesce(owner.byte_size, artifact.byte_size) as byte_size,
+             coalesce(owner.media_type, artifact.media_type) as media_type,
+             coalesce(owner.package_provenance, artifact.package_provenance) as package_provenance,
+             owner.owner_key
+      from cloud.package_artifacts artifact
+      left join cloud.package_artifact_owners owner
+        on owner.package_digest = artifact.package_digest
+       and owner.owner_key = ${ownerKey ?? null}
+      where artifact.package_digest = any(${digests})
+        and (
+          ${ownerKey ?? null}::text is null
+          or owner.owner_key is not null
+        )
+      order by artifact.package_digest asc
+    `;
+    return rows.map(packageArtifactRecord);
+  }
+
   async listArtifacts(input?: { limit?: number; ownerKey?: string | undefined }): Promise<PackageArtifactRecord[]> {
     const rows = await this.sql`
       select artifact.*,
