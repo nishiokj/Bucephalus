@@ -574,9 +574,9 @@ export class RunRepository {
     token: string;
     runnerInstanceId?: string | null;
     packageDigest?: string | null;
-  }): Promise<void> {
+  }): Promise<{ runId: string }> {
     const rows = await this.sql`
-      select attempt.attempt_id
+      select attempt.attempt_id, attempt.run_id
       from cloud.run_attempts attempt
       join cloud.runs run using (run_id)
       where attempt.attempt_id = ${input.attemptId}
@@ -587,15 +587,20 @@ export class RunRepository {
         and (${input.packageDigest ?? null}::text is null or run.package_digest = ${input.packageDigest ?? null})
       limit 1
     `;
-    if (rows.length === 0) {
+    const attempt = rows[0];
+    if (!attempt) {
       throw new HttpError(401, "unauthorized", "worker attempt requires a valid attempt token");
     }
+    return { runId: String(attempt.run_id) };
   }
 }
 
 export function requireStringMap(value: unknown, pointer: string): Record<string, string> {
-  if (!isRecord(value)) {
+  if (value === undefined || value === null) {
     return {};
+  }
+  if (!isRecord(value)) {
+    throw new HttpError(400, "invalid_string_map", `${pointer} must be an object`);
   }
   const out: Record<string, string> = {};
   for (const [key, item] of Object.entries(value)) {

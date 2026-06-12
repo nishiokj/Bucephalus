@@ -218,6 +218,17 @@ if (typeof manifest.release.version !== "string" || manifest.release.version.tri
 if (typeof manifest.release.target !== "string" || !manifest.release.target.includes("linux")) {
   fail("release.target must be a Linux target");
 }
+const expectedPlatform = manifest.release.target.startsWith("x86_64-")
+  ? "linux/amd64"
+  : manifest.release.target.startsWith("aarch64-")
+    ? "linux/arm64"
+    : null;
+if (!expectedPlatform) {
+  fail("release.target must map to a supported Cloud image platform");
+}
+if (manifest.release.platform !== expectedPlatform) {
+  fail("release.platform must match the platform derived from release.target");
+}
 if (typeof manifest.release.git_sha !== "string" || !/^[a-f0-9]{40}$/.test(manifest.release.git_sha)) {
   fail("release.git_sha must be a 40-character lowercase git object id");
 }
@@ -285,6 +296,9 @@ for (const image of manifest.images) {
   if (typeof image.image_id !== "string" || !digest.test(image.image_id) || zeroDigest.test(image.image_id)) {
     fail(`${image.component}.image_id must be a sha256 image id and not an all-zero placeholder`);
   }
+  if (image.platform !== manifest.release.platform) {
+    fail(`${image.component}.platform must match release.platform`);
+  }
   if (image.image_size_bytes !== undefined && image.image_size_bytes !== null && (!Number.isSafeInteger(image.image_size_bytes) || image.image_size_bytes <= 0)) {
     fail(`${image.component}.image_size_bytes must be absent, null, or a positive integer`);
   }
@@ -315,10 +329,9 @@ for (const image of manifest.images) {
   if (typeof image.dockerfile.sha256 !== "string" || !sha256.test(image.dockerfile.sha256)) {
     fail(`${image.component}.dockerfile.sha256 must be a lowercase sha256 digest`);
   }
-  if (image.build_context !== undefined) {
-    if (!image.build_context || typeof image.build_context !== "object") {
-      fail(`${image.component}.build_context must be an object when present`);
-    }
+  if (!image.build_context || typeof image.build_context !== "object") {
+    fail(`${image.component}.build_context is required`);
+  }
     const expectedContextPath = `contexts/${image.component}`;
     if (image.build_context.path !== expectedContextPath) {
       fail(`${image.component}.build_context.path must be ${expectedContextPath}`);
@@ -359,7 +372,7 @@ for (const image of manifest.images) {
       fail(`${image.component}.build_context must include ${expectedDockerfile}`);
     }
     const expectedContextPayloads = {
-      api: ["bucephalus-cloud/runtime-dist/server.js"],
+      api: ["bucephalus-cloud/runtime-dist/server.js", "bin/bucephalus"],
       "pool-controller": ["bucephalus-cloud/runtime-dist/poolController.js"],
       migrations: [
         "bucephalus-cloud/runtime-dist/db/migrate.js",
@@ -370,6 +383,7 @@ for (const image of manifest.images) {
         "bucephalus-cloud/runtime-dist/secretResolver.js",
         "bucephalus-cloud/runtime-dist/networkPolicyClient.js",
         "bin/bucephalus-worker-runner",
+        "bin/bucephalus-modal-launcher",
       ],
     }[image.component];
     for (const payload of expectedContextPayloads) {
@@ -384,13 +398,9 @@ for (const image of manifest.images) {
         }
       }
     }
-    if (image.component !== "worker" && contextSeen.has("bin/bucephalus")) {
-      fail(`${image.component}.build_context must not include the Rust core binary`);
+    if (image.component !== "api" && contextSeen.has("bin/bucephalus")) {
+      fail(`${image.component}.build_context must not include the Rust core binary; API includes it for hosted authoring builds`);
     }
-    if (contextSeen.has("bin/bucephalus")) {
-      fail(`${image.component}.build_context must not include the full Rust CLI binary`);
-    }
-  }
   if (image.timings_seconds !== undefined) {
     for (const field of ["build", "boundary_verify", "push", "total"]) {
       if (!Number.isFinite(image.timings_seconds[field]) || image.timings_seconds[field] < 0) {

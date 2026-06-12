@@ -143,7 +143,15 @@ paths:
                   type: object
                   additionalProperties:
                     type: string
-                  description: Plain environment values supplied for this run.
+                    maxLength: 32768
+                  description: >
+                    Plain non-secret environment values supplied for this run.
+                    Keys must be uppercase shell identifiers matching
+                    [A-Z_][A-Z0-9_]*, must not collide with secret_refs keys,
+                    and must not use reserved Cloud runtime/control-plane names
+                    such as DATABASE_URL, BUCEPHALUS_CLOUD_WORKER_TOKEN, or
+                    provider credential variables. Values must not contain NUL
+                    bytes and are limited to 32768 UTF-8 bytes.
                 secret_refs:
                   type: object
                   additionalProperties:
@@ -157,7 +165,7 @@ paths:
                     gcp-secret-manager://projects/<project>/secrets/<secret>/versions/<version>
                     and aws-secrets-manager://<secret-id>.
                 runtime_options:
-                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                  $ref: '#/components/schemas/CloudRuntimeOptions'
                   description: >
                     Run-time execution options. Cloud backends use `backend`
                     values such as `runner-docker` or `modal`; `runner-docker`
@@ -224,6 +232,10 @@ paths:
     get:
       operationId: listRunRuntimeEvents
       summary: List live trace events for a Cloud run.
+      description: >
+        One chronological stream combining trial trajectory rows (live-ingested
+        during the run, repaired from worker runtime snapshots after it) and
+        worker harness lifecycle events, distinguished by source.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - name: run_id
@@ -440,6 +452,100 @@ paths:
                 properties:
                   event:
                     $ref: '#/components/schemas/RunEvent'
+  /v1/worker/run-attempts/{attempt_id}/runtime/event-rows:
+    post:
+      operationId: ingestRunAttemptRuntimeEventRows
+      summary: Land a batch of live trial event rows for a run attempt.
+      description: >
+        Worker live-evidence ingestion. Batches are idempotent: rows are keyed
+        by (core_run_id, trial_id, schedule_idx, attempt, row_seq) and a replay
+        upserts in place, so at-least-once delivery from the worker pump is
+        safe. Requires the attempt token.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - runner_instance_id
+                - rows
+              properties:
+                runner_instance_id:
+                  type: string
+                  format: uuid
+                  minLength: 1
+                rows:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required:
+                      - core_run_id
+                      - trial_id
+                      - schedule_idx
+                      - attempt
+                      - row_seq
+                      - event_type
+                    properties:
+                      core_run_id:
+                        type: string
+                        pattern: '^run_[A-Za-z0-9_.-]+$'
+                      trial_id:
+                        type: string
+                        minLength: 1
+                      schedule_idx:
+                        type: integer
+                        minimum: 0
+                      attempt:
+                        type: integer
+                        minimum: 0
+                      row_seq:
+                        type: integer
+                        minimum: 0
+                      slot_commit_id:
+                        type: string
+                      variant_id:
+                        type: string
+                      task_id:
+                        type: string
+                      repl_idx:
+                        type: integer
+                        minimum: 0
+                      seq:
+                        type: integer
+                        minimum: 0
+                      event_type:
+                        type: string
+                        minLength: 1
+                      ts:
+                        type:
+                          - string
+                          - 'null'
+                      payload:
+                        $ref: './common.yaml#/components/schemas/AnyJsonObject'
+      responses:
+        '200':
+          description: Batch landed.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - received
+                  - upserted
+                properties:
+                  received:
+                    type: integer
+                  upserted:
+                    type: integer
   /v1/worker/run-attempts/{attempt_id}/complete:
     post:
       operationId: completeRunAttempt
@@ -934,6 +1040,11 @@ components:
           type: object
           additionalProperties:
             type: string
+            maxLength: 32768
+          description: >
+            Plain non-secret environment values supplied for this run. Keys
+            obey the same constraints as the create-run request and never
+            overlap with secret_refs keys.
         secret_refs:
           type: object
           additionalProperties:
@@ -947,7 +1058,7 @@ components:
             Manager and AWS Secrets Manager forms; env/file refs require
             explicit local-development opt-in.
         runtime_options:
-          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+          $ref: '#/components/schemas/CloudRuntimeOptions'
         run_requirements:
           $ref: '#/components/schemas/RunRequirements'
         created_at:
@@ -1141,6 +1252,22 @@ components:
         - payload
         - row
       properties:
+        source:
+          type: string
+          enum:
+            - trial
+            - worker
+          description: >
+            trial rows come from trial trajectories; worker rows are harness
+            lifecycle markers (materializing, core starting, ...).
+        event_id:
+          type: string
+          description: Stable unique id for the event within the run stream.
+        recorded_at:
+          type:
+            - string
+            - 'null'
+          description: Event timestamp when the producer reported one.
         core_run_id:
           type: string
         trial_id:
@@ -1481,6 +1608,93 @@ components:
             enum:
               - reusable_vm
               - single_use_vm
+    CloudRuntimeOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        backend:
+          type: string
+          enum:
+            - runner-docker
+            - runner_docker
+            - local-docker
+            - local_docker
+            - modal
+        executor:
+          type: string
+          enum:
+            - runner-docker
+            - runner_docker
+            - local-docker
+            - local_docker
+            - modal
+        arch:
+          type: string
+          enum:
+            - x86_64
+            - amd64
+            - arm64
+            - aarch64
+        cpu_count:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        cpu:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        memory_mb:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        disk_mb:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        isolation:
+          type: string
+          enum:
+            - reusable_vm
+            - single_use_vm
+        timeout_ms:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        max_parallel_trials:
+          $ref: '#/components/schemas/PositiveIntegerLike'
+        network:
+          type: object
+          additionalProperties: false
+          properties:
+            default:
+              type: string
+              enum:
+                - none
+                - allowlist_enforced
+            task_sandbox:
+              type: string
+              enum:
+                - none
+                - allowlist_enforced
+            agent:
+              type: string
+              enum:
+                - none
+                - allowlist_enforced
+            egress:
+              type: array
+              items:
+                type: string
+                minLength: 1
+        sidecars:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        accelerators:
+          type: array
+          items:
+            type: string
+            minLength: 1
+      description: >
+        Hosted Cloud runtime overrides. Unknown keys are rejected by the API so
+        typos cannot silently fall back to default runner resources.
+    PositiveIntegerLike:
+      anyOf:
+        - type: integer
+          minimum: 1
+        - type: string
+          pattern: '^[1-9][0-9]*$'
     RunRequirements:
       type: object
       additionalProperties: false

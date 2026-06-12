@@ -112,19 +112,28 @@ bucephalus run <package_dir> --smoke-test --materialize full --json
 bucephalus run <package_dir> --materialize full --json
 ```
 
-For hosted Cloud runs, use `buc` after producing a sealed package:
+For hosted Cloud runs, use `buc` against the hosted API:
 
 ```bash
 bucephalus login --resource <api-url>
-bucephalus build experiment.yaml --out .bucephalus-package
-buc build .bucephalus-package
-buc doctor <package-digest> --secret-ref NAME=provider://ref
-buc run <package-digest> --secret-ref NAME=provider://ref
+buc build experiment.yaml
+buc secrets put NAME --from-env NAME
+buc doctor <package-digest> --secret-ref NAME=bucephalus://NAME
+buc run <package-digest> --secret-ref NAME=bucephalus://NAME
 ```
 
-`buc build experiment.yaml` is intentionally rejected today: hosted YAML
-authoring build is not implemented in the Cloud API yet, so the sealed package
-boundary is explicit. See [Hosted Cloud CLI](docs/user/cloud-cli.md).
+`buc build experiment.yaml` uploads the YAML directory as an authoring context,
+runs the bundled Core builder in Cloud, imports the produced sealed package, and
+reports hosted Cloud readiness. Existing sealed packages can still be uploaded
+with `buc build <package-dir>`. For nested experiments that reference shared
+repo files, use `buc build path/to/experiment.yaml --context-root .` so the
+Cloud build receives the intended authoring tree. Local generated and credential
+material such as `.env`, `.npmrc`, `.ssh`, `.aws`, `node_modules`, and `target`
+is excluded from YAML context uploads and rejected by the hosted API. Hosted
+secrets are write-only:
+`buc secrets put` stores the value in Cloud and returns a stable
+`bucephalus://NAME` ref for doctor/run. See
+[Hosted Cloud CLI](docs/user/cloud-cli.md).
 
 ## What Bucephalus Does
 

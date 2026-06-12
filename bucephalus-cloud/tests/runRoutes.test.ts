@@ -550,6 +550,215 @@ describe("Cloud run routes", () => {
     });
   });
 
+  test("run creation rejects invalid plain env names before queueing", async () => {
+    const packages = {
+      async getArtifact() {
+        throw new Error("getArtifact should not be called");
+      },
+    };
+    const runs = {
+      async createRun() {
+        throw new Error("createRun should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          env: {
+            "bad-name": "1",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    )).rejects.toThrow("invalid environment variable name 'bad-name'");
+  });
+
+  test("run creation rejects malformed env maps instead of treating them as empty", async () => {
+    const packages = {
+      async getArtifact() {
+        throw new Error("getArtifact should not be called");
+      },
+    };
+    const runs = {
+      async createRun() {
+        throw new Error("createRun should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          env: "PUBLIC_MODE=smoke",
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    )).rejects.toThrow("/env must be an object");
+  });
+
+  test("run creation rejects malformed secret ref maps instead of treating them as empty", async () => {
+    const packages = {
+      async getArtifact() {
+        return packageRecordWithSecrets();
+      },
+    };
+    const runs = {
+      async createRun() {
+        throw new Error("createRun should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          secret_refs: "OPENAI_API_KEY=bucephalus://OPENAI_API_KEY",
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    )).rejects.toThrow("/secret_refs must be an object");
+  });
+
+  test("run creation rejects env names reserved for Cloud runtime state", async () => {
+    const packages = {
+      async getArtifact() {
+        throw new Error("getArtifact should not be called");
+      },
+    };
+    const runs = {
+      async createRun() {
+        throw new Error("createRun should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          env: {
+            DATABASE_URL: "postgres://user-db",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    )).rejects.toThrow("reserved for Cloud runtime/control-plane state");
+  });
+
+  test("run creation rejects plain env keys that collide with secret refs", async () => {
+    const packages = {
+      async getArtifact() {
+        return packageRecordWithSecrets();
+      },
+    };
+    const runs = {
+      async createRun() {
+        throw new Error("createRun should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          env: {
+            OPENAI_API_KEY: "not-a-secret",
+          },
+          secret_refs: {
+            OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/latest",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    )).rejects.toThrow("cannot also be supplied in /secret_refs");
+  });
+
+  test("run creation persists validated plain env separately from secret refs", async () => {
+    const packages = {
+      async getArtifact() {
+        return packageRecordWithSecrets();
+      },
+    };
+    const observed: { env?: Record<string, string>; secretRefs?: Record<string, string> } = {};
+    const runs = {
+      async createRun(input: { env: Record<string, string>; secretRefs: Record<string, string> }) {
+        observed.env = input.env;
+        observed.secretRefs = input.secretRefs;
+        return runRecord();
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          env: {
+            PUBLIC_MODE: "smoke",
+          },
+          secret_refs: {
+            OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/latest",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(response!.status).toBe(201);
+    expect(observed.env).toEqual({ PUBLIC_MODE: "smoke" });
+    expect(observed.secretRefs).toEqual({
+      OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/latest",
+    });
+  });
+
   test("run creation rejects hosted refs that name no uploaded secret", async () => {
     const packages = {
       async getArtifact() {
@@ -586,7 +795,7 @@ describe("Cloud run routes", () => {
       "worker-token",
       authContext("user-a"),
       secrets as unknown as CloudSecretRepository,
-    )).rejects.toThrow("No hosted secret named 'OPENAI_API_KEY'");
+    )).rejects.toThrow("buc secrets put OPENAI_API_KEY --from-env OPENAI_API_KEY");
   });
 
   test("run creation rejects requirements that no active runner pool can satisfy", async () => {

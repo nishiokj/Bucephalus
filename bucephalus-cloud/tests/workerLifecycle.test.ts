@@ -8,12 +8,12 @@ import {
   collectRuntimeSnapshot,
   coreRunnerEnv,
   coreRunnerFailureMessage,
-  discoverCoreRunIdsFromRunRoot,
   dockerRegistryAuthHeaders,
   loadWorkerConfig,
   materializeAttemptSecrets,
   materializePackage,
 } from "../src/worker";
+import { discoverCoreRunIdsFromRunRoot } from "../src/workerEvidence";
 import { canonicalJsonStringify, sha256Digest, type JsonObject } from "../src/primitives";
 
 describe("worker lifecycle cleanup helpers", () => {
@@ -367,6 +367,8 @@ describe("worker lifecycle cleanup helpers", () => {
           retainAttemptWorkspaces: false,
           provisionRequestId: null,
           providerInstanceId: null,
+          liveEvidence: true,
+          evidenceIntervalMs: 2000,
         },
         {
           claimed: true,
@@ -598,7 +600,10 @@ async function writeMinimalSealedPackage(root: string): Promise<{ archivePath: s
   const resolvedExperiment = currentResolvedExperiment();
   await writeFile(join(packageDir, "resolved_experiment.json"), JSON.stringify(resolvedExperiment));
   await writeFile(join(packageDir, "staging_manifest.json"), JSON.stringify({
-    schema_version: "package_staging_manifest_v1",
+    schema_version: "runtime_path_staging_manifest_v1",
+    variants: {
+      baseline: [],
+    },
   }));
 
   const checksums = await checksumsForPackage(packageDir);
@@ -608,11 +613,23 @@ async function writeMinimalSealedPackage(root: string): Promise<{ archivePath: s
     schema_version: "sealed_package_lock_v1",
     package_digest: packageDigest,
   }));
+  await writeFile(join(packageDir, "package_checks.json"), JSON.stringify({
+    schema_version: "package_checks_v1",
+    package_digest: packageDigest,
+    passed: true,
+    checks: [],
+    summary: {
+      checks: 0,
+      failed: 0,
+      warnings: 0,
+    },
+  }));
   await writeFile(join(packageDir, "manifest.json"), JSON.stringify({
     schema_version: "sealed_run_package_v2",
     created_at: "2026-06-04T00:00:00Z",
     resolved_experiment: resolvedExperiment,
     checksums_ref: "checksums.json",
+    package_checks_ref: "package_checks.json",
     package_digest: packageDigest,
   }));
 

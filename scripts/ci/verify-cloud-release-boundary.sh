@@ -74,6 +74,7 @@ const installScriptPath = "scripts/install.sh";
 const installScriptText = read(installScriptPath);
 const cloudImageBuildPath = "scripts/release/build-cloud-images.sh";
 const cloudImageBuildText = read(cloudImageBuildPath);
+const cloudPackageJson = JSON.parse(read("bucephalus-cloud/package.json"));
 const gcpInfraPath = "bucephalus-cloud/infra/gcp/main.tf";
 const gcpInfraText = read(gcpInfraPath);
 const gcpVariablesPath = "bucephalus-cloud/infra/gcp/variables.tf";
@@ -728,6 +729,64 @@ if (/docker\s+(?:push|login)\b/.test(deployWorkflowText)) {
 if (!cloudGatesText.includes("scripts/release/verify-cloud-signing-policy.sh")) {
   fail(`${cloudGatesPath} must run the Path 2 signing policy verifier`);
 }
+if (!cloudGatesText.includes("== Hosted product CLI Rust tests ==") || !cloudGatesText.includes("--bin buc")) {
+  fail(`${cloudGatesPath} must run hosted product CLI Rust tests before broad workspace tests`);
+}
+if (!cloudGatesText.includes("scripts/ci/smoke-hosted-authoring-real-core.sh")) {
+  fail(`${cloudGatesPath} must run the real-Core hosted authoring smoke`);
+}
+if (!cloudGatesText.includes("scripts/ci/smoke-buc-hosted-workflow.sh")) {
+  fail(`${cloudGatesPath} must run the hosted buc workflow HTTP smoke`);
+}
+const cloudPackageScripts = cloudPackageJson.scripts ?? {};
+if (cloudPackageScripts["test:smoke:real-core"] !== "../scripts/ci/smoke-hosted-authoring-real-core.sh") {
+  fail("bucephalus-cloud/package.json must expose test:smoke:real-core for the hosted real-Core smoke");
+}
+if (cloudPackageScripts["test:smoke:hosted-workflow"] !== "../scripts/ci/smoke-buc-hosted-workflow.sh") {
+  fail("bucephalus-cloud/package.json must expose test:smoke:hosted-workflow for the DB-backed hosted buc workflow smoke");
+}
+if (!read("scripts/ci/smoke-buc-hosted-workflow.sh").includes("bun run check:postgres")) {
+  fail("scripts/ci/smoke-buc-hosted-workflow.sh must preflight Postgres readiness before building/running the hosted workflow smoke");
+}
+const hostedWorkflowSmokeTest = read("bucephalus-cloud/tests/bucHostedWorkflowSmoke.test.ts");
+for (const requiredFragment of [
+  "\"build\"",
+  "--context-root",
+  "hosted_authoring_build",
+  "/authoring_build/source_upload_id",
+  "/build_environment/source/upload_id",
+  "/build_environment/source/entrypoint",
+  ".env leaked into hosted context",
+  ".npmrc leaked into hosted context",
+  ".ssh leaked into hosted context",
+  ".aws leaked into hosted context",
+  "node_modules leaked into hosted context",
+  "target leaked into hosted context",
+  "DATABASE_URL leaked into hosted Core",
+  "worker token leaked into hosted Core",
+]) {
+  if (!hostedWorkflowSmokeTest.includes(requiredFragment)) {
+    fail(`bucephalus-cloud/tests/bucHostedWorkflowSmoke.test.ts must keep the DB-backed smoke on the hosted authoring build path and assert ${requiredFragment}`);
+  }
+}
+if (!cloudGatesText.includes("== Cloud Postgres readiness ==") || !cloudGatesText.includes("bun run check:postgres")) {
+  fail(`${cloudGatesPath} must preflight Postgres readiness before DB-backed migration and hosted workflow tests`);
+}
+if (!cloudGatesText.includes("run_with_timeout \"Rust workspace tests\" cargo test --workspace")) {
+  fail(`${cloudGatesPath} must bound the broad Rust workspace tests so Cloud gates cannot hang indefinitely on local Docker state`);
+}
+if (!cloudGatesText.includes("DATABASE_URL is required for Cloud migration integration tests in CI")) {
+  fail(`${cloudGatesPath} must fail in CI when DATABASE_URL is absent so migration tests are not silently skipped`);
+}
+for (const userDocPath of [
+  "README.md",
+  "docs/user/cloud-cli.md",
+  "docs/user/cloud-authoring-api.md",
+]) {
+  if (read(userDocPath).includes("provider://ref")) {
+    fail(`${userDocPath} must not document fake provider://ref placeholders; use hosted bucephalus:// refs or concrete provider schemes`);
+  }
+}
 
 if (!cloudImageBuildText.includes("prepare_image_context")) {
   fail(`${cloudImageBuildPath} must build from generated per-component image contexts`);
@@ -786,7 +845,7 @@ for (const dockerfilePath of listFiles("bucephalus-cloud/images").filter((file) 
   }
 }
 const componentRuntimeEntries = new Map([
-  ["bucephalus-cloud/images/Dockerfile.api", ["runtime-dist/server.js"]],
+  ["bucephalus-cloud/images/Dockerfile.api", ["runtime-dist/server.js", "bin/bucephalus"]],
   ["bucephalus-cloud/images/Dockerfile.migrations", ["runtime-dist/db/migrate.js", "runtime-dist/db/promoteWorkerImage.js"]],
   ["bucephalus-cloud/images/Dockerfile.pool-controller", ["runtime-dist/poolController.js"]],
   ["bucephalus-cloud/images/Dockerfile.worker", ["runtime-dist/worker.js", "runtime-dist/secretResolver.js", "runtime-dist/networkPolicyClient.js", "bin/bucephalus"]],
@@ -838,6 +897,8 @@ for (const eventName of ["pull_request", "push"]) {
     "bucephalus-cloud/infra/gcp/**",
     "scripts/install.sh",
     "scripts/ci/verify-cloud-release-boundary.sh",
+    "scripts/ci/smoke-buc-hosted-workflow.sh",
+    "scripts/ci/smoke-hosted-authoring-real-core.sh",
     "scripts/deploy/**",
     "scripts/release/configure-gcp-artifact-registry-auth.sh",
     "scripts/release/verify-cloud-image-promotion-evidence-index.sh",
@@ -886,8 +947,41 @@ if (!releaseBoundaryPolicyJob) {
   }
 }
 
+const cloudGatesJob = cloudCiJobs["cloud-gates"];
+if (!cloudGatesJob) {
+  fail(`${cloudCiWorkflowPath} must contain cloud-gates job`);
+} else {
+  const postgresService = cloudGatesJob.services?.postgres;
+  if (!postgresService) {
+    fail(`${cloudCiWorkflowPath} cloud-gates job must provide a postgres service for migration integration tests`);
+  } else {
+    if (postgresService.image !== "pgvector/pgvector:pg16") {
+      fail(`${cloudCiWorkflowPath} cloud-gates postgres service must use pgvector/pgvector:pg16`);
+    }
+    const ports = postgresService.ports ?? [];
+    if (!ports.includes("55432:5432")) {
+      fail(`${cloudCiWorkflowPath} cloud-gates postgres service must expose 55432:5432 for DATABASE_URL`);
+    }
+    if (!String(postgresService.options ?? "").includes("pg_isready")) {
+      fail(`${cloudCiWorkflowPath} cloud-gates postgres service must have a pg_isready health check`);
+    }
+  }
+  const databaseUrl = cloudGatesJob.env?.DATABASE_URL ?? "";
+  if (databaseUrl !== "postgres://bucephalus:bucephalus_dev@127.0.0.1:55432/bucephalus_cloud") {
+    fail(`${cloudCiWorkflowPath} cloud-gates job must set DATABASE_URL so migration tests cannot be skipped in CI`);
+  }
+  const cloudGateCommands = (cloudGatesJob.steps ?? [])
+    .map((step) => String(step.run ?? ""))
+    .join("\n");
+  if (!cloudGateCommands.includes("scripts/ci/cloud-gates.sh")) {
+    fail(`${cloudCiWorkflowPath} cloud-gates job must run scripts/ci/cloud-gates.sh`);
+  }
+}
+
 for (const script of [
   "scripts/ci/cloud-gates.sh",
+  "scripts/ci/smoke-buc-hosted-workflow.sh",
+  "scripts/ci/smoke-hosted-authoring-real-core.sh",
   "scripts/ci/verify-cloud-release-boundary.sh",
   ...listFiles("scripts/deploy").filter((file) => file.endsWith(".sh")),
   ...listFiles("scripts/release").filter((file) => file.endsWith(".sh")),
@@ -1137,6 +1231,12 @@ for (const script of [
   if (/image_id must be a sha256 image id/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must require Docker sha256 image IDs`);
   }
+  if (/release\.platform must match the platform derived from release\.target/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must require target-derived image platform evidence`);
+  }
+  if (/\.platform must match release\.platform/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must require each image platform to match the release platform`);
+  }
   if (/metadata_file must be/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must reject local filesystem paths in image metadata evidence`);
   }
@@ -1164,11 +1264,14 @@ for (const script of [
   if (/build_context\.files must match file_count/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must verify per-component build context file inventories`);
   }
-  if (/must not include the Rust core binary/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
-    fail(`${script} must keep the Rust core binary out of non-worker images`);
+  if (/build_context is required/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must require per-component build context inventories`);
   }
-  if (/must not include the full Rust CLI binary/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
-    fail(`${script} must keep the full Rust CLI binary out of worker image contexts`);
+  if (/bin\/bucephalus-modal-launcher/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must require the worker image context to include the Modal launcher`);
+  }
+  if (/API includes it for hosted authoring builds/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must allow the API image, and only the API image, to carry the Rust core binary for hosted authoring builds`);
   }
   if (/image_size_bytes must be absent, null, or a positive integer/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must validate image size evidence`);
@@ -1410,6 +1513,39 @@ for (const dockerfile of listFiles("bucephalus-cloud/images")) {
       fail(`${dockerfile} contains forbidden image-boundary content matching ${forbidden}`);
     }
   }
+}
+
+const experimentRouteText = read("bucephalus-cloud/src/routes/experiments.ts");
+const cloudConfigText = read("bucephalus-cloud/src/config.ts");
+for (const required of [
+  "BUCEPHALUS_RELEASE_GIT_SHA",
+  "BUCEPHALUS_CLOUD_API_IMAGE_DIGEST",
+  "hosted_build_environment_v1",
+  "buildEnvironmentEvidence",
+  "builder_image_digest_missing",
+  "withBuildEnvironmentEvidence",
+  "complete_build_environment_evidence",
+]) {
+  if (!experimentRouteText.includes(required)) {
+    fail(`hosted experiment build route must report deployed build environment provenance: ${required}`);
+  }
+}
+for (const required of [
+  "BUCEPHALUS_CLOUD_BUILD_EVIDENCE_POLICY",
+  "warn",
+  "enforce",
+]) {
+  if (!cloudConfigText.includes(required)) {
+    fail(`Cloud config must parse hosted build evidence policy: ${required}`);
+  }
+}
+
+const gcpMainText = read("bucephalus-cloud/infra/gcp/main.tf");
+if (!/name\s+=\s+"BUCEPHALUS_CLOUD_API_IMAGE_DIGEST"[\s\S]*?value\s+=\s+regex\("sha256:\[a-f0-9\]\{64\}\$", var\.api_image_digest\)/.test(gcpMainText)) {
+  fail("GCP API service must pass the deployed API image digest into BUCEPHALUS_CLOUD_API_IMAGE_DIGEST");
+}
+if (!/name\s+=\s+"BUCEPHALUS_CLOUD_BUILD_EVIDENCE_POLICY"[\s\S]*?value\s+=\s+"enforce"/.test(gcpMainText)) {
+  fail("GCP API service must enforce complete hosted build environment evidence");
 }
 
 const baseImagePolicy = JSON.parse(read("bucephalus-cloud/images/base-image-policy.json"));

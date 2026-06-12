@@ -8,7 +8,14 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import { inspectSealedPackageArchive } from "./imports/sealedPackage";
+import { redactSensitiveJsonObject } from "./jsonRedaction";
 import { releaseIdentity } from "./release";
+import {
+  discoverCoreRunIdsFromRunRoot,
+  startEvidencePump,
+  type EvidencePump,
+} from "./workerEvidence";
+export { discoverCoreRunIdsFromRunRoot } from "./workerEvidence";
 import {
   childTraceContext,
   initTelemetry,
@@ -37,6 +44,8 @@ interface WorkerConfig {
   retainAttemptWorkspaces: boolean;
   provisionRequestId: string | null;
   providerInstanceId: string | null;
+  liveEvidence: boolean;
+  evidenceIntervalMs: number;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -48,7 +57,6 @@ const RUNTIME_SNAPSHOT_MAX_EVIDENCE_RECORDS = 500;
 const RUNTIME_SNAPSHOT_MAX_JSON_BYTES = 2 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_PAYLOAD_ENVELOPE_BYTES = 128 * 1024;
-const REDACTED_VALUE = "[redacted]";
 const DOCKER_SOCKET_PATH = "/var/run/docker.sock";
 const DOCKER_API_VERSION = "v1.41";
 
@@ -167,6 +175,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
   })();
 
   let materialized: MaterializedPackage | null = null;
+  let evidencePump: EvidencePump | null = null;
   let coreError: unknown = null;
   let cleanupError: unknown = null;
 
@@ -185,11 +194,25 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         run_root_dir: materialized.runRootDir,
         manifest_experiment_id: stringAt(materialized.manifestJson, "/resolved_experiment/experiment/id"),
       });
+      evidencePump = startLiveEvidencePump(config, claim, materialized, runContext);
       await prePullRunImages(config, claim);
       await applyRuntimeNetworkPolicy(config, claim, materialized);
       await executeCoreRun(config, claim, materialized, runContext);
     } catch (error) {
       coreError = error;
+    }
+
+    if (evidencePump) {
+      // Drain before the snapshot pass so the stream is complete first and
+      // the snapshot is reduced to its repair role. Pump trouble never
+      // outranks the core outcome.
+      try {
+        const stats = await evidencePump.stop();
+        await appendEvent(config, claim, "worker.runtime.live_evidence_summary", { ...stats });
+      } catch (error) {
+        logError("worker.evidence_pump_stop_failed", runContext, { error: errorMessage(error) });
+      }
+      evidencePump = null;
     }
 
     if (materialized) {
@@ -585,51 +608,6 @@ function assertCoreRunId(coreRunId: string): void {
   if (!/^run_[A-Za-z0-9_.-]+$/.test(coreRunId)) {
     throw new WorkerError(`Invalid Core run id '${coreRunId}'`);
   }
-}
-
-function redactSensitiveJsonObject(value: JsonObject): JsonObject {
-  return redactSensitiveJsonValue(value, null) as JsonObject;
-}
-
-function redactSensitiveJsonValue(value: unknown, key: string | null): unknown {
-  if (key !== null && sensitiveJsonKey(key)) {
-    return REDACTED_VALUE;
-  }
-  if (typeof value === "string") {
-    return sensitiveStringValue(value) ? REDACTED_VALUE : value;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => redactSensitiveJsonValue(item, null));
-  }
-  if (isRecord(value)) {
-    const out: JsonObject = {};
-    for (const [childKey, childValue] of Object.entries(value)) {
-      out[childKey] = redactSensitiveJsonValue(childValue, childKey);
-    }
-    return out;
-  }
-  return value;
-}
-
-function sensitiveJsonKey(key: string): boolean {
-  const normalized = key.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
-  return normalized.includes("secret")
-    || normalized.includes("password")
-    || normalized.includes("passwd")
-    || normalized.includes("token")
-    || normalized.includes("apikey")
-    || normalized.includes("credential")
-    || normalized.includes("authorization")
-    || normalized.includes("bearer");
-}
-
-function sensitiveStringValue(value: string): boolean {
-  return value.includes("gcp-secret-manager://")
-    || value.includes("aws-secrets-manager://")
-    || /\bAKIA[0-9A-Z]{16}\b/.test(value)
-    || /\bASIA[0-9A-Z]{16}\b/.test(value)
-    || /\bsk-[A-Za-z0-9_-]{20,}\b/.test(value)
-    || /\bya29\.[A-Za-z0-9_-]{20,}\b/.test(value);
 }
 
 export function coreRunnerEnv(): NodeJS.ProcessEnv {
@@ -1092,22 +1070,6 @@ async function cleanupAttemptWorkspace(
   };
 }
 
-export async function discoverCoreRunIdsFromRunRoot(runRootDir: string): Promise<string[]> {
-  let entries: Dirent[];
-  try {
-    entries = await readdir(runRootDir, { withFileTypes: true });
-  } catch (error) {
-    if (isNodeError(error) && error.code === "ENOENT") {
-      return [];
-    }
-    throw error;
-  }
-  return entries
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith("run_"))
-    .map((entry) => entry.name)
-    .sort();
-}
-
 async function cleanupDockerRuntimeResources(
   config: WorkerConfig,
   coreRunIds: string[],
@@ -1398,6 +1360,43 @@ async function workerResourceSnapshot(config: WorkerConfig): Promise<JsonObject 
   };
 }
 
+function startLiveEvidencePump(
+  config: WorkerConfig,
+  claim: RunClaim,
+  materialized: MaterializedPackage,
+  context: TraceContext,
+): EvidencePump | null {
+  if (!config.liveEvidence) {
+    return null;
+  }
+  return startEvidencePump(
+    {
+      postEventRows: async (rows) => {
+        await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/runtime/event-rows`, {
+          method: "POST",
+          authToken: claim.attempt.attempt_token,
+          body: {
+            runner_instance_id: requireRunnerInstanceId(config),
+            rows,
+          },
+        });
+      },
+      announceCoreRuns: async (coreRunIds) => {
+        await appendEvent(config, claim, "worker.runtime.core_runs_discovered", {
+          core_run_ids: coreRunIds,
+        });
+      },
+      onError: (stage, fields) => {
+        logError("worker.evidence_pump_error", context, { stage, ...fields });
+      },
+    },
+    {
+      runRootDir: materialized.runRootDir,
+      intervalMs: config.evidenceIntervalMs,
+    },
+  );
+}
+
 async function appendEvent(
   config: WorkerConfig,
   claim: RunClaim,
@@ -1524,6 +1523,8 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
     retainAttemptWorkspaces: booleanEnv(env.BUCEPHALUS_WORKER_RETAIN_ATTEMPT_WORKSPACES, false),
     provisionRequestId: env.BUCEPHALUS_RUNNER_PROVISION_REQUEST_ID?.trim() || null,
     providerInstanceId: env.BUCEPHALUS_RUNNER_PROVIDER_INSTANCE_ID?.trim() || null,
+    liveEvidence: booleanEnv(env.BUCEPHALUS_WORKER_LIVE_EVIDENCE, true),
+    evidenceIntervalMs: numberEnv(env.BUCEPHALUS_WORKER_EVIDENCE_INTERVAL_MS, 2000),
   };
 }
 

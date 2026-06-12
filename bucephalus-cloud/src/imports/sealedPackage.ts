@@ -10,8 +10,12 @@ const MAX_SMALL_JSON_BYTES = 8 * 1024 * 1024;
 const PACKAGE_CHECKS_FILE = "package_checks.json";
 const PACKAGE_CHECKS_SCHEMA_VERSION = "package_checks_v1";
 const STAGING_MANIFEST_FILE = "staging_manifest.json";
+const STAGING_MANIFEST_SCHEMA_VERSION = "runtime_path_staging_manifest_v1";
 const PACKAGE_BLOBS_DIR = "blobs";
 const CAS_POINTER_SCHEMA = "bucephalus_cas_pointer_v1";
+const BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER = "__BUCEPHALUS_TASK_WORKDIR__";
+const BUCEPHALUS_RUNNER_SUPPORT_REL_DIR = ".bucephalus/support";
+const BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR = "/bucephalus/in/runtime";
 const RUNTIME_PAYLOAD_ROOTS = new Set([
   "tasks",
   "files",
@@ -402,34 +406,258 @@ async function verifySealedPackageIntegrity(
   }
 
   const packageChecksRef = valueAt(manifest, "/package_checks_ref");
-  if (typeof packageChecksRef === "string") {
-    validateMetadataRefOutsideRuntimePayload(packageChecksRef, "package_checks_ref");
-    const packageChecks = await parseSmallJsonObjectFile(
-      resolvePackagePathUnderRoot(packageDir, packageChecksRef, "package_checks_ref"),
-      "package_checks.json",
-      "/package_checks",
-    );
-    if (valueAt(packageChecks, "/schema_version") !== PACKAGE_CHECKS_SCHEMA_VERSION) {
-      throw inspectionError(`package checks schema_version must be ${PACKAGE_CHECKS_SCHEMA_VERSION}`, {
-        severity: "error",
-        code: "invalid_package_checks_schema",
-        pointer: "/package_checks/schema_version",
-        message: `package_checks.json schema_version must be ${PACKAGE_CHECKS_SCHEMA_VERSION}.`,
-      });
-    }
+  if (typeof packageChecksRef !== "string") {
+    throw inspectionError("sealed package manifest missing package_checks_ref", {
+      severity: "error",
+      code: "missing_package_checks_ref",
+      pointer: "/manifest/package_checks_ref",
+      message: "manifest.json must include package_checks_ref so Cloud imports can enforce package checks before run creation.",
+    });
   }
+  validateMetadataRefOutsideRuntimePayload(packageChecksRef, "package_checks_ref");
+  const packageChecks = await parseSmallJsonObjectFile(
+    resolvePackagePathUnderRoot(packageDir, packageChecksRef, "package_checks_ref"),
+    "package_checks.json",
+    "/package_checks",
+  );
+  validatePackageChecks(packageChecks, manifestDigest);
 
   const resolvedExperimentJson = await parseSmallJsonObjectFile(
     resolvePackagePathUnderRoot(packageDir, "resolved_experiment.json", "checksums.files"),
     "resolved_experiment.json",
     "/resolved_experiment",
   );
-  await parseSmallJsonObjectFile(
+  const manifestResolvedExperiment = valueAt(manifest, "/resolved_experiment");
+  if (!isJsonObject(manifestResolvedExperiment)
+    || canonicalJsonStringify(manifestResolvedExperiment) !== canonicalJsonStringify(resolvedExperimentJson)) {
+    throw inspectionError("manifest resolved_experiment does not match resolved_experiment.json", {
+      severity: "error",
+      code: "resolved_experiment_mismatch",
+      pointer: "/manifest/resolved_experiment",
+      message: "manifest.json resolved_experiment must match the checksummed resolved_experiment.json exactly.",
+    });
+  }
+  const stagingManifest = await parseSmallJsonObjectFile(
     resolvePackagePathUnderRoot(packageDir, STAGING_MANIFEST_FILE, "checksums.files"),
     STAGING_MANIFEST_FILE,
     "/staging_manifest",
   );
+  await validateRuntimeStagingManifest(packageDir, stagingManifest);
   return { resolvedExperimentJson };
+}
+
+function validatePackageChecks(packageChecks: JsonObject, expectedPackageDigest: string): void {
+  if (valueAt(packageChecks, "/schema_version") !== PACKAGE_CHECKS_SCHEMA_VERSION) {
+    throw inspectionError(`package checks schema_version must be ${PACKAGE_CHECKS_SCHEMA_VERSION}`, {
+      severity: "error",
+      code: "invalid_package_checks_schema",
+      pointer: "/package_checks/schema_version",
+      message: `package_checks.json schema_version must be ${PACKAGE_CHECKS_SCHEMA_VERSION}.`,
+    });
+  }
+  if (valueAt(packageChecks, "/package_digest") !== expectedPackageDigest) {
+    throw inspectionError("package checks package_digest does not match manifest package_digest", {
+      severity: "error",
+      code: "package_checks_digest_mismatch",
+      pointer: "/package_checks/package_digest",
+      message: "package_checks.json package_digest must match manifest package_digest.",
+    });
+  }
+  const checks = valueAt(packageChecks, "/checks");
+  if (!Array.isArray(checks)) {
+    throw inspectionError("package checks checks must be an array", {
+      severity: "error",
+      code: "invalid_package_checks_report",
+      pointer: "/package_checks/checks",
+      message: "package_checks.json checks must be an array.",
+    });
+  }
+  const failed = checks.filter((check) => isJsonObject(check) && check.status === "fail").length;
+  const warnings = checks.filter((check) => isJsonObject(check) && check.status === "warn").length;
+  const summaryChecks = valueAt(packageChecks, "/summary/checks");
+  const summaryFailed = valueAt(packageChecks, "/summary/failed");
+  const summaryWarnings = valueAt(packageChecks, "/summary/warnings");
+  if (summaryChecks !== checks.length || summaryFailed !== failed || summaryWarnings !== warnings) {
+    throw inspectionError("package checks summary does not match checks", {
+      severity: "error",
+      code: "invalid_package_checks_report",
+      pointer: "/package_checks/summary",
+      message: "package_checks.json summary counts must match the checks array.",
+    });
+  }
+  const passed = valueAt(packageChecks, "/passed");
+  if (typeof passed !== "boolean" || passed !== (failed === 0)) {
+    throw inspectionError("package checks passed flag does not match failed checks", {
+      severity: "error",
+      code: "invalid_package_checks_report",
+      pointer: "/package_checks/passed",
+      message: "package_checks.json passed must be true exactly when no checks failed.",
+    });
+  }
+  if (!passed) {
+    throw inspectionError("package checks did not pass", {
+      severity: "error",
+      code: "package_checks_failed",
+      pointer: "/package_checks",
+      message: "Cloud import rejects packages whose package_checks.json report did not pass.",
+    });
+  }
+}
+
+async function validateRuntimeStagingManifest(packageDir: string, manifest: JsonObject): Promise<void> {
+  if (valueAt(manifest, "/schema_version") !== STAGING_MANIFEST_SCHEMA_VERSION) {
+    throw inspectionError(`runtime staging manifest schema_version must be ${STAGING_MANIFEST_SCHEMA_VERSION}`, {
+      severity: "error",
+      code: "invalid_staging_manifest_schema",
+      pointer: "/staging_manifest/schema_version",
+      message: `staging_manifest.json schema_version must be ${STAGING_MANIFEST_SCHEMA_VERSION}.`,
+    });
+  }
+  const variants = valueAt(manifest, "/variants");
+  if (!isJsonObject(variants)) {
+    throw inspectionError("runtime staging manifest missing variants object", {
+      severity: "error",
+      code: "invalid_staging_manifest_variants",
+      pointer: "/staging_manifest/variants",
+      message: "staging_manifest.json variants must be an object keyed by variant id.",
+    });
+  }
+  for (const [variantId, rawEntries] of Object.entries(variants)) {
+    if (!Array.isArray(rawEntries)) {
+      throw inspectionError(`runtime staging manifest variant '${variantId}' must be an array`, {
+        severity: "error",
+        code: "invalid_staging_manifest_variant",
+        pointer: `/staging_manifest/variants/${escapeJsonPointer(variantId)}`,
+        message: `staging_manifest.json variants['${variantId}'] must be an array.`,
+      });
+    }
+    await validateRuntimeStagingManifestVariant(packageDir, variantId, rawEntries);
+  }
+}
+
+async function validateRuntimeStagingManifestVariant(
+  packageDir: string,
+  variantId: string,
+  entries: unknown[],
+): Promise<void> {
+  const priorRuntimePaths: Array<{ path: string }> = [];
+  const seenRuntimePaths = new Map<string, number>();
+  for (const [idx, entry] of entries.entries()) {
+    const pointer = `/staging_manifest/variants/${escapeJsonPointer(variantId)}/${idx}`;
+    if (!isJsonObject(entry)) {
+      throw inspectionError(`runtime staging manifest variant '${variantId}' entry ${idx} must be an object`, {
+        severity: "error",
+        code: "invalid_staging_manifest_entry",
+        pointer,
+        message: `staging manifest entry ${idx} for variant '${variantId}' must be an object.`,
+      });
+    }
+    for (const key of Object.keys(entry)) {
+      if (!["original_relative_path", "packaged_path", "runtime_path", "required", "read_only"].includes(key)) {
+        throw inspectionError(`runtime staging manifest variant '${variantId}' entry ${idx} has unknown key '${key}'`, {
+          severity: "error",
+          code: "invalid_staging_manifest_entry",
+          pointer: `${pointer}/${escapeJsonPointer(key)}`,
+          message: `staging manifest entry ${idx} for variant '${variantId}' contains unsupported key '${key}'.`,
+        });
+      }
+    }
+    const packagedPath = requiredStringValue(entry.packaged_path, `${pointer}/packaged_path`, "packaged_path");
+    const runtimePath = validateRunnerStagedDestinationPath(
+      requiredStringValue(entry.runtime_path, `${pointer}/runtime_path`, "runtime_path"),
+      `${pointer}/runtime_path`,
+    );
+    if (typeof entry.required !== "boolean" || typeof entry.read_only !== "boolean") {
+      throw inspectionError(`runtime staging manifest variant '${variantId}' entry ${idx} missing required/read_only booleans`, {
+        severity: "error",
+        code: "invalid_staging_manifest_entry",
+        pointer,
+        message: "staging manifest entries must include boolean required and read_only fields.",
+      });
+    }
+    const sourcePath = resolvePackagePathUnderRoot(packageDir, packagedPath, "staging_manifest.packaged_path");
+    const source = await stat(sourcePath).catch(() => null);
+    if (!source) {
+      throw inspectionError(`runtime staging manifest variant '${variantId}' entry ${idx} references missing packaged_path '${packagedPath}'`, {
+        severity: "error",
+        code: "missing_staging_packaged_path",
+        pointer: `${pointer}/packaged_path`,
+        message: `staging manifest packaged_path '${packagedPath}' must exist inside the sealed package.`,
+      });
+    }
+    const previousIdx = seenRuntimePaths.get(runtimePath);
+    if (previousIdx !== undefined) {
+      throw inspectionError(`runtime staging manifest variant '${variantId}' duplicates runtime_path '${runtimePath}'`, {
+        severity: "error",
+        code: "duplicate_staging_runtime_path",
+        pointer: `${pointer}/runtime_path`,
+        message: `runtime_path '${runtimePath}' is duplicated at entries ${previousIdx} and ${idx}; each runtime destination must be unique.`,
+      });
+    }
+    for (const previous of priorRuntimePaths) {
+      if (runtimeStagingPathsOverlap(previous.path, runtimePath)) {
+        throw inspectionError(`runtime staging manifest variant '${variantId}' has overlapping runtime paths`, {
+          severity: "error",
+          code: "overlapping_staging_runtime_path",
+          pointer: `${pointer}/runtime_path`,
+          message: `runtime_path '${previous.path}' and '${runtimePath}' overlap; each runtime destination must be disjoint.`,
+        });
+      }
+    }
+    seenRuntimePaths.set(runtimePath, idx);
+    priorRuntimePaths.push({ path: runtimePath });
+  }
+}
+
+function requiredStringValue(value: unknown, pointer: string, fieldName: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw inspectionError(`runtime staging manifest ${fieldName} is required`, {
+      severity: "error",
+      code: "invalid_staging_manifest_entry",
+      pointer,
+      message: `${fieldName} must be a non-empty string.`,
+    });
+  }
+  return value.trim();
+}
+
+function validateRunnerStagedDestinationPath(raw: string, pointer: string): string {
+  const trimmed = raw.trim();
+  const taskSupportPrefix = `${BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER}/${BUCEPHALUS_RUNNER_SUPPORT_REL_DIR}`;
+  if (trimmed === taskSupportPrefix || trimmed.startsWith(`${taskSupportPrefix}/`)) {
+    rejectParentPathSegments(trimmed.slice(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER.length), pointer);
+    return trimmed;
+  }
+  if (!(trimmed === BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR || trimmed.startsWith(`${BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR}/`))) {
+    throw inspectionError("runtime staging destination is outside the Cloud runtime contract roots", {
+      severity: "error",
+      code: "invalid_staging_runtime_path",
+      pointer,
+      message: `runtime_path must be under ${BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER}/${BUCEPHALUS_RUNNER_SUPPORT_REL_DIR} or ${BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR}.`,
+    });
+  }
+  rejectParentPathSegments(trimmed, pointer);
+  return trimmed;
+}
+
+function rejectParentPathSegments(value: string, pointer: string): void {
+  if (value.split("/").some((segment) => segment === "..")) {
+    throw inspectionError("runtime staging destination cannot contain parent components", {
+      severity: "error",
+      code: "invalid_staging_runtime_path",
+      pointer,
+      message: "runtime_path cannot contain '..' path components.",
+    });
+  }
+}
+
+function runtimeStagingPathsOverlap(left: string, right: string): boolean {
+  const a = left.trim().replace(/\/+$/g, "");
+  const b = right.trim().replace(/\/+$/g, "");
+  if (!a || !b) {
+    return false;
+  }
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
 async function parseSmallJsonObjectFile(path: string, filename: string, pointer: string): Promise<JsonObject> {
@@ -727,10 +955,8 @@ function validateSealedManifest(manifest: JsonObject): ImportDiagnostic[] {
   requireNonemptyString(diagnostics, manifest, "/created_at");
   requireObjectForImport(diagnostics, manifest, "/resolved_experiment");
   requireNonemptyString(diagnostics, manifest, "/checksums_ref");
+  requireNonemptyString(diagnostics, manifest, "/package_checks_ref");
   requireDigest(diagnostics, manifest, "/package_digest");
-  if (valueAt(manifest, "/package_checks_ref") !== undefined) {
-    requireNonemptyString(diagnostics, manifest, "/package_checks_ref");
-  }
   return diagnostics;
 }
 

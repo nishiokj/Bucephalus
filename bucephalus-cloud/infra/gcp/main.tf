@@ -608,6 +608,16 @@ resource "google_cloud_run_v2_service" "api" {
       }
 
       env {
+        name  = "BUCEPHALUS_CLOUD_API_IMAGE_DIGEST"
+        value = regex("sha256:[a-f0-9]{64}$", var.api_image_digest)
+      }
+
+      env {
+        name  = "BUCEPHALUS_CLOUD_BUILD_EVIDENCE_POLICY"
+        value = "enforce"
+      }
+
+      env {
         name  = "BUCEPHALUS_CLOUD_STORAGE_BACKEND"
         value = var.cloud_object_storage_backend
       }

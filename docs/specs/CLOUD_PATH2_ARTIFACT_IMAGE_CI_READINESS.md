@@ -54,7 +54,8 @@ user-secret policy.
   `bucephalus-cloud/images/` and are copied into the release bundle.
 - Cloud release bundles include both the full `bin/bucephalus` CLI for
   compatibility/provenance and a narrow `bin/bucephalus-worker-runner` binary
-  for worker execution.
+  for worker execution. The API image includes the full CLI for hosted
+  authoring builds; worker images must not.
 - `scripts/release/build-cloud-images.sh` builds those images only from a
   verified release bundle, requires a digest-addressed Bun base image, and
   records local image-boundary verification evidence for every component. It
@@ -81,9 +82,10 @@ user-secret policy.
   for publication. Image manifests and provenance carry per-component build
   context inventories, local Docker image size evidence, and build/verify/push
   timing evidence for ongoing 75% cut verification.
-- The worker image copies `bin/bucephalus-worker-runner`, routes
-  `/usr/local/bin/bucephalus` to that binary, and rejects image contexts that
-  include the full Rust CLI binary.
+- The worker image copies `bin/bucephalus-worker-runner` and
+  `bin/bucephalus-modal-launcher`, routes `/usr/local/bin/bucephalus` to the
+  narrow runner binary, and rejects image contexts that include the full Rust
+  CLI binary.
 - `.github/workflows/bucephalus-release.yml` runs Cloud validation once in
   `release-gates`; Linux core matrix jobs assemble Cloud bundles immediately
   after verifying their core archives and set
@@ -101,8 +103,9 @@ user-secret policy.
   pushed manifests under GCP Artifact Registry component repositories. It also
   requires every image entry to prove local boundary inspection, records the
   release-root `.dockerignore` digest, and records each component Dockerfile
-  digest before promotion evidence can be accepted. It also verifies each
-  component build-context inventory, requires image size evidence when Docker
+  digest before promotion evidence can be accepted. It also verifies the
+  target-derived image platform, each component build-context inventory, and
+  requires image size evidence when Docker
   reports it, keeps the Rust core binary out of non-worker images, and keeps
   database migrations out of non-migration images. Image metadata evidence is
   recorded as artifact-local filenames with Docker `sha256:<digest>` image IDs
@@ -289,17 +292,30 @@ contract before Path 2 can be proven end to end:
   Needed input: who approves production promotion and where that approval is
   recorded.
 
-## Known Non-Path-2 Gate Failure
+## Enforced Local Gate
 
-`scripts/ci/cloud-gates.sh` currently fails before Cloud typecheck/tests when
-the Rust test suite runs. The failure is not in the Path 2 release/image
-boundary scripts; focused Path 2 gates pass. The failing Rust tests are runtime
-persistence/control-plane tests with stale shared state symptoms, such as
-unexpected existing SQLite evidence rows, previously committed schedule slots,
-and poisoned runtime-control test locks. This must be resolved before the full
-release gate can be green, but it belongs to the runtime/control-plane test
-surface rather than the artifact, image, checksum, or digest-publishing
-boundary.
+`scripts/ci/cloud-gates.sh` is the required local/CI gate for Cloud/Core changes.
+It installs Cloud dependencies, verifies release/signing boundary policy, checks
+Rust formatting, runs the hosted product CLI Rust tests, runs Cloud typecheck
+and tests, runs `scripts/ci/smoke-hosted-authoring-real-core.sh` to exercise
+the hosted authoring build route with the real Core binary, then runs the broad
+Rust workspace tests under a bounded timeout so local Docker executor state
+cannot hang the Cloud gate indefinitely. It validates OpenAPI and runs Cloud
+migration integration tests when `DATABASE_URL` is set. Database-backed gates
+also run `scripts/ci/smoke-buc-hosted-workflow.sh`, which drives the actual
+`buc` binary over HTTP through `buc build <nested experiment.yaml>
+--context-root <root>`, hosted Core authoring, package import, Cloud readiness,
+doctor, hosted secret upload, run creation, worker claim, runtime evidence
+ingest, run readback, and package inspection against a scratch migrated
+database. The smoke fixture checks nested authoring-context packaging, shared
+file inclusion, exclusion/rejection of local credential and generated material
+such as `.env`, `.npmrc`, `.ssh`, `.aws`, `node_modules`, and `target`, and
+hosted Core environment isolation from control-plane secrets. In CI,
+`DATABASE_URL` is required so migration coverage cannot be silently skipped.
+Before migration and workflow smoke coverage runs,
+`bun run check:postgres` must prove the database URL reaches a Postgres server
+and must fail fast with credential-redacted diagnostics when the TCP port is
+absent or accepts connections without a Postgres handshake/query.
 
 ## Explicit Non-Readiness
 

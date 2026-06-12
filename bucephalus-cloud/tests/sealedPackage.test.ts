@@ -1,5 +1,5 @@
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
 import * as tar from "tar";
@@ -240,6 +240,31 @@ describe("sealed package import inspection", () => {
     }
   });
 
+  test("rejects manifests whose resolved experiment differs from the checksummed file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-cloud-package-"));
+    try {
+      const { packageDir } = await writePackage(root, {
+        schema_version: "sealed_run_package_v2",
+        created_at: "2026-05-27T00:00:00Z",
+        resolved_experiment: currentResolvedExperiment(),
+      });
+      const manifest = JSON.parse(await readFile(join(packageDir, "manifest.json"), "utf8")) as JsonObject;
+      manifest.resolved_experiment = {
+        ...currentResolvedExperiment(),
+        experiment: { id: "forged", name: "Forged" },
+      };
+      await writeFile(join(packageDir, "manifest.json"), JSON.stringify(manifest));
+      const archivePath = await archivePackage(root, packageDir);
+
+      await expect(inspectSealedPackageArchive({
+        archivePath,
+        workDir: join(root, "work"),
+      })).rejects.toThrow("manifest resolved_experiment does not match resolved_experiment.json");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects unchecksummed payload files", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-cloud-package-"));
     try {
@@ -256,6 +281,75 @@ describe("sealed package import inspection", () => {
         archivePath,
         workDir: join(root, "work"),
       })).rejects.toThrow("unchecksummed payload file");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects runtime staging destinations outside Cloud runner contract roots", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-cloud-package-"));
+    try {
+      const { archivePath } = await writePackage(root, {
+        schema_version: "sealed_run_package_v2",
+        created_at: "2026-05-27T00:00:00Z",
+        resolved_experiment: currentResolvedExperiment(),
+      }, [], {
+        extraFiles: {
+          "runtime_assets/defaults.json": "{}",
+        },
+        stagingManifest: {
+          schema_version: "runtime_path_staging_manifest_v1",
+          variants: {
+            baseline: [{
+              packaged_path: "runtime_assets/defaults.json",
+              runtime_path: "/tmp/defaults.json",
+              required: true,
+              read_only: true,
+            }],
+          },
+        },
+      });
+
+      await expect(inspectSealedPackageArchive({
+        archivePath,
+        workDir: join(root, "work"),
+      })).rejects.toThrow("runtime staging destination is outside the Cloud runtime contract roots");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects packages whose package checks did not pass", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-cloud-package-"));
+    try {
+      const { archivePath } = await writePackage(root, {
+        schema_version: "sealed_run_package_v2",
+        created_at: "2026-05-27T00:00:00Z",
+        resolved_experiment: currentResolvedExperiment(),
+      }, [], {
+        packageChecks(packageDigest) {
+          return {
+            schema_version: "package_checks_v1",
+            package_digest: packageDigest,
+            passed: false,
+            checks: [{
+              name: "runtime_staging",
+              status: "fail",
+              message: "bad staged path",
+            }],
+            summary: {
+              checks: 1,
+              failed: 1,
+              warnings: 0,
+            },
+          };
+        },
+      });
+
+      await expect(inspectSealedPackageArchive({
+        archivePath,
+        workDir: join(root, "work"),
+      })).rejects.toThrow("package checks did not pass");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -285,13 +379,26 @@ async function writePackage(
   root: string,
   manifest: JsonObject,
   tasks: unknown[] = [],
+  options: {
+    stagingManifest?: JsonObject;
+    extraFiles?: Record<string, string>;
+    packageChecks?: (packageDigest: string) => JsonObject;
+  } = {},
 ): Promise<{ archivePath: string; packageDir: string; packageDigest: string }> {
   const packageDir = join(root, "package");
   await mkdir(packageDir, { recursive: true });
   await writeFile(join(packageDir, "resolved_experiment.json"), JSON.stringify(manifest.resolved_experiment));
-  await writeFile(join(packageDir, "staging_manifest.json"), JSON.stringify({
-    schema_version: "package_staging_manifest_v1",
+  await writeFile(join(packageDir, "staging_manifest.json"), JSON.stringify(options.stagingManifest ?? {
+    schema_version: "runtime_path_staging_manifest_v1",
+    variants: {
+      baseline: [],
+    },
   }));
+  for (const [rel, contents] of Object.entries(options.extraFiles ?? {})) {
+    const path = join(packageDir, rel);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, contents);
+  }
   if (tasks.length > 0) {
     await mkdir(join(packageDir, "tasks"), { recursive: true });
     await writeFile(join(packageDir, "tasks", "tasks.jsonl"), tasks.map((task) => JSON.stringify(task)).join("\n"));
@@ -306,9 +413,21 @@ async function writePackage(
     schema_version: "sealed_package_lock_v1",
     package_digest: packageDigest,
   }));
+  await writeFile(join(packageDir, "package_checks.json"), JSON.stringify(options.packageChecks?.(packageDigest) ?? {
+    schema_version: "package_checks_v1",
+    package_digest: packageDigest,
+    passed: true,
+    checks: [],
+    summary: {
+      checks: 0,
+      failed: 0,
+      warnings: 0,
+    },
+  }));
   await writeFile(join(packageDir, "manifest.json"), JSON.stringify({
     ...manifest,
     checksums_ref: "checksums.json",
+    package_checks_ref: "package_checks.json",
     package_digest: packageDigest,
   }));
   return {

@@ -52,6 +52,24 @@ describe("config", () => {
     expect(config.runnerAdminToken).toBe("runner-admin-token");
   });
 
+  test("defaults build evidence policy to warn for local development", () => {
+    expect(loadConfig({}).buildEvidencePolicy).toBe("warn");
+  });
+
+  test("loads build evidence enforcement policy", () => {
+    const config = loadConfig({
+      BUCEPHALUS_CLOUD_BUILD_EVIDENCE_POLICY: "enforce",
+    });
+
+    expect(config.buildEvidencePolicy).toBe("enforce");
+  });
+
+  test("rejects unknown build evidence policies", () => {
+    expect(() => loadConfig({
+      BUCEPHALUS_CLOUD_BUILD_EVIDENCE_POLICY: "maybe",
+    })).toThrow("BUCEPHALUS_CLOUD_BUILD_EVIDENCE_POLICY must be 'warn' or 'enforce'");
+  });
+
   test("loads rate limiting safety defaults", () => {
     expect(loadConfig({}).rateLimit).toEqual({
       enabled: true,

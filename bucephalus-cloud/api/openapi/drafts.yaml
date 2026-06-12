@@ -387,6 +387,8 @@ components:
           type: string
           enum:
             - inline
+            - inline_existing
+            - inline_unregistered
             - alias
             - digest
             - inferred
@@ -439,4 +441,3 @@ components:
           properties:
             ref:
               $ref: './common.yaml#/components/schemas/RegistryRef'
-

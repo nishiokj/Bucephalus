@@ -15,12 +15,18 @@ paths:
   /v1/experiments/builds:
     post:
       operationId: createHostedExperimentBuild
-      summary: Create a hosted build record from a completed sealed package upload.
+      summary: Create a hosted build record from a sealed package or authoring context upload.
       description: >
-        Imports a completed upload as a sealed package artifact and records a
-        hosted build identity. This is the hosted workflow noun over the lower
-        level package import primitive; it does not run local Core build logic
-        and does not yet compile authoring YAML in the hosted API.
+        For sealed package uploads, imports the completed upload as a package
+        artifact. For authoring context uploads, the referenced upload must be
+        a completed .tgz, .tar.gz, or .tar archive; the API verifies the
+        materialized archive bytes against the completed upload digest and byte
+        size, extracts it in an isolated workspace, runs the bundled Core
+        builder with a bounded timeout, imports the produced sealed package,
+        then evaluates the accepted package against the hosted Cloud runtime target. Package
+        import enforces the sealed package
+        metadata contract, package checks report, checksums, CAS blobs, and
+        runtime staging destinations before any build is marked runnable.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
       requestBody:
@@ -36,10 +42,21 @@ paths:
                 upload_id:
                   type: string
                   format: uuid
+                input_kind:
+                  type: string
+                  enum:
+                    - sealed_package
+                    - authoring_context
+                  default: sealed_package
+                entrypoint:
+                  type: string
+                  description: Relative POSIX path to experiment YAML inside an authoring_context upload.
                 label:
                   type:
                     - string
                     - 'null'
+                runtime_options:
+                  $ref: './runs.yaml#/components/schemas/CloudRuntimeOptions'
       responses:
         '201':
           description: Hosted build created.
@@ -76,7 +93,7 @@ paths:
                   additionalProperties:
                     type: string
                 runtime_options:
-                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                  $ref: './runs.yaml#/components/schemas/CloudRuntimeOptions'
       responses:
         '200':
           description: Package is runnable with the supplied hosted inputs.
@@ -99,8 +116,12 @@ components:
       required:
         - build_id
         - build_kind
+        - build_environment
         - authoring_build
         - status
+        - label
+        - package_digest
+        - cloud_readiness
         - import
       properties:
         build_id:
@@ -110,21 +131,56 @@ components:
           type: string
           enum:
             - sealed_package_import
+            - hosted_authoring_build
+        build_environment:
+          $ref: '#/components/schemas/HostedBuildEnvironment'
         authoring_build:
           type: object
           additionalProperties: false
+          description: >
+            Hosted authoring build result. For build_kind=hosted_authoring_build,
+            succeeded and failed results identify the source_upload_id and
+            entrypoint the Cloud builder attempted. For
+            build_kind=sealed_package_import, status is unavailable and no
+            authoring source identity is reported because Cloud imported an
+            already sealed package.
           required:
             - status
-            - message
           properties:
             status:
               type: string
               enum:
                 - unavailable
+                - succeeded
+                - failed
             message:
               type: string
+            source_upload_id:
+              type: string
+              format: uuid
+            entrypoint:
+              type: string
+            context_entries:
+              type: integer
+              minimum: 0
+            context_expanded_bytes:
+              type: integer
+              minimum: 0
+            core:
+              $ref: './common.yaml#/components/schemas/AnyJsonObject'
+            error:
+              type: string
+            code:
+              type: string
+            detail:
+              $ref: './common.yaml#/components/schemas/AnyJsonObject'
         status:
           type: string
+          enum:
+            - accepted
+            - failed
+            - cloud_runnable
+            - cloud_blocked
         label:
           type:
             - string
@@ -133,8 +189,334 @@ components:
           anyOf:
             - $ref: './common.yaml#/components/schemas/Digest'
             - type: 'null'
+        cloud_readiness:
+          $ref: '#/components/schemas/HostedCloudReadiness'
         import:
-          $ref: './imports.yaml#/components/schemas/ImportJob'
+          anyOf:
+            - $ref: './imports.yaml#/components/schemas/ImportJob'
+            - type: 'null'
+    HostedBuildEnvironment:
+      type: object
+      additionalProperties: false
+      required:
+        - schema_version
+        - target
+        - source
+        - runtime_options
+        - builder
+        - core
+        - package_contract
+        - evidence
+      properties:
+        schema_version:
+          type: string
+          enum:
+            - hosted_build_environment_v1
+        target:
+          type: object
+          additionalProperties: false
+          required:
+            - kind
+            - name
+          properties:
+            kind:
+              type: string
+              enum:
+                - hosted_cloud
+            name:
+              type: string
+              enum:
+                - default
+        source:
+          type: object
+          additionalProperties: false
+          required:
+            - input_kind
+            - upload_id
+            - filename
+            - media_type
+            - content_digest
+            - byte_size
+          properties:
+            input_kind:
+              type: string
+              enum:
+                - sealed_package
+                - authoring_context
+            upload_id:
+              type: string
+              format: uuid
+            filename:
+              type: string
+            media_type:
+              type: string
+            content_digest:
+              $ref: './common.yaml#/components/schemas/Digest'
+            byte_size:
+              type: integer
+              minimum: 0
+            entrypoint:
+              type: string
+          description: >
+            Immutable source upload evidence for this hosted build. For
+            authoring_context builds this is the source archive uploaded by the
+            CLI; for sealed_package builds this is the package archive imported
+            directly.
+        runtime_options:
+          $ref: './runs.yaml#/components/schemas/CloudRuntimeOptions'
+        builder:
+          type: object
+          additionalProperties: false
+          required:
+            - kind
+            - image_digest
+            - release_version
+            - git_sha
+            - os
+            - arch
+          properties:
+            kind:
+              type: string
+              enum:
+                - api_embedded_core
+            image_digest:
+              anyOf:
+                - $ref: './common.yaml#/components/schemas/Digest'
+                - type: 'null'
+            release_version:
+              type:
+                - string
+                - 'null'
+            git_sha:
+              type:
+                - string
+                - 'null'
+            os:
+              type: string
+            arch:
+              type: string
+        core:
+          type: object
+          additionalProperties: false
+          required:
+            - command
+            - path
+            - version
+            - timeout_ms
+          properties:
+            command:
+              type: string
+              enum:
+                - bucephalus build
+            path:
+              type: string
+            version:
+              type:
+                - string
+                - 'null'
+            timeout_ms:
+              type: integer
+              minimum: 1
+        package_contract:
+          type: object
+          additionalProperties: false
+          required:
+            - input_kind
+            - authoring_compiler
+            - sealed_schema_version
+            - readiness_schema_version
+            - cloud_readiness_required
+          properties:
+            input_kind:
+              type: string
+              enum:
+                - sealed_package
+                - authoring_context
+            authoring_compiler:
+              type: string
+              enum:
+                - core_universal_v1
+            sealed_schema_version:
+              type: string
+              enum:
+                - sealed_run_package_v2
+            readiness_schema_version:
+              type: string
+              enum:
+                - hosted_cloud_readiness_v1
+            cloud_readiness_required:
+              type: boolean
+        evidence:
+          type: object
+          additionalProperties: false
+          required:
+            - policy
+            - status
+            - missing
+            - checks
+          properties:
+            policy:
+              type: string
+              enum:
+                - warn
+                - enforce
+            status:
+              type: string
+              enum:
+                - complete
+                - partial
+            missing:
+              type: array
+              items:
+                type: string
+            checks:
+              type: array
+              items:
+                type: object
+                additionalProperties: false
+                required:
+                  - name
+                  - status
+                  - code
+                  - message
+                properties:
+                  name:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - passed
+                      - warning
+                  code:
+                    type: string
+                  message:
+                    type: string
+    HostedCloudReadiness:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - target
+        - runtime_options
+        - package_digest
+        - package_status
+        - run_requirements
+        - secret_requirements
+        - required_actions
+        - checks
+      properties:
+        status:
+          type: string
+          enum:
+            - cloud_runnable
+            - cloud_blocked
+            - unavailable
+        target:
+          type: object
+          additionalProperties: false
+          required:
+            - kind
+            - name
+          properties:
+            kind:
+              type: string
+              enum:
+                - hosted_cloud
+            name:
+              type: string
+              enum:
+                - default
+        runtime_options:
+          $ref: './runs.yaml#/components/schemas/CloudRuntimeOptions'
+        package_digest:
+          anyOf:
+            - $ref: './common.yaml#/components/schemas/Digest'
+            - type: 'null'
+        package_status:
+          type:
+            - string
+            - 'null'
+        run_requirements:
+          anyOf:
+            - $ref: './runs.yaml#/components/schemas/RunRequirements'
+            - type: 'null'
+        secret_requirements:
+          type: array
+          items:
+            $ref: '#/components/schemas/HostedSecretRequirement'
+        required_actions:
+          type: array
+          description: Actionable next steps needed before this build can be rebuilt or run in hosted Cloud.
+          items:
+            $ref: '#/components/schemas/HostedCloudAction'
+        checks:
+          type: array
+          items:
+            $ref: '#/components/schemas/HostedCloudCheck'
+    HostedCloudAction:
+      type: object
+      additionalProperties: false
+      required:
+        - action
+        - stage
+        - description
+      properties:
+        action:
+          type: string
+        stage:
+          type: string
+          enum:
+            - before_run
+            - before_rebuild
+            - operator
+        description:
+          type: string
+        command:
+          type: string
+        requirement_id:
+          type: string
+        blocking:
+          type: boolean
+    HostedCloudCheck:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - status
+        - code
+        - message
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          enum:
+            - passed
+            - blocked
+            - warning
+            - unavailable
+        code:
+          type: string
+        message:
+          type: string
+        detail:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    HostedSecretRequirement:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - target
+        - required_for_variants
+      properties:
+        id:
+          type: string
+        target:
+          type: string
+        required_for_variants:
+          type: array
+          items:
+            type: string
     HostedExperimentDoctor:
       type: object
       additionalProperties: false
@@ -170,26 +552,12 @@ components:
         secret_requirements:
           type: array
           items:
-            type: object
-            additionalProperties: false
-            required:
-              - id
-              - target
-              - required_for_variants
-            properties:
-              id:
-                type: string
-              target:
-                type: string
-              required_for_variants:
-                type: array
-                items:
-                  type: string
+            $ref: '#/components/schemas/HostedSecretRequirement'
         supplied_secret_ids:
           type: array
           items:
             type: string
         runtime_options:
-          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+          $ref: './runs.yaml#/components/schemas/CloudRuntimeOptions'
         run_requirements:
           $ref: './runs.yaml#/components/schemas/RunRequirements'

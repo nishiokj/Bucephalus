@@ -3,7 +3,7 @@ import { createSql } from "../src/db/client";
 import type { Sql } from "../src/db/client";
 import { migrationFiles, runMigrations } from "../src/db/migrate";
 
-const defaultDatabaseUrl = "postgres://bucephalus:bucephalus_dev@localhost:55432/bucephalus_cloud";
+const defaultDatabaseUrl = "postgres://bucephalus:bucephalus_dev@127.0.0.1:55432/bucephalus_cloud";
 
 function migrationTestBaseUrl(): string {
   return process.env.BUCEPHALUS_MIGRATION_TEST_DATABASE_URL

@@ -113,6 +113,32 @@ export interface RuntimeEventRecord {
   row: JsonObject;
 }
 
+/** Trial event row as accepted from the worker live-evidence pump. */
+export interface RuntimeEventRowInsert {
+  core_run_id: string;
+  trial_id: string;
+  schedule_idx: number;
+  attempt: number;
+  row_seq: number;
+  slot_commit_id: string;
+  variant_id: string;
+  task_id: string;
+  repl_idx: number;
+  seq: number;
+  event_type: string;
+  ts: string | null;
+  payload: JsonObject;
+  row: JsonObject;
+}
+
+export interface WorkerLifecycleEventRecord {
+  event_id: string;
+  seq: number;
+  event_type: string;
+  payload: JsonObject;
+  created_at: string;
+}
+
 export interface RuntimeSnapshotRecord {
   core_run_id: string;
   run_dir_name: string;
@@ -130,6 +156,12 @@ export interface RuntimeTrialSummaryRecord {
   contract_trace?: JsonObject;
   trial_events?: JsonObject[];
 }
+
+// Live-ingested rows need a deterministic account id so retried batches hit
+// the same primary key. Runner-direct writes derive theirs from the runner
+// host; worker-pumped rows all land under this marker.
+const WORKER_INGEST_ACCOUNT_ID = "cloud-worker";
+const RUNTIME_SNAPSHOT_EVENT_TYPE = "worker.runtime.snapshot";
 
 export class RuntimeRepository {
   private readonly schema: string;
@@ -423,22 +455,79 @@ export class RuntimeRepository {
       row: parseObject(row.row_json),
     }));
     const snapshotEvents = runtimeEventRowsFromSnapshots(runtimeSnapshots)
-      .filter((row) => row.row_seq > (input?.afterRowSeq ?? -1))
-      .filter((row) => !legacyEvents.some((legacy) => runtimeEventKey(legacy) === runtimeEventKey(row)));
-    return [
-      ...legacyEvents,
-      ...snapshotEvents,
-    ]
-      .sort((a, b) => {
-        const core = a.core_run_id.localeCompare(b.core_run_id);
-        if (core !== 0) {
-          return core;
-        }
-        return a.schedule_idx - b.schedule_idx
-          || a.attempt - b.attempt
-          || a.row_seq - b.row_seq;
-      })
-      .slice(0, limit);
+      .filter((row) => row.row_seq > (input?.afterRowSeq ?? -1));
+    return mergeRuntimeEventRecords(legacyEvents, snapshotEvents).slice(0, limit);
+  }
+
+  /**
+   * Idempotently lands live-ingested trial event rows. Conflicting rows are
+   * refreshed rather than dropped so a late identity-enrichment pass (once a
+   * trial's contract trace exists) can upgrade attribution fields in place.
+   */
+  async upsertEventRows(rows: RuntimeEventRowInsert[]): Promise<number> {
+    if (rows.length === 0) {
+      return 0;
+    }
+    const values = rows.map((row) => ({
+      account_id: WORKER_INGEST_ACCOUNT_ID,
+      run_id: row.core_run_id,
+      trial_id: row.trial_id,
+      schedule_idx: row.schedule_idx,
+      attempt: row.attempt,
+      row_seq: row.row_seq,
+      slot_commit_id: row.slot_commit_id,
+      variant_id: row.variant_id,
+      task_id: row.task_id,
+      repl_idx: row.repl_idx,
+      seq: row.seq,
+      event_type: row.event_type,
+      ts: row.ts,
+      payload_json: JSON.stringify(row.payload),
+      row_json: JSON.stringify(row.row),
+    }));
+    const result = await this.sql`
+      insert into ${this.table("event_rows")} ${this.sql(values)}
+      on conflict (account_id, run_id, trial_id, schedule_idx, attempt, row_seq)
+      do update set
+        slot_commit_id = excluded.slot_commit_id,
+        variant_id = excluded.variant_id,
+        task_id = excluded.task_id,
+        repl_idx = excluded.repl_idx,
+        seq = excluded.seq,
+        event_type = excluded.event_type,
+        ts = excluded.ts,
+        payload_json = excluded.payload_json,
+        row_json = excluded.row_json
+    `;
+    return result.count;
+  }
+
+  /**
+   * Worker harness lifecycle events for a cloud run (materializing, core
+   * starting, …). Runtime snapshot payloads are megabytes of repair data, so
+   * they surface as a marker without the payload body.
+   */
+  async workerLifecycleEvents(cloudRunId: string, input?: { limit?: number }): Promise<WorkerLifecycleEventRecord[]> {
+    const limit = boundedLimit(input?.limit, 200);
+    const rows = await this.sql`
+      select event_id, seq, event_type, payload, created_at
+      from cloud.run_events
+      where run_id = ${cloudRunId}
+      order by seq
+      limit ${limit}
+    `;
+    return rows.map((row) => {
+      const eventType = String(row.event_type);
+      return {
+        event_id: String(row.event_id),
+        seq: Number(row.seq),
+        event_type: eventType,
+        payload: eventType === RUNTIME_SNAPSHOT_EVENT_TYPE
+          ? { note: "runtime snapshot payload omitted from event stream" }
+          : parseObject(row.payload),
+        created_at: String(row.created_at),
+      };
+    });
   }
 
   private async coreRunIdsForCloudRun(cloudRunId: string): Promise<string[]> {
@@ -887,6 +976,37 @@ function runtimeContractStageKey(
 
 function runtimeEventKey(row: Pick<RuntimeEventRecord, "core_run_id" | "trial_id" | "attempt" | "row_seq">): string {
   return `${row.core_run_id}\0${row.trial_id}\0${row.attempt}\0${row.row_seq}`;
+}
+
+/**
+ * Store rows win over snapshot-derived rows, and duplicate logical rows
+ * within a source (e.g. the same row landed by both a direct runtime store
+ * writer and the worker pump under different account ids) collapse to the
+ * first occurrence.
+ */
+export function mergeRuntimeEventRecords(
+  storeRows: RuntimeEventRecord[],
+  snapshotRows: RuntimeEventRecord[],
+): RuntimeEventRecord[] {
+  const seen = new Set<string>();
+  const merged: RuntimeEventRecord[] = [];
+  for (const row of [...storeRows, ...snapshotRows]) {
+    const key = runtimeEventKey(row);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(row);
+  }
+  return merged.sort((a, b) => {
+    const core = a.core_run_id.localeCompare(b.core_run_id);
+    if (core !== 0) {
+      return core;
+    }
+    return a.schedule_idx - b.schedule_idx
+      || a.attempt - b.attempt
+      || a.row_seq - b.row_seq;
+  });
 }
 
 function runtimeAttemptObjectKey(

@@ -1,9 +1,11 @@
 import { spawnSync } from "node:child_process";
 import {
+  canonicalJsonStringify,
   canonicalizeEntity,
   normalizationHints,
   resolveRegistryRef,
   type EntityKind,
+  type JsonValue,
   type JsonObject,
   type RegistryResolverRepository,
 } from "../primitives";
@@ -51,6 +53,14 @@ export interface SchedulePreview {
   max_concurrency: number | null;
   unresolved_refs: string[];
   warnings: DraftIssue[];
+}
+
+export interface DraftDiffChange {
+  op: "add" | "remove" | "replace";
+  pointer: string;
+  left?: JsonValue;
+  right?: JsonValue;
+  significance: "identity" | "behavior" | "metadata" | "presentation" | "unknown";
 }
 
 export async function canonicalizeDraft(draft: JsonObject): Promise<{
@@ -245,6 +255,12 @@ export function exportDraftYaml(draft: JsonObject): string {
   return result.stdout;
 }
 
+export function diffDraftJson(left: JsonValue, right: JsonValue): DraftDiffChange[] {
+  const changes: DraftDiffChange[] = [];
+  collectDiffChanges(left, right, "", changes);
+  return changes;
+}
+
 function validationIssues(draft: JsonObject): DraftIssue[] {
   const issues: DraftIssue[] = [];
   const requiredObjects = [
@@ -314,6 +330,83 @@ function validationIssues(draft: JsonObject): DraftIssue[] {
     });
   }
   return issues;
+}
+
+function collectDiffChanges(
+  left: JsonValue | undefined,
+  right: JsonValue | undefined,
+  pointer: string,
+  changes: DraftDiffChange[],
+): void {
+  if (left === undefined && right === undefined) {
+    return;
+  }
+  if (left === undefined) {
+    changes.push({
+      op: "add",
+      pointer,
+      right: right as JsonValue,
+      significance: pointerSignificance(pointer),
+    });
+    return;
+  }
+  if (right === undefined) {
+    changes.push({
+      op: "remove",
+      pointer,
+      left,
+      significance: pointerSignificance(pointer),
+    });
+    return;
+  }
+  if (isJsonObject(left) && isJsonObject(right)) {
+    const keys = Array.from(new Set([...Object.keys(left), ...Object.keys(right)])).sort();
+    for (const key of keys) {
+      collectDiffChanges(
+        left[key],
+        right[key],
+        `${pointer}/${escapeJsonPointer(key)}`,
+        changes,
+      );
+    }
+    return;
+  }
+  if (Array.isArray(left) && Array.isArray(right)) {
+    const length = Math.max(left.length, right.length);
+    for (let index = 0; index < length; index += 1) {
+      collectDiffChanges(left[index], right[index], `${pointer}/${index}`, changes);
+    }
+    return;
+  }
+  if (canonicalJsonStringify(left) !== canonicalJsonStringify(right)) {
+    changes.push({
+      op: "replace",
+      pointer,
+      left,
+      right,
+      significance: pointerSignificance(pointer),
+    });
+  }
+}
+
+function pointerSignificance(pointer: string): DraftDiffChange["significance"] {
+  if (pointer === "/experiment/id" || pointer.endsWith("/__cloud/digest")) {
+    return "identity";
+  }
+  if (pointer.endsWith("/name") || pointer.endsWith("/display_name") || pointer === "/experiment/name") {
+    return "presentation";
+  }
+  if (pointer.includes("/metadata") || pointer.includes("/__cloud")) {
+    return "metadata";
+  }
+  if (pointer === "") {
+    return "unknown";
+  }
+  return "behavior";
+}
+
+function escapeJsonPointer(value: string): string {
+  return value.replace(/~/g, "~0").replace(/\//g, "~1");
 }
 
 function registryRefFromDraftEntity(kind: EntityKind, value: JsonObject) {
