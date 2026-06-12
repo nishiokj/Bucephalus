@@ -6,6 +6,7 @@ export interface RegistrySearchOptions {
   kind?: EntityKind;
   q: string;
   limit: number;
+  ownerKey?: string | undefined;
 }
 
 export interface RegistrySearchHit {
@@ -15,6 +16,13 @@ export interface RegistrySearchHit {
   aliases: string[];
   score: number;
   metadata: Record<string, unknown>;
+  used_by_runs: number;
+  last_used_at: string | null;
+}
+
+export interface RegistryUsage {
+  used_by_runs: number;
+  last_used_at: string | null;
 }
 
 export interface AliasReview {
@@ -55,6 +63,11 @@ export class RegistryRepository {
       limit 1
     `;
     return (rows[0] as Record<string, unknown> | undefined) ?? null;
+  }
+
+  async usageForDigest(digest: string, ownerKey?: string): Promise<RegistryUsage> {
+    const usage = await this.usageForDigests([digest], ownerKey);
+    return usage.get(digest) ?? { used_by_runs: 0, last_used_at: null };
   }
 
   async register(entity: CanonicalEntity, sourceUri?: string | null): Promise<boolean> {
@@ -271,7 +284,7 @@ export class RegistryRepository {
             order by o.created_at desc, display_name asc
             limit ${limit}
           `;
-      return rows as unknown as RegistrySearchHit[];
+      return await this.withUsage(rows as unknown as RegistrySearchHit[], options.ownerKey);
     }
     const pattern = `%${query}%`;
     const rows = options.kind
@@ -352,7 +365,74 @@ export class RegistryRepository {
           order by score desc, display_name asc
           limit ${limit}
         `;
-    return rows as unknown as RegistrySearchHit[];
+    return await this.withUsage(rows as unknown as RegistrySearchHit[], options.ownerKey);
+  }
+
+  private async withUsage(rows: RegistrySearchHit[], ownerKey?: string): Promise<RegistrySearchHit[]> {
+    const usage = await this.usageForDigests(rows.map((row) => row.content_digest), ownerKey);
+    return rows.map((row) => ({
+      ...row,
+      ...(usage.get(row.content_digest) ?? { used_by_runs: 0, last_used_at: null }),
+    }));
+  }
+
+  private async usageForDigests(digests: string[], ownerKey?: string): Promise<Map<string, RegistryUsage>> {
+    const uniqueDigests = [...new Set(digests)];
+    if (uniqueDigests.length === 0) {
+      return new Map();
+    }
+    const rows = await this.sql`
+      with requested(content_digest) as (
+        select unnest(${uniqueDigests}::text[])
+      ),
+      package_registry_digests as (
+        select
+          artifact.package_digest,
+          artifact.package_digest as content_digest
+        from cloud.package_artifacts artifact
+        where artifact.package_digest = any(${uniqueDigests}::text[])
+        union
+        select
+          artifact.package_digest,
+          trim(both '"' from digest_value::text) as content_digest
+        from cloud.package_artifacts artifact
+        cross join lateral jsonb_path_query(
+          artifact.resolved_experiment_json,
+          'lax $.**.__cloud.digest'
+        ) as digest_value
+        where trim(both '"' from digest_value::text) = any(${uniqueDigests}::text[])
+      ),
+      usage as (
+        select
+          package_registry_digests.content_digest,
+          count(distinct run.run_id)::int as used_by_runs,
+          max(run.created_at) as last_used_at
+        from package_registry_digests
+        join cloud.runs run
+          on run.package_digest = package_registry_digests.package_digest
+        where (${ownerKey ?? null}::text is null or run.owner_key = ${ownerKey ?? null})
+        group by package_registry_digests.content_digest
+      )
+      select
+        requested.content_digest,
+        coalesce(usage.used_by_runs, 0)::int as used_by_runs,
+        usage.last_used_at
+      from requested
+      left join usage
+        on usage.content_digest = requested.content_digest
+    `;
+    return new Map(rows.map((row) => {
+      const usage = row as { content_digest: string; used_by_runs: number | string; last_used_at: string | null };
+      return [
+        usage.content_digest,
+        {
+          used_by_runs: typeof usage.used_by_runs === "number"
+            ? usage.used_by_runs
+            : Number.parseInt(usage.used_by_runs, 10),
+          last_used_at: usage.last_used_at,
+        },
+      ];
+    }));
   }
 }
 

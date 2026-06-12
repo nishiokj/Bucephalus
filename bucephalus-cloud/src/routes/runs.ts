@@ -9,7 +9,7 @@ import {
   type RuntimeEventRowInsert,
   type WorkerLifecycleEventRecord,
 } from "../runtime/repository";
-import { RunnerRepository, type RunnerPoolRecord } from "../runners/repository";
+import { RunnerRepository, type RunnerInstanceRecord, type RunnerPoolRecord } from "../runners/repository";
 import {
   optionalJsonObject,
   PackageRepository,
@@ -39,6 +39,15 @@ interface CloudSecretRequirement {
   id: string;
   target: string;
   required_for_variants: string[];
+}
+
+type PendingReason = "no_matching_runner" | "waiting_for_capacity";
+
+interface RunWireEnrichment {
+  experiment_name: string | null;
+  trials_completed: number | null;
+  trials_total: number | null;
+  pending_reason: PendingReason | null;
 }
 
 export async function handleRunRoute(
@@ -131,7 +140,8 @@ export async function handleRunRoute(
   if (request.method === "GET" && url.pathname === "/v1/runs") {
     const limit = limitFromUrl(url);
     const records = await runs.listRuns({ limit, ownerKey });
-    return jsonResponse({ runs: records.map(runToWire) });
+    const enrichment = await enrichRuns(records, packages, runtime, runners, ownerKey);
+    return jsonResponse({ runs: records.map((run) => runToWire(run, enrichment.get(run.run_id))) });
   }
 
   const runtimeRoute = runtimePath(url.pathname);
@@ -175,9 +185,12 @@ export async function handleRunRoute(
     if (!run) {
       throw new HttpError(404, "run_not_found", "Run not found");
     }
-    const attempts = await runs.listAttempts(runId);
+    const [attempts, enrichment] = await Promise.all([
+      runs.listAttempts(runId),
+      enrichRuns([run], packages, runtime, runners, ownerKey),
+    ]);
     return jsonResponse({
-      ...runToWire(run),
+      ...runToWire(run, enrichment.get(run.run_id)),
       attempts: attempts.map(attemptToWire),
     });
   }
@@ -598,6 +611,47 @@ export async function requireSchedulableRun(
       })),
     },
   );
+}
+
+async function pendingReasonsForRuns(
+  runs: CloudRunRecord[],
+  runners: RunnerRepository,
+): Promise<Map<string, PendingReason>> {
+  if (runs.length === 0) {
+    return new Map();
+  }
+  const [pools, instances] = await Promise.all([
+    runners.listPools(),
+    runners.listInstances({ limit: 500 }),
+  ]);
+  return pendingReasonsFromRunnerState(runs, pools, instances);
+}
+
+function pendingReasonsFromRunnerState(
+  runs: CloudRunRecord[],
+  pools: RunnerPoolRecord[],
+  instances: RunnerInstanceRecord[],
+): Map<string, PendingReason> {
+  const activePools = pools.filter((pool) => pool.status === "active");
+  const runnablePools = activePools.filter((pool) => pool.active_worker_image_id);
+  const onlineInstances = instances.filter((instance) => instance.status === "online");
+  return new Map(runs.map((run) => {
+    const matchingPools = runnablePools.filter((pool) => poolSatisfiesRun(pool, run.run_requirements));
+    const matchingInstances = onlineInstances.filter((instance) =>
+      matchingPools.some((pool) => pool.runner_pool_id === instance.runner_pool_id)
+      && capabilitiesSatisfyRun(instance.capabilities, run.run_requirements)
+    );
+    return [
+      run.run_id,
+      matchingPools.length > 0 || matchingInstances.length > 0
+        ? "waiting_for_capacity"
+        : "no_matching_runner",
+    ];
+  }));
+}
+
+function isQueuedRunStatus(status: string): boolean {
+  return status === "created" || status === "waiting_for_runner";
 }
 
 function poolSatisfiesRun(pool: RunnerPoolRecord, requirements: RunRequirements): boolean {
@@ -1206,6 +1260,38 @@ function packageToWire(artifact: PackageArtifactRecord) {
   };
 }
 
+async function enrichRuns(
+  runs: CloudRunRecord[],
+  packages: PackageRepository,
+  runtime: RuntimeRepository,
+  runners: RunnerRepository,
+  ownerKey?: string,
+): Promise<Map<string, RunWireEnrichment>> {
+  if (runs.length === 0) {
+    return new Map();
+  }
+  const runIds = runs.map((run) => run.run_id);
+  const packageDigests = [...new Set(runs.map((run) => run.package_digest))].sort();
+  const queuedRuns = runs.filter((run) => isQueuedRunStatus(run.status));
+  const [artifacts, progress, pendingReasons] = await Promise.all([
+    packages.listArtifactsByDigests(packageDigests, ownerKey),
+    runtime.trialProgressForCloudRuns(runIds),
+    pendingReasonsForRuns(queuedRuns, runners),
+  ]);
+  const artifactByDigest = new Map(artifacts.map((artifact) => [artifact.package_digest, artifact]));
+  const progressByRunId = new Map(progress.map((item) => [item.cloud_run_id, item]));
+  return new Map(runs.map((run) => {
+    const artifact = artifactByDigest.get(run.package_digest) ?? null;
+    const trialProgress = progressByRunId.get(run.run_id);
+    return [run.run_id, {
+      experiment_name: artifact ? packageName(artifact) : null,
+      trials_completed: trialProgress?.trials_completed ?? null,
+      trials_total: trialProgress?.trials_total ?? null,
+      pending_reason: pendingReasons.get(run.run_id) ?? null,
+    }];
+  }));
+}
+
 // Packages need a human-readable identity wherever they are listed; without
 // one, consumers fall back to stringifying structures. The authoritative name
 // is the resolved experiment's name sealed inside the package.
@@ -1314,14 +1400,18 @@ function nullableNumber(value: number | string | null): number | null {
   return typeof value === "number" ? value : Number.parseInt(value, 10);
 }
 
-function runToWire(run: CloudRunRecord) {
+function runToWire(run: CloudRunRecord, enrichment?: RunWireEnrichment) {
   const envKeys = Object.keys(run.env ?? {}).sort();
   const secretIds = Object.keys(run.secret_refs ?? {}).sort();
   return {
     run_id: run.run_id,
     package_digest: run.package_digest,
+    experiment_name: enrichment?.experiment_name ?? null,
     run_label: run.run_label,
     status: run.status,
+    pending_reason: isQueuedRunStatus(run.status) ? enrichment?.pending_reason ?? null : null,
+    trials_completed: enrichment?.trials_completed ?? null,
+    trials_total: enrichment?.trials_total ?? null,
     env_keys: envKeys,
     secret_ids: secretIds,
     runtime_options: run.runtime_options,

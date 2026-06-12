@@ -530,17 +530,16 @@ apply=true
 That mode writes `deploy_control_plane_services = false`, applies the durable
 substrate through a remote GCS backend, and creates prerequisites such as
 Artifact Registry without accepting placeholder image digests. After the release
-or candidate workflow pushes real images and uploads promotion evidence, run the
-deploy workflow with `deployment_stage=services` for the normal app promotion.
-The candidate workflow does this automatically only for runtime-only main
-changes; deploy-boundary changes stop at plan-only, and mixed runtime plus
-deploy-boundary changes build images but still stop at a plan. Runtime changes
-bundled with candidate/CI policy changes also stop at plan-only. The workflow
-resolves the version to the pushed-image handoff, or receives exact same-run
-candidate evidence from automation, downloads it, verifies
+workflow pushes real images and uploads `cloud-release-promotion-<version>`, use
+`.github/workflows/bucephalus-cloud-promote.yml` for the normal production hot
+path: `mode=preview` inspects the promotion and `mode=promote` applies it. The
+candidate workflow can pass exact same-run candidate evidence to the same
+backend for development-style automation. The deploy backend resolves the
+version to the pushed-image handoff, or receives exact same-run candidate
+evidence from automation, downloads it, verifies
 `cloud-image-promotion-evidence.json`, writes non-secret deploy tfvars with
-`scripts/deploy/write-gcp-deploy-tfvars.sh`, and runs Terraform with a remote
-GCS backend.
+`scripts/deploy/write-gcp-deploy-tfvars.sh`, and runs Terraform with a remote GCS
+backend.
 
 ```text
 terraform plan \

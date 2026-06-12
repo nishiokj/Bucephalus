@@ -80,7 +80,7 @@ const server = Bun.serve({
         ? await auth.requireUser(request, "Bucephalus Cloud")
         : null;
 
-      const registryResponse = await handleRegistryRoute(request, url, registry);
+      const registryResponse = await handleRegistryRoute(request, url, registry, userAuth);
       if (registryResponse) {
         return withCors(registryResponse);
       }

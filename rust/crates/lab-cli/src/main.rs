@@ -11992,9 +11992,10 @@ mod tests {
             Some("Cloud API requires OAuth bearer authentication"),
         );
         assert!(message.contains("Cloud upload requires Cloud authentication"));
-        assert!(message.contains("bucephalus login"));
+        assert!(message.contains("bucephalus login --resource <hosted-api-url>"));
         assert!(message.contains("BUCEPHALUS_CLOUD_USER_TOKEN"));
         assert!(message.contains("bucephalus setup status"));
+        assert!(message.contains("buc health"));
     }
 
     #[test]

@@ -20,6 +20,12 @@ export interface RuntimeResults {
   attempt_objects: RuntimeAttemptObjectRecord[];
 }
 
+export interface RuntimeTrialProgress {
+  cloud_run_id: string;
+  trials_completed: number | null;
+  trials_total: number | null;
+}
+
 export interface RuntimeTrialResultRecord {
   core_run_id: string;
   trial_id: string;
@@ -208,6 +214,93 @@ export class RuntimeRepository {
       ...storedValues,
       ...runtimeValuesFromSnapshots(runtimeSnapshots, key),
     ];
+  }
+
+  async trialProgressForCloudRuns(cloudRunIds: string[]): Promise<RuntimeTrialProgress[]> {
+    const ids = [...new Set(cloudRunIds)].sort();
+    if (ids.length === 0) {
+      return [];
+    }
+    const coreRunIdsByCloudRunId = await this.coreRunIdsForCloudRuns(ids);
+    const allCoreRunIds = [...new Set([...coreRunIdsByCloudRunId.values()].flat())].sort();
+    const completedByCoreRunId = new Map<string, number>();
+    const totalByCoreRunId = new Map<string, number>();
+    if (allCoreRunIds.length > 0) {
+      const [rows, totals] = await Promise.all([
+        this.sql`
+          select run_id, count(distinct schedule_idx)::int as trials_completed
+          from ${this.table("trial_conclusion_rows")}
+          where run_id = any(${allCoreRunIds})
+          group by run_id
+        `.catch((error) => {
+          if (isMissingRuntimeStore(error)) {
+            return [];
+          }
+          throw error;
+        }),
+        this.scheduleProgressTotalsForCoreRuns(ids, allCoreRunIds),
+      ]);
+      for (const row of rows) {
+        completedByCoreRunId.set(String(row.run_id), Number(row.trials_completed));
+      }
+      for (const total of totals) {
+        totalByCoreRunId.set(total.core_run_id, total.trials_total);
+      }
+    }
+    return ids.map((cloudRunId) => {
+      const coreRunIds = coreRunIdsByCloudRunId.get(cloudRunId) ?? [];
+      if (coreRunIds.length === 0) {
+        return { cloud_run_id: cloudRunId, trials_completed: null, trials_total: null };
+      }
+      const totals = coreRunIds
+        .map((coreRunId) => totalByCoreRunId.get(coreRunId))
+        .filter((total): total is number => total !== undefined);
+      return {
+        cloud_run_id: cloudRunId,
+        trials_completed: coreRunIds.reduce((sum, coreRunId) => sum + (completedByCoreRunId.get(coreRunId) ?? 0), 0),
+        trials_total: totals.length === 0 ? null : totals.reduce((sum, total) => sum + total, 0),
+      };
+    });
+  }
+
+  private async scheduleProgressTotalsForCoreRuns(
+    cloudRunIds: string[],
+    coreRunIds: string[],
+  ): Promise<Array<{ core_run_id: string; trials_total: number }>> {
+    const [storedRows, snapshotRows] = await Promise.all([
+      this.sql`
+        select run_id, max((value_json::jsonb->>'total_slots')::int)::int as trials_total
+        from ${this.table("runtime_kv")}
+        where run_id = any(${coreRunIds})
+          and key = 'schedule_progress_v2'
+          and value_json::jsonb->>'total_slots' ~ '^[0-9]+$'
+        group by run_id
+      `.catch((error) => {
+        if (isMissingRuntimeStore(error)) {
+          return [];
+        }
+        throw error;
+      }),
+      this.sql`
+        select payload->>'core_run_id' as run_id,
+               max((payload#>>'{runtime_values,schedule_progress_v2,total_slots}')::int)::int as trials_total
+        from cloud.run_events
+        where run_id = any(${cloudRunIds})
+          and event_type = 'worker.runtime.snapshot'
+          and payload ? 'core_run_id'
+          and payload#>>'{runtime_values,schedule_progress_v2,total_slots}' ~ '^[0-9]+$'
+        group by payload->>'core_run_id'
+      `,
+    ]);
+    const totals = new Map<string, number>();
+    for (const row of [...storedRows, ...snapshotRows]) {
+      const coreRunId = String(row.run_id);
+      const total = Number(row.trials_total);
+      if (Number.isSafeInteger(total) && total >= 0) {
+        totals.set(coreRunId, Math.max(totals.get(coreRunId) ?? 0, total));
+      }
+    }
+    return [...totals.entries()].map(([core_run_id, trials_total]) => ({ core_run_id, trials_total }));
   }
 
   async results(cloudRunId: string, input?: { limit?: number }): Promise<RuntimeResults> {
@@ -538,6 +631,23 @@ export class RuntimeRepository {
     return [...new Set([...cloudEventIds, ...legacyDiscoveredIds])].sort();
   }
 
+  private async coreRunIdsForCloudRuns(cloudRunIds: string[]): Promise<Map<string, string[]>> {
+    const [cloudEventIds, legacyDiscoveredIds] = await Promise.all([
+      this.cloudEventCoreRunIdsForCloudRuns(cloudRunIds),
+      this.legacyDiscoveredCoreRunIdsForCloudRuns(cloudRunIds),
+    ]);
+    const out = new Map<string, string[]>();
+    for (const cloudRunId of cloudRunIds) {
+      out.set(cloudRunId, [
+        ...new Set([
+          ...(cloudEventIds.get(cloudRunId) ?? []),
+          ...(legacyDiscoveredIds.get(cloudRunId) ?? []),
+        ]),
+      ].sort());
+    }
+    return out;
+  }
+
   private async cloudEventCoreRunIds(cloudRunId: string): Promise<string[]> {
     const rows = await this.sql`
       with
@@ -564,6 +674,32 @@ export class RuntimeRepository {
     return rows.map((row) => String(row.core_run_id));
   }
 
+  private async cloudEventCoreRunIdsForCloudRuns(cloudRunIds: string[]): Promise<Map<string, string[]>> {
+    const rows = await this.sql`
+      with
+      cleanup_ids as (
+        select events.run_id as cloud_run_id, core_ids.core_run_id
+        from cloud.run_events events
+        cross join lateral jsonb_array_elements_text(events.payload->'core_run_ids') as core_ids(core_run_id)
+        where events.run_id = any(${cloudRunIds})
+          and jsonb_typeof(events.payload->'core_run_ids') = 'array'
+      ),
+      snapshot_ids as (
+        select run_id as cloud_run_id, payload->>'core_run_id' as core_run_id
+        from cloud.run_events
+        where run_id = any(${cloudRunIds})
+          and event_type = 'worker.runtime.snapshot'
+          and payload ? 'core_run_id'
+          and nullif(payload->>'core_run_id', '') is not null
+      )
+      select cloud_run_id, core_run_id from cleanup_ids
+      union
+      select cloud_run_id, core_run_id from snapshot_ids
+      order by cloud_run_id, core_run_id
+    `;
+    return groupCoreRunIds(rows);
+  }
+
   private async legacyDiscoveredCoreRunIds(cloudRunId: string): Promise<string[]> {
     const rows = await this.sql`
       with run_roots as (
@@ -587,6 +723,31 @@ export class RuntimeRepository {
       throw error;
     });
     return rows.map((row) => String(row.core_run_id));
+  }
+
+  private async legacyDiscoveredCoreRunIdsForCloudRuns(cloudRunIds: string[]): Promise<Map<string, string[]>> {
+    const rows = await this.sql`
+      with run_roots as (
+        select distinct run_id as cloud_run_id, payload->>'run_root_dir' as run_root_dir
+        from cloud.run_events
+        where run_id = any(${cloudRunIds})
+          and payload ? 'run_root_dir'
+          and nullif(payload->>'run_root_dir', '') is not null
+      ),
+      discovered_ids as (
+        select distinct run_roots.cloud_run_id, runtime_runs.run_id as core_run_id
+        from ${this.table("runs")} runtime_runs
+        join run_roots on runtime_runs.run_dir like run_roots.run_root_dir || '/%'
+      )
+      select cloud_run_id, core_run_id from discovered_ids
+      order by cloud_run_id, core_run_id
+    `.catch((error) => {
+      if (isMissingRuntimeStore(error)) {
+        return [];
+      }
+      throw error;
+    });
+    return groupCoreRunIds(rows);
   }
 
   private async workerRuntimeSnapshots(cloudRunId: string): Promise<RuntimeSnapshotRecord[]> {
@@ -694,6 +855,16 @@ function parseObject(value: unknown): JsonObject {
 
 function parseJson(value: unknown): JsonValue {
   return (typeof value === "string" ? JSON.parse(value) : value) as JsonValue;
+}
+
+function groupCoreRunIds(rows: unknown[]): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const row of rows as Array<{ cloud_run_id: unknown; core_run_id: unknown }>) {
+    const cloudRunId = String(row.cloud_run_id);
+    const coreRunId = String(row.core_run_id);
+    out.set(cloudRunId, [...(out.get(cloudRunId) ?? []), coreRunId]);
+  }
+  return out;
 }
 
 function isMissingRuntimeStore(error: unknown): boolean {

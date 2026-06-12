@@ -1,4 +1,8 @@
 import {
+  authOwnerKey,
+  type AuthContext,
+} from "../auth";
+import {
   HttpError,
   jsonResponse,
   optionalString,
@@ -23,7 +27,9 @@ export async function handleRegistryRoute(
   request: Request,
   url: URL,
   repository: RegistryRepository,
+  auth?: AuthContext | null,
 ): Promise<Response | null> {
+  const ownerKey = authOwnerKey(auth);
   if (request.method === "POST" && url.pathname === "/v1/registry/canonicalize") {
     return canonicalize(request);
   }
@@ -45,9 +51,12 @@ export async function handleRegistryRoute(
     if (!object) {
       throw new HttpError(404, "not_found", "Content object not found");
     }
+    const usage = await repository.usageForDigest(digest, ownerKey);
     return jsonResponse({
       object,
       aliases: await repository.aliasesForDigest(digest),
+      used_by_runs: usage.used_by_runs,
+      last_used_at: usage.last_used_at,
     });
   }
 
@@ -58,6 +67,7 @@ export async function handleRegistryRoute(
     const searchOptions = {
       q,
       limit,
+      ownerKey,
     };
     const hits = await repository.search(
       kind ? { ...searchOptions, kind } : searchOptions,

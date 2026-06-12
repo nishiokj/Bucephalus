@@ -62,6 +62,9 @@ const deployWorkflow = YAML.parse(deployWorkflowText);
 const candidateWorkflowPath = ".github/workflows/bucephalus-cloud-candidate.yml";
 const candidateWorkflowText = read(candidateWorkflowPath);
 const candidateWorkflow = YAML.parse(candidateWorkflowText);
+const promoteWorkflowPath = ".github/workflows/bucephalus-cloud-promote.yml";
+const promoteWorkflowText = read(promoteWorkflowPath);
+const promoteWorkflow = YAML.parse(promoteWorkflowText);
 const cleanupWorkflowPath = ".github/workflows/bucephalus-gcp-cleanup.yml";
 const cleanupWorkflowText = read(cleanupWorkflowPath);
 const cleanupWorkflow = YAML.parse(cleanupWorkflowText);
@@ -104,6 +107,9 @@ for (const forbidden of [
   }
   if (forbidden.test(candidateWorkflowText)) {
     fail(`${candidateWorkflowPath} contains retired deployment surface matching ${forbidden}`);
+  }
+  if (forbidden.test(promoteWorkflowText)) {
+    fail(`${promoteWorkflowPath} contains retired deployment surface matching ${forbidden}`);
   }
 }
 
@@ -199,6 +205,59 @@ if (!read("scripts/release/resolve-cloud-release-artifacts.sh").includes("cloud-
 
 if (!deployWorkflowText.includes("actions/download-artifact@v4")) {
   fail(`${deployWorkflowPath} must download pushed image promotion evidence from a release workflow run`);
+}
+if (deployWorkflow.name !== "Bucephalus GCP Deploy Backend") {
+  fail(`${deployWorkflowPath} must be named as the advanced backend, not the normal operator promotion path`);
+}
+const promoteWorkflowInputs = promoteWorkflow.on?.workflow_dispatch?.inputs ?? {};
+if (promoteWorkflow.name !== "Bucephalus Cloud Promote") {
+  fail(`${promoteWorkflowPath} must be the operator-facing Cloud promotion workflow`);
+}
+if (promoteWorkflowInputs.release_version?.type !== "string" || promoteWorkflowInputs.release_version?.required !== true) {
+  fail(`${promoteWorkflowPath} must require the exact released version to promote`);
+}
+if (
+  promoteWorkflowInputs.target?.type !== "choice"
+  || promoteWorkflowInputs.target?.default !== "bucephalus"
+  || !Array.isArray(promoteWorkflowInputs.target?.options)
+  || promoteWorkflowInputs.target.options.join(",") !== "bucephalus"
+) {
+  fail(`${promoteWorkflowPath} must expose only the current production target`);
+}
+if (
+  promoteWorkflowInputs.mode?.type !== "choice"
+  || promoteWorkflowInputs.mode?.default !== "preview"
+  || !Array.isArray(promoteWorkflowInputs.mode?.options)
+  || !promoteWorkflowInputs.mode.options.includes("preview")
+  || !promoteWorkflowInputs.mode.options.includes("promote")
+) {
+  fail(`${promoteWorkflowPath} must expose preview/promote, not Terraform apply language`);
+}
+for (const forbiddenInput of ["deployment_stage", "apply", "github_environment", "promotion_run_id", "promotion_artifact_name", "checkout_ref"]) {
+  if (promoteWorkflowInputs[forbiddenInput]) {
+    fail(`${promoteWorkflowPath} must not expose backend input ${forbiddenInput} in the operator hot path`);
+  }
+}
+const promoteJobs = promoteWorkflow.jobs ?? {};
+const promoteReleaseJob = promoteJobs["promote-release"];
+if (!promoteReleaseJob) {
+  fail(`${promoteWorkflowPath} must contain promote-release reusable workflow job`);
+} else {
+  if (promoteReleaseJob.uses !== "./.github/workflows/bucephalus-gcp-deploy.yml") {
+    fail(`${promoteWorkflowPath} promote-release must delegate to the canonical GCP deploy backend`);
+  }
+  if (promoteReleaseJob.with?.deployment_stage !== "services") {
+    fail(`${promoteWorkflowPath} promote-release must hardcode the normal services stage`);
+  }
+  if (!String(promoteReleaseJob.with?.apply ?? "").includes("inputs.mode == 'promote'")) {
+    fail(`${promoteWorkflowPath} promote-release must map mode=promote to backend apply`);
+  }
+  if (promoteReleaseJob.with?.github_environment !== "${{ inputs.target }}" || promoteReleaseJob.with?.release_version !== "${{ inputs.release_version }}") {
+    fail(`${promoteWorkflowPath} promote-release must pass target and exact release version to the backend`);
+  }
+  if (promoteReleaseJob.permissions?.contents !== "read" || promoteReleaseJob.permissions?.actions !== "read" || promoteReleaseJob.permissions?.["id-token"] !== "write") {
+    fail(`${promoteWorkflowPath} promote-release must receive contents/actions read and OIDC token write permissions`);
+  }
 }
 const deployWorkflowInputs = deployWorkflow.on?.workflow_dispatch?.inputs ?? {};
 const deployStageInput = deployWorkflowInputs.deployment_stage;
@@ -1225,6 +1284,7 @@ for (const eventName of ["pull_request", "push"]) {
   for (const requiredPath of [
     ".github/workflows/bucephalus-gcp-cleanup.yml",
     ".github/workflows/bucephalus-gcp-deploy.yml",
+    ".github/workflows/bucephalus-cloud-promote.yml",
     ".github/workflows/bucephalus-release.yml",
     "docs/specs/CLOUD_DEPLOYMENT_GOAL_STATE.md",
     "docs/specs/CLOUD_PATH2_ARTIFACT_IMAGE_CI_READINESS.md",

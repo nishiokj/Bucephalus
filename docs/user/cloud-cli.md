@@ -40,11 +40,18 @@ buc run <package-digest> --secret-ref NAME=bucephalus://NAME
 
 ## Setup
 
-Log in once and persist the hosted API URL:
+There is not a separate `buc login` command in this build. Sign-in is currently
+the shared Bucephalus Cloud auth path: log in once with the Core CLI and persist
+the hosted API URL:
 
 ```bash
 bucephalus login --resource <api-url>
 ```
+
+`buc` then reads the shared Cloud profile and cached OAuth files from
+`BUCEPHALUS_HOME`: `cloud.json`, `auth/cloud_user_token`,
+`auth/cloud_refresh_token`, and `auth/cloud_user_token.json`. If the cache has a
+refresh token, `buc` refreshes the access token before making Cloud API calls.
 
 You can also pass credentials per command:
 

@@ -209,13 +209,17 @@ user-secret policy.
   manifest, image-build provenance, generated tfvars, and
   `cloud-image-promotion-evidence.json` self-hashed checksum index before
   deploy-side promotion consumes them.
+- `.github/workflows/bucephalus-cloud-promote.yml` is the production promotion
+  entrypoint: operators provide an exact release version and choose `preview` or
+  `promote`. It delegates to the reusable GCP deploy backend with the normal
+  service stage and hides Terraform/app-stage knobs from the hot path.
 - The GCP deploy workflow supports a rare substrate-only stage with
   `deploy_control_plane_services=false`, allowing Artifact Registry and other
   durable substrate resources to be created before any real image digests exist.
-  Normal service promotion uses `deployment_stage=services`, consumes only
-  verified `gcp-image-digests.tfvars`, applies the exact generated Terraform
-  plan, runs migrations, promotes the active worker image, and smokes the API in
-  one workflow run. The older `api` and `pool` stage names remain compatibility
+  The reusable normal service stage consumes only verified
+  `gcp-image-digests.tfvars`, applies the exact generated Terraform plan, runs
+  migrations, promotes the active worker image, and smokes the API in one
+  workflow run. The older `api` and `pool` stage names remain compatibility
   aliases rather than required manual hops.
 - `.github/workflows/bucephalus-cloud-candidate.yml` is the fast main-to-dev
   lane: after `Bucephalus Cloud CI` succeeds on `main`, it classifies the
