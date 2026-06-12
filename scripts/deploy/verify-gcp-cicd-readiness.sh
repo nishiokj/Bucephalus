@@ -350,6 +350,33 @@ assert_numeric_variable_or_enabled_secret_version() {
   fi
 }
 
+assert_optional_numeric_variable_or_enabled_secret_version() {
+  local json="$1"
+  local name="$2"
+  local secret_id="$3"
+  local current version
+  current="$(json_variable_value "${json}" "${name}")"
+  if [[ "${current}" =~ ^[1-9][0-9]*$ ]]; then
+    pass "optional GitHub environment variable ${name} pins Secret Manager version ${current}"
+    return
+  fi
+  if [[ -n "${current}" ]]; then
+    missing "optional GitHub environment variable ${name} is numeric when set"
+    return
+  fi
+  version="$(gcloud secrets versions list "${secret_id}" \
+    --project "${PROJECT_ID}" \
+    --filter "state=enabled" \
+    --sort-by "~createTime" \
+    --limit 1 \
+    --format "value(name)" 2>/dev/null || true)"
+  if [[ "${version}" =~ ^[1-9][0-9]*$ ]]; then
+    pass "optional Secret Manager has enabled version for ${secret_id}; ${name} can be auto-resolved"
+  else
+    pass "optional runner admin token secret is absent; API deploy will use worker-token compatibility admin"
+  fi
+}
+
 if [[ -z "${PROJECT_NUMBER}" ]]; then
   PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)' 2>/dev/null || true)"
 fi
@@ -538,6 +565,11 @@ if [[ "${REQUIRE_DEPLOY_SECRETS}" == "true" ]]; then
   else
     missing "GitHub environment secret exists in ${GITHUB_ENVIRONMENT}: BUCEPHALUS_WORKER_SMOKE"
   fi
+  if contains_line "BUCEPHALUS_RUNNER_ADMIN_SMOKE" "${env_secrets}"; then
+    pass "optional GitHub environment secret exists in ${GITHUB_ENVIRONMENT}: BUCEPHALUS_RUNNER_ADMIN_SMOKE"
+  else
+    pass "optional GitHub environment secret absent in ${GITHUB_ENVIRONMENT}: BUCEPHALUS_RUNNER_ADMIN_SMOKE"
+  fi
   if contains_line "BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN" "${env_secrets}"; then
     pass "optional GitHub environment secret exists in ${GITHUB_ENVIRONMENT}: BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN"
   else
@@ -550,6 +582,7 @@ if [[ "${REQUIRE_API_STAGE}" == "true" || "${REQUIRE_POOL_STAGE}" == "true" ]]; 
   assert_numeric_variable_or_enabled_secret_version "${env_variables}" BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION "${name_prefix}-api-database-url"
   assert_numeric_variable_or_enabled_secret_version "${env_variables}" BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION "${name_prefix}-migrator-database-url"
   assert_numeric_variable_or_enabled_secret_version "${env_variables}" BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION "${name_prefix}-worker-token"
+  assert_optional_numeric_variable_or_enabled_secret_version "${env_variables}" BUCEPHALUS_RUNNER_ADMIN_TOKEN_SECRET_VERSION "${name_prefix}-runner-admin-token"
 fi
 
 if [[ "${REQUIRE_POOL_STAGE}" == "true" ]]; then

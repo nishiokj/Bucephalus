@@ -69,6 +69,12 @@ describe("GCE runner provider Modal bridge", () => {
       { workerImageFallback: "us-central1-docker.pkg.dev/project/repo/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } as any,
     )).toBe("us-central1-docker.pkg.dev/project/repo/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
   });
+
+  test("passes the exact worker image ref into worker metadata env", () => {
+    const script = renderStartupScript(startupConfig());
+
+    expect(script).toContain("BUCEPHALUS_WORKER_IMAGE_REF=${WORKER_IMAGE}");
+  });
   
   test("uses configured worker image only as a compatibility fallback", () => {
     expect(workerImageForRequest(

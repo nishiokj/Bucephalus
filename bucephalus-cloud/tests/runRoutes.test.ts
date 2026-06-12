@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
 import { handleRunRoute } from "../src/routes/runs";
 import type { AuthContext } from "../src/auth";
+import { HttpError } from "../src/http";
 import type { PackageRepository, RunAttemptRecord, RunRepository } from "../src/packages/repository";
 import type { CloudSecretRepository } from "../src/secrets/repository";
 import type { RuntimeRepository } from "../src/runtime/repository";
@@ -349,6 +350,45 @@ describe("Cloud run routes", () => {
       code: "missing_header",
       message: "package content download requires x-bucephalus-attempt-id",
     });
+    expect(packageLookups).toBe(0);
+  });
+
+  test("package content download rejects attempt tokens not bound to the requested package before artifact lookup", async () => {
+    const requestedDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let packageLookups = 0;
+    const observed: { packageDigest: string | null | undefined } = { packageDigest: undefined };
+    const packages = {
+      async getArtifact() {
+        packageLookups += 1;
+        return null;
+      },
+    };
+    const runs = {
+      async verifyAttemptToken(input: { packageDigest?: string | null }) {
+        observed.packageDigest = input.packageDigest;
+        throw new HttpError(401, "unauthorized", "worker attempt requires a valid attempt token");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request(`https://cloud.example/v1/packages/${requestedDigest}/content`, {
+        headers: {
+          authorization: "Bearer attempt-token-for-another-run",
+          "x-bucephalus-attempt-id": "attempt-1",
+        },
+      }),
+      new URL(`https://cloud.example/v1/packages/${requestedDigest}/content`),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    )).rejects.toMatchObject({
+      status: 401,
+      code: "unauthorized",
+      message: "worker attempt requires a valid attempt token",
+    });
+    expect(observed.packageDigest).toBe(requestedDigest);
     expect(packageLookups).toBe(0);
   });
 

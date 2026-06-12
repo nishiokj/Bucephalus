@@ -45,42 +45,40 @@ deployment path.
    pool-controller, migrations, and worker images.
 5. Verify pushed image promotion evidence and update Terraform image inputs
    only from the generated `gcp-image-digests.tfvars`.
-6. Render API-phase deploy tfvars from non-secret operator inputs, including the
-   Google OAuth user client ID and explicit API/migrator/worker secret versions,
-   with `deploy_api_services=true` and `deploy_pool_controller=false`.
-7. Run Terraform plan against the remote GCS backend with API-phase deploy
-   tfvars and generated image digest tfvars.
-8. Apply the migration Cloud Run Job revision for the selected migration image.
-9. Run the migration Cloud Run Job using the migrator identity.
-10. Apply Terraform to create the API Cloud Run service revision for the
-   selected API image digest.
-11. Create or confirm the API-owned runner pool record through the API and feed
-   its ID into the pool-controller deploy input.
-12. Render pool-phase deploy tfvars with `deploy_api_services=true`,
-   `deploy_pool_controller=true`, the API-created runner pool ID, and explicit
-   pool-controller provider command secret versions.
-13. Confirm the pool-controller provider command secrets point at the image-owned
+6. Create or confirm the API-owned runner pool record and feed its ID into the
+   services deploy input before enabling the pool-controller service.
+7. Render services deploy tfvars from non-secret operator inputs, including the
+   Google OAuth user client ID, explicit API/migrator/worker secret versions, the
+   API-created runner pool ID, and explicit pool-controller provider command
+   secret versions, with `deploy_api_services=true` and
+   `deploy_pool_controller=true`.
+8. Confirm the pool-controller provider command secrets point at the image-owned
    GCE provider scripts and that the pool controller has the declared GCE runner
    service account/IAM grants.
-14. Apply Terraform to create the pool-controller Cloud Run service revision for
-   the selected pool-controller image digest. The API remains declared in the
-   same graph and must not be destroyed during this phase.
-15. Smoke the API through the approved ingress path:
+9. Run Terraform plan against the remote GCS backend with services deploy tfvars
+   and generated image digest tfvars.
+10. Apply the exact Terraform plan generated in the same workflow run, creating
+   or updating the migration job, API service, pool-controller service, and
+   worker-image-promotion job.
+11. Run the migration Cloud Run Job using the migrator identity.
+12. Promote the active worker image through the worker-image-promotion job.
+13. Smoke the API through the approved ingress path:
    - `/readyz`
    - an authenticated user API request
    - an authenticated worker API request
-16. Observe logs, metrics, Cloud Run revision health, Cloud SQL connectivity, and
+14. Observe logs, metrics, Cloud Run revision health, Cloud SQL connectivity, and
    pool controller reconciliation errors.
-17. Record the promoted digests, migration result, smoke result, Terraform output
+15. Record the promoted digests, migration result, smoke result, Terraform output
    snapshot, and operator identity.
 
 The active GitHub Actions path is `.github/workflows/bucephalus-gcp-deploy.yml`.
 It consumes the `cloud-image-promotion-evidence-<target>` artifact from a
 release workflow run rather than accepting handwritten image digest inputs. Use
-`deployment_stage=api` before the runner pool exists, then
-`deployment_stage=pool` after the API-created pool ID exists. Leave `apply=false`
-for plan-only review, or set `apply=true` to apply the generated plan from the
-same workflow run.
+`deployment_stage=services` for normal app promotion after the API-created pool
+ID exists. `deployment_stage=api` and `deployment_stage=pool` remain accepted
+compatibility aliases for older runbooks. Leave `apply=false` for plan-only
+review, or set `apply=true` to apply the generated plan from the same workflow
+run.
 
 The active cleanup path is `.github/workflows/bucephalus-gcp-cleanup.yml`.
 `cleanup_target=pool-controller` removes only the pool-controller service.

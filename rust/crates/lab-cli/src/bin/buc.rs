@@ -921,14 +921,11 @@ fn draft_validate(context: CliContext) -> Result<()> {
         &["--file", "--validation-level"],
         &["--json"],
     )?;
+    let validation_level = validation_level_option(&context.args)?;
     let draft = draft_from_args(&context.args)?;
     let mut body = Map::new();
     body.insert("draft".to_string(), draft);
-    insert_option_string(
-        &mut body,
-        "validation_level",
-        option_value(&context.args, "--validation-level")?,
-    );
+    insert_option_string(&mut body, "validation_level", validation_level);
     ensure_api_configured(&context)?;
     let response = cloud_fetch(
         &context,
@@ -3108,6 +3105,18 @@ fn option_value(args: &[String], name: &str) -> Result<Option<String>> {
         Ok(Some(value.clone()))
     } else {
         Ok(None)
+    }
+}
+
+fn validation_level_option(args: &[String]) -> Result<Option<String>> {
+    let Some(value) = option_value(args, "--validation-level")? else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        "authoring" | "package" | "launch_hint" => Ok(Some(value)),
+        _ => bail!(
+            "--validation-level must be one of authoring, package, launch_hint"
+        ),
     }
 }
 
@@ -6086,6 +6095,19 @@ mod tests {
         .to_string();
         assert!(validate_err.contains("--validation-level requires a value"));
         assert!(!validate_err.contains("failed to read"));
+
+        let invalid_validation_level_err = run(vec![
+            "author".to_string(),
+            "validate".to_string(),
+            "missing-draft.yaml".to_string(),
+            "--validation-level".to_string(),
+            "runtime".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(invalid_validation_level_err
+            .contains("--validation-level must be one of authoring, package, launch_hint"));
+        assert!(!invalid_validation_level_err.contains("failed to read"));
 
         let diff_err = run(vec![
             "author".to_string(),

@@ -43,6 +43,7 @@ locals {
     api_database_url                    = "${local.name_prefix}-api-database-url"
     migrator_database_url               = "${local.name_prefix}-migrator-database-url"
     worker_token                        = "${local.name_prefix}-worker-token"
+    runner_admin_token                  = "${local.name_prefix}-runner-admin-token"
     r2_access_key_id                    = "${local.name_prefix}-r2-access-key-id"
     r2_secret_access_key                = "${local.name_prefix}-r2-secret-access-key"
     modal_token_id                      = "${local.name_prefix}-modal-token-id"
@@ -61,6 +62,10 @@ locals {
     }
     worker_token_api = {
       secret_key = "worker_token"
+      member     = "serviceAccount:${google_service_account.api.email}"
+    }
+    runner_admin_token_api = {
+      secret_key = "runner_admin_token"
       member     = "serviceAccount:${google_service_account.api.email}"
     }
     r2_access_key_id_api = {
@@ -134,6 +139,7 @@ resource "terraform_data" "deploy_input_preflight" {
     api_database_secret      = var.api_database_url_secret_version
     migrator_database_secret = var.migrator_database_url_secret_version
     worker_token_secret      = var.worker_token_secret_version
+    runner_admin_secret      = var.runner_admin_token_secret_version
     object_storage_backend   = var.cloud_object_storage_backend
     gcs_bucket               = var.cloud_gcs_bucket
     gcs_prefix               = var.cloud_gcs_prefix
@@ -747,6 +753,19 @@ resource "google_cloud_run_v2_service" "api" {
           secret_key_ref {
             secret  = google_secret_manager_secret.control_plane["worker_token"].secret_id
             version = var.worker_token_secret_version
+          }
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.runner_admin_token_secret_version == null ? [] : [var.runner_admin_token_secret_version]
+        content {
+          name = "BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.control_plane["runner_admin_token"].secret_id
+              version = env.value
+            }
           }
         }
       }

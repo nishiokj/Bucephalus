@@ -13,6 +13,81 @@ import type { CloudSecretRepository } from "../src/secrets/repository";
 import { canonicalJsonStringify, sha256Digest } from "../src/primitives";
 
 describe("Hosted experiment routes", () => {
+  test("hosted authoring build looks up source uploads under the authenticated owner before building", async () => {
+    const observed: { uploadId?: string; ownerKey: string | null | undefined } = { ownerKey: undefined };
+    const imports = {
+      async getUpload(uploadId: string, ownerKey?: string | null) {
+        observed.uploadId = uploadId;
+        observed.ownerKey = ownerKey;
+        return null;
+      },
+    };
+
+    await expect(handleExperimentRoute(
+      new Request("https://cloud.example/v1/experiments/builds", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          input_kind: "authoring_context",
+          upload_id: "source-upload",
+          entrypoint: "experiment.yaml",
+        }),
+      }),
+      new URL("https://cloud.example/v1/experiments/builds"),
+      imports as unknown as ImportRepository,
+      {} as PackageRepository,
+      {} as RunRepository,
+      {} as RunnerRepository,
+      authContext("user-a"),
+      {} as CloudSecretRepository,
+    )).rejects.toMatchObject({
+      status: 404,
+      code: "upload_not_found",
+      message: "Upload not found",
+    });
+    expect(observed).toEqual({
+      uploadId: "source-upload",
+      ownerKey: "issuer:user-a",
+    });
+  });
+
+  test("sealed package build looks up uploaded packages under the authenticated owner before import", async () => {
+    const observed: { uploadId?: string; ownerKey: string | null | undefined } = { ownerKey: undefined };
+    const imports = {
+      async getUpload(uploadId: string, ownerKey?: string | null) {
+        observed.uploadId = uploadId;
+        observed.ownerKey = ownerKey;
+        return null;
+      },
+    };
+
+    await expect(handleExperimentRoute(
+      new Request("https://cloud.example/v1/experiments/builds", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          input_kind: "sealed_package",
+          upload_id: "package-upload",
+        }),
+      }),
+      new URL("https://cloud.example/v1/experiments/builds"),
+      imports as unknown as ImportRepository,
+      {} as PackageRepository,
+      {} as RunRepository,
+      {} as RunnerRepository,
+      authContext("user-b"),
+      {} as CloudSecretRepository,
+    )).rejects.toMatchObject({
+      status: 404,
+      code: "upload_not_found",
+      message: "Upload not found",
+    });
+    expect(observed).toEqual({
+      uploadId: "package-upload",
+      ownerKey: "issuer:user-b",
+    });
+  });
+
   test("hosted authoring build runs Core, imports the produced package, and reports Cloud readiness", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-authoring-build-"));
     const previousCore = process.env.BUCEPHALUS_CLOUD_CORE_CLI;

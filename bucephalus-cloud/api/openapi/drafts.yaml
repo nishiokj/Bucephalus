@@ -137,10 +137,17 @@ paths:
                 additionalProperties: false
                 required:
                   - valid
+                  - validation_level
                   - issues
                 properties:
                   valid:
                     type: boolean
+                  validation_level:
+                    type: string
+                    enum:
+                      - authoring
+                      - package
+                      - launch_hint
                   issues:
                     type: array
                     items:

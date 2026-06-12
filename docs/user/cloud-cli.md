@@ -68,7 +68,7 @@ Use the top-level workflow commands for day-to-day work:
 buc health
 buc author canonicalize experiment.yaml
 buc author resolve experiment.yaml
-buc author validate experiment.yaml
+buc author validate experiment.yaml --validation-level launch_hint
 buc build <experiment.yaml-or-package> [--context-root DIR]
 buc packages list
 buc inspect <package-digest>
@@ -87,7 +87,7 @@ Long-form noun commands are equivalent:
 ```bash
 buc drafts canonicalize <draft.yaml-or-json>
 buc drafts resolve <draft.yaml-or-json>
-buc drafts validate <draft.yaml-or-json>
+buc drafts validate <draft.yaml-or-json> --validation-level package
 buc drafts suggest <draft.yaml-or-json> --target variant
 buc drafts diff <left-draft.yaml> <right-draft.yaml>
 buc packages list
@@ -115,7 +115,17 @@ buc runs value <run-id> <key>
    buc author canonicalize experiment.yaml
    buc author resolve experiment.yaml
    buc author validate experiment.yaml
+   buc author validate experiment.yaml --validation-level package
+   buc author validate experiment.yaml --validation-level launch_hint
    ```
+
+   `authoring` validation catches draft structure and registry reference issues.
+   `package` adds checks for packaging inputs such as case sources, variant
+   identity, relative build-context paths, and secret mount shape. `launch_hint`
+   adds non-fatal hosted-run guidance, such as required `--secret-ref` values,
+   network capability hints, and local image rewrite warnings. These commands do
+   not upload the authoring context or prove file existence; hosted build is the
+   first step that sees the complete upload boundary.
 
 2. Build for hosted Cloud:
 
@@ -254,7 +264,9 @@ buc doctor <package-digest> --secret-ref GEMINI_API_KEY=gcp-secret-manager://pro
    `__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support` and
    `/bucephalus/in/runtime`.
 4. Create a Cloud upload, upload bytes, and complete the upload.
-5. Call `POST /v1/experiments/builds`.
+5. Call `POST /v1/experiments/builds`. The referenced upload is resolved under
+   the authenticated Cloud owner; knowing another user's upload id is not a
+   build capability.
 6. For authoring contexts, the API runs bundled Core in an isolated workspace
    and imports the produced sealed package through the same sealed-package
    contract checks used for direct package uploads.
@@ -410,3 +422,16 @@ next steps for clients and UI surfaces:
 
 `bucephalus-cloud` is an internal operator utility for service and runner-pool
 administration. Product workflows belong in `buc`.
+
+Runner-pool administration uses `BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN` when it is
+configured. Worker daemons use `BUCEPHALUS_CLOUD_WORKER_TOKEN` for registration,
+heartbeats, queue claims, package downloads, and attempt updates. If no runner
+admin token is configured, the worker token remains the compatibility admin
+credential. Once the admin token is configured, worker-token headers no longer
+authorize runner-pool administration. The HTTP API accepts the admin credential
+as `Authorization: Bearer ...` or `X-Bucephalus-Runner-Admin-Token`; worker
+routes accept bearer or `X-Bucephalus-Worker-Token`.
+
+On GCP deploys, `runner_admin_token_secret_version` injects the admin token into
+the API service only. The pool controller and runner VMs continue to receive the
+worker token but not the runner-admin credential.

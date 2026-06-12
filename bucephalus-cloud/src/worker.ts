@@ -44,6 +44,7 @@ interface WorkerConfig {
   retainAttemptWorkspaces: boolean;
   provisionRequestId: string | null;
   providerInstanceId: string | null;
+  workerImageRef: string | null;
   liveEvidence: boolean;
   evidenceIntervalMs: number;
 }
@@ -1338,6 +1339,7 @@ async function runnerMetadata(config: WorkerConfig): Promise<JsonObject> {
     release: releaseIdentity(),
     ...(config.provisionRequestId ? { provision_request_id: config.provisionRequestId } : {}),
     ...(config.providerInstanceId ? { provider_instance_id: config.providerInstanceId } : {}),
+    ...(config.workerImageRef ? { worker_image_ref: config.workerImageRef } : {}),
     cleanup_policy: {
       mode: "reuse_vm_mandatory_cleanup_poison_on_failure",
       retain_attempt_workspaces: config.retainAttemptWorkspaces,
@@ -1523,6 +1525,7 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
     retainAttemptWorkspaces: booleanEnv(env.BUCEPHALUS_WORKER_RETAIN_ATTEMPT_WORKSPACES, false),
     provisionRequestId: env.BUCEPHALUS_RUNNER_PROVISION_REQUEST_ID?.trim() || null,
     providerInstanceId: env.BUCEPHALUS_RUNNER_PROVIDER_INSTANCE_ID?.trim() || null,
+    workerImageRef: env.BUCEPHALUS_WORKER_IMAGE_REF?.trim() || null,
     liveEvidence: booleanEnv(env.BUCEPHALUS_WORKER_LIVE_EVIDENCE, true),
     evidenceIntervalMs: numberEnv(env.BUCEPHALUS_WORKER_EVIDENCE_INTERVAL_MS, 2000),
   };

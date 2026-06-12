@@ -18,15 +18,17 @@ paths:
       summary: Create a hosted build record from a sealed package or authoring context upload.
       description: >
         For sealed package uploads, imports the completed upload as a package
-        artifact. For authoring context uploads, the referenced upload must be
-        a completed .tgz, .tar.gz, or .tar archive; the API verifies the
-        materialized archive bytes against the completed upload digest and byte
-        size, extracts it in an isolated workspace, runs the bundled Core
+        artifact. The upload_id is resolved only inside the authenticated
+        user's completed uploads; knowing another user's upload id is not a
+        build capability. For authoring context uploads, the referenced upload
+        must be a completed .tgz, .tar.gz, or .tar archive; the API verifies
+        the materialized archive bytes against the completed upload digest and
+        byte size, extracts it in an isolated workspace, runs the bundled Core
         builder with a bounded timeout, imports the produced sealed package,
-        then evaluates the accepted package against the hosted Cloud runtime target. Package
-        import enforces the sealed package
-        metadata contract, package checks report, checksums, CAS blobs, and
-        runtime staging destinations before any build is marked runnable.
+        then evaluates the accepted package against the hosted Cloud runtime
+        target. Package import enforces the sealed package metadata contract,
+        package checks report, checksums, CAS blobs, and runtime staging
+        destinations before any build is marked runnable.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
       requestBody:
@@ -64,6 +66,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HostedExperimentBuild'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
         '409':
           $ref: './common.yaml#/components/responses/Conflict'
   /v1/experiments/doctor:
@@ -101,6 +109,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HostedExperimentDoctor'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
         '400':
           $ref: './common.yaml#/components/responses/BadRequest'
         '409':

@@ -2,10 +2,12 @@ import { HttpError, jsonResponse, optionalString, readJsonObject, requireRecord,
 import {
   canonicalizeDraft,
   diffDraftJson,
+  DRAFT_VALIDATION_LEVELS,
   exportDraftYaml,
   previewSchedule,
   resolveDraftRefs,
   validateDraft,
+  type DraftValidationLevel,
 } from "../drafts/primitives";
 import { ENTITY_KINDS, type EntityKind, type JsonObject, type JsonValue } from "../primitives";
 import { RegistryRepository, type RegistrySearchHit } from "../registry/repository";
@@ -41,13 +43,16 @@ export async function handleDraftRoute(
   }
 
   if (request.method === "POST" && url.pathname === "/v1/drafts/validate") {
-    const draft = await draftFromRequest(request);
+    const body = await readJsonObject(request);
+    const draft = requireRecord(body.draft, "/draft") as JsonObject;
+    const validationLevel = draftValidationLevel(body.validation_level);
     const result = await validateDraft(draft, {
       hasDigest: (kind, digest) => repository.hasDigest(kind, digest),
       resolveAlias: (kind, alias, scope) => repository.resolveAlias(kind, alias, scope),
-    });
+    }, { validationLevel });
     return jsonResponse({
       valid: result.valid,
+      validation_level: result.validationLevel,
       issues: issuesToWire(result.issues),
       resolved_refs: result.resolvedRefs.map(bindingToWire),
     });
@@ -166,6 +171,20 @@ function targetToEntityKind(target: string): EntityKind | null {
     return null;
   }
   throw new HttpError(400, "invalid_request", "/target is not a supported suggestion target");
+}
+
+function draftValidationLevel(value: unknown): DraftValidationLevel {
+  if (value === undefined || value === null) {
+    return "authoring";
+  }
+  if (typeof value === "string" && DRAFT_VALIDATION_LEVELS.includes(value as DraftValidationLevel)) {
+    return value as DraftValidationLevel;
+  }
+  throw new HttpError(
+    400,
+    "invalid_validation_level",
+    "/validation_level must be one of authoring, package, launch_hint",
+  );
 }
 
 async function resolveDraftSide(

@@ -34,6 +34,7 @@ oauth_jwks_url       = "https://www.googleapis.com/oauth2/v3/certs"
 # api_database_url_secret_version = "1"
 # migrator_database_url_secret_version = "1"
 # worker_token_secret_version = "1"
+# runner_admin_token_secret_version = "1"
 #
 # The values below are required only when deploy_pool_controller=true.
 #

@@ -685,6 +685,10 @@ paths:
     post:
       operationId: createRunnerPool
       summary: Create a runner pool.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       requestBody:
         required: true
         content:
@@ -698,9 +702,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerPool'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
     get:
       operationId: listRunnerPools
       summary: List runner pools.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       responses:
         '200':
           description: Runner pools.
@@ -716,10 +726,16 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RunnerPool'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-pools/{runner_pool_id}:
     get:
       operationId: getRunnerPool
       summary: Fetch a runner pool.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerPoolId'
       responses:
@@ -729,10 +745,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerPool'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-pools/{runner_pool_id}/drain:
     post:
       operationId: drainRunnerPool
       summary: Mark a runner pool draining.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerPoolId'
       responses:
@@ -742,10 +764,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerPool'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-pools/{runner_pool_id}/disable:
     post:
       operationId: disableRunnerPool
       summary: Disable an internal runner pool.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerPoolId'
       responses:
@@ -755,10 +783,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerPool'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/register:
     post:
       operationId: registerRunnerInstance
       summary: Register a runner VM daemon instance.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
+      description: Requires the Cloud worker service token, either as a bearer token or X-Bucephalus-Worker-Token.
       requestBody:
         required: true
         content:
@@ -772,10 +806,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances:
     get:
       operationId: listRunnerInstances
       summary: List runner VM daemon instances.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - name: runner_pool_id
           in: query
@@ -799,10 +839,16 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/expire-stale:
     post:
       operationId: expireStaleRunnerInstances
       summary: Mark stale runner instances offline.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       requestBody:
         required: false
         content:
@@ -833,10 +879,16 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-provision-requests:
     get:
       operationId: listRunnerProvisionRequests
       summary: List runner VM provision requests.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - name: runner_pool_id
           in: query
@@ -860,10 +912,16 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/RunnerProvisionRequest'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/{runner_instance_id}/heartbeat:
     post:
       operationId: heartbeatRunnerInstance
       summary: Heartbeat a runner VM daemon instance.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
+      description: Requires the Cloud worker service token, either as a bearer token or X-Bucephalus-Worker-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerInstanceId'
       requestBody:
@@ -885,10 +943,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/{runner_instance_id}/drain:
     post:
       operationId: drainRunnerInstance
       summary: Mark a runner instance draining.
+      security:
+        - runnerAdminBearerAuth: []
+        - runnerAdminTokenHeader: []
+      description: Requires the runner admin token, either as a bearer token or X-Bucephalus-Runner-Admin-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerInstanceId'
       responses:
@@ -898,10 +962,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/{runner_instance_id}/unhealthy:
     post:
       operationId: markRunnerInstanceUnhealthy
       summary: Mark a runner instance unhealthy after a host or cleanup failure.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
+      description: Requires the Cloud worker service token, either as a bearer token or X-Bucephalus-Worker-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerInstanceId'
       requestBody:
@@ -917,10 +987,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-instances/{runner_instance_id}/offline:
     post:
       operationId: markRunnerInstanceOffline
       summary: Mark a runner instance offline after daemon shutdown.
+      security:
+        - workerBearerAuth: []
+        - workerTokenHeader: []
+      description: Requires the Cloud worker service token, either as a bearer token or X-Bucephalus-Worker-Token.
       parameters:
         - $ref: '#/components/parameters/RunnerInstanceId'
       requestBody:
@@ -936,6 +1012,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
 components:
   securitySchemes:
     bearerAuth:
@@ -946,6 +1024,10 @@ components:
       $ref: './common.yaml#/components/securitySchemes/workerBearerAuth'
     workerTokenHeader:
       $ref: './common.yaml#/components/securitySchemes/workerTokenHeader'
+    runnerAdminBearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/runnerAdminBearerAuth'
+    runnerAdminTokenHeader:
+      $ref: './common.yaml#/components/securitySchemes/runnerAdminTokenHeader'
   parameters:
     AttemptId:
       name: attempt_id

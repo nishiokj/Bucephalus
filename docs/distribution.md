@@ -530,10 +530,10 @@ apply=true
 That mode writes `deploy_control_plane_services = false`, applies the durable
 substrate through a remote GCS backend, and creates prerequisites such as
 Artifact Registry without accepting placeholder image digests. After the release
-workflow pushes real images and uploads promotion evidence, run the deploy
-workflow with `deployment_stage=api`, then later `deployment_stage=pool` after
-the API-created runner pool ID is configured. The workflow resolves the version
-to the pushed-image handoff, downloads it, verifies
+or candidate workflow pushes real images and uploads promotion evidence, run the
+deploy workflow with `deployment_stage=services` for the normal app promotion.
+The workflow resolves the version to the pushed-image handoff, or receives exact
+same-run candidate evidence from automation, downloads it, verifies
 `cloud-image-promotion-evidence.json`, writes non-secret deploy tfvars with
 `scripts/deploy/write-gcp-deploy-tfvars.sh`, and runs Terraform with a remote
 GCS backend.

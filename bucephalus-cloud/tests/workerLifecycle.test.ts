@@ -214,10 +214,12 @@ describe("worker lifecycle cleanup helpers", () => {
       BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
       BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
       BUCEPHALUS_WORKER_MIN_FREE_BYTES: "1",
+      BUCEPHALUS_WORKER_IMAGE_REF: "us-central1-docker.pkg.dev/project/repo/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     });
 
     expect(config.apiUrl).toBe("https://cloud.example");
     expect(config.runnerPoolId).toBe("pool-1");
+    expect(config.workerImageRef).toBe("us-central1-docker.pkg.dev/project/repo/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     expect(config.capabilities.resources).not.toContain("network_perimeter");
   });
 
@@ -367,6 +369,7 @@ describe("worker lifecycle cleanup helpers", () => {
           retainAttemptWorkspaces: false,
           provisionRequestId: null,
           providerInstanceId: null,
+          workerImageRef: null,
           liveEvidence: true,
           evidenceIntervalMs: 2000,
         },

@@ -137,6 +137,104 @@ describe("draft routes", () => {
     }));
   });
 
+  test("validate applies requested package-level checks", async () => {
+    const draft = {
+      ...minimalDraft(),
+      matrix: {
+        ...minimalDraft().matrix,
+        cases: {},
+      },
+    };
+
+    const response = await handleDraftRoute(
+      new Request("https://cloud.example/v1/drafts/validate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          draft,
+          validation_level: "package",
+        }),
+      }),
+      new URL("https://cloud.example/v1/drafts/validate"),
+      {} as unknown as RegistryRepository,
+    );
+
+    expect(response).not.toBeNull();
+    expect(response!.status).toBe(200);
+    const body = await response!.json();
+    expect(body.validation_level).toBe("package");
+    expect(body.valid).toBe(false);
+    expect(body.issues).toContainEqual(expect.objectContaining({
+      severity: "error",
+      code: "missing_cases_source",
+      pointer: "/matrix/cases",
+    }));
+  });
+
+  test("validate launch hints surface cloud runtime dependencies without failing warnings", async () => {
+    const draft = {
+      ...minimalDraft(),
+      runtime: {
+        compute: {
+          backend: "modal",
+        },
+        secrets: [{
+          name: "GEMINI_API_KEY",
+          mount: {
+            target: "/run/secrets/gemini_api_key",
+          },
+        }],
+        network: {
+          egress: ["generativelanguage.googleapis.com"],
+        },
+      },
+    };
+
+    const response = await handleDraftRoute(
+      new Request("https://cloud.example/v1/drafts/validate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          draft,
+          validation_level: "launch_hint",
+        }),
+      }),
+      new URL("https://cloud.example/v1/drafts/validate"),
+      {} as unknown as RegistryRepository,
+    );
+
+    expect(response).not.toBeNull();
+    expect(response!.status).toBe(200);
+    const body = await response!.json();
+    expect(body.validation_level).toBe("launch_hint");
+    expect(body.valid).toBe(true);
+    expect(body.issues).toContainEqual(expect.objectContaining({
+      severity: "info",
+      code: "cloud_secret_ref_required",
+      pointer: "/runtime/secrets/0",
+    }));
+    expect(body.issues).toContainEqual(expect.objectContaining({
+      severity: "info",
+      code: "cloud_network_requirements",
+      pointer: "/runtime/network",
+    }));
+  });
+
+  test("validate rejects unknown validation levels instead of silently downgrading", async () => {
+    await expect(handleDraftRoute(
+      new Request("https://cloud.example/v1/drafts/validate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          draft: minimalDraft(),
+          validation_level: "runtime",
+        }),
+      }),
+      new URL("https://cloud.example/v1/drafts/validate"),
+      {} as unknown as RegistryRepository,
+    )).rejects.toThrow("/validation_level must be one of authoring, package, launch_hint");
+  });
+
   test("diff compares draft sides with JSON pointer changes", async () => {
     const repository = {
       async getContentObject() {

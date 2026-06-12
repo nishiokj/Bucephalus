@@ -356,19 +356,33 @@ export class RunRepository {
   }): Promise<{ run: CloudRunRecord; attempt: RunAttemptRecord } | null> {
     return await this.sql.begin(async (tx) => {
       const instances = await tx`
-        select instance.*, pool.status as runner_pool_status
+        select instance.*,
+               pool.status as runner_pool_status,
+               pool.active_worker_image_id,
+               image.image_ref as active_worker_image_ref
         from cloud.runner_instances instance
         join cloud.runner_pools pool using (runner_pool_id)
+        join cloud.runner_worker_images image
+          on image.runner_worker_image_id = pool.active_worker_image_id
         where instance.runner_instance_id = ${input.runnerInstanceId}
           and instance.status = 'online'
           and pool.status = 'active'
+          and pool.active_worker_image_id is not null
+          and (
+            instance.metadata->>'worker_image_ref' is null
+            or image.image_ref = instance.metadata->>'worker_image_ref'
+          )
           and instance.last_heartbeat_at >= now() - (${Math.max(input.leaseSeconds * 2, 30).toString()} || ' seconds')::interval
         for update
         limit 1
       `;
       const instance = instances[0] as { capabilities?: WorkerCapabilities } | undefined;
       if (!instance) {
-        throw new HttpError(404, "runner_instance_not_claimable", "Runner instance is not online in an active pool");
+        throw new HttpError(
+          404,
+          "runner_instance_not_claimable",
+          "Runner instance is not online in an active pool with the current promoted worker image",
+        );
       }
       const capabilities = normalizeCapabilities(instance.capabilities);
       const capabilityIsolation = capabilities.isolation ?? [];

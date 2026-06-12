@@ -209,14 +209,20 @@ user-secret policy.
   manifest, image-build provenance, generated tfvars, and
   `cloud-image-promotion-evidence.json` self-hashed checksum index before
   deploy-side promotion consumes them.
-- The GCP deploy workflow supports a substrate-only stage with
+- The GCP deploy workflow supports a rare substrate-only stage with
   `deploy_control_plane_services=false`, allowing Artifact Registry and other
   durable substrate resources to be created before any real image digests exist.
-  Full service promotion later sets `deploy_control_plane_services=true` and
-  consumes only verified `gcp-image-digests.tfvars`. Plan actions run Terraform
-  plan, while digest apply promotions skip the unused pre-plan and go straight
-  to the migration-target apply or selected service apply that will change
-  state.
+  Normal service promotion uses `deployment_stage=services`, consumes only
+  verified `gcp-image-digests.tfvars`, applies the exact generated Terraform
+  plan, runs migrations, promotes the active worker image, and smokes the API in
+  one workflow run. The older `api` and `pool` stage names remain compatibility
+  aliases rather than required manual hops.
+- `.github/workflows/bucephalus-cloud-candidate.yml` is the fast main-to-dev
+  lane: after `Bucephalus Cloud CI` succeeds on `main`, it builds the deployable
+  Linux x86_64 Cloud bundle/images, uploads verified promotion evidence named
+  by version plus git SHA, and calls the GCP deploy workflow for
+  `bucephalus-dev`. Full public GitHub Release asset publication remains in
+  `.github/workflows/bucephalus-release.yml`.
 - `scripts/deploy/bootstrap-gcp-github-oidc.sh` is the audited one-time
   bootstrap for release/deploy Workload Identity: it is dry-run by default and
   can enable prerequisite APIs, create the Terraform state bucket, create
@@ -276,8 +282,11 @@ contract before Path 2 can be proven end to end:
   remote GCS backend, runs the migration job, and smokes user plus worker auth.
   Needed input: deploy Workload Identity
   provider/service account, Terraform backend bucket/prefix, API-created runner
-  pool ID, numeric Secret Manager versions, smoke identity tokens, and approval
-  to apply `deployment_stage=substrate`, then `api`, then `pool`.
+  pool ID, numeric Secret Manager versions, optional runner-admin Secret Manager
+  version and smoke identity if runner-pool administration is split from worker
+  auth, smoke identity tokens, and approval to apply
+  `deployment_stage=substrate` once and `deployment_stage=services` for normal
+  app promotions.
 - Service teardown now uses `.github/workflows/bucephalus-gcp-cleanup.yml` with
   explicit cleanup targets, keeping routine cleanup separate from forward deploy
   stages and preserving durable substrate resources by default.
