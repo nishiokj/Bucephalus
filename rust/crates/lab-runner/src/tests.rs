@@ -2484,7 +2484,8 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("does not yet support trial_runtime sidecars"),
+            err.to_string()
+                .contains("supports trial_runtime sidecars only with placement=same_sandbox"),
             "unexpected error: {err}"
         );
         assert!(

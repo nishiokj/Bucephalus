@@ -727,6 +727,82 @@ func runShellChecked(ctx context.Context, sandbox *modal.Sandbox, label, script,
 	return nil
 }
 
+func runCommandChecked(ctx context.Context, sandbox *modal.Sandbox, label string, command []string, env map[string]string, workdir string, timeoutSeconds int) error {
+	process, err := sandbox.Exec(ctx, command, &modal.SandboxExecParams{
+		Env:     env,
+		Workdir: workdir,
+		Timeout: time.Duration(timeoutSeconds) * time.Second,
+	})
+	if err != nil {
+		return err
+	}
+	exitCode, stdout, stderr, err := waitAndRead(ctx, process)
+	if err != nil {
+		return err
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("modal sandbox command %q failed with exit %d\nstdout:\n%s\nstderr:\n%s", label, exitCode, stdout, stderr)
+	}
+	return nil
+}
+
+func startSameSandboxEphemeral(ctx context.Context, sandbox *modal.Sandbox, ephemeral map[string]any) error {
+	id := stringValue(ephemeral, "id")
+	command := stringList(ephemeral["command"])
+	if id == "" {
+		return errors.New("modal ephemeral missing id")
+	}
+	if len(command) == 0 {
+		return fmt.Errorf("modal ephemeral %q missing command", id)
+	}
+	stdoutPath := stringValue(jsonObject(ephemeral["stdout"]), "remote_path")
+	stderrPath := stringValue(jsonObject(ephemeral["stderr"]), "remote_path")
+	pidPath := "/bucephalus/state/ephemerals/" + id + ".pid"
+	script := "set -e\n" +
+		"workdir=$1\nstdout_path=$2\nstderr_path=$3\npid_path=$4\nshift 4\n" +
+		"mkdir -p \"$(dirname \"$stdout_path\")\" \"$(dirname \"$stderr_path\")\" \"$(dirname \"$pid_path\")\"\n" +
+		"if [ -n \"$workdir\" ]; then cd \"$workdir\"; fi\n" +
+		"(\"$@\" >\"$stdout_path\" 2>\"$stderr_path\" </dev/null & echo $! >\"$pid_path\")"
+	startCommand := append([]string{"/bin/sh", "-lc", script, "bucephalus-ephemeral-" + id, stringValue(ephemeral, "workdir"), stdoutPath, stderrPath, pidPath}, command...)
+	if err := runCommandChecked(ctx, sandbox, "start_ephemeral_"+id, startCommand, stringMap(ephemeral["env"]), "", 30); err != nil {
+		return err
+	}
+	readiness := jsonObject(ephemeral["readiness"])
+	if len(readiness) == 0 {
+		return nil
+	}
+	return runCommandChecked(
+		ctx,
+		sandbox,
+		"readiness_ephemeral_"+id,
+		stringList(readiness["command"]),
+		stringMap(ephemeral["env"]),
+		stringValue(ephemeral, "workdir"),
+		intValue(readiness, "timeout_seconds", 30),
+	)
+}
+
+func startSameSandboxEphemerals(ctx context.Context, sandbox *modal.Sandbox, spec map[string]any) error {
+	for _, ephemeral := range jsonObjects(spec["ephemerals"]) {
+		if stringValue(ephemeral, "placement") != "same_sandbox" {
+			return fmt.Errorf("modal launcher supports only same_sandbox ephemerals, got %q for %q", stringValue(ephemeral, "placement"), stringValue(ephemeral, "id"))
+		}
+		if err := startSameSandboxEphemeral(ctx, sandbox, ephemeral); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyEphemeralLogsToLocal(ctx context.Context, fsys *modal.SandboxFilesystem, spec map[string]any) {
+	for _, ephemeral := range jsonObjects(spec["ephemerals"]) {
+		for _, stream := range []string{"stdout", "stderr"} {
+			output := jsonObject(ephemeral[stream])
+			copyOptionalToLocal(ctx, fsys, stringValue(output, "remote_path"), stringValue(output, "local_path"))
+		}
+	}
+}
+
 func ensureInlineCaptureSize(label, remotePath string, data []byte, maxInlineCaptureBytes *int) error {
 	if maxInlineCaptureBytes != nil && len(data) > *maxInlineCaptureBytes {
 		return fmt.Errorf("%s capture at %s is too large to inline: bytes=%d max=%d", label, remotePath, len(data), *maxInlineCaptureBytes)
@@ -1209,7 +1285,8 @@ func runLaunch(specPath string) error {
 		writeRuntimeWorker(specPath, "task", sandbox)
 		fsys := sandbox.Filesystem()
 		grader := jsonObject(spec["grader"])
-		bootstrapRuntimeTransfer := len(grader) == 0
+		ephemerals := jsonObjects(spec["ephemerals"])
+		bootstrapRuntimeTransfer := len(grader) == 0 && len(ephemerals) == 0
 		if !bootstrapRuntimeTransfer {
 			if err := runShellChecked(ctx, sandbox, "runtime_transfer_extract", "tar -xzf "+runtimeTransferArchivePath+" -C /", "", intValue(spec, "sandbox_timeout_seconds", 3600)); err != nil {
 				return err
@@ -1217,6 +1294,9 @@ func runLaunch(specPath string) error {
 			if err := prepareModalGrader(ctx, sandbox, grader); err != nil {
 				return err
 			}
+		}
+		if err := startSameSandboxEphemerals(ctx, sandbox, spec); err != nil {
+			return err
 		}
 		for index, execSpec := range jsonObjects(spec["execs"]) {
 			record, err := runProcess(ctx, sandbox, execSpec, result, "", bootstrapRuntimeTransfer && index == 0)
@@ -1302,6 +1382,7 @@ func runLaunch(specPath string) error {
 		fsys := sandbox.Filesystem()
 		copyOptionalToLocal(ctx, fsys, stringValue(jsonObject(spec["result"]), "remote_path"), stringValue(jsonObject(spec["result"]), "local_path"))
 		copyOptionalToLocal(ctx, fsys, stringValue(jsonObject(spec["events"]), "scratch_path"), stringValue(jsonObject(spec["events"]), "local_path"))
+		copyEphemeralLogsToLocal(ctx, fsys, spec)
 		transportFS := fsys
 		if graderSandbox != nil {
 			transportFS = graderSandbox.Filesystem()

@@ -255,6 +255,14 @@ pub(crate) fn reject_legacy_authoring_surface(json_value: &Value) -> Result<()> 
         ("/sidecars", "/ephemerals"),
         ("/matrix/tasks", "/matrix/cases"),
         ("/runtime/externals", "/externals"),
+        (
+            "/runtime/storage",
+            "nothing; storage is runner-owned today and local-fs is the default runtime behavior",
+        ),
+        (
+            "/runtime/traces",
+            "nothing; trace sinks are runner-owned today, and command traces should be declared with /traces when needed",
+        ),
         ("/variant_plan", "/matrix/variants"),
         (
             "/overrides",
@@ -474,9 +482,7 @@ fn reject_scheduling_comparison_authoring_overlap(json_value: &Value) -> Result<
         return Ok(());
     };
     if comparison != "paired" {
-        return Err(anyhow!(
-            "/scheduling/comparison only supports paired; omit it for default scheduling or declare /policy/policies/scheduling directly"
-        ));
+        return Err(unsupported_scheduling_comparison_error(comparison));
     }
     if json_value.pointer("/policy/policies/scheduling").is_some() {
         return Err(anyhow!(
@@ -484,6 +490,12 @@ fn reject_scheduling_comparison_authoring_overlap(json_value: &Value) -> Result<
         ));
     }
     Ok(())
+}
+
+fn unsupported_scheduling_comparison_error(value: &str) -> anyhow::Error {
+    anyhow!(
+        "unsupported scheduling.comparison '{value}'; this authoring shorthand only accepts 'paired'. For the default run order, remove scheduling.comparison. For an explicit run order, set policy.policies.scheduling to one of: variant_sequential, paired_interleaved, randomized."
+    )
 }
 
 fn reject_empty_grader_authoring(json_value: &Value) -> Result<()> {
@@ -820,9 +832,7 @@ fn lower_scheduling_comparison_into_policy(json_value: &mut Value) -> Result<()>
         return Ok(());
     };
     if comparison != "paired" {
-        return Err(anyhow!(
-            "/scheduling/comparison only supports paired; omit it for default scheduling or declare /policy/policies/scheduling directly"
-        ));
+        return Err(unsupported_scheduling_comparison_error(&comparison));
     }
     if json_value.pointer("/policy/policies/scheduling").is_some() {
         return Err(anyhow!(
@@ -3344,10 +3354,54 @@ mod tests {
         let msg = err.to_string();
 
         assert!(
-            msg.contains("/scheduling/comparison only supports paired")
-                && msg.contains("/policy/policies/scheduling"),
+            msg.contains("unsupported scheduling.comparison 'none'")
+                && msg.contains("remove scheduling.comparison")
+                && msg.contains("policy.policies.scheduling")
+                && msg.contains("variant_sequential")
+                && msg.contains("paired_interleaved")
+                && msg.contains("randomized"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn rejects_noop_runtime_backend_fields_before_schema_validation() {
+        for (field, expected) in [
+            (
+                "storage",
+                "storage is runner-owned today and local-fs is the default runtime behavior",
+            ),
+            (
+                "traces",
+                "trace sinks are runner-owned today, and command traces should be declared with /traces when needed",
+            ),
+        ] {
+            let mut value = json!({
+                "experiment": { "id": "default_eval" },
+                "runtime": {
+                    "compute": { "backend": "local-docker" }
+                },
+                "matrix": {
+                    "cases": { "path": "cases.jsonl" },
+                    "variants": [{ "id": "base", "baseline": true }]
+                },
+                "stages": {
+                    "case": {},
+                    "agent": { "command": ["agent"] }
+                }
+            });
+            value["runtime"][field] = json!({ "backend": "local-fs" });
+
+            let err = reject_legacy_authoring_surface(&value)
+                .expect_err("retired runtime backend fields should fail pre-schema");
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("/runtime/{field}")));
+            assert!(msg.contains(expected), "unexpected error: {msg}");
+            assert!(
+                !msg.contains("Additional properties"),
+                "pre-schema error should not leak JSON Schema wording: {msg}"
+            );
+        }
     }
 
     #[test]

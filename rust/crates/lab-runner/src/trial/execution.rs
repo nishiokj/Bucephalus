@@ -54,7 +54,8 @@ use crate::trial::layout::{
 };
 use crate::trial::prepare::TrialPaths;
 use crate::trial::sidecar::{
-    sidecar_env_for_stage, sidecar_plans_for_stage, trial_sidecar_plans, RuntimeSidecarPlan,
+    sidecar_env_for_stage, sidecar_plans_for_stage, sidecar_stage_ids, trial_sidecar_plans,
+    RuntimeSidecarPlan,
 };
 use crate::trial::spec::TaskMaterializationKind;
 use crate::trial::state::{

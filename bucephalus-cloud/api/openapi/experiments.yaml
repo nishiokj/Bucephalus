@@ -1,0 +1,195 @@
+openapi: 3.1.0
+info:
+  title: Bucephalus Hosted Experiments API
+  version: 0.1.0
+  description: >
+    Hosted experiment workflow endpoints. These endpoints are intentionally
+    cloud-owned: they validate package/runability against hosted API state and
+    active runner capacity instead of asking a local CLI to infer cloud truth.
+servers:
+  - url: https://api.bucephalus.dev
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /v1/experiments/builds:
+    post:
+      operationId: createHostedExperimentBuild
+      summary: Create a hosted build record from a completed sealed package upload.
+      description: >
+        Imports a completed upload as a sealed package artifact and records a
+        hosted build identity. This is the hosted workflow noun over the lower
+        level package import primitive; it does not run local Core build logic
+        and does not yet compile authoring YAML in the hosted API.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - upload_id
+              properties:
+                upload_id:
+                  type: string
+                  format: uuid
+                label:
+                  type:
+                    - string
+                    - 'null'
+      responses:
+        '201':
+          description: Hosted build created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HostedExperimentBuild'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+  /v1/experiments/doctor:
+    post:
+      operationId: doctorHostedExperiment
+      summary: Diagnose whether an accepted package can run on hosted Cloud.
+      description: >
+        Checks package acceptance, secret refs, image portability, network
+        requirements, architecture, resources, and active runner pool
+        schedulability without creating a run.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - package_digest
+              properties:
+                package_digest:
+                  $ref: './common.yaml#/components/schemas/Digest'
+                secret_refs:
+                  type: object
+                  additionalProperties:
+                    type: string
+                runtime_options:
+                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+      responses:
+        '200':
+          description: Package is runnable with the supplied hosted inputs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HostedExperimentDoctor'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+components:
+  securitySchemes:
+    bearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/bearerAuth'
+  schemas:
+    HostedExperimentBuild:
+      type: object
+      additionalProperties: false
+      required:
+        - build_id
+        - build_kind
+        - authoring_build
+        - status
+        - import
+      properties:
+        build_id:
+          type: string
+          format: uuid
+        build_kind:
+          type: string
+          enum:
+            - sealed_package_import
+        authoring_build:
+          type: object
+          additionalProperties: false
+          required:
+            - status
+            - message
+          properties:
+            status:
+              type: string
+              enum:
+                - unavailable
+            message:
+              type: string
+        status:
+          type: string
+        label:
+          type:
+            - string
+            - 'null'
+        package_digest:
+          anyOf:
+            - $ref: './common.yaml#/components/schemas/Digest'
+            - type: 'null'
+        import:
+          $ref: './imports.yaml#/components/schemas/ImportJob'
+    HostedExperimentDoctor:
+      type: object
+      additionalProperties: false
+      required:
+        - ok
+        - status
+        - package_digest
+        - package_status
+        - image_refs
+        - secret_requirements
+        - supplied_secret_ids
+        - runtime_options
+        - run_requirements
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+          enum:
+            - runnable
+        package_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        package_status:
+          type: string
+        name:
+          type:
+            - string
+            - 'null'
+        image_refs:
+          type: array
+          items:
+            type: string
+        secret_requirements:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - id
+              - target
+              - required_for_variants
+            properties:
+              id:
+                type: string
+              target:
+                type: string
+              required_for_variants:
+                type: array
+                items:
+                  type: string
+        supplied_secret_ids:
+          type: array
+          items:
+            type: string
+        runtime_options:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        run_requirements:
+          $ref: './runs.yaml#/components/schemas/RunRequirements'

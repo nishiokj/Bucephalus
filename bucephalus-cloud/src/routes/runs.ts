@@ -311,8 +311,44 @@ async function createRun(
   secrets?: CloudSecretRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
-  const packageDigest = requireString(body.package_digest, "/package_digest");
-  const artifact = await packages.getArtifact(packageDigest, ownerKey);
+  const diagnosis = await diagnoseCloudRunRequest({
+    body,
+    packages,
+    runners,
+    ownerKey,
+    secrets,
+    requireHostedSecretRefs: true,
+  });
+
+  const run = await runs.createRun({
+    packageDigest: diagnosis.artifact.package_digest,
+    runLabel: optionalString(body.run_label, "/run_label"),
+    env: requireStringMap(body.env, "/env"),
+    secretRefs: await resolveHostedSecretRefs(diagnosis.secretRefs, secrets, ownerKey),
+    runtimeOptions: diagnosis.runtimeOptions,
+    ownerKey,
+    runRequirements: diagnosis.runRequirements,
+  });
+  return jsonResponse(runToWire(run), { status: 201 });
+}
+
+export interface CloudRunDiagnosis {
+  artifact: PackageArtifactRecord;
+  secretRefs: Record<string, string>;
+  runtimeOptions: JsonObject;
+  runRequirements: RunRequirements;
+}
+
+export async function diagnoseCloudRunRequest(input: {
+  body: Record<string, unknown>;
+  packages: PackageRepository;
+  runners: RunnerRepository;
+  ownerKey?: string | undefined;
+  secrets?: CloudSecretRepository | undefined;
+  requireHostedSecretRefs?: boolean;
+}): Promise<CloudRunDiagnosis> {
+  const packageDigest = requireString(input.body.package_digest, "/package_digest");
+  const artifact = await input.packages.getArtifact(packageDigest, input.ownerKey);
   if (!artifact) {
     throw new HttpError(404, "package_not_found", "Package artifact not found");
   }
@@ -320,29 +356,27 @@ async function createRun(
     throw new HttpError(409, "package_not_runnable", "Package artifact is not accepted");
   }
 
-  const secretRefs = cloudSecretRefs(requireStringMap(body.secret_refs, "/secret_refs"));
-  const runtimeOptions = optionalJsonObject(body.runtime_options as JsonValue | undefined, "/runtime_options");
+  const secretRefs = cloudSecretRefs(requireStringMap(input.body.secret_refs, "/secret_refs"));
+  if (input.requireHostedSecretRefs) {
+    await resolveHostedSecretRefs(secretRefs, input.secrets, input.ownerKey);
+  }
+  const runtimeOptions = optionalJsonObject(input.body.runtime_options as JsonValue | undefined, "/runtime_options");
   validatePackageSecretRefs(artifact, secretRefs);
   const runRequirements = runRequirementsForArtifact(
     artifact,
     runtimeOptions,
     secretRefs,
   );
-  await requireSchedulableRun(runners, runRequirements);
-
-  const run = await runs.createRun({
-    packageDigest,
-    runLabel: optionalString(body.run_label, "/run_label"),
-    env: requireStringMap(body.env, "/env"),
-    secretRefs: await resolveHostedSecretRefs(secretRefs, secrets, ownerKey),
+  await requireSchedulableRun(input.runners, runRequirements);
+  return {
+    artifact,
+    secretRefs,
     runtimeOptions,
-    ownerKey,
     runRequirements,
-  });
-  return jsonResponse(runToWire(run), { status: 201 });
+  };
 }
 
-async function requireSchedulableRun(
+export async function requireSchedulableRun(
   runners: RunnerRepository,
   requirements: RunRequirements,
 ): Promise<void> {
@@ -911,7 +945,7 @@ function validatePackageSecretRefs(
   }
 }
 
-function packageSecretRequirements(artifact: PackageArtifactRecord): CloudSecretRequirement[] {
+export function packageSecretRequirements(artifact: PackageArtifactRecord): CloudSecretRequirement[] {
   const rawSecrets = jsonPointerValue(artifact.resolved_experiment_json, "/runtime/secrets");
   if (!Array.isArray(rawSecrets)) {
     return [];

@@ -1032,9 +1032,39 @@ fn validate_modal_execution_request(
     request: &TrialRunRequest<'_>,
     task_sandbox_plan: &TaskSandboxPlan,
 ) -> Result<()> {
-    if !trial_sidecar_plans(request.runtime_experiment)?.is_empty() {
+    for plan in trial_sidecar_plans(request.runtime_experiment)? {
+        if plan.placement != "same_sandbox" {
+            return Err(anyhow!(
+                "executor modal supports trial_runtime sidecars only with placement=same_sandbox; sidecar '{}' declares placement='{}'",
+                plan.id,
+                plan.placement
+            ));
+        }
+        if plan.lifecycle != "per-trial" {
+            return Err(anyhow!(
+                "executor modal supports only per-trial same_sandbox sidecars; sidecar '{}' declares lifecycle='{}'",
+                plan.id,
+                plan.lifecycle
+            ));
+        }
+        if plan.image != task_sandbox_plan.image {
+            return Err(anyhow!(
+                "executor modal same_sandbox sidecar '{}' must use the task sandbox image '{}', got '{}'",
+                plan.id,
+                task_sandbox_plan.image,
+                plan.image
+            ));
+        }
+        if plan.command.is_empty() {
+            return Err(anyhow!(
+                "executor modal same_sandbox sidecar '{}' requires a command",
+                plan.id
+            ));
+        }
+    }
+    if !sidecar_stage_ids(request.runtime_experiment, "grader")?.is_empty() {
         return Err(anyhow!(
-            "executor modal does not yet support trial_runtime sidecars"
+            "executor modal same_sandbox sidecars are currently supported only for the agent stage"
         ));
     }
     if request
@@ -1379,6 +1409,52 @@ fn modal_secret_env_names(request: &TrialRunRequest<'_>) -> Vec<String> {
     names.into_iter().collect()
 }
 
+fn modal_ephemeral_log_path(trial_dir: &Path, id: &str, stream: &str) -> PathBuf {
+    trial_dir.join("logs").join("ephemerals").join(format!(
+        "{}.{}.log",
+        sanitize_for_fs(id),
+        stream
+    ))
+}
+
+fn modal_same_sandbox_ephemerals_value(
+    request: &TrialRunRequest<'_>,
+    trial_dir: &Path,
+    timeout_secs: u64,
+) -> Result<Value> {
+    let mut items = Vec::new();
+    for plan in sidecar_plans_for_stage(request.runtime_experiment, "agent")? {
+        let readiness = plan.readiness.as_ref().map(|readiness| {
+            json!({
+                "command": readiness.command,
+                "timeout_seconds": readiness
+                    .timeout_ms
+                    .map(|value| value.div_ceil(1000).max(1))
+                    .unwrap_or(30),
+            })
+        });
+        items.push(json!({
+            "id": plan.id,
+            "placement": plan.placement,
+            "stage": "agent",
+            "command": plan.command,
+            "env": plan.env,
+            "workdir": plan.workdir.unwrap_or_else(|| request.task_workdir.to_string()),
+            "timeout_seconds": timeout_secs,
+            "stdout": {
+                "remote_path": format!("/bucephalus/out/ephemerals/{}.stdout.log", sanitize_for_fs(&plan.id)),
+                "local_path": modal_ephemeral_log_path(trial_dir, &plan.id, "stdout"),
+            },
+            "stderr": {
+                "remote_path": format!("/bucephalus/out/ephemerals/{}.stderr.log", sanitize_for_fs(&plan.id)),
+                "local_path": modal_ephemeral_log_path(trial_dir, &plan.id, "stderr"),
+            },
+            "readiness": readiness,
+        }));
+    }
+    Ok(Value::Array(items))
+}
+
 fn build_modal_launch_spec(
     backend: &ModalExecutionBackend,
     sync: &S3CompatibleRuntimeSync,
@@ -1389,6 +1465,7 @@ fn build_modal_launch_spec(
     grading: Option<&ModalGradingLaunchSpec>,
 ) -> Result<ModalLaunchSpec> {
     let mut env = build_exec_env(request, request.task_workdir, None, true);
+    extend_with_sidecar_env(&mut env, request, "agent")?;
     env.insert(
         BUCEPHALUS_ENV_TRIAL_INPUT_PATH.to_string(),
         request.io_paths.trial_input_path.clone(),
@@ -1516,6 +1593,7 @@ fn build_modal_launch_spec(
         .div_ceil(1000)
         .max(1)
         .saturating_add(30);
+    let ephemerals = modal_same_sandbox_ephemerals_value(request, trial_dir, timeout_secs)?;
     Ok(ModalLaunchSpec {
         value: json!({
             "app_name": backend.app_name,
@@ -1546,6 +1624,7 @@ fn build_modal_launch_spec(
                     "local_path": trial_agent_stderr_path(trial_dir),
                 },
             }],
+            "ephemerals": ephemerals,
             "sync": {
                 "type": sync.kind_label(),
                 "bucket": sync.bucket,

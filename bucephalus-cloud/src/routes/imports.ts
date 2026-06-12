@@ -235,6 +235,16 @@ async function importSealedPackage(
   ownerKey?: string,
 ): Promise<Response> {
   const body = await readJsonObject(request);
+  const job = await importSealedPackageUpload(body, imports, packages, ownerKey);
+  return jsonResponse(importJobToWire(job), { status: 201 });
+}
+
+export async function importSealedPackageUpload(
+  body: Record<string, unknown>,
+  imports: ImportRepository,
+  packages: PackageRepository,
+  ownerKey?: string,
+): Promise<ImportJobRecord> {
   const uploadId = requireString(body.upload_id, "/upload_id");
   const upload = await imports.getUpload(uploadId, ownerKey);
   if (!upload) {
@@ -293,7 +303,7 @@ async function importSealedPackage(
   if (!job) {
     throw new HttpError(500, "import_missing_after_create", "Import missing after creation");
   }
-  return jsonResponse(importJobToWire(job), { status: 201 });
+  return job;
 }
 
 function uploadToWire(upload: UploadRecord) {
@@ -312,7 +322,7 @@ function uploadToWire(upload: UploadRecord) {
   };
 }
 
-function importJobToWire(job: ImportJobRecord) {
+export function importJobToWire(job: ImportJobRecord) {
   return {
     import_id: job.import_id,
     upload_id: job.upload_id,

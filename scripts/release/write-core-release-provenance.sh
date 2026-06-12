@@ -112,6 +112,7 @@ const provenance = {
   },
   artifacts: {
     core_binary: manifest.artifacts.core_binary,
+    hosted_cli_binary: manifest.artifacts.hosted_cli_binary,
     modal_launcher_binary: manifest.artifacts.modal_launcher_binary,
   },
   builder: {

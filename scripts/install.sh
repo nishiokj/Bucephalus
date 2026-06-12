@@ -170,6 +170,7 @@ validate_archive_contents() {
   fi
 
   seen_bucephalus=0
+  seen_buc=0
   seen_cloud=0
   seen_modal=0
   seen_readme=0
@@ -191,6 +192,13 @@ validate_archive_contents() {
           exit 1
         fi
         seen_bucephalus=1
+        ;;
+      buc)
+        if [ "$seen_buc" -eq 1 ]; then
+          printf '%s\n' "duplicate release archive entry: $entry" >&2
+          exit 1
+        fi
+        seen_buc=1
         ;;
       bucephalus-cloud)
         if [ "$seen_cloud" -eq 1 ]; then
@@ -245,6 +253,7 @@ EOF
 
   missing=""
   [ "$seen_bucephalus" -eq 1 ] || missing="${missing} bucephalus"
+  [ "$seen_buc" -eq 1 ] || missing="${missing} buc"
   [ "$seen_cloud" -eq 1 ] || missing="${missing} bucephalus-cloud"
   [ "$seen_modal" -eq 1 ] || missing="${missing} bucephalus-modal-launcher"
   [ "$seen_readme" -eq 1 ] || missing="${missing} README.md"
@@ -264,6 +273,10 @@ if [ ! -x "${tmp_dir}/bucephalus" ]; then
   printf '%s\n' "archive did not contain executable bucephalus" >&2
   exit 1
 fi
+if [ ! -x "${tmp_dir}/buc" ]; then
+  printf '%s\n' "archive did not contain executable buc" >&2
+  exit 1
+fi
 if [ ! -x "${tmp_dir}/bucephalus-modal-launcher" ]; then
   printf '%s\n' "archive did not contain executable bucephalus-modal-launcher" >&2
   exit 1
@@ -275,10 +288,11 @@ fi
 
 mkdir -p "$install_dir"
 install -m 0755 "${tmp_dir}/bucephalus" "${install_dir}/bucephalus"
+install -m 0755 "${tmp_dir}/buc" "${install_dir}/buc"
 install -m 0755 "${tmp_dir}/bucephalus-cloud" "${install_dir}/bucephalus-cloud"
 install -m 0755 "${tmp_dir}/bucephalus-modal-launcher" "${install_dir}/bucephalus-modal-launcher"
 
-printf '%s\n' "Installed bucephalus, bucephalus-cloud (operator utility), and bucephalus-modal-launcher to ${install_dir}"
+printf '%s\n' "Installed bucephalus, buc (hosted Cloud CLI), bucephalus-cloud (operator utility), and bucephalus-modal-launcher to ${install_dir}"
 "${install_dir}/bucephalus" --version
 
 # Idempotently append an export line to a POSIX shell profile. The sentinel
