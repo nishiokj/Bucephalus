@@ -291,7 +291,6 @@ for path in \
   bun.lock \
   bun.runtime.lock \
   tsconfig.json \
-  docker-compose.yml \
   scripts \
   src \
   api \
