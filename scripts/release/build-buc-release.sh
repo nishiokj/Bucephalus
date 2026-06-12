@@ -221,10 +221,10 @@ if [[ -n "${WORKER_RUNNER_BIN_INPUT}" ]]; then
 else
   echo "== Building bucephalus-worker-runner ${VERSION} =="
   if [[ -n "${TARGET}" ]]; then
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features worker-runner --bin bucephalus-worker-runner --target "${TARGET}"
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features worker-runner-postgres --bin bucephalus-worker-runner --target "${TARGET}"
     WORKER_RUNNER_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus-worker-runner"
   else
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features worker-runner --bin bucephalus-worker-runner
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features worker-runner-postgres --bin bucephalus-worker-runner
     WORKER_RUNNER_BIN="${ROOT_DIR}/target/release/bucephalus-worker-runner"
   fi
 fi

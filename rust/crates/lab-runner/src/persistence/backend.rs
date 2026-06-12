@@ -3,9 +3,8 @@ use crate::experiment::state::{
 };
 use crate::model::{TrialExecutionResult, TrialSlot};
 use crate::persistence::journal::{RunSink, SqliteRunJournal};
-use crate::persistence::postgres::{
-    postgres_schema_name, quote_ident, PostgresRunStore, BUCEPHALUS_RUN_STORE_URL_ENV,
-};
+#[cfg(feature = "postgres-store")]
+use crate::persistence::postgres::{postgres_schema_name, quote_ident, PostgresRunStore};
 use crate::persistence::rows::EventRow;
 use crate::persistence::store::account_sqlite_path_for_run;
 pub(crate) use crate::persistence::store::AttemptObjectUpsert;
@@ -14,6 +13,7 @@ use crate::persistence::store::{SlotCommitTransactionInput, SqliteRunStore};
 use crate::trial::state::TrialAttemptState;
 use anyhow::Result;
 use anyhow::{anyhow, Context};
+#[cfg(feature = "postgres-store")]
 use postgres::{Client, NoTls};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub(crate) const BUCEPHALUS_RUN_STORE_ENV: &str = "BUCEPHALUS_RUN_STORE";
+pub(crate) const BUCEPHALUS_RUN_STORE_URL_ENV: &str = "BUCEPHALUS_RUN_STORE_URL";
 
 pub(crate) trait RuntimeKvStore {
     fn put_runtime_json(&mut self, key: &str, value: &Value) -> Result<()>;
@@ -359,6 +360,7 @@ impl PerformanceSampleStore for SqliteRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl RuntimeKvStore for PostgresRunStore {
     fn put_runtime_json(&mut self, key: &str, value: &Value) -> Result<()> {
         PostgresRunStore::put_runtime_json(self, key, value)
@@ -369,6 +371,7 @@ impl RuntimeKvStore for PostgresRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl TrialAttemptStateStore for PostgresRunStore {
     fn upsert_trial_attempt_state(
         &mut self,
@@ -380,6 +383,7 @@ impl TrialAttemptStateStore for PostgresRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl TrialAttemptStore for PostgresRunStore {
     fn load_latest_trial_attempt(
         &self,
@@ -398,6 +402,7 @@ impl TrialAttemptStore for PostgresRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl EventRowStore for PostgresRunStore {
     fn append_event_rows(&mut self, rows: &[EventRow]) -> Result<()> {
         RunSink::append_event_rows(self, rows)
@@ -408,6 +413,7 @@ impl EventRowStore for PostgresRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl ScheduleSlotStore for PostgresRunStore {
     fn ensure_schedule_slots(&mut self, run_id: &str, schedule: &[TrialSlot]) -> Result<()> {
         PostgresRunStore::ensure_schedule_slots(self, run_id, schedule)
@@ -473,6 +479,7 @@ impl ScheduleSlotStore for PostgresRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl ScheduleSlotReadStore for PostgresRunStore {
     fn schedule_slot(
         &self,
@@ -483,6 +490,7 @@ impl ScheduleSlotReadStore for PostgresRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl SlotCommitRecordStore for PostgresRunStore {
     fn upsert_slot_commit_record(&mut self, record: &Value) -> Result<()> {
         PostgresRunStore::upsert_slot_commit_record(self, record)
@@ -497,6 +505,7 @@ impl SlotCommitRecordStore for PostgresRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl PendingCompletionStore for PostgresRunStore {
     fn replace_pending_trial_completions(&mut self, run_id: &str, rows: &[Value]) -> Result<()> {
         PostgresRunStore::replace_pending_trial_completions(self, run_id, rows)
@@ -511,6 +520,7 @@ impl PendingCompletionStore for PostgresRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl AttemptObjectStore for PostgresRunStore {
     fn upsert_attempt_object(&mut self, row: AttemptObjectUpsert<'_>) -> Result<()> {
         PostgresRunStore::upsert_attempt_object(self, row)
@@ -526,6 +536,7 @@ impl AttemptObjectStore for PostgresRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl LineageStore for PostgresRunStore {
     fn latest_lineage_version_id_for_trial(
         &self,
@@ -540,6 +551,7 @@ impl LineageStore for PostgresRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl RuntimeOperationStore for PostgresRunStore {
     fn upsert_runtime_operation(
         &mut self,
@@ -552,6 +564,7 @@ impl RuntimeOperationStore for PostgresRunStore {
     }
 }
 
+#[cfg(feature = "postgres-store")]
 impl PerformanceSampleStore for PostgresRunStore {
     fn upsert_performance_sample(&mut self, payload: &Value) -> Result<()> {
         PostgresRunStore::upsert_performance_sample(self, payload)
@@ -561,7 +574,20 @@ impl PerformanceSampleStore for PostgresRunStore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunStoreBackend {
     Sqlite,
+    #[cfg(feature = "postgres-store")]
     Postgres,
+}
+
+#[cfg(feature = "postgres-store")]
+fn selected_postgres_backend() -> Result<RunStoreBackend> {
+    Ok(RunStoreBackend::Postgres)
+}
+
+#[cfg(not(feature = "postgres-store"))]
+fn selected_postgres_backend() -> Result<RunStoreBackend> {
+    Err(anyhow!(
+        "postgres run store selected but lab-runner was built without the postgres-store feature"
+    ))
 }
 
 fn selected_backend_from_values(
@@ -573,7 +599,7 @@ fn selected_backend_from_values(
     if let Some(value) = run_store {
         return match value.trim().to_ascii_lowercase().as_str() {
             "" | "sqlite" => Ok(RunStoreBackend::Sqlite),
-            "postgres" | "postgresql" => Ok(RunStoreBackend::Postgres),
+            "postgres" | "postgresql" => selected_postgres_backend(),
             other => Err(anyhow!(
                 "unsupported {} '{}'",
                 BUCEPHALUS_RUN_STORE_ENV,
@@ -582,10 +608,10 @@ fn selected_backend_from_values(
         };
     }
     if run_store_url.is_some_and(|value| !value.trim().is_empty()) {
-        return Ok(RunStoreBackend::Postgres);
+        return selected_postgres_backend();
     }
     if cloud_api_url.is_some() && database_url.is_some_and(|value| !value.trim().is_empty()) {
-        return Ok(RunStoreBackend::Postgres);
+        return selected_postgres_backend();
     }
     Ok(RunStoreBackend::Sqlite)
 }
@@ -604,6 +630,7 @@ fn selected_backend() -> Result<RunStoreBackend> {
     )
 }
 
+#[cfg(feature = "postgres-store")]
 fn postgres_url() -> Result<String> {
     std::env::var(BUCEPHALUS_RUN_STORE_URL_ENV)
         .ok()
@@ -615,6 +642,7 @@ fn postgres_url() -> Result<String> {
         )
 }
 
+#[cfg(feature = "postgres-store")]
 fn open_postgres_store(run_dir: &Path) -> Result<PostgresRunStore> {
     PostgresRunStore::open(run_dir, &postgres_url()?)
 }
@@ -638,10 +666,12 @@ fn run_control_run_id(value: Option<Value>) -> Result<Option<String>> {
     Ok(Some(run_id.to_string()))
 }
 
+#[cfg(feature = "postgres-store")]
 fn postgres_client() -> Result<Client> {
     Client::connect(&postgres_url()?, NoTls).context("connect postgres runtime store")
 }
 
+#[cfg(feature = "postgres-store")]
 fn postgres_table(schema: &str, name: &str) -> String {
     format!("{}.{}", quote_ident(schema), quote_ident(name))
 }
@@ -669,6 +699,7 @@ pub(crate) fn load_runtime_json(run_dir: &Path, key: &str) -> Result<Option<Valu
             raw.map(|payload| serde_json::from_str::<Value>(&payload).context("parse runtime json"))
                 .transpose()
         }
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => {
             let Some(run_id) = run_id_from_dir(run_dir) else {
                 return Ok(None);
@@ -708,6 +739,7 @@ pub(crate) fn resolve_run_dir(run_id: &str, anchor: &Path) -> Result<Option<Path
                 .optional()?;
             Ok(run_dir.map(PathBuf::from))
         }
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => {
             let schema = postgres_schema_name()?;
             let account_id = crate::persistence::store::active_account_id()?;
@@ -750,6 +782,7 @@ pub(crate) fn list_run_inventory(anchor: &Path) -> Result<Vec<RunStoreInventoryE
             }
             Ok(entries)
         }
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => {
             let schema = postgres_schema_name()?;
             let account_id = crate::persistence::store::active_account_id()?;
@@ -818,6 +851,7 @@ pub(crate) fn run_metrics(run_dir: &Path) -> Result<RunStoreMetrics> {
                 pass_rate,
             })
         }
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => {
             let Some(run_id) = run_id_from_dir(run_dir) else {
                 return Ok(RunStoreMetrics::default());
@@ -872,6 +906,7 @@ pub(crate) fn open_runtime_state_store(
 ) -> Result<Box<dyn RuntimeStateStore + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunStore::open(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -879,6 +914,7 @@ pub(crate) fn open_runtime_state_store(
 pub(crate) fn open_event_row_store(run_dir: &Path) -> Result<Box<dyn EventRowStore + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunJournal::new(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -888,6 +924,7 @@ pub(crate) fn open_schedule_slot_store(
 ) -> Result<Box<dyn ScheduleSlotStore + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunStore::open(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -897,6 +934,7 @@ pub(crate) fn open_schedule_slot_read_store(
 ) -> Result<Box<dyn ScheduleSlotReadStore + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunStore::open(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -906,6 +944,7 @@ pub(crate) fn open_trial_attempt_store(
 ) -> Result<Box<dyn TrialAttemptStore + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunStore::open(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -915,6 +954,7 @@ pub(crate) fn open_slot_commit_record_store(
 ) -> Result<Box<dyn SlotCommitRecordStore + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunStore::open(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -924,6 +964,7 @@ pub(crate) fn open_pending_completion_store(
 ) -> Result<Box<dyn PendingCompletionStore + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunStore::open(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -933,6 +974,7 @@ pub(crate) fn open_attempt_object_store(
 ) -> Result<Box<dyn AttemptObjectStore + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunStore::open(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -940,6 +982,7 @@ pub(crate) fn open_attempt_object_store(
 pub(crate) fn open_lineage_store(run_dir: &Path) -> Result<Box<dyn LineageStore + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunStore::open(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -949,6 +992,7 @@ pub(crate) fn open_runtime_operation_store(
 ) -> Result<Box<dyn RuntimeOperationStore + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunStore::open(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -958,6 +1002,7 @@ pub(crate) fn open_performance_sample_store(
 ) -> Result<Box<dyn PerformanceSampleStore + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunStore::open(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -965,6 +1010,7 @@ pub(crate) fn open_performance_sample_store(
 pub(crate) fn open_run_sink(run_dir: &Path) -> Result<Box<dyn RunSink + Send>> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(Box::new(SqliteRunJournal::new(run_dir)?)),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok(Box::new(open_postgres_store(run_dir)?)),
     }
 }
@@ -972,6 +1018,7 @@ pub(crate) fn open_run_sink(run_dir: &Path) -> Result<Box<dyn RunSink + Send>> {
 pub(crate) fn run_store_location(run_dir: &Path) -> Result<String> {
     match selected_backend()? {
         RunStoreBackend::Sqlite => Ok(account_sqlite_path_for_run(run_dir)?.display().to_string()),
+        #[cfg(feature = "postgres-store")]
         RunStoreBackend::Postgres => Ok("postgres:<configured>".to_string()),
     }
 }
@@ -1119,6 +1166,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "postgres-store")]
     fn run_store_backend_accepts_explicit_postgres() {
         assert_eq!(
             selected_backend_from_values(Some("postgres"), None, None, None).unwrap(),
@@ -1127,6 +1175,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "postgres-store"))]
+    fn run_store_backend_rejects_explicit_postgres_without_feature() {
+        let err = selected_backend_from_values(Some("postgres"), None, None, None)
+            .expect_err("postgres selection should require postgres-store feature");
+        assert!(
+            err.to_string().contains("postgres-store feature"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "postgres-store")]
     fn run_store_backend_uses_explicit_store_url() {
         assert_eq!(
             selected_backend_from_values(None, Some("postgres://example/db"), None, None).unwrap(),
@@ -1135,6 +1195,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "postgres-store")]
     fn run_store_backend_uses_database_url_only_in_cloud_context() {
         assert_eq!(
             selected_backend_from_values(None, None, None, Some("postgres://example/db")).unwrap(),

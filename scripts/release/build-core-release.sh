@@ -148,10 +148,10 @@ if [[ -n "${CORE_BIN_INPUT}" ]]; then
 else
   echo "== Building bucephalus ${VERSION} for ${TARGET_LABEL} =="
   if [[ -n "${TARGET}" ]]; then
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus --target "${TARGET}"
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features core-cli --bin bucephalus --target "${TARGET}"
     CORE_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus"
   else
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features core-cli --bin bucephalus
     CORE_BIN="${ROOT_DIR}/target/release/bucephalus"
   fi
 fi

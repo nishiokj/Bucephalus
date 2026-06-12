@@ -51,7 +51,7 @@ path = "src/bin/buc.rs"
 required-features = ["hosted-cli"]
 
 [features]
-default = ["core-cli", "worker-runner", "cloud-operator", "hosted-cli"]
+default = ["core-cli", "worker-runner-postgres", "cloud-operator", "hosted-cli"]
 core-cli = [
   "dep:base64",
   "dep:chrono",
@@ -78,6 +78,10 @@ core-cli = [
 worker-runner = [
   "dep:clap",
   "dep:lab-runner",
+]
+worker-runner-postgres = [
+  "worker-runner",
+  "lab-runner/postgres-store",
 ]
 cloud-operator = [
   "dep:flate2",
@@ -109,7 +113,7 @@ flate2 = { workspace = true, optional = true }
 lab-analysis = { workspace = true, optional = true }
 lab-core = { workspace = true, optional = true }
 lab-provenance = { workspace = true, optional = true }
-lab-runner = { workspace = true, optional = true }
+lab-runner = { workspace = true, default-features = false, optional = true }
 lab-schemas = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }

@@ -20,7 +20,6 @@ use std::fs;
 use std::path::Path;
 
 const DEFAULT_SCHEMA: &str = "bucephalus_runtime";
-pub(crate) const BUCEPHALUS_RUN_STORE_URL_ENV: &str = "BUCEPHALUS_RUN_STORE_URL";
 pub(crate) const BUCEPHALUS_RUN_STORE_SCHEMA_ENV: &str = "BUCEPHALUS_RUN_STORE_SCHEMA";
 const REQUIRED_TABLES: &[&str] = &[
     "account_profile",

@@ -180,8 +180,8 @@ jobs:
           --manifest-path Cargo.toml
           -p bucephalus-cli
           --release
-          --features worker-runner
-          --bin bucephalus
+          --no-default-features
+          --features worker-runner-postgres
           --bin bucephalus-worker-runner
           --target "${{ matrix.target }}"
 
@@ -198,9 +198,6 @@ jobs:
             --version "${{ steps.version.outputs.version }}"
             --target "${{ matrix.target }}"
           )
-          if [[ "${{ steps.worker_runner_cache.outputs.cache-hit }}" != "true" ]]; then
-            args+=(--core-bin "target/${{ matrix.target }}/release/bucephalus")
-          fi
           scripts/release/build-core-release.sh "${args[@]}"
 
       - name: Verify core release archive
