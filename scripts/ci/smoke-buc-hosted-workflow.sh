@@ -13,7 +13,7 @@ fi
   bun run check:postgres
 )
 
-cargo build -p bucephalus-cli --bin buc --manifest-path "${ROOT_DIR}/Cargo.toml"
+cargo build -p bucephalus-cli --no-default-features --features hosted-cli --bin buc --manifest-path "${ROOT_DIR}/Cargo.toml"
 
 (
   cd "${ROOT_DIR}"

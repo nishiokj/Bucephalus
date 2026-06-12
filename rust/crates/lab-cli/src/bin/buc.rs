@@ -10,13 +10,14 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "../cloud_auth_ux.rs"]
 mod cloud_auth_ux;
+#[path = "../cloud_login.rs"]
+mod cloud_login;
 use cloud_auth_ux::BUCEPHALUS_CLOUD_USER_TOKEN_ENV;
 
 const BUCEPHALUS_CLOUD_API_URL_ENV: &str = "BUCEPHALUS_CLOUD_API_URL";
@@ -115,6 +116,9 @@ fn run(argv: Vec<String>) -> Result<()> {
             "unknown hosted command: {}\n\nRun `buc help` for the Cloud product commands.",
             entered_command_name(group, command)
         ),
+        (Some("login"), _) => login(alias_args(&context, 1)),
+        (Some("logout"), _) => logout(alias_args(&context, 1)),
+        (Some("auth"), Some("status")) => auth_status(with_args(&context, rest)),
         (Some("health"), None) => health(with_args(&context, rest)),
         (Some("build"), _) => experiment_build(alias_args(&context, 1)),
         (Some("doctor"), _) => experiment_doctor(alias_args(&context, 1)),
@@ -168,6 +172,8 @@ fn known_hosted_command(group: Option<&str>, command: Option<&str>) -> bool {
     matches!(
         (group, command),
         (Some("health"), None)
+            | (Some("login" | "logout"), _)
+            | (Some("auth"), Some("status"))
             | (Some("build" | "doctor" | "run" | "inspect"), _)
             | (
                 Some("author" | "drafts"),
@@ -204,6 +210,7 @@ fn group_command_without_leaf(group: Option<&str>, command: Option<&str>) -> boo
                     | "doctor"
                     | "run"
                     | "inspect"
+                    | "auth"
                     | "author"
                     | "drafts"
                     | "packages"
@@ -246,7 +253,7 @@ fn alias_args(context: &CliContext, skip: usize) -> CliContext {
 
 fn parse_global_args(argv: Vec<String>) -> Result<CliContext> {
     let mut args = argv;
-    let mut api_url = std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).unwrap_or_default();
+    let mut api_url = env_non_empty(BUCEPHALUS_CLOUD_API_URL_ENV).unwrap_or_default();
     let mut user_token = env_non_empty(BUCEPHALUS_CLOUD_USER_TOKEN_ENV);
 
     let mut index = 0;
@@ -269,14 +276,17 @@ fn parse_global_args(argv: Vec<String>) -> Result<CliContext> {
     }
 
     if user_token.is_none() {
-        user_token = shared_cloud_user_token()?;
+        user_token = cloud_login::shared_cloud_user_token()?;
     }
     if api_url.trim().is_empty() {
-        if let Ok(home) = lab_runner::bucephalus_home() {
-            if let Some(url) = lab_runner::cloud_profile_string(&home, "/api_url") {
+        if let Ok(home) = lab_core::bucephalus_home() {
+            if let Some(url) = lab_core::cloud_profile_string(&home, "/api_url") {
                 api_url = url;
             }
         }
+    }
+    if api_url.trim().is_empty() {
+        api_url = cloud_login::DEFAULT_BUCEPHALUS_CLOUD_API_URL.to_string();
     }
 
     Ok(CliContext {
@@ -290,187 +300,12 @@ fn parse_global_args(argv: Vec<String>) -> Result<CliContext> {
 fn ensure_api_configured(context: &CliContext) -> Result<()> {
     if context.api_url.trim().is_empty() {
         bail!(
-            "buc needs a hosted API URL. Run `bucephalus login --resource <api-url>` once to persist it, or pass --api-url / set {}.",
+            "buc needs a hosted API URL. This build defaults to {}. Override it with --api-url or {} for dev/staging/self-hosted Cloud.",
+            cloud_login::DEFAULT_BUCEPHALUS_CLOUD_API_URL,
             BUCEPHALUS_CLOUD_API_URL_ENV
         );
     }
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct CloudTokenPaths {
-    access: PathBuf,
-    refresh: PathBuf,
-    cache: PathBuf,
-}
-
-fn shared_cloud_user_token() -> Result<Option<String>> {
-    let home = match lab_runner::bucephalus_home() {
-        Ok(home) => home,
-        Err(_) => return Ok(None),
-    };
-    let paths = cloud_token_paths(&home);
-    if let Some(cache) = read_cloud_token_cache(&paths) {
-        if cloud_token_cache_needs_refresh(&cache) {
-            return refresh_cloud_token_cache(&paths, &cache)
-                .map(Some)
-                .context("failed to refresh cached Cloud OAuth token");
-        }
-        if let Some(token) = cache.get("access_token").and_then(Value::as_str) {
-            let token = token.trim();
-            if !token.is_empty() {
-                return Ok(Some(token.to_string()));
-            }
-        }
-    }
-    Ok(fs::read_to_string(paths.access)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty()))
-}
-
-fn cloud_token_paths(home: &Path) -> CloudTokenPaths {
-    let auth_dir = home.join("auth");
-    CloudTokenPaths {
-        access: auth_dir.join("cloud_user_token"),
-        refresh: auth_dir.join("cloud_refresh_token"),
-        cache: auth_dir.join("cloud_user_token.json"),
-    }
-}
-
-fn read_cloud_token_cache(paths: &CloudTokenPaths) -> Option<Value> {
-    let raw = fs::read_to_string(&paths.cache).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-fn cloud_token_cache_needs_refresh(cache: &Value) -> bool {
-    let Some(expires_at_ms) = cache.get("expires_at_ms").and_then(Value::as_i64) else {
-        return false;
-    };
-    let Some(refresh_token) = cache.get("refresh_token").and_then(Value::as_str) else {
-        return false;
-    };
-    !refresh_token.trim().is_empty() && expires_at_ms <= current_unix_time_ms() + 60_000
-}
-
-fn refresh_cloud_token_cache(paths: &CloudTokenPaths, cache: &Value) -> Result<String> {
-    let token_endpoint = cache
-        .get("token_endpoint")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("cached Cloud token is missing token_endpoint"))?;
-    let client_id = cache
-        .get("client_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("cached Cloud token is missing client_id"))?;
-    let refresh_token = cache
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("cached Cloud token is missing refresh_token"))?;
-    let response = Client::new()
-        .post(token_endpoint)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", client_id),
-        ])
-        .send()
-        .with_context(|| format!("failed to refresh Cloud token at {}", token_endpoint))?;
-    let status = response.status().as_u16();
-    let bytes = response.bytes()?.to_vec();
-    if !(200..300).contains(&status) {
-        bail!(
-            "Cloud token refresh failed with status {}: {}",
-            status,
-            String::from_utf8_lossy(&bytes).trim()
-        );
-    }
-    let token: Value = serde_json::from_slice(&bytes)?;
-    let mut merged = token.clone();
-    if merged
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .is_none()
-    {
-        if let Some(object) = merged.as_object_mut() {
-            object.insert("refresh_token".to_string(), json!(refresh_token));
-        }
-    }
-    write_cloud_token_cache(paths, cache, &merged)?;
-    merged
-        .get("access_token")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("Cloud token refresh response missing access_token"))
-}
-
-fn write_cloud_token_cache(paths: &CloudTokenPaths, existing: &Value, token: &Value) -> Result<()> {
-    let access_token = token
-        .get("access_token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("token response missing access_token"))?;
-    let refresh_token = token
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .or_else(|| existing.get("refresh_token").and_then(Value::as_str));
-    let issued_at = current_unix_time_ms();
-    let expires_at_ms = token
-        .get("expires_in")
-        .and_then(Value::as_i64)
-        .map(|seconds| issued_at + seconds.saturating_mul(1000));
-    let cache = json!({
-        "schema_version": "bucephalus_cloud_oauth_token_v1",
-        "issuer": existing.get("issuer").and_then(Value::as_str),
-        "client_id": existing.get("client_id").and_then(Value::as_str),
-        "audience": existing.get("audience").and_then(Value::as_str),
-        "resource": existing.get("resource").and_then(Value::as_str),
-        "scope": existing.get("scope").and_then(Value::as_str),
-        "token_endpoint": existing.get("token_endpoint").and_then(Value::as_str),
-        "token_type": token.get("token_type").and_then(Value::as_str).unwrap_or("Bearer"),
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "issued_at_ms": issued_at,
-        "expires_at_ms": expires_at_ms
-    });
-    write_secret_file(&paths.access, format!("{access_token}\n").as_bytes())?;
-    if let Some(refresh_token) = refresh_token {
-        write_secret_file(&paths.refresh, format!("{refresh_token}\n").as_bytes())?;
-    }
-    write_secret_file(
-        &paths.cache,
-        serde_json::to_string_pretty(&cache)?.as_bytes(),
-    )?;
-    Ok(())
-}
-
-fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        return Ok(());
-    }
-    #[cfg(not(unix))]
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        Ok(())
-    }
 }
 
 fn health(context: CliContext) -> Result<()> {
@@ -478,6 +313,101 @@ fn health(context: CliContext) -> Result<()> {
     reject_no_positionals(&context.args, "buc health")?;
     ensure_api_configured(&context)?;
     print_json(&cloud_fetch(&context, Method::GET, "/readyz", None, None)?)
+}
+
+fn login(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--issuer",
+            "--client-id",
+            "--audience",
+            "--api-url",
+            "--resource",
+            "--scope",
+        ],
+        &["--no-browser", "--json"],
+    )?;
+    reject_no_positionals(&context.args, "buc login")?;
+    let api_url = match option_value(&context.args, "--api-url")? {
+        Some(value) => Some(value),
+        None => option_value(&context.args, "--resource")?,
+    }
+    .or_else(|| non_empty(context.api_url.clone()));
+    let result = cloud_login::run_login(cloud_login::DeviceLoginOptions {
+        issuer: option_value(&context.args, "--issuer")?,
+        client_id: option_value(&context.args, "--client-id")?,
+        audience: option_value(&context.args, "--audience")?,
+        api_url,
+        scope: option_value(&context.args, "--scope")?,
+        no_browser: flag_present(&context.args, "--no-browser"),
+    })?;
+    if json_requested(&context.args) {
+        print_json(&result)
+    } else {
+        println!("login: ready");
+        println!(
+            "api_url: {}",
+            result["api_url"].as_str().unwrap_or("unknown")
+        );
+        println!(
+            "token_path: {}",
+            result["token_path"].as_str().unwrap_or("unknown")
+        );
+        if let Some(path) = result["refresh_token_path"].as_str() {
+            println!("refresh_token_path: {path}");
+        }
+        println!("next: buc health");
+        Ok(())
+    }
+}
+
+fn logout(context: CliContext) -> Result<()> {
+    reject_unknown_options(&context.args, &[], &["--dry-run", "--json"])?;
+    reject_no_positionals(&context.args, "buc logout")?;
+    let result = cloud_login::run_logout(flag_present(&context.args, "--dry-run"))?;
+    if json_requested(&context.args) {
+        print_json(&result)
+    } else {
+        println!("logout: {}", result["status"].as_str().unwrap_or("unknown"));
+        if let Some(files) = result["files"].as_array() {
+            for file in files {
+                if let (Some(kind), Some(status), Some(path)) = (
+                    file["kind"].as_str(),
+                    file["status"].as_str(),
+                    file["path"].as_str(),
+                ) {
+                    println!("auth_file: {kind} {status} {path}");
+                }
+            }
+        }
+        if let Some(note) = result["env"]["note"].as_str() {
+            println!("note: {note}");
+        }
+        Ok(())
+    }
+}
+
+fn auth_status(context: CliContext) -> Result<()> {
+    reject_unknown_options(&context.args, &[], &["--json"])?;
+    reject_no_positionals(&context.args, "buc auth status")?;
+    let result = cloud_login::auth_status()?;
+    if json_requested(&context.args) {
+        print_json(&result)
+    } else {
+        let auth = &result["auth"];
+        println!("auth: {}", auth["status"].as_str().unwrap_or("unknown"));
+        if let Some(source) = auth["source"].as_str() {
+            println!("source: {source}");
+        }
+        if let Some(api_url) = auth["api_url"].as_str() {
+            println!("api_url: {api_url}");
+        }
+        if auth["status"].as_str() == Some("missing") {
+            println!("auth_next: buc login");
+        }
+        Ok(())
+    }
 }
 
 fn package_upload(context: CliContext) -> Result<()> {
@@ -2470,9 +2400,9 @@ fn cloud_error_message(status: u16, payload: &Value) -> String {
 }
 
 fn append_user_auth_hint(context: &CliContext, message: String) -> String {
-    let token_path = lab_runner::bucephalus_home()
+    let token_path = lab_core::bucephalus_home()
         .ok()
-        .map(|home| cloud_token_paths(&home).access);
+        .map(|home| cloud_login::cloud_token_paths(&home).access);
     cloud_auth_ux::user_auth_hint(
         &message,
         context.user_token.is_some(),
@@ -3205,6 +3135,11 @@ fn positional_args(args: &[String]) -> Vec<String> {
     let options_with_values = [
         "--api-url",
         "--user-token",
+        "--issuer",
+        "--client-id",
+        "--audience",
+        "--resource",
+        "--scope",
         "--label",
         "--file",
         "--context-root",
@@ -4209,42 +4144,45 @@ fn help_text() -> &'static str {
 local runners, or manage Cloud operator pools.
 
 Usage:
-  buc [--api-url URL] [--user-token TOKEN] health
-  buc [--api-url URL] [--user-token TOKEN] build <experiment.yaml|package-dir|package.tgz> [--context-root DIR] [--label TEXT] [--json]
-  buc [--api-url URL] [--user-token TOKEN] doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
-  buc [--api-url URL] [--user-token TOKEN] run <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--label TEXT] [--json]
-  buc [--api-url URL] [--user-token TOKEN] inspect <package-digest> [--json]
-  buc [--api-url URL] [--user-token TOKEN] author canonicalize <draft.yaml|draft.json> [--json]
-  buc [--api-url URL] [--user-token TOKEN] author resolve <draft.yaml|draft.json> [--json]
-  buc [--api-url URL] [--user-token TOKEN] author validate <draft.yaml|draft.json> [--validation-level authoring|package|launch_hint] [--json]
-  buc [--api-url URL] [--user-token TOKEN] author suggest <draft.yaml|draft.json> --target VALUE [--q TEXT] [--limit N] [--json]
-  buc [--api-url URL] [--user-token TOKEN] author diff <left.yaml|json> <right.yaml|json> [--json]
-  buc [--api-url URL] [--user-token TOKEN] author export <draft.yaml|draft.json> [--format yaml|resolved_json] [--json]
-  buc [--api-url URL] [--user-token TOKEN] author preview <draft.yaml|draft.json> [--json]
+  buc login [--no-browser] [--json]
+  buc logout [--dry-run] [--json]
+  buc auth status [--json]
+  buc health
+  buc build <experiment.yaml|package-dir|package.tgz> [--context-root DIR] [--label TEXT] [--json]
+  buc doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
+  buc run <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--label TEXT] [--json]
+  buc inspect <package-digest> [--json]
+  buc author canonicalize <draft.yaml|draft.json> [--json]
+  buc author resolve <draft.yaml|draft.json> [--json]
+  buc author validate <draft.yaml|draft.json> [--validation-level authoring|package|launch_hint] [--json]
+  buc author suggest <draft.yaml|draft.json> --target VALUE [--q TEXT] [--limit N] [--json]
+  buc author diff <left.yaml|json> <right.yaml|json> [--json]
+  buc author export <draft.yaml|draft.json> [--format yaml|resolved_json] [--json]
+  buc author preview <draft.yaml|draft.json> [--json]
 
 Long-form nouns:
-  buc [--api-url URL] [--user-token TOKEN] drafts canonicalize <draft.yaml|draft.json> [--json]
-  buc [--api-url URL] [--user-token TOKEN] drafts resolve <draft.yaml|draft.json> [--json]
-  buc [--api-url URL] [--user-token TOKEN] drafts validate <draft.yaml|draft.json> [--validation-level authoring|package|launch_hint] [--json]
-  buc [--api-url URL] [--user-token TOKEN] drafts suggest <draft.yaml|draft.json> --target VALUE [--q TEXT] [--limit N] [--json]
-  buc [--api-url URL] [--user-token TOKEN] drafts diff <left.yaml|json> <right.yaml|json> [--json]
-  buc [--api-url URL] [--user-token TOKEN] drafts export <draft.yaml|draft.json> [--format yaml|resolved_json] [--json]
-  buc [--api-url URL] [--user-token TOKEN] drafts preview-schedule <draft.yaml|draft.json> [--json]
-  buc [--api-url URL] [--user-token TOKEN] packages list [--limit N] [--json]
-  buc [--api-url URL] [--user-token TOKEN] packages upload <package-dir|package.tgz> [--label TEXT] [--json]
-  buc [--api-url URL] [--user-token TOKEN] packages inspect <package-digest> [--json]
-  buc [--api-url URL] [--user-token TOKEN] secrets list [--json]
-  buc [--api-url URL] [--user-token TOKEN] secrets put <name> (--value-file PATH|--from-env ENV|--stdin) [--json]
-  buc [--api-url URL] [--user-token TOKEN] secrets delete <name> [--json]
-  buc [--api-url URL] [--user-token TOKEN] experiments build <experiment.yaml|package-dir|package.tgz> [--context-root DIR] [--label TEXT] [--json]
-  buc [--api-url URL] [--user-token TOKEN] experiments doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
-  buc [--api-url URL] [--user-token TOKEN] runs list [--limit N] [--json]
-  buc [--api-url URL] [--user-token TOKEN] runs create <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--label TEXT] [--json]
-  buc [--api-url URL] [--user-token TOKEN] runs get <run-id> [--json]
-  buc [--api-url URL] [--user-token TOKEN] runs runtime <run-id> [--json]
-  buc [--api-url URL] [--user-token TOKEN] runs events <run-id> [--limit N] [--after-row-seq N] [--json]
-  buc [--api-url URL] [--user-token TOKEN] runs results <run-id> [--limit N] [--json]
-  buc [--api-url URL] [--user-token TOKEN] runs value <run-id> <key> [--json]
+  buc drafts canonicalize <draft.yaml|draft.json> [--json]
+  buc drafts resolve <draft.yaml|draft.json> [--json]
+  buc drafts validate <draft.yaml|draft.json> [--validation-level authoring|package|launch_hint] [--json]
+  buc drafts suggest <draft.yaml|draft.json> --target VALUE [--q TEXT] [--limit N] [--json]
+  buc drafts diff <left.yaml|json> <right.yaml|json> [--json]
+  buc drafts export <draft.yaml|draft.json> [--format yaml|resolved_json] [--json]
+  buc drafts preview-schedule <draft.yaml|draft.json> [--json]
+  buc packages list [--limit N] [--json]
+  buc packages upload <package-dir|package.tgz> [--label TEXT] [--json]
+  buc packages inspect <package-digest> [--json]
+  buc secrets list [--json]
+  buc secrets put <name> (--value-file PATH|--from-env ENV|--stdin) [--json]
+  buc secrets delete <name> [--json]
+  buc experiments build <experiment.yaml|package-dir|package.tgz> [--context-root DIR] [--label TEXT] [--json]
+  buc experiments doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
+  buc runs list [--limit N] [--json]
+  buc runs create <package-digest> [--secret-ref NAME=REF ...] [--label TEXT] [--json]
+  buc runs get <run-id> [--json]
+  buc runs runtime <run-id> [--json]
+  buc runs events <run-id> [--limit N] [--after-row-seq N] [--json]
+  buc runs results <run-id> [--limit N] [--json]
+  buc runs value <run-id> <key> [--json]
 
 Cloud package boundary:
   build accepts authoring YAML or a sealed package directory/archive. YAML is
@@ -4261,10 +4199,13 @@ Authoring context:
   target is excluded before upload; the hosted API rejects those paths too.
 
 Auth:
-  Sign in with `bucephalus login --resource <api-url>`. buc reuses the shared
+  Sign in with `buc login`. buc reuses the shared
   Bucephalus Cloud profile and cached tokens from BUCEPHALUS_HOME, refreshing
-  cached OAuth tokens when a refresh token is present. You can also pass
-  --api-url and --user-token per command.
+  cached OAuth tokens when a refresh token is present.
+
+Advanced overrides:
+  --api-url URL        Development, staging, or self-hosted Cloud API.
+  --user-token TOKEN   OAuth access token override for automation.
 
 Runtime options:
   --backend VALUE --arch VALUE --isolation VALUE --cpu-count N --memory-mb N
@@ -4274,14 +4215,19 @@ Runtime options:
   For network use JSON, e.g. network={"default":"allowlist_enforced","egress":["api.openai.com"]}.
 
 Environment:
-  BUCEPHALUS_CLOUD_API_URL       Hosted API base URL; falls back to the profile
-                                 persisted by `bucephalus login`
+  BUCEPHALUS_CLOUD_API_URL       Development, staging, or self-hosted API
+                                 override. Hosted Cloud defaults to
+                                 https://api.bucephalus.dev
   BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token override
 "#
 }
 
 fn command_help_text(group: Option<&str>, command: Option<&str>) -> Option<&'static str> {
     match (group, command) {
+        (Some("login"), _) => Some(LOGIN_HELP),
+        (Some("logout"), _) => Some(LOGOUT_HELP),
+        (Some("auth"), None) | (Some("auth"), Some("--help" | "-h")) => Some(AUTH_HELP),
+        (Some("auth"), Some("status")) => Some(AUTH_STATUS_HELP),
         (Some("health"), None) | (Some("health"), Some("--help" | "-h")) => Some(HEALTH_HELP),
         (Some("build"), _) => Some(BUILD_HELP),
         (Some("doctor"), _) => Some(DOCTOR_HELP),
@@ -4334,6 +4280,48 @@ Check hosted API readiness.
 
 Usage:
   buc health
+"#;
+
+const LOGIN_HELP: &str = r#"buc login
+
+Authenticate to the hosted Cloud product and persist the Cloud profile.
+
+Usage:
+  buc login [--no-browser] [--json]
+
+Notes:
+  For normal hosted Cloud, no API URL is required. The command stores Cloud auth
+  under BUCEPHALUS_HOME and reuses it for later buc commands.
+
+Advanced:
+  --api-url URL is for dev/staging/self-hosted Cloud. --issuer, --client-id,
+  --audience, and --scope override the OAuth config discovered from the hosted
+  API. --resource is accepted only as a backwards-compatible alias for
+  --api-url; new scripts should use --api-url.
+"#;
+
+const LOGOUT_HELP: &str = r#"buc logout
+
+Remove cached hosted Cloud auth files from BUCEPHALUS_HOME.
+
+Usage:
+  buc logout [--dry-run] [--json]
+"#;
+
+const AUTH_HELP: &str = r#"buc auth
+
+Inspect hosted Cloud auth state.
+
+Usage:
+  buc auth status [--json]
+"#;
+
+const AUTH_STATUS_HELP: &str = r#"buc auth status
+
+Show whether buc can find local hosted Cloud auth state.
+
+Usage:
+  buc auth status [--json]
 "#;
 
 const BUILD_HELP: &str = r#"buc build
@@ -4727,13 +4715,8 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
-fn current_unix_time_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| {
-            i64::try_from(duration.as_millis()).expect("Unix timestamp milliseconds must fit i64")
-        })
-        .expect("system time must be after Unix epoch")
+fn flag_present(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
 }
 
 fn make_temp_dir(prefix: &str) -> Result<PathBuf> {
@@ -4807,15 +4790,13 @@ mod tests {
     }
 
     #[test]
-    fn hosted_authoring_yaml_uses_build_command_and_requires_api_config() {
+    fn hosted_authoring_yaml_commands_are_recognized_before_cloud_calls() {
         let _lock = lock_env();
         let home = temp_dir("authoring_api_config");
         let root = temp_dir("authoring_api_config_project");
         fs::create_dir_all(&root).unwrap();
         let experiment = root.join("experiment.yaml");
-        fs::write(&experiment, "experiment: {}\n").unwrap();
         let modal_experiment = root.join("experiment.modal.yaml");
-        fs::write(&modal_experiment, "experiment: {}\n").unwrap();
         let home_s = home.display().to_string();
         let _env = EnvVarGuard::set(&[
             ("BUCEPHALUS_HOME", Some(home_s.as_str())),
@@ -4831,7 +4812,7 @@ mod tests {
         .unwrap_err()
         .to_string();
 
-        assert!(err.contains("hosted API URL"));
+        assert!(err.contains("authoring YAML path does not exist"));
         assert!(!err.contains("unknown hosted command"));
 
         let natural_err = run(vec![
@@ -4840,7 +4821,7 @@ mod tests {
         ])
         .unwrap_err()
         .to_string();
-        assert!(natural_err.contains("hosted API URL"));
+        assert!(natural_err.contains("authoring YAML path does not exist"));
         assert!(
             !natural_err.contains("unknown hosted command"),
             "natural build command should be recognized before failing: {natural_err}"
@@ -7659,27 +7640,32 @@ mod tests {
     fn help_is_hosted_product_cli_not_operator_cli() {
         let help = help_text();
 
-        assert!(help.contains(
-            "buc [--api-url URL] [--user-token TOKEN] build <experiment.yaml|package-dir|package.tgz> [--context-root DIR]"
-        ));
+        assert!(help
+            .contains("buc build <experiment.yaml|package-dir|package.tgz> [--context-root DIR]"));
+        assert!(help.contains("buc login [--no-browser] [--json]"));
+        assert!(help.contains("buc logout [--dry-run]"));
+        assert!(help.contains("buc auth status"));
         assert!(help.contains("Authoring context:"));
         assert!(help.contains("Auth:"));
-        assert!(help.contains("bucephalus login --resource <api-url>"));
+        assert!(help.contains("Sign in with `buc login`"));
+        assert!(help.contains("Advanced overrides:"));
+        assert!(help.contains("--api-url URL        Development"));
+        assert!(!help.contains("buc [--api-url URL]"));
         assert!(help.contains("refreshing"));
         assert!(help.contains("--context-root DIR"));
-        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] run <package-digest>"));
+        assert!(help.contains("buc run <package-digest>"));
         assert!(help.contains("Long-form nouns:"));
         assert!(help.contains("hosted Cloud readiness"));
-        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] author canonicalize"));
-        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] author resolve"));
-        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] author validate"));
-        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] packages list"));
-        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] secrets put <name>"));
-        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] runs list"));
-        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] runs runtime"));
-        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] runs events"));
-        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] runs results"));
-        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] runs value"));
+        assert!(help.contains("buc author canonicalize"));
+        assert!(help.contains("buc author resolve"));
+        assert!(help.contains("buc author validate"));
+        assert!(help.contains("buc packages list"));
+        assert!(help.contains("buc secrets put <name>"));
+        assert!(help.contains("buc runs list"));
+        assert!(help.contains("buc runs runtime"));
+        assert!(help.contains("buc runs events"));
+        assert!(help.contains("buc runs results"));
+        assert!(help.contains("buc runs value"));
         assert!(!help.contains("runner-pool"));
         assert!(!help.contains("runner-instance"));
         assert!(!help.contains("build-upload"));
@@ -7712,6 +7698,10 @@ mod tests {
         assert!(known_hosted_command(Some("experiments"), Some("build")));
         assert!(known_hosted_command(Some("experiments"), Some("doctor")));
         assert!(known_hosted_command(Some("runs"), Some("create")));
+        assert!(known_hosted_command(Some("login"), None));
+        assert!(known_hosted_command(Some("login"), Some("--api-url")));
+        assert!(known_hosted_command(Some("logout"), None));
+        assert!(known_hosted_command(Some("auth"), Some("status")));
         assert!(known_hosted_command(Some("build"), Some("package-dir")));
         assert!(known_hosted_command(Some("doctor"), Some("sha256:abc")));
         assert!(known_hosted_command(Some("run"), Some("sha256:abc")));
@@ -7825,7 +7815,91 @@ mod tests {
             .expect("top-level build help should render without API config");
         run(vec!["health".to_string(), "--help".to_string()])
             .expect("health help should render without API config");
+        run(vec!["login".to_string(), "--help".to_string()])
+            .expect("login help should render without API config");
+        run(vec!["auth".to_string()]).expect("auth help should render without API config");
+        run(vec![
+            "auth".to_string(),
+            "status".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("auth status help should render without API config");
         run(vec!["runs".to_string()]).expect("command group help should render without API config");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_commands_are_first_class_buc_workflow() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(4, |request, _index| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/v1/auth/config") => {
+                    let host = request.header("host").expect("host header");
+                    json!({
+                        "schema_version": "bucephalus_cloud_auth_config_v1",
+                        "issuer": format!("http://{host}"),
+                        "client_id": "buc-client",
+                        "audience": "buc-client",
+                        "scope": "openid profile email"
+                    })
+                }
+                ("GET", "/.well-known/oauth-authorization-server") => {
+                    let host = request.header("host").expect("host header");
+                    json!({
+                        "device_authorization_endpoint": format!("http://{host}/oauth/device"),
+                        "token_endpoint": format!("http://{host}/oauth/token")
+                    })
+                }
+                ("POST", "/oauth/device") => json!({
+                    "device_code": "device-1",
+                    "user_code": "ABCD-EFGH",
+                    "verification_uri": "https://login.example/device",
+                    "expires_in": 60,
+                    "interval": 1
+                }),
+                ("POST", "/oauth/token") => json!({
+                    "access_token": "access-123",
+                    "refresh_token": "refresh-456",
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                }),
+                _ => panic!(
+                    "unexpected auth workflow request: {} {}",
+                    request.method, request.path
+                ),
+            }
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("auth_commands_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+            (cloud_login::BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV, None),
+            (cloud_login::BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV, None),
+            (cloud_login::BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV, None),
+        ]);
+
+        run(vec!["auth".to_string(), "status".to_string()])
+            .expect("buc auth status should read local auth state without API config");
+        run(vec!["logout".to_string(), "--dry-run".to_string()])
+            .expect("buc logout --dry-run should inspect local auth state without API config");
+
+        run(vec!["login".to_string(), "--no-browser".to_string()])
+            .expect("buc login should discover hosted auth config without an API URL argument");
+
+        let status = cloud_login::auth_status().unwrap();
+        assert_eq!(status["auth"]["status"], "ready");
+        assert_eq!(status["auth"]["api_url"], api_url);
+        let token = fs::read_to_string(home.join("auth/cloud_user_token")).unwrap();
+        assert_eq!(token, "access-123\n");
+        let requests = server.join();
+        assert_eq!(requests[0].path, "/v1/auth/config");
+        assert_eq!(requests[1].path, "/.well-known/oauth-authorization-server");
+        assert_eq!(requests[2].path, "/oauth/device");
+        assert_eq!(requests[3].path, "/oauth/token");
+
         let _ = fs::remove_dir_all(home);
     }
 
@@ -8183,10 +8257,10 @@ mod tests {
 
         assert!(message.contains("Cloud auth required"));
         assert!(message.contains("The CLI did not find a user bearer token"));
-        assert!(message.contains("bucephalus login --resource <hosted-api-url>"));
+        assert!(message.contains("buc login"));
         assert!(message.contains("BUCEPHALUS_CLOUD_USER_TOKEN"));
         assert!(message.contains("auth/cloud_user_token"));
-        assert!(message.contains("bucephalus setup status --json"));
+        assert!(message.contains("buc auth status"));
         assert!(message.contains("buc health"));
     }
 

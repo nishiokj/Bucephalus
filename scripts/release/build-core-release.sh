@@ -159,19 +159,19 @@ fi
 install -m 0755 "${CORE_BIN}" "${RELEASE_DIR}/bucephalus"
 echo "== Building buc ${VERSION} for ${TARGET_LABEL} =="
 if [[ -n "${TARGET}" ]]; then
-  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin buc --target "${TARGET}"
+  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features hosted-cli --bin buc --target "${TARGET}"
   BUC_BIN="${ROOT_DIR}/target/${TARGET}/release/buc"
 else
-  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin buc
+  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features hosted-cli --bin buc
   BUC_BIN="${ROOT_DIR}/target/release/buc"
 fi
 install -m 0755 "${BUC_BIN}" "${RELEASE_DIR}/buc"
 echo "== Building bucephalus-cloud ${VERSION} for ${TARGET_LABEL} =="
 if [[ -n "${TARGET}" ]]; then
-  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus-cloud --target "${TARGET}"
+  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features cloud-operator --bin bucephalus-cloud --target "${TARGET}"
   CLOUD_CLI_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus-cloud"
 else
-  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus-cloud
+  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features cloud-operator --bin bucephalus-cloud
   CLOUD_CLI_BIN="${ROOT_DIR}/target/release/bucephalus-cloud"
 fi
 install -m 0755 "${CLOUD_CLI_BIN}" "${RELEASE_DIR}/bucephalus-cloud"

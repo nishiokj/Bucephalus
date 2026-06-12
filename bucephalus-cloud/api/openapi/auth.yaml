@@ -15,6 +15,46 @@ servers:
 security:
   - bearerAuth: []
 paths:
+  /v1/auth/config:
+    get:
+      operationId: getAuthConfig
+      security: []
+      summary: Return public OAuth login metadata for first-party clients.
+      description: >
+        Public endpoint used by `buc login` to discover the hosted Cloud OAuth
+        issuer, client id, audience, and scope. It never returns secrets.
+      responses:
+        '200':
+          description: Public login configuration.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - schema_version
+                  - issuer
+                  - client_id
+                  - audience
+                  - scope
+                properties:
+                  schema_version:
+                    type: string
+                    const: bucephalus_cloud_auth_config_v1
+                  issuer:
+                    type:
+                      - string
+                      - 'null'
+                  client_id:
+                    type:
+                      - string
+                      - 'null'
+                  audience:
+                    type:
+                      - string
+                      - 'null'
+                  scope:
+                    type: string
   /v1/auth/sessions:
     post:
       operationId: createSession

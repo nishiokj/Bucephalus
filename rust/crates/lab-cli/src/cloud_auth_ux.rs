@@ -15,6 +15,6 @@ pub(crate) fn user_auth_hint(message: &str, sent_token: bool, token_path: Option
         });
 
     format!(
-        "{message}\n\nCloud auth required.\n{token_source}\nAuthenticate with one of:\n  - bucephalus login --resource <hosted-api-url>\n  - export {BUCEPHALUS_CLOUD_USER_TOKEN_ENV}=<oauth-access-token>\n{token_file_hint}\n\nThen verify local auth state with: bucephalus setup status --json\nThen verify hosted connectivity with: buc health"
+        "{message}\n\nCloud auth required.\n{token_source}\nAuthenticate with one of:\n  - buc login\n  - export {BUCEPHALUS_CLOUD_USER_TOKEN_ENV}=<oauth-access-token>\n{token_file_hint}\n\nThen verify local auth state with: buc auth status\nThen verify hosted connectivity with: buc health"
     )
 }

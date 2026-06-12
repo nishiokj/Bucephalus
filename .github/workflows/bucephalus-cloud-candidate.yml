@@ -205,6 +205,7 @@ jobs:
           --manifest-path Cargo.toml
           -p bucephalus-cli
           --release
+          --features worker-runner
           --bin bucephalus
           --bin bucephalus-worker-runner
           --target "${RELEASE_TARGET}"

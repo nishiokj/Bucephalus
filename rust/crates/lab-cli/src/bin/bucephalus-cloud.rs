@@ -71,7 +71,7 @@ fn run(argv: Vec<String>) -> Result<()> {
             entered_command_name(group, command)
         ),
         _ if context.api_url.is_empty() => bail!(
-            "no Cloud API configured; run `bucephalus login --resource <api-url>` once to persist it, or pass --api-url / set {}",
+            "no Cloud API configured. Product users should run `buc login`; operator/dev workflows must pass --api-url or set {}.",
             BUCEPHALUS_CLOUD_API_URL_ENV
         ),
         (Some("health"), None) => print_json(&cloud_fetch(
@@ -204,8 +204,8 @@ fn parse_global_args(argv: Vec<String>) -> Result<CliContext> {
         user_token = shared_cloud_user_token()?;
     }
     if api_url.trim().is_empty() {
-        if let Ok(home) = lab_runner::bucephalus_home() {
-            if let Some(url) = lab_runner::cloud_profile_string(&home, "/api_url") {
+        if let Ok(home) = lab_core::bucephalus_home() {
+            if let Some(url) = lab_core::cloud_profile_string(&home, "/api_url") {
                 api_url = url;
             }
         }
@@ -229,7 +229,7 @@ struct CloudTokenPaths {
 }
 
 fn shared_cloud_user_token() -> Result<Option<String>> {
-    let home = match lab_runner::bucephalus_home() {
+    let home = match lab_core::bucephalus_home() {
         Ok(home) => home,
         Err(_) => return Ok(None),
     };
@@ -990,7 +990,7 @@ fn cloud_fetch(
 }
 
 fn append_user_auth_hint(context: &CliContext, message: String) -> String {
-    let token_path = lab_runner::bucephalus_home()
+    let token_path = lab_core::bucephalus_home()
         .ok()
         .map(|home| cloud_token_paths(&home).access);
     cloud_auth_ux::user_auth_hint(
@@ -1684,7 +1684,8 @@ mod tests {
         let message = err.to_string();
 
         assert!(message.contains("no Cloud API configured"));
-        assert!(message.contains("bucephalus login --resource <api-url>"));
+        assert!(message.contains("Product users should run `buc login`"));
+        assert!(message.contains("operator/dev workflows must pass --api-url"));
         assert!(message.contains(BUCEPHALUS_CLOUD_API_URL_ENV));
         fs::remove_dir_all(home).ok();
     }

@@ -4,6 +4,33 @@ import type { AuthContext } from "../src/auth";
 import type { ApiTokenRecord, ApiTokenRepository } from "../src/tokens/repository";
 
 describe("auth token routes", () => {
+  test("publishes safe login config without requiring user auth", async () => {
+    const harness = tokenHarness();
+    const response = await handleAuthRoute(
+      new Request("https://cloud.example/v1/auth/config"),
+      new URL("https://cloud.example/v1/auth/config"),
+      harness.repository,
+      null,
+      {
+        required: true,
+        issuer: "https://accounts.google.com",
+        audiences: ["client-1.apps.googleusercontent.com", "client-2.apps.googleusercontent.com"],
+        jwksUrl: "https://www.googleapis.com/oauth2/v3/certs",
+      },
+    );
+
+    expect(response!.status).toBe(200);
+    const body = await response!.json();
+    expect(body).toEqual({
+      schema_version: "bucephalus_cloud_auth_config_v1",
+      issuer: "https://accounts.google.com",
+      client_id: "client-1.apps.googleusercontent.com",
+      audience: "client-1.apps.googleusercontent.com",
+      scope: "openid profile email",
+    });
+    expect(harness.created).toHaveLength(0);
+  });
+
   test("exchanges an OAuth credential for a session token returned exactly once", async () => {
     const harness = tokenHarness();
     const response = await handleAuthRoute(

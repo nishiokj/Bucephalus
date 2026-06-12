@@ -40,12 +40,10 @@ buc run <package-digest> --secret-ref NAME=bucephalus://NAME
 
 ## Setup
 
-There is not a separate `buc login` command in this build. Sign-in is currently
-the shared Bucephalus Cloud auth path: log in once with the Core CLI and persist
-the hosted API URL:
+Log in once and persist the hosted API URL:
 
 ```bash
-bucephalus login --resource <api-url>
+buc login
 ```
 
 `buc` then reads the shared Cloud profile and cached OAuth files from
@@ -53,11 +51,14 @@ bucephalus login --resource <api-url>
 `auth/cloud_refresh_token`, and `auth/cloud_user_token.json`. If the cache has a
 refresh token, `buc` refreshes the access token before making Cloud API calls.
 
-You can also pass credentials per command:
+Automation can also pass a token per command:
 
 ```bash
-buc --api-url <api-url> --user-token <token> health
+buc --user-token <token> health
 ```
+
+`--api-url` is for development, staging, and self-hosted Cloud overrides. The
+hosted product defaults to `https://api.bucephalus.dev`.
 
 Environment variables:
 
@@ -72,6 +73,8 @@ Environment variables:
 Use the top-level workflow commands for day-to-day work:
 
 ```bash
+buc login
+buc auth status
 buc health
 buc author canonicalize experiment.yaml
 buc author resolve experiment.yaml
@@ -87,6 +90,7 @@ buc runs list
 buc runs events <run-id>
 buc runs results <run-id>
 buc runs value <run-id> <key>
+buc logout
 ```
 
 Long-form noun commands are equivalent:

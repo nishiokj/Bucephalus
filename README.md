@@ -115,7 +115,7 @@ bucephalus run <package_dir> --materialize full --json
 For hosted Cloud runs, use `buc` against the hosted API:
 
 ```bash
-bucephalus login --resource <api-url>
+buc login
 buc build experiment.yaml
 buc secrets put NAME --from-env NAME
 buc doctor <package-digest> --secret-ref NAME=bucephalus://NAME
@@ -167,7 +167,7 @@ Common operator commands:
 | Command | Purpose |
 | --- | --- |
 | `bucephalus init` | Generate an experiment, cases, and adapter from an agent client workflow. |
-| `bucephalus login` / `bucephalus logout` | Cache or remove Cloud OAuth credentials for first-party Cloud flows. |
+| `buc login` / `buc logout` | Cache or remove hosted Cloud OAuth credentials. |
 | `bucephalus dev` | Build, check, preflight, and smoke-test a YAML experiment. |
 | `bucephalus doctor` | Diagnose build/check/preflight readiness without launching a full run. |
 | `bucephalus run` | Run YAML directly or execute a sealed package. |

@@ -113,7 +113,7 @@ const server = Bun.serve({
         return withCors(runnerResponse);
       }
 
-      const authResponse = await handleAuthRoute(request, url, apiTokens, userAuth);
+      const authResponse = await handleAuthRoute(request, url, apiTokens, userAuth, config.auth);
       if (authResponse) {
         return withCors(authResponse);
       }
@@ -169,6 +169,9 @@ function withCors(response: Response): Response {
 }
 
 function requiresUserAuth(pathname: string): boolean {
+  if (pathname === "/v1/auth/config") {
+    return false;
+  }
   if (pathname.startsWith("/v1/worker/") || pathname.startsWith("/v1/runner-")) {
     return false;
   }

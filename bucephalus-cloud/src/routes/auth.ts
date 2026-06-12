@@ -1,4 +1,5 @@
 import { authOwnerKey, bearerToken, isTokenAuth, type AuthContext } from "../auth";
+import type { AuthConfig } from "../config";
 import { HttpError, jsonResponse, optionalString, readJsonObject } from "../http";
 import { TOKEN_SECRET_PREFIX, type ApiTokenRecord, type ApiTokenRepository } from "../tokens/repository";
 
@@ -12,9 +13,13 @@ export async function handleAuthRoute(
   url: URL,
   tokens: ApiTokenRepository,
   auth?: AuthContext | null,
+  authConfig?: AuthConfig,
 ): Promise<Response | null> {
   if (!url.pathname.startsWith("/v1/auth/")) {
     return null;
+  }
+  if (request.method === "GET" && url.pathname === "/v1/auth/config") {
+    return jsonResponse(publicAuthConfig(authConfig));
   }
   if (!auth) {
     throw new HttpError(401, "unauthorized", "Auth management requires an authenticated user");
@@ -76,6 +81,17 @@ export async function handleAuthRoute(
   }
 
   return null;
+}
+
+function publicAuthConfig(config?: AuthConfig) {
+  const audience = config?.audiences?.find((value) => value.trim().length > 0) ?? null;
+  return {
+    schema_version: "bucephalus_cloud_auth_config_v1",
+    issuer: config?.issuer ?? null,
+    client_id: audience,
+    audience,
+    scope: "openid profile email",
+  };
 }
 
 function requireOwnerKey(auth: AuthContext): string {

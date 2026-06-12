@@ -28,44 +28,97 @@ include = [
 [[bin]]
 name = "bucephalus"
 path = "src/main.rs"
+required-features = ["core-cli"]
 
 [[bin]]
 name = "lab"
 path = "src/bin/lab.rs"
+required-features = ["core-cli"]
 
 [[bin]]
 name = "bucephalus-worker-runner"
 path = "src/bin/bucephalus-worker-runner.rs"
+required-features = ["worker-runner"]
 
 [[bin]]
 name = "bucephalus-cloud"
 path = "src/bin/bucephalus-cloud.rs"
+required-features = ["cloud-operator"]
 
 [[bin]]
 name = "buc"
 path = "src/bin/buc.rs"
+required-features = ["hosted-cli"]
+
+[features]
+default = ["core-cli", "worker-runner", "cloud-operator", "hosted-cli"]
+core-cli = [
+  "dep:base64",
+  "dep:chrono",
+  "dep:clap",
+  "dep:crossterm",
+  "dep:ctrlc",
+  "dep:flate2",
+  "dep:lab-analysis",
+  "dep:lab-core",
+  "dep:lab-provenance",
+  "dep:lab-runner",
+  "dep:lab-schemas",
+  "dep:libc",
+  "dep:percent-encoding",
+  "dep:ratatui",
+  "dep:reqwest",
+  "dep:rusqlite",
+  "dep:serde",
+  "dep:serde_yaml",
+  "dep:sha2",
+  "dep:tar",
+  "dep:walkdir",
+]
+worker-runner = [
+  "dep:clap",
+  "dep:lab-runner",
+]
+cloud-operator = [
+  "dep:flate2",
+  "dep:lab-core",
+  "dep:percent-encoding",
+  "dep:reqwest",
+  "dep:serde_yaml",
+  "dep:sha2",
+  "dep:tar",
+]
+hosted-cli = [
+  "dep:flate2",
+  "dep:lab-core",
+  "dep:percent-encoding",
+  "dep:reqwest",
+  "dep:serde_yaml",
+  "dep:sha2",
+  "dep:tar",
+]
 
 [dependencies]
 anyhow.workspace = true
-base64.workspace = true
-chrono.workspace = true
-clap.workspace = true
-crossterm.workspace = true
-ctrlc.workspace = true
-flate2.workspace = true
-lab-analysis.workspace = true
-lab-core.workspace = true
-lab-provenance.workspace = true
-lab-runner.workspace = true
-lab-schemas.workspace = true
-libc.workspace = true
-percent-encoding.workspace = true
-ratatui.workspace = true
-reqwest.workspace = true
-rusqlite.workspace = true
-serde.workspace = true
+base64 = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
+ctrlc = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+lab-analysis = { workspace = true, optional = true }
+lab-core = { workspace = true, optional = true }
+lab-provenance = { workspace = true, optional = true }
+lab-runner = { workspace = true, optional = true }
+lab-schemas = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+percent-encoding = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 serde_json.workspace = true
-serde_yaml.workspace = true
-sha2.workspace = true
-tar.workspace = true
-walkdir.workspace = true
+serde_yaml = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+walkdir = { workspace = true, optional = true }
