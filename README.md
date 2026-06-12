@@ -7,7 +7,7 @@ Experiments are controlled executions where we aim to extract measurable outcome
 - Sandboxing agents with your product + documentation and measuring the frequency of successful onboarding / bootstrapping
 - Regression testing your agent system on a new model release
 
-[User Docs](docs/user/index.md) · [Cookbook](cookbook/README.md) · [Concepts](docs/user/concepts.md) · [YAML Reference](docs/user/experiment-yaml-reference.md) · [Distribution](docs/distribution.md)
+[User Docs](docs/user/index.md) · [Cookbook](cookbook/README.md) · [Concepts](docs/user/concepts.md) · [YAML Reference](docs/user/experiment-yaml-reference.md) · [Hosted Cloud CLI](docs/user/cloud-cli.md) · [Distribution](docs/distribution.md)
 
 **Built with:** Rust · Tokio · Docker · SQLite
 
@@ -111,6 +111,20 @@ bucephalus preflight <package_dir> --json
 bucephalus run <package_dir> --smoke-test --materialize full --json
 bucephalus run <package_dir> --materialize full --json
 ```
+
+For hosted Cloud runs, use `buc` after producing a sealed package:
+
+```bash
+bucephalus login --resource <api-url>
+bucephalus build experiment.yaml --out .bucephalus-package
+buc build .bucephalus-package
+buc doctor <package-digest> --secret-ref NAME=provider://ref
+buc run <package-digest> --secret-ref NAME=provider://ref
+```
+
+`buc build experiment.yaml` is intentionally rejected today: hosted YAML
+authoring build is not implemented in the Cloud API yet, so the sealed package
+boundary is explicit. See [Hosted Cloud CLI](docs/user/cloud-cli.md).
 
 ## What Bucephalus Does
 

@@ -85,6 +85,10 @@ fn run(argv: Vec<String>) -> Result<()> {
             entered_command_name(group, command)
         ),
         (Some("health"), None) => health(with_args(&context, rest)),
+        (Some("build"), _) => experiment_build(alias_args(&context, 1)),
+        (Some("doctor"), _) => experiment_doctor(alias_args(&context, 1)),
+        (Some("run"), _) => run_create(alias_args(&context, 1)),
+        (Some("inspect"), _) => package_inspect(alias_args(&context, 1)),
         (Some("packages"), Some("upload")) => package_upload(with_args(&context, rest)),
         (Some("packages"), Some("inspect")) => package_inspect(with_args(&context, rest)),
         (Some("experiments"), Some("build")) => experiment_build(with_args(&context, rest)),
@@ -102,6 +106,7 @@ fn known_hosted_command(group: Option<&str>, command: Option<&str>) -> bool {
     matches!(
         (group, command),
         (Some("health"), None)
+            | (Some("build" | "doctor" | "run" | "inspect"), _)
             | (Some("packages"), Some("upload" | "inspect"))
             | (Some("experiments"), Some("build" | "doctor"))
             | (Some("runs"), Some("create" | "get"))
@@ -109,7 +114,11 @@ fn known_hosted_command(group: Option<&str>, command: Option<&str>) -> bool {
 }
 
 fn group_command_without_leaf(group: Option<&str>, command: Option<&str>) -> bool {
-    command.is_none() && matches!(group, Some("packages" | "experiments" | "runs"))
+    command.is_none()
+        && matches!(
+            group,
+            Some("build" | "doctor" | "run" | "inspect" | "packages" | "experiments" | "runs")
+        )
 }
 
 fn help_requested(args: &[String]) -> bool {
@@ -136,6 +145,10 @@ fn with_args(context: &CliContext, args: Vec<String>) -> CliContext {
         args,
         client: context.client.clone(),
     }
+}
+
+fn alias_args(context: &CliContext, skip: usize) -> CliContext {
+    with_args(context, context.args.iter().skip(skip).cloned().collect())
 }
 
 fn parse_global_args(argv: Vec<String>) -> Result<CliContext> {
@@ -554,7 +567,8 @@ fn reject_authoring_yaml(path: &Path) -> Result<()> {
         .to_ascii_lowercase();
     if lower.ends_with(".yaml") || lower.ends_with(".yml") {
         bail!(
-            "buc expects a sealed package, not authoring YAML. Hosted authoring build from experiment.yaml is not implemented in the Cloud API yet. Today: run `bucephalus build experiment.yaml --out <package-dir>` locally, then `buc experiments build <package-dir>`. This command never shells out to local Core."
+            "buc build expects a sealed package, not authoring YAML. Hosted authoring build from YAML is not implemented in the Cloud API yet. Today: run `bucephalus build {}` locally, then `buc build <package-dir>`. This command never shells out to local Core.",
+            path.display()
         );
     }
     Ok(())
@@ -1081,7 +1095,7 @@ fn print_import_summary(value: &Value, source: Option<&str>) -> Result<()> {
     if let Some(package_digest) = value.get("package_digest").and_then(Value::as_str) {
         lines.push(format!("package_digest: {package_digest}"));
         lines.push(format!(
-            "next: buc experiments doctor {package_digest} --secret-ref NAME=provider://ref"
+            "next: buc doctor {package_digest} --secret-ref NAME=provider://ref"
         ));
     }
     if let Some(error_message) = value.get("error_message").and_then(Value::as_str) {
@@ -1119,7 +1133,7 @@ fn build_summary_lines(value: &Value, source: &str) -> Result<Vec<String>> {
         lines.push(format!("package_digest: {package_digest}"));
         if status == "accepted" {
             lines.push(format!(
-                "next: buc experiments doctor {package_digest} --secret-ref NAME=provider://ref"
+                "next: buc doctor {package_digest} --secret-ref NAME=provider://ref"
             ));
         }
     }
@@ -1139,7 +1153,7 @@ fn build_summary_lines(value: &Value, source: &str) -> Result<Vec<String>> {
     }
     if status != "accepted" {
         lines.push(
-            "next: fix the package diagnostics, rebuild locally with `bucephalus build`, then rerun `buc experiments build <package-dir>`."
+            "next: fix the package diagnostics, rebuild locally with `bucephalus build`, then rerun `buc build <package-dir>`."
                 .to_string(),
         );
     }
@@ -1232,7 +1246,7 @@ fn print_doctor_summary(value: &Value) -> Result<()> {
         lines.push(format!("run_requirements: {}", compact_json(requirements)?));
     }
     lines.push(format!(
-        "next: buc runs create {digest} --secret-ref NAME=provider://ref"
+        "next: buc run {digest} --secret-ref NAME=provider://ref"
     ));
     println!("{}", lines.join("\n"));
     Ok(())
@@ -1267,6 +1281,12 @@ local runners, or manage Cloud operator pools.
 
 Usage:
   buc [--api-url URL] [--user-token TOKEN] health
+  buc [--api-url URL] [--user-token TOKEN] build <package-dir|package.tgz> [--label TEXT] [--json]
+  buc [--api-url URL] [--user-token TOKEN] doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
+  buc [--api-url URL] [--user-token TOKEN] run <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--label TEXT] [--json]
+  buc [--api-url URL] [--user-token TOKEN] inspect <package-digest> [--json]
+
+Long-form nouns:
   buc [--api-url URL] [--user-token TOKEN] packages upload <package-dir|package.tgz> [--label TEXT] [--json]
   buc [--api-url URL] [--user-token TOKEN] packages inspect <package-digest> [--json]
   buc [--api-url URL] [--user-token TOKEN] experiments build <package-dir|package.tgz> [--label TEXT] [--json]
@@ -1278,6 +1298,8 @@ Cloud package boundary:
   experiments build accepts a sealed package directory/archive and calls
   POST /v1/experiments/builds after upload. Passing experiment.yaml is rejected
   because hosted authoring build is not implemented in the Cloud API yet.
+  Build locally first with `bucephalus build experiment.yaml --out <package-dir>`,
+  then upload with `buc build <package-dir>`.
 
 Runtime options:
   --backend VALUE --arch VALUE --isolation VALUE --cpu-count N --memory-mb N
@@ -1293,6 +1315,10 @@ Environment:
 fn command_help_text(group: Option<&str>, command: Option<&str>) -> Option<&'static str> {
     match (group, command) {
         (Some("health"), None) | (Some("health"), Some("--help" | "-h")) => Some(HEALTH_HELP),
+        (Some("build"), _) => Some(BUILD_HELP),
+        (Some("doctor"), _) => Some(DOCTOR_HELP),
+        (Some("run"), _) => Some(RUN_HELP),
+        (Some("inspect"), _) => Some(INSPECT_HELP),
         (Some("packages"), None) | (Some("packages"), Some("--help" | "-h")) => Some(PACKAGES_HELP),
         (Some("packages"), Some("upload")) => Some(PACKAGES_UPLOAD_HELP),
         (Some("packages"), Some("inspect")) => Some(PACKAGES_INSPECT_HELP),
@@ -1314,6 +1340,46 @@ Check hosted API readiness.
 
 Usage:
   buc health
+"#;
+
+const BUILD_HELP: &str = r#"buc build
+
+Upload a sealed package and create a hosted build/import record.
+
+Usage:
+  buc build <package-dir|package.tgz> [--label TEXT] [--json]
+
+Boundary:
+  `buc build` does not compile authoring YAML in the Cloud yet. Build the sealed
+  package with local Core first:
+
+    bucephalus build experiment.yaml --out <package-dir>
+    buc build <package-dir>
+"#;
+
+const DOCTOR_HELP: &str = r#"buc doctor
+
+Ask the hosted API whether a package can run with the supplied secrets and
+runtime options. This uses the same gates as `buc run`.
+
+Usage:
+  buc doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
+"#;
+
+const RUN_HELP: &str = r#"buc run
+
+Preflight with Cloud doctor, then queue a hosted run.
+
+Usage:
+  buc run <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--label TEXT] [--json]
+"#;
+
+const INSPECT_HELP: &str = r#"buc inspect
+
+Fetch package metadata and secret requirements from the hosted API.
+
+Usage:
+  buc inspect <package-digest> [--json]
 "#;
 
 const PACKAGES_HELP: &str = r#"buc packages
@@ -1525,9 +1591,23 @@ mod tests {
         .unwrap_err()
         .to_string();
 
-        assert!(err.contains("Hosted authoring build from experiment.yaml is not implemented"));
+        assert!(err.contains("Hosted authoring build from YAML is not implemented"));
         assert!(err.contains("never shells out to local Core"));
         assert!(!err.contains("hosted API URL"));
+
+        let natural_err = run(vec![
+            "build".to_string(),
+            "experiment.modal.yaml".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(natural_err.contains("buc build expects a sealed package"));
+        assert!(natural_err.contains("Hosted authoring build from YAML is not implemented"));
+        assert!(natural_err.contains("bucephalus build experiment.modal.yaml"));
+        assert!(
+            !natural_err.contains("unknown hosted command"),
+            "natural build command should be recognized before failing: {natural_err}"
+        );
         let _ = fs::remove_dir_all(home);
     }
 
@@ -1535,8 +1615,10 @@ mod tests {
     fn help_is_hosted_product_cli_not_operator_cli() {
         let help = help_text();
 
-        assert!(help.contains("experiments build <package-dir|package.tgz>"));
-        assert!(help.contains("runs create <package-digest>"));
+        assert!(help
+            .contains("buc [--api-url URL] [--user-token TOKEN] build <package-dir|package.tgz>"));
+        assert!(help.contains("buc [--api-url URL] [--user-token TOKEN] run <package-digest>"));
+        assert!(help.contains("Long-form nouns:"));
         assert!(help.contains("POST /v1/experiments/builds"));
         assert!(!help.contains("runner-pool"));
         assert!(!help.contains("runner-instance"));
@@ -1550,6 +1632,10 @@ mod tests {
         assert!(known_hosted_command(Some("experiments"), Some("build")));
         assert!(known_hosted_command(Some("experiments"), Some("doctor")));
         assert!(known_hosted_command(Some("runs"), Some("create")));
+        assert!(known_hosted_command(Some("build"), Some("package-dir")));
+        assert!(known_hosted_command(Some("doctor"), Some("sha256:abc")));
+        assert!(known_hosted_command(Some("run"), Some("sha256:abc")));
+        assert!(known_hosted_command(Some("inspect"), Some("sha256:abc")));
         assert!(!known_hosted_command(Some("runner-pool"), Some("create")));
         assert!(!known_hosted_command(Some("deploy"), None));
         assert!(!known_hosted_command(Some("build-upload"), None));
@@ -1638,6 +1724,8 @@ mod tests {
             "--help".to_string(),
         ])
         .expect("nested help should not require API config or package path");
+        run(vec!["build".to_string(), "--help".to_string()])
+            .expect("top-level build help should render without API config");
         run(vec!["health".to_string(), "--help".to_string()])
             .expect("health help should render without API config");
         run(vec!["runs".to_string()]).expect("command group help should render without API config");

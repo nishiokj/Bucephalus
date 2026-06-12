@@ -13,8 +13,9 @@ curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/in
 
 It detects macOS/Linux plus arm64/x86_64, downloads the matching GitHub Release
 archive, verifies the archive checksum, rejects unexpected or unsafe archive
-entries before extraction, and installs `bucephalus`, `bucephalus-cloud`, and
-`bucephalus-modal-launcher` into `$HOME/.local/bin` unless
+entries before extraction, and installs `bucephalus`, `buc`,
+`bucephalus-cloud` (operator utility), and `bucephalus-modal-launcher` into
+`$HOME/.local/bin` unless
 `BUCEPHALUS_INSTALL_DIR` is set.
 The sibling checksum file must contain exactly one record in the release format:
 `<lowercase-sha256>  <archive-name>`.
@@ -45,8 +46,9 @@ cargo install --path rust/crates/lab-cli
 
 The legacy `lab` executable is still installed as a compatibility alias when
 installing from Cargo. Public release archives ship the user-facing
-`bucephalus` CLI plus its `bucephalus-cloud` and `bucephalus-modal-launcher`
-runtime helpers, not the provider deployment bundle.
+`bucephalus` local CLI, the `buc` hosted Cloud product CLI, the
+`bucephalus-cloud` operator utility, and the `bucephalus-modal-launcher`
+runtime helper, not the provider deployment bundle.
 
 ## Build from source
 
@@ -74,6 +76,7 @@ library crates:
 ```text
 cli package: bucephalus-cli
 binary:  bucephalus
+cloud:   buc
 alias:   lab
 formula: bucephalus
 ```
@@ -98,7 +101,7 @@ bucephalus-aarch64-unknown-linux-gnu.tar.gz
 <archive>.sha256
 ```
 
-Each archive contains `bucephalus`, `bucephalus-cloud`, the packaged
+Each archive contains `bucephalus`, `buc`, `bucephalus-cloud`, the packaged
 `bucephalus-modal-launcher` helper used by the Modal backend, `README.md`,
 `LICENSE`, `release-manifest.json`, and `SHA256SUMS`. Build one locally with:
 
@@ -119,7 +122,7 @@ scripts/release/verify-core-release-provenance.sh \
 ```
 
 The Homebrew formula can consume the same archive for its target, verify SHA256,
-and install `bucephalus`, `bucephalus-cloud`, and
+and install `bucephalus`, `buc`, `bucephalus-cloud`, and
 `bucephalus-modal-launcher` into the same bin directory.
 
 In GitHub Actions these archives are uploaded as `cli-installer-<target>` so
