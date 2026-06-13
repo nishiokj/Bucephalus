@@ -78,6 +78,10 @@ const cloudGatesPath = "scripts/ci/cloud-gates.sh";
 const cloudGatesText = read(cloudGatesPath);
 const candidateClassifierPath = "scripts/ci/classify-cloud-candidate-change.sh";
 const candidateClassifierText = read(candidateClassifierPath);
+const modalLauncherGoModPath = "modal-launcher/go.mod";
+const modalLauncherGoModText = read(modalLauncherGoModPath);
+const modalLauncherMainPath = "modal-launcher/main.go";
+const modalLauncherMainText = read(modalLauncherMainPath);
 const deployTfvarsWriterPath = "scripts/deploy/write-gcp-deploy-tfvars.sh";
 const deployTfvarsWriterText = read(deployTfvarsWriterPath);
 const installScriptPath = "scripts/install.sh";
@@ -181,6 +185,21 @@ if (releaseInputNames.length !== 1 || releaseWorkflowInputs.version || releaseWo
 }
 if (!releaseWorkflowText.includes("scripts/release/resolve-release-version.sh")) {
   fail(`${releaseWorkflowPath} must resolve artifact versions from tags or tracked package metadata`);
+}
+if ((releaseWorkflowText.match(/go-version: "1\.25\.x"/g) ?? []).length < 2) {
+  fail(`${releaseWorkflowPath} must build Modal launcher artifacts with Go 1.25.x for embedded fallback root support`);
+}
+if (!candidateWorkflowText.includes('go-version: "1.25.x"')) {
+  fail(`${candidateWorkflowPath} must build Modal launcher candidate artifacts with Go 1.25.x for embedded fallback root support`);
+}
+if (!/^go 1\.25\.0$/m.test(modalLauncherGoModText)) {
+  fail(`${modalLauncherGoModPath} must declare Go 1.25.0 for the fallback root bundle dependency`);
+}
+if (!modalLauncherGoModText.includes("golang.org/x/crypto/x509roots/fallback")) {
+  fail(`${modalLauncherGoModPath} must depend on the maintained fallback root bundle`);
+}
+if (!modalLauncherMainText.includes('_ "golang.org/x/crypto/x509roots/fallback"')) {
+  fail(`${modalLauncherMainPath} must embed fallback TLS roots for worker images without an OS CA bundle`);
 }
 for (const inputName of [
   "cloudflare_worker_name",

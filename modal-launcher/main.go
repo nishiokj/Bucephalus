@@ -16,6 +16,7 @@ import (
 	"time"
 
 	modal "github.com/modal-labs/modal-client/go"
+	_ "golang.org/x/crypto/x509roots/fallback"
 )
 
 const runtimeTransferArchivePath = "/tmp/bucephalus-runtime-transfer.tar.gz"

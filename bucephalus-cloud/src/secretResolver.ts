@@ -6,6 +6,7 @@ import {
   allowsControlPlaneSecretRefs,
   controlPlaneSecretRefViolation,
 } from "./secrets/policy";
+import { SECRET_FILE_MODE } from "./secretFiles";
 
 type JsonObject = Record<string, unknown>;
 
@@ -244,7 +245,7 @@ function resolvedOutputPath(outputDir: string, relativePath: string): string {
 async function writeSecretFile(outputPath: string, value: string): Promise<void> {
   let file;
   try {
-    file = await open(outputPath, "wx", 0o600);
+    file = await open(outputPath, "wx", SECRET_FILE_MODE);
   } catch (error) {
     if (isRecord(error) && error.code === "EEXIST") {
       throw new SecretResolverError(`Secret output file already exists: ${outputPath}`);
@@ -256,7 +257,7 @@ async function writeSecretFile(outputPath: string, value: string): Promise<void>
   } finally {
     await file.close();
   }
-  await chmod(outputPath, 0o600);
+  await chmod(outputPath, SECRET_FILE_MODE);
 }
 
 async function runProviderCommand(executable: string, args: string[]): Promise<{ stdout: string; stderr: string }> {

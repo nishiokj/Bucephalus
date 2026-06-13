@@ -150,6 +150,7 @@ describe("attempt secret resolver", () => {
       const secretPath = join(root, relativePath);
       expect(await readFile(secretPath, "utf8")).toBe("secret-value");
       expect((await stat(secretPath)).isFile()).toBe(true);
+      expect((await stat(secretPath)).mode & 0o777).toBe(0o444);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

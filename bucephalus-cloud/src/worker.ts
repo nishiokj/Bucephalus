@@ -10,6 +10,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { inspectSealedPackageArchive } from "./imports/sealedPackage";
 import { redactSensitiveJsonObject } from "./jsonRedaction";
 import { releaseIdentity } from "./release";
+import { SECRET_FILE_MODE } from "./secretFiles";
 import {
   discoverCoreRunIdsFromRunRoot,
   startEvidencePump,
@@ -924,7 +925,7 @@ export async function materializeAttemptSecrets(
     if (!fileStat.isFile()) {
       throw new WorkerError(`Secret resolver output for '${id}' is not a file`);
     }
-    await chmod(outputPath, 0o600);
+    await chmod(outputPath, SECRET_FILE_MODE);
     files[id] = outputPath;
   }
   const missing = secretEntries.map(([id]) => id).filter((id) => !files[id]);

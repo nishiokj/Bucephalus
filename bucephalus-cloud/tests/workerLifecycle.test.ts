@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
@@ -544,6 +544,7 @@ describe("worker lifecycle cleanup helpers", () => {
 
       expect(Object.keys(files)).toEqual(["OPENAI_API_KEY"]);
       expect(files.OPENAI_API_KEY).toBe(join(root, "secrets", "OPENAI_API_KEY.secret"));
+      expect((await stat(files.OPENAI_API_KEY!)).mode & 0o777).toBe(0o444);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
