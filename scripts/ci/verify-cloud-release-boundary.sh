@@ -1271,15 +1271,16 @@ if (/runCommand\("docker"|spawn\("docker"/.test(workerText)) {
 
 const runtimePackage = JSON.parse(read("bucephalus-cloud/package.runtime.json"));
 const runtimeDependencies = Object.keys(runtimePackage.dependencies ?? {}).sort();
-if (JSON.stringify(runtimeDependencies) !== JSON.stringify(["postgres", "tar"])) {
-  fail("bucephalus-cloud/package.runtime.json must contain only backend runtime dependencies postgres and tar");
+if (JSON.stringify(runtimeDependencies) !== JSON.stringify(["postgres", "tar", "yaml"])) {
+  fail("bucephalus-cloud/package.runtime.json must contain only backend runtime dependencies postgres, tar, and yaml");
 }
 for (const forbiddenRuntimeDependency of ["react", "react-dom", "vite", "@vitejs/plugin-react", "tailwindcss", "lucide-react", "recharts"]) {
   if (runtimeDependencies.includes(forbiddenRuntimeDependency)) {
     fail(`bucephalus-cloud/package.runtime.json must not include frontend dependency ${forbiddenRuntimeDependency}`);
   }
 }
-if (!read("bucephalus-cloud/bun.runtime.lock").includes('"postgres"') || !read("bucephalus-cloud/bun.runtime.lock").includes('"tar"')) {
+const runtimeLockText = read("bucephalus-cloud/bun.runtime.lock");
+if (!runtimeLockText.includes('"postgres"') || !runtimeLockText.includes('"tar"') || !runtimeLockText.includes('"yaml"')) {
   fail("bucephalus-cloud/bun.runtime.lock must lock backend runtime dependencies");
 }
 
