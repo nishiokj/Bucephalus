@@ -638,7 +638,8 @@ jobs:
               code_challenge_method: "plain",
               access_type: "offline",
             });
-            console.log(`${config.issuer.replace(/\\/+$/, "")}/o/oauth2/v2/auth?${params}`);
+            const issuer = String(config.issuer ?? "").replace(new RegExp("/+$"), "");
+            console.log(`${issuer}/o/oauth2/v2/auth?${params}`);
           ')"
           oauth_page="$(curl -LsS --max-time 20 "${auth_url}")"
           if printf '%s' "${oauth_page}" | grep -Eiq 'redirect_uri_mismatch|invalid_client|restricted_client|Error 400|Error 403|Access blocked'; then
