@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { cp, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as tar from "tar";
@@ -26,8 +26,25 @@ describe("hosted authoring real Core smoke", () => {
       const coreCli = resolve(process.env.BUCEPHALUS_CLOUD_CORE_CLI ?? "target/debug/bucephalus");
       expect(existsSync(coreCli), `real Core binary is required at ${coreCli}`).toBe(true);
       const cookbookDir = resolve("cookbook/agent-eval");
+      const sourceDir = join(root, "source");
+      await cp(cookbookDir, sourceDir, { recursive: true });
+      await writeFile(join(sourceDir, "bucephalus.project.yaml"), [
+        "schema_version: bucephalus_project_v1",
+        "project:",
+        "  id: real_core_smoke",
+        "package_sources:",
+        "  default:",
+        "    root: .",
+        "    entrypoints:",
+        "      - experiment.yaml",
+        "    include:",
+        "      - \"**\"",
+        "targets:",
+        "  hosted_cloud: {}",
+        "",
+      ].join("\n"));
       const sourceArchive = join(root, "agent-eval-authoring.tgz");
-      await tar.c({ gzip: true, cwd: cookbookDir, file: sourceArchive }, (await readdir(cookbookDir)).sort());
+      await tar.c({ gzip: true, cwd: sourceDir, file: sourceArchive }, (await readdir(sourceDir)).sort());
 
       process.env.BUCEPHALUS_CLOUD_CORE_CLI = coreCli;
       process.env.BUCEPHALUS_CLOUD_DATA_DIR = join(root, "data");
@@ -66,6 +83,12 @@ describe("hosted authoring real Core smoke", () => {
       expect(body.authoring_build.source_upload_id).toBe("source-upload");
       expect(body.authoring_build.core.command).toBe("bucephalus build");
       expect(body.authoring_build.entrypoint).toBe("experiment.yaml");
+      expect(body.authoring_build.project_manifest).toEqual(expect.objectContaining({
+        path: "bucephalus.project.yaml",
+        project_id: "real_core_smoke",
+        package_source: "default",
+        entrypoint: "experiment.yaml",
+      }));
       expect(body.import.status).toBe("accepted");
       expect(body.package_digest).toMatch(/^sha256:[a-f0-9]{64}$/);
       expect(body.build_environment.source).toEqual(expect.objectContaining({
@@ -74,6 +97,12 @@ describe("hosted authoring real Core smoke", () => {
         content_digest: sha256Digest(await readFile(sourceArchive)),
         byte_size: (await readFile(sourceArchive)).byteLength,
         entrypoint: "experiment.yaml",
+        project_manifest: expect.objectContaining({
+          path: "bucephalus.project.yaml",
+          project_id: "real_core_smoke",
+          package_source: "default",
+          entrypoint: "experiment.yaml",
+        }),
       }));
       expect(body.build_environment.package_contract).toEqual(expect.objectContaining({
         authoring_compiler: "core_universal_v1",
