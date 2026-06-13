@@ -1398,7 +1398,7 @@ Usage:
 
 Environment:
   BUCEPHALUS_CLOUD_API_URL       Cloud API base URL; falls back to the profile
-                                 persisted by `bucephalus login` (no localhost default)
+                                 persisted by `buc login` (no localhost default)
   BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token override for health checks
   BUCEPHALUS_CLOUD_WORKER_TOKEN  Required for runner pool and worker management commands
   BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN
@@ -1737,7 +1737,7 @@ mod tests {
             "Bucephalus Cloud requires OAuth bearer authentication".to_string(),
         );
 
-        assert!(message.contains("bucephalus login"));
+        assert!(message.contains("buc login"));
         assert!(message.contains("export BUCEPHALUS_CLOUD_USER_TOKEN=<oauth-access-token>"));
         assert!(message.contains("cloud_user_token"));
         assert!(message.contains("The CLI did not find a user bearer token"));
