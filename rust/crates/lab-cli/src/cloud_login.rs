@@ -449,15 +449,9 @@ fn auth_status_for_home(home: &Path) -> Value {
             {
                 "type": "cli_command",
                 "command": "buc login",
-                "description": "Start OAuth device login and cache Cloud tokens for this user."
+                "description": "Open the hosted Cloud sign-in flow and cache Cloud tokens for this user."
             }
-        ],
-        "oauth": {
-            "issuer_env": BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV,
-            "client_id_env": BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV,
-            "audience_env": BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV,
-            "scope_env": BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV
-        }
+        ]
     })
 }
 

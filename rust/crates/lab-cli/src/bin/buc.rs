@@ -4747,10 +4747,10 @@ Notes:
   under BUCEPHALUS_HOME and reuses it for later buc commands.
 
 Advanced:
-  --api-url URL is for dev/staging/self-hosted Cloud. --issuer, --client-id,
-  --audience, and --scope override the OAuth config discovered from the hosted
-  API. --resource is accepted only as a backwards-compatible alias for
-  --api-url; new scripts should use --api-url.
+  --api-url URL is for dev/staging/self-hosted Cloud. Normal hosted users do
+  not need an API URL, issuer, audience, or client id. --resource is accepted
+  only as a backwards-compatible alias for --api-url; new scripts should use
+  --api-url.
 "#;
 
 const LOGOUT_HELP: &str = r#"buc logout
@@ -8433,6 +8433,13 @@ mod tests {
 
         run(vec!["auth".to_string(), "status".to_string()])
             .expect("buc auth status should read local auth state without API config");
+        let missing_status = cloud_login::auth_status().unwrap();
+        assert_eq!(missing_status["auth"]["status"], "missing");
+        assert!(missing_status["auth"].get("oauth").is_none());
+        assert_eq!(
+            missing_status["auth"]["actions"][0]["description"],
+            "Open the hosted Cloud sign-in flow and cache Cloud tokens for this user."
+        );
         run(vec!["logout".to_string(), "--dry-run".to_string()])
             .expect("buc logout --dry-run should inspect local auth state without API config");
 
