@@ -356,6 +356,8 @@ for (const requiredEnv of [
   "BUCEPHALUS_DEPLOYMENT_ENVIRONMENT",
   "BUCEPHALUS_GCP_RESOURCE_PREFIX",
   "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID",
+  "BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_ID",
+  "BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_SECRET_VERSION",
   "BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION",
   "BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION",
   "BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION",
@@ -1511,6 +1513,14 @@ if (!/resource\s+"terraform_data"\s+"deploy_input_preflight"/.test(gcpInfraText)
 }
 if (!/BUCEPHALUS_CLOUD_OAUTH_AUDIENCE[\s\S]*var\.oauth_user_client_id/.test(gcpInfraText)) {
   fail(`${gcpInfraPath} must inject the user OAuth client ID as the API OAuth audience`);
+}
+if (!/variable\s+"oauth_cli_client_secret_secret_version"/.test(gcpVariablesText)) {
+  fail(`${gcpVariablesPath} must require an explicit Secret Manager version for the CLI OAuth client secret`);
+}
+if (
+  !/dynamic\s+"env"\s*\{[\s\S]*for_each\s*=\s*var\.oauth_cli_client_secret_secret_version[\s\S]*name\s*=\s*"BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_SECRET"[\s\S]*secret\s*=\s*google_secret_manager_secret\.control_plane\["oauth_cli_client_secret"\]\.secret_id/.test(gcpInfraText)
+) {
+  fail(`${gcpInfraPath} must inject the CLI OAuth client secret from Secret Manager, not Terraform state`);
 }
 if (!/variable\s+"oauth_jwks_url"/.test(gcpVariablesText) || !/https:\/\/www\.googleapis\.com\/oauth2\/v3\/certs/.test(gcpVariablesText)) {
   fail(`${gcpVariablesPath} must require an explicit Google-compatible OAuth JWKS URL`);

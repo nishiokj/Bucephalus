@@ -46,6 +46,7 @@ locals {
     runner_admin_token                  = "${local.name_prefix}-runner-admin-token"
     r2_access_key_id                    = "${local.name_prefix}-r2-access-key-id"
     r2_secret_access_key                = "${local.name_prefix}-r2-secret-access-key"
+    oauth_cli_client_secret             = "${local.name_prefix}-oauth-cli-client-secret"
     modal_token_id                      = "${local.name_prefix}-modal-token-id"
     modal_token_secret                  = "${local.name_prefix}-modal-token-secret"
     modal_s3_access_key_id              = "${local.name_prefix}-modal-s3-access-key-id"
@@ -74,6 +75,10 @@ locals {
     }
     r2_secret_access_key_api = {
       secret_key = "r2_secret_access_key"
+      member     = "serviceAccount:${google_service_account.api.email}"
+    }
+    oauth_cli_client_secret_api = {
+      secret_key = "oauth_cli_client_secret"
       member     = "serviceAccount:${google_service_account.api.email}"
     }
     api_database_url_pool_controller = {
@@ -135,6 +140,7 @@ resource "terraform_data" "deploy_input_preflight" {
     migration_image_digest   = var.migration_image_digest
     worker_image_digest      = var.worker_image_digest
     oauth_user_client_id     = var.oauth_user_client_id
+    oauth_cli_client_secret  = var.oauth_cli_client_secret_secret_version
     runner_pool_id           = var.pool_controller_runner_pool_id
     api_database_secret      = var.api_database_url_secret_version
     migrator_database_secret = var.migrator_database_url_secret_version
@@ -176,6 +182,10 @@ resource "terraform_data" "deploy_input_preflight" {
     precondition {
       condition     = !local.deploy_api_services || var.oauth_user_client_id != null
       error_message = "oauth_user_client_id is required when API services are deployed."
+    }
+    precondition {
+      condition     = !local.deploy_api_services || var.oauth_cli_client_id == null || var.oauth_cli_client_secret_secret_version != null
+      error_message = "oauth_cli_client_secret_secret_version is required when API services are deployed with oauth_cli_client_id."
     }
     precondition {
       condition     = !local.deploy_api_services || var.api_database_url_secret_version != null
@@ -728,6 +738,19 @@ resource "google_cloud_run_v2_service" "api" {
       env {
         name  = "BUCEPHALUS_CLOUD_OAUTH_CLI_SCOPE"
         value = var.oauth_cli_scope
+      }
+
+      dynamic "env" {
+        for_each = var.oauth_cli_client_secret_secret_version == null ? [] : [var.oauth_cli_client_secret_secret_version]
+        content {
+          name = "BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.control_plane["oauth_cli_client_secret"].secret_id
+              version = env.value
+            }
+          }
+        }
       }
 
       env {

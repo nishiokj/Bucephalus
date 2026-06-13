@@ -24,6 +24,7 @@ cloud_sql_point_in_time_recovery_enabled = false
 
 oauth_issuer         = "https://accounts.google.com"
 oauth_user_client_id = "<google-oauth-client-id>.apps.googleusercontent.com"
+oauth_cli_client_id  = "<cli-oauth-client-id>.apps.googleusercontent.com"
 oauth_jwks_url       = "https://www.googleapis.com/oauth2/v3/certs"
 
 # The values below are required only when deploy_api_services=true or
@@ -35,6 +36,7 @@ oauth_jwks_url       = "https://www.googleapis.com/oauth2/v3/certs"
 # migrator_database_url_secret_version = "1"
 # worker_token_secret_version = "1"
 # runner_admin_token_secret_version = "1"
+# oauth_cli_client_secret_secret_version = "1"
 #
 # The values below are required only when deploy_pool_controller=true.
 #

@@ -16,6 +16,7 @@ describe("auth token routes", () => {
         issuer: "https://accounts.google.com",
         audiences: ["client-1.apps.googleusercontent.com", "client-2.apps.googleusercontent.com"],
         cliClientId: "cli-client.apps.googleusercontent.com",
+        cliClientSecret: null,
         cliScope: "openid email",
         jwksUrl: "https://www.googleapis.com/oauth2/v3/certs",
       },
@@ -30,6 +31,113 @@ describe("auth token routes", () => {
       audience: "cli-client.apps.googleusercontent.com",
       scope: "openid email",
     });
+    expect(harness.created).toHaveLength(0);
+  });
+
+  test("publishes hosted code exchange only when the API holds the CLI client secret", async () => {
+    const harness = tokenHarness();
+    const response = await handleAuthRoute(
+      new Request("https://cloud.example/v1/auth/config"),
+      new URL("https://cloud.example/v1/auth/config"),
+      harness.repository,
+      null,
+      {
+        required: true,
+        issuer: "https://accounts.google.com",
+        audiences: ["cli-client.apps.googleusercontent.com"],
+        cliClientId: "cli-client.apps.googleusercontent.com",
+        cliClientSecret: "secret",
+        cliScope: "openid email",
+        jwksUrl: "https://www.googleapis.com/oauth2/v3/certs",
+      },
+    );
+
+    expect(response!.status).toBe(200);
+    const body = await response!.json();
+    expect(body.code_exchange_path).toBe("/v1/auth/oauth/exchange");
+  });
+
+  test("exchanges browser OAuth code through Cloud and mints a session token", async () => {
+    const harness = tokenHarness();
+    const response = await handleAuthRoute(
+      new Request("https://cloud.example/v1/auth/oauth/exchange", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          code: "oauth-code",
+          redirect_uri: "http://127.0.0.1:49152/callback",
+          client_id: "cli-client.apps.googleusercontent.com",
+          code_verifier: "verifier",
+        }),
+      }),
+      new URL("https://cloud.example/v1/auth/oauth/exchange"),
+      harness.repository,
+      null,
+      {
+        required: true,
+        issuer: "https://accounts.google.com",
+        audiences: ["cli-client.apps.googleusercontent.com"],
+        cliClientId: "cli-client.apps.googleusercontent.com",
+        cliClientSecret: "secret",
+        cliScope: "openid email",
+        jwksUrl: "https://www.googleapis.com/oauth2/v3/certs",
+      },
+      {
+        async exchangeOAuthCode(input) {
+          expect(input.code).toBe("oauth-code");
+          expect(input.redirectUri).toBe("http://127.0.0.1:49152/callback");
+          expect(input.codeVerifier).toBe("verifier");
+          expect(input.authConfig.cliClientSecret).toBe("secret");
+          return { id_token: "google-id-token" };
+        },
+        async verifyOAuthToken(token) {
+          expect(token).toBe("google-id-token");
+          return oauthContext("user-a");
+        },
+      },
+    );
+
+    expect(response!.status).toBe(201);
+    const body = await response!.json();
+    expect(body.schema_version).toBe("bucephalus_cloud_login_session_v1");
+    expect(body.access_token).toBe("buc_new-secret");
+    expect(body.token).toBe("buc_new-secret");
+    expect(body.token_type).toBe("Bearer");
+    expect(body.expires_in).toBe(30 * 24 * 60 * 60);
+    expect(harness.created[0]).toMatchObject({
+      kind: "session",
+      issuer: "https://accounts.google.com",
+      subject: "user-a",
+      ttlSeconds: 30 * 24 * 60 * 60,
+    });
+  });
+
+  test("rejects hosted browser OAuth exchange when Cloud lacks the client secret", async () => {
+    const harness = tokenHarness();
+    await expect(handleAuthRoute(
+      new Request("https://cloud.example/v1/auth/oauth/exchange", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          code: "oauth-code",
+          redirect_uri: "http://127.0.0.1:49152/callback",
+          client_id: "cli-client.apps.googleusercontent.com",
+          code_verifier: "verifier",
+        }),
+      }),
+      new URL("https://cloud.example/v1/auth/oauth/exchange"),
+      harness.repository,
+      null,
+      {
+        required: true,
+        issuer: "https://accounts.google.com",
+        audiences: ["cli-client.apps.googleusercontent.com"],
+        cliClientId: "cli-client.apps.googleusercontent.com",
+        cliClientSecret: null,
+        cliScope: "openid email",
+        jwksUrl: "https://www.googleapis.com/oauth2/v3/certs",
+      },
+    )).rejects.toThrow("client secret");
     expect(harness.created).toHaveLength(0);
   });
 

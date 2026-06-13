@@ -51,6 +51,7 @@ struct CloudAuthConfig {
     client_id: Option<String>,
     audience: Option<String>,
     scope: Option<String>,
+    code_exchange_path: Option<String>,
 }
 
 pub fn run_login(options: DeviceLoginOptions) -> Result<Value> {
@@ -116,6 +117,8 @@ pub fn run_login(options: DeviceLoginOptions) -> Result<Value> {
             &token_endpoint,
             &client_id,
             &scope,
+            &api_url,
+            discovered.code_exchange_path.as_deref(),
             options.no_browser,
         )?
     } else {
@@ -489,6 +492,7 @@ fn fetch_cloud_auth_config(api_url: &str) -> Result<CloudAuthConfig> {
         client_id: string_field(&value, "client_id"),
         audience: string_field(&value, "audience"),
         scope: string_field(&value, "scope"),
+        code_exchange_path: string_field(&value, "code_exchange_path"),
     })
 }
 
@@ -566,6 +570,8 @@ fn browser_authorization_code_login(
     token_endpoint: &str,
     client_id: &str,
     scope: &str,
+    api_url: &str,
+    code_exchange_path: Option<&str>,
     no_browser: bool,
 ) -> Result<Value> {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -595,6 +601,16 @@ fn browser_authorization_code_login(
     eprintln!("Waiting for browser authorization...");
 
     let code = wait_for_authorization_code(&listener, &state)?;
+    if let Some(path) = code_exchange_path {
+        return exchange_authorization_code_with_cloud(
+            api_url,
+            path,
+            client_id,
+            &redirect_uri,
+            &code_verifier,
+            &code,
+        );
+    }
     exchange_authorization_code(
         token_endpoint,
         client_id,
@@ -733,6 +749,58 @@ fn exchange_authorization_code(
         bail_with_status("OAuth authorization code exchange failed", status, &bytes)?;
     }
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn exchange_authorization_code_with_cloud(
+    api_url: &str,
+    code_exchange_path: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+    code: &str,
+) -> Result<Value> {
+    let endpoint = hosted_code_exchange_url(api_url, code_exchange_path)?;
+    let response = Client::new()
+        .post(&endpoint)
+        .json(&json!({
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "code_verifier": code_verifier,
+        }))
+        .send()
+        .with_context(|| {
+            format!(
+                "failed to exchange OAuth authorization code with Bucephalus Cloud at {}",
+                endpoint
+            )
+        })?;
+    let status = response.status().as_u16();
+    let bytes = response.bytes()?.to_vec();
+    if !(200..300).contains(&status) {
+        bail_with_status(
+            "Bucephalus Cloud OAuth authorization code exchange failed",
+            status,
+            &bytes,
+        )?;
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn hosted_code_exchange_url(api_url: &str, code_exchange_path: &str) -> Result<String> {
+    let path = code_exchange_path.trim();
+    if path.is_empty() {
+        return Err(anyhow!("hosted auth config code_exchange_path is empty"));
+    }
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return Ok(path.to_string());
+    }
+    if !path.starts_with('/') {
+        return Err(anyhow!(
+            "hosted auth config code_exchange_path must be an absolute path"
+        ));
+    }
+    Ok(format!("{}{}", api_url.trim_end_matches('/'), path))
 }
 
 fn pkce_challenge(verifier: &str) -> String {

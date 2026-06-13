@@ -167,6 +167,7 @@ jobs:
           BUCEPHALUS_HOSTED_API_URL: ${{ vars.BUCEPHALUS_HOSTED_API_URL }}
           BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID || vars.BUCEPHALUS_OAUTH_USER_CLIENT_ID }}
           BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_ID: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_ID || vars.BUCEPHALUS_OAUTH_CLI_CLIENT_ID }}
+          BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_SECRET_VERSION: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_SECRET_VERSION || secrets.BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_SECRET_VERSION }}
           BUCEPHALUS_GOOGLE_OAUTH_CLI_SCOPE: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLI_SCOPE || 'openid email' }}
           BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID: ${{ vars.BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID || secrets.BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID }}
           BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION: ${{ vars.BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION || secrets.BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION }}
@@ -210,6 +211,9 @@ jobs:
           if [[ "${NEEDS_API_CONFIG}" == "true" && -z "${BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_ID}" ]]; then
             missing+=("BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_ID")
           fi
+          if [[ "${NEEDS_API_CONFIG}" == "true" && -z "${BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_SECRET_VERSION}" ]]; then
+            missing+=("BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_SECRET_VERSION")
+          fi
           if [[ "${NEEDS_API_CONFIG}" == "true" && -z "${BUCEPHALUS_HOSTED_API_URL}" ]]; then
             missing+=("BUCEPHALUS_HOSTED_API_URL")
           fi
@@ -238,6 +242,7 @@ jobs:
             echo "BUCEPHALUS_HOSTED_API_URL=${BUCEPHALUS_HOSTED_API_URL%/}"
             echo "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID=${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}"
             echo "BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_ID=${BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_ID}"
+            echo "BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_SECRET_VERSION=${BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_SECRET_VERSION}"
             echo "BUCEPHALUS_GOOGLE_OAUTH_CLI_SCOPE=${BUCEPHALUS_GOOGLE_OAUTH_CLI_SCOPE}"
             echo "BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID=${BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID}"
             echo "BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION=${BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION}"
@@ -431,6 +436,7 @@ jobs:
             --resource-prefix "${BUCEPHALUS_GCP_RESOURCE_PREFIX}" \
             --oauth-user-client-id "${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}" \
             --oauth-cli-client-id "${BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_ID}" \
+            --oauth-cli-client-secret-version "${BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_SECRET_VERSION}" \
             --oauth-cli-scope "${BUCEPHALUS_GOOGLE_OAUTH_CLI_SCOPE}" \
             --pool-controller-runner-pool-id "${BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID}" \
             --api-database-url-secret-version "${BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION}" \
@@ -624,6 +630,9 @@ jobs:
             }
             if (config.client_id !== process["env"].BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_ID) {
               throw new Error("hosted auth config client_id does not match BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_ID");
+            }
+            if (config.code_exchange_path !== "/v1/auth/oauth/exchange") {
+              throw new Error("hosted auth config must publish the Cloud OAuth code exchange path");
             }
           '
           auth_url="$(AUTH_CONFIG="${auth_config}" bun -e '

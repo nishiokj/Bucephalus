@@ -9,6 +9,7 @@ describe("OAuth verifier", () => {
       issuer: "https://issuer.example",
       audiences: ["bucephalus-cloud"],
       cliClientId: null,
+      cliClientSecret: null,
       cliScope: "openid email",
       jwksUrl: "https://issuer.example/.well-known/jwks.json",
     });
@@ -24,6 +25,7 @@ describe("OAuth verifier", () => {
       issuer: "https://issuer.example",
       audiences: ["bucephalus-cloud"],
       cliClientId: null,
+      cliClientSecret: null,
       cliScope: "openid email",
       jwksUrl: "https://issuer.example/.well-known/jwks.json",
     });
@@ -50,6 +52,7 @@ describe("OAuth verifier", () => {
         issuer: "https://issuer.example",
         audiences: ["bucephalus-cloud"],
         cliClientId: null,
+        cliClientSecret: null,
         cliScope: "openid email",
         jwksUrl: "https://issuer.example/.well-known/jwks.json",
       });
@@ -94,6 +97,7 @@ describe("OAuth verifier", () => {
       issuer: null,
       audiences: null,
       cliClientId: null,
+      cliClientSecret: null,
       cliScope: "openid email",
       jwksUrl: null,
     })).toThrow("Unauthenticated Bucephalus Cloud API mode is not supported");

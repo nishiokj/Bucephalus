@@ -76,12 +76,20 @@ buc login
 Hosted login opens a browser OAuth flow and listens on a local loopback
 callback. No hosted user should need to provide `--api-url`; that option is only
 for development, staging, or self-hosted Cloud. The hosted API publishes the CLI
-OAuth client and scope from `/v1/auth/config`.
+OAuth client, scope, and server-side authorization-code exchange path from
+`/v1/auth/config`.
 
-`buc` then reads the shared Cloud profile and cached OAuth files from
-`BUCEPHALUS_HOME`: `cloud.json`, `auth/cloud_user_token`,
-`auth/cloud_refresh_token`, and `auth/cloud_user_token.json`. If the cache has a
-refresh token, `buc` refreshes the access token before making Cloud API calls.
+`buc` sends the browser authorization code and PKCE verifier back to the hosted
+API, which performs the OAuth token exchange with its own server-side secret and
+returns a Bucephalus session token. The CLI never needs the OAuth client secret
+and never asks hosted users for issuer, audience, or internal API endpoint
+details.
+
+`buc` then reads the shared Cloud profile and cached auth files from
+`BUCEPHALUS_HOME`: `cloud.json`, `auth/cloud_user_token`, and
+`auth/cloud_user_token.json`. If a self-hosted OAuth cache includes
+`auth/cloud_refresh_token`, `buc` can refresh the access token before making
+Cloud API calls.
 
 Automation can also pass a token per command:
 

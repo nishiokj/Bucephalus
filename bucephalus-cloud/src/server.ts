@@ -43,7 +43,8 @@ const runners = new RunnerRepository(sql);
 const secrets = new CloudSecretRepository(sql);
 const secretStore = new SecretStore(createSecretStoreBackend(config), config.secrets.prefix);
 const apiTokens = new ApiTokenRepository(sql);
-const auth = new CloudAuthenticator(new OAuthVerifier(config.auth), apiTokens);
+const oauthVerifier = new OAuthVerifier(config.auth);
+const auth = new CloudAuthenticator(oauthVerifier, apiTokens);
 const rateLimiter = new InMemoryRateLimiter(config.rateLimit);
 
 const server = Bun.serve({
@@ -113,7 +114,9 @@ const server = Bun.serve({
         return withCors(runnerResponse);
       }
 
-      const authResponse = await handleAuthRoute(request, url, apiTokens, userAuth, config.auth);
+      const authResponse = await handleAuthRoute(request, url, apiTokens, userAuth, config.auth, {
+        verifyOAuthToken: (token) => oauthVerifier.verifyToken(token, "Bucephalus Cloud login"),
+      });
       if (authResponse) {
         return withCors(authResponse);
       }
@@ -170,6 +173,9 @@ function withCors(response: Response): Response {
 
 function requiresUserAuth(pathname: string): boolean {
   if (pathname === "/v1/auth/config") {
+    return false;
+  }
+  if (pathname === "/v1/auth/oauth/exchange") {
     return false;
   }
   if (pathname.startsWith("/v1/worker/") || pathname.startsWith("/v1/runner-")) {

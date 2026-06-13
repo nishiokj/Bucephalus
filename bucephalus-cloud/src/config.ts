@@ -30,6 +30,7 @@ export interface AuthConfig {
   issuer: string | null;
   audiences: string[] | null;
   cliClientId: string | null;
+  cliClientSecret: string | null;
   cliScope: string;
   jwksUrl: string | null;
 }
@@ -64,6 +65,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const issuer = env.BUCEPHALUS_CLOUD_OAUTH_ISSUER?.trim() || null;
   const audiences = parseCsv(env.BUCEPHALUS_CLOUD_OAUTH_AUDIENCE);
   const cliClientId = env.BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_ID?.trim() || null;
+  const cliClientSecret = env.BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_SECRET?.trim() || null;
   const cliScope = env.BUCEPHALUS_CLOUD_OAUTH_CLI_SCOPE?.trim() || "openid email";
   const explicitJwksUrl = env.BUCEPHALUS_CLOUD_OAUTH_JWKS_URL?.trim() || null;
   const authRequired = env.BUCEPHALUS_CLOUD_AUTH_REQUIRED?.trim().toLowerCase() || null;
@@ -90,6 +92,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       issuer,
       audiences,
       cliClientId,
+      cliClientSecret,
       cliScope,
       jwksUrl,
     },

@@ -46,10 +46,12 @@ describe("config", () => {
     const config = loadConfig({
       BUCEPHALUS_CLOUD_OAUTH_AUDIENCE: "web-client.apps.googleusercontent.com, sdk-client.apps.googleusercontent.com",
       BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_ID: "sdk-client.apps.googleusercontent.com",
+      BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_SECRET: "client-secret",
       BUCEPHALUS_CLOUD_OAUTH_CLI_SCOPE: "openid email",
     });
 
     expect(config.auth.cliClientId).toBe("sdk-client.apps.googleusercontent.com");
+    expect(config.auth.cliClientSecret).toBe("client-secret");
     expect(config.auth.cliScope).toBe("openid email");
   });
 

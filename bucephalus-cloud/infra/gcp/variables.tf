@@ -145,6 +145,17 @@ variable "oauth_cli_scope" {
   }
 }
 
+variable "oauth_cli_client_secret_secret_version" {
+  description = "Secret Manager version containing the OAuth client secret used by the hosted API to exchange buc browser login codes."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.oauth_cli_client_secret_secret_version == null || can(regex("^[1-9][0-9]*$", var.oauth_cli_client_secret_secret_version))
+    error_message = "oauth_cli_client_secret_secret_version must be an explicit numeric Secret Manager version when set."
+  }
+}
+
 variable "oauth_jwks_url" {
   description = "JWKS URL used to verify user OAuth bearer tokens. For Google ID tokens this is https://www.googleapis.com/oauth2/v3/certs."
   type        = string
