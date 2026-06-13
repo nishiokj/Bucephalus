@@ -642,16 +642,17 @@ Cloud gate indefinitely. It also validates OpenAPI YAML parseability plus local
 `DATABASE_URL` is set. With database coverage enabled it also runs
 `scripts/ci/smoke-buc-hosted-workflow.sh`, which starts a real HTTP route
 harness backed by a scratch Postgres database and drives the actual `buc`
-binary through `buc build <nested experiment.yaml> --context-root <root>`,
-hosted Core authoring, package import, Cloud readiness, hosted secret upload,
-doctor, run creation, worker claim, runtime evidence ingest, run readback, and
-package inspection. The smoke fixture checks that shared context files are
-present, local credential/generated material such as `.env`, `.npmrc`, `.ssh`,
-`.aws`, `node_modules`, and `target` is excluded from authoring uploads or
-rejected by the hosted API, and control-plane secrets such as `DATABASE_URL`
-and `BUCEPHALUS_CLOUD_WORKER_TOKEN` are not forwarded into hosted Core. In CI,
-a missing `DATABASE_URL` fails the gate instead of silently
-skipping migration coverage.
+binary through `buc build <nested experiment.yaml>` with a
+`bucephalus.project.yaml` manifest at the shared project root, hosted Core
+authoring, package import, Cloud readiness, hosted secret upload, doctor, run
+creation, worker claim, runtime evidence ingest, run readback, and package
+inspection. The smoke fixture checks that manifest-declared shared context
+files are present, local credential/generated material such as `.env`, `.npmrc`,
+`.ssh`, `.aws`, `node_modules`, and `target` is excluded from authoring uploads
+or rejected by the hosted API, and control-plane secrets such as `DATABASE_URL`
+and `BUCEPHALUS_CLOUD_WORKER_TOKEN` are not forwarded into hosted Core. In CI, a
+missing `DATABASE_URL` fails the gate instead of silently skipping migration
+coverage.
 Before DB-backed tests run, `bun run check:postgres` performs a bounded
 credential-redacted readiness check. If the TCP port is open but does not
 complete a Postgres handshake/query, the gate reports that state explicitly so

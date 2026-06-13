@@ -320,12 +320,13 @@ Rust workspace tests under a bounded timeout so local Docker executor state
 cannot hang the Cloud gate indefinitely. It validates OpenAPI and runs Cloud
 migration integration tests when `DATABASE_URL` is set. Database-backed gates
 also run `scripts/ci/smoke-buc-hosted-workflow.sh`, which drives the actual
-`buc` binary over HTTP through `buc build <nested experiment.yaml>
---context-root <root>`, hosted Core authoring, package import, Cloud readiness,
-doctor, hosted secret upload, run creation, worker claim, runtime evidence
-ingest, run readback, and package inspection against a scratch migrated
-database. The smoke fixture checks nested authoring-context packaging, shared
-file inclusion, exclusion/rejection of local credential and generated material
+`buc` binary over HTTP through `buc build <nested experiment.yaml>` with a
+`bucephalus.project.yaml` manifest at the shared project root, hosted Core
+authoring, package import, Cloud readiness, doctor, hosted secret upload, run
+creation, worker claim, runtime evidence ingest, run readback, and package
+inspection against a scratch migrated database. The smoke fixture checks
+nested authoring-context packaging, manifest-declared shared file inclusion,
+exclusion/rejection of local credential and generated material
 such as `.env`, `.npmrc`, `.ssh`, `.aws`, `node_modules`, and `target`, and
 hosted Core environment isolation from control-plane secrets. In CI,
 `DATABASE_URL` is required so migration coverage cannot be silently skipped.
