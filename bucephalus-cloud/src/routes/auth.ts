@@ -84,13 +84,13 @@ export async function handleAuthRoute(
 }
 
 function publicAuthConfig(config?: AuthConfig) {
-  const audience = config?.audiences?.find((value) => value.trim().length > 0) ?? null;
+  const audience = config?.cliClientId ?? config?.audiences?.find((value) => value.trim().length > 0) ?? null;
   return {
     schema_version: "bucephalus_cloud_auth_config_v1",
     issuer: config?.issuer ?? null,
     client_id: audience,
     audience,
-    scope: "openid profile email",
+    scope: config?.cliScope ?? "openid email",
   };
 }
 

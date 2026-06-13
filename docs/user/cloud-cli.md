@@ -73,6 +73,11 @@ Log in once and persist the hosted API URL:
 buc login
 ```
 
+Hosted login opens a browser OAuth flow and listens on a local loopback
+callback. No hosted user should need to provide `--api-url`; that option is only
+for development, staging, or self-hosted Cloud. The hosted API publishes the CLI
+OAuth client and scope from `/v1/auth/config`.
+
 `buc` then reads the shared Cloud profile and cached OAuth files from
 `BUCEPHALUS_HOME`: `cloud.json`, `auth/cloud_user_token`,
 `auth/cloud_refresh_token`, and `auth/cloud_user_token.json`. If the cache has a
@@ -85,7 +90,8 @@ buc --user-token <token> health
 ```
 
 `--api-url` is for development, staging, and self-hosted Cloud overrides. The
-hosted product defaults to `https://api.bucephalus.dev`.
+installed hosted product default is baked into the release from
+`BUCEPHALUS_HOSTED_API_URL`.
 
 Environment variables:
 

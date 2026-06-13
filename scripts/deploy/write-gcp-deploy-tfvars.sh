@@ -8,6 +8,8 @@ DEPLOYMENT_ENVIRONMENT=""
 RESOURCE_PREFIX="buc"
 OAUTH_ISSUER="https://accounts.google.com"
 OAUTH_USER_CLIENT_ID=""
+OAUTH_CLI_CLIENT_ID=""
+OAUTH_CLI_SCOPE="openid email"
 OAUTH_JWKS_URL="https://www.googleapis.com/oauth2/v3/certs"
 CLOUD_OBJECT_STORAGE_BACKEND="${BUCEPHALUS_CLOUD_OBJECT_STORAGE_BACKEND:-gcs}"
 CLOUD_GCS_BUCKET="${BUCEPHALUS_CLOUD_GCS_BUCKET:-}"
@@ -46,6 +48,7 @@ Usage: scripts/deploy/write-gcp-deploy-tfvars.sh --out <path> \
   --region <gcp-region> \
   --environment <name> \
   --oauth-user-client-id <client-id.apps.googleusercontent.com> \
+  --oauth-cli-client-id <client-id.apps.googleusercontent.com> \
   --pool-controller-runner-pool-id <uuid> \
   --api-database-url-secret-version <number> \
   --migrator-database-url-secret-version <number> \
@@ -55,6 +58,7 @@ Usage: scripts/deploy/write-gcp-deploy-tfvars.sh --out <path> \
   --pool-controller-reap-cmd-json-secret-version <number> \
   [--resource-prefix <prefix>] \
   [--oauth-issuer <url>] \
+  [--oauth-cli-scope <scope>] \
   [--oauth-jwks-url <url>] \
   [--cloud-object-storage-backend filesystem|gcs|r2] \
   [--cloud-gcs-bucket <bucket>] \
@@ -114,6 +118,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --oauth-user-client-id)
       OAUTH_USER_CLIENT_ID="${2:-}"
+      shift 2
+      ;;
+    --oauth-cli-client-id)
+      OAUTH_CLI_CLIENT_ID="${2:-}"
+      shift 2
+      ;;
+    --oauth-cli-scope)
+      OAUTH_CLI_SCOPE="${2:-}"
       shift 2
       ;;
     --oauth-jwks-url)
@@ -267,6 +279,8 @@ DEPLOYMENT_ENVIRONMENT="${DEPLOYMENT_ENVIRONMENT}" \
 RESOURCE_PREFIX="${RESOURCE_PREFIX}" \
 OAUTH_ISSUER="${OAUTH_ISSUER}" \
 OAUTH_USER_CLIENT_ID="${OAUTH_USER_CLIENT_ID}" \
+OAUTH_CLI_CLIENT_ID="${OAUTH_CLI_CLIENT_ID}" \
+OAUTH_CLI_SCOPE="${OAUTH_CLI_SCOPE}" \
 OAUTH_JWKS_URL="${OAUTH_JWKS_URL}" \
 CLOUD_OBJECT_STORAGE_BACKEND="${CLOUD_OBJECT_STORAGE_BACKEND}" \
 CLOUD_GCS_BUCKET="${CLOUD_GCS_BUCKET}" \
@@ -309,6 +323,8 @@ const values = {
   resource_prefix: process.env.RESOURCE_PREFIX,
   oauth_issuer: process.env.OAUTH_ISSUER,
   oauth_user_client_id: optional(process.env.OAUTH_USER_CLIENT_ID),
+  oauth_cli_client_id: optional(process.env.OAUTH_CLI_CLIENT_ID),
+  oauth_cli_scope: process.env.OAUTH_CLI_SCOPE,
   oauth_jwks_url: process.env.OAUTH_JWKS_URL,
   cloud_object_storage_backend: process.env.CLOUD_OBJECT_STORAGE_BACKEND,
   cloud_gcs_bucket: optional(process.env.CLOUD_GCS_BUCKET),
@@ -351,6 +367,8 @@ const alwaysChecks = [
 ];
 const serviceChecks = [
   ["oauth_user_client_id", /^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com(?:\s*,\s*[A-Za-z0-9._-]+\.apps\.googleusercontent\.com)*$/],
+  ["oauth_cli_client_id", /^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$/],
+  ["oauth_cli_scope", /^openid(?:\s+[A-Za-z0-9:./_-]+)*$/],
   ["cloud_object_storage_backend", /^(filesystem|r2|gcs)$/],
   ["api_database_url_secret_version", /^[1-9][0-9]*$/],
   ["migrator_database_url_secret_version", /^[1-9][0-9]*$/],
@@ -458,6 +476,8 @@ const order = [
   "resource_prefix",
   "oauth_issuer",
   "oauth_user_client_id",
+  "oauth_cli_client_id",
+  "oauth_cli_scope",
   "oauth_jwks_url",
   "cloud_object_storage_backend",
   "cloud_gcs_bucket",

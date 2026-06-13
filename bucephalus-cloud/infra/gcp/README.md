@@ -158,8 +158,16 @@ API as `BUCEPHALUS_CLOUD_OAUTH_AUDIENCE`, because the verifier checks the JWT
 ```hcl
 oauth_issuer         = "https://accounts.google.com"
 oauth_user_client_id = "<google-oauth-client-id>.apps.googleusercontent.com"
+oauth_cli_client_id  = "<cli-oauth-client-id>.apps.googleusercontent.com"
+oauth_cli_scope      = "openid email"
 oauth_jwks_url       = "https://www.googleapis.com/oauth2/v3/certs"
 ```
+
+`oauth_user_client_id` is the accepted audience list. `oauth_cli_client_id` is
+the client `buc login` uses to obtain an ID token through the browser/loopback
+flow, and it must also appear in `oauth_user_client_id`. Keep these as separate
+inputs so web/UI clients, smoke identities, and the CLI can evolve without
+teaching users infrastructure endpoints.
 
 The OAuth client ID is not a secret. OAuth client secrets, if a browser or CLI
 flow later needs one, must not be placed in Terraform variables or state.

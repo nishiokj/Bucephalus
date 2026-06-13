@@ -15,6 +15,8 @@ describe("auth token routes", () => {
         required: true,
         issuer: "https://accounts.google.com",
         audiences: ["client-1.apps.googleusercontent.com", "client-2.apps.googleusercontent.com"],
+        cliClientId: "cli-client.apps.googleusercontent.com",
+        cliScope: "openid email",
         jwksUrl: "https://www.googleapis.com/oauth2/v3/certs",
       },
     );
@@ -24,9 +26,9 @@ describe("auth token routes", () => {
     expect(body).toEqual({
       schema_version: "bucephalus_cloud_auth_config_v1",
       issuer: "https://accounts.google.com",
-      client_id: "client-1.apps.googleusercontent.com",
-      audience: "client-1.apps.googleusercontent.com",
-      scope: "openid profile email",
+      client_id: "cli-client.apps.googleusercontent.com",
+      audience: "cli-client.apps.googleusercontent.com",
+      scope: "openid email",
     });
     expect(harness.created).toHaveLength(0);
   });

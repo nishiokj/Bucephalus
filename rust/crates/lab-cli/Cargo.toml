@@ -93,6 +93,7 @@ cloud-operator = [
   "dep:tar",
 ]
 hosted-cli = [
+  "dep:base64",
   "dep:flate2",
   "dep:lab-core",
   "dep:percent-encoding",

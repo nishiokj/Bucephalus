@@ -20,7 +20,8 @@ deployment path.
 - digest-addressed migration image from verified promotion evidence
 - digest-addressed worker image from verified promotion evidence for GCE
   per-run runner VMs
-- Google OAuth issuer, user OAuth client ID, and JWKS URL
+- Google OAuth issuer, user OAuth client ID, CLI OAuth client ID, CLI scope, and
+  JWKS URL
 - Secret Manager versions for:
   - API database URL
   - migrator database URL
@@ -64,6 +65,8 @@ deployment path.
 12. Promote the active worker image through the worker-image-promotion job.
 13. Smoke the API through the approved ingress path:
    - `/readyz`
+   - unauthenticated `/v1/auth/config`
+   - Google authorization URL front-door validation for the published CLI client
    - an authenticated user API request
    - an authenticated worker API request
 14. Observe logs, metrics, Cloud Run revision health, Cloud SQL connectivity, and

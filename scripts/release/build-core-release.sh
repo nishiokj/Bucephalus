@@ -24,6 +24,8 @@ The archive is named bucephalus-<target>.tar.gz and contains:
 
 Use --core-bin only with a prebuilt bucephalus binary from a verified matching
 target build in the same workflow.
+Set BUCEPHALUS_HOSTED_API_URL to bake the hosted product API URL into the
+installed buc binary. Release CI must provide this value.
 USAGE
 }
 
@@ -85,6 +87,7 @@ sha256_file() {
 }
 
 require_command cargo
+require_command bun
 require_command git
 require_command go
 require_command rustc
@@ -103,6 +106,18 @@ if [[ "${GIT_DIRTY}" == "true" && "${BUCEPHALUS_RELEASE_ALLOW_DIRTY:-false}" != 
 fi
 
 BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+HOSTED_API_URL="${BUCEPHALUS_HOSTED_API_URL:-}"
+if [[ -n "${HOSTED_API_URL}" ]]; then
+  if [[ ! "${HOSTED_API_URL}" =~ ^https://[^[:space:]]+$ ]]; then
+    echo "BUCEPHALUS_HOSTED_API_URL must be an https URL" >&2
+    exit 2
+  fi
+  HOSTED_API_URL="${HOSTED_API_URL%/}"
+fi
+HOSTED_API_URL_JSON="null"
+if [[ -n "${HOSTED_API_URL}" ]]; then
+  HOSTED_API_URL_JSON="$(HOSTED_API_URL="${HOSTED_API_URL}" bun -e 'console.log(JSON.stringify(process.env.HOSTED_API_URL))')"
+fi
 if [[ -n "${TARGET}" ]]; then
   TARGET_LABEL="${TARGET}"
 else
@@ -159,10 +174,10 @@ fi
 install -m 0755 "${CORE_BIN}" "${RELEASE_DIR}/bucephalus"
 echo "== Building buc ${VERSION} for ${TARGET_LABEL} =="
 if [[ -n "${TARGET}" ]]; then
-  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features hosted-cli --bin buc --target "${TARGET}"
+  BUCEPHALUS_HOSTED_API_URL="${HOSTED_API_URL}" cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features hosted-cli --bin buc --target "${TARGET}"
   BUC_BIN="${ROOT_DIR}/target/${TARGET}/release/buc"
 else
-  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features hosted-cli --bin buc
+  BUCEPHALUS_HOSTED_API_URL="${HOSTED_API_URL}" cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features hosted-cli --bin buc
   BUC_BIN="${ROOT_DIR}/target/release/buc"
 fi
 install -m 0755 "${BUC_BIN}" "${RELEASE_DIR}/buc"
@@ -196,6 +211,7 @@ cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
   "git_dirty": ${GIT_DIRTY},
   "build_date": "${BUILD_DATE}",
   "target": "${TARGET_LABEL}",
+  "hosted_api_url": ${HOSTED_API_URL_JSON},
   "artifacts": {
     "core_binary": {
       "path": "bucephalus",

@@ -48,9 +48,11 @@ output "service_accounts" {
 output "user_oauth" {
   description = "User OAuth verifier settings injected into the API. The client ID is not a secret."
   value = {
-    issuer     = var.oauth_issuer
-    client_ids = var.oauth_user_client_id
-    jwks_url   = var.oauth_jwks_url
+    issuer        = var.oauth_issuer
+    client_ids    = var.oauth_user_client_id
+    cli_client_id = var.oauth_cli_client_id
+    cli_scope     = var.oauth_cli_scope
+    jwks_url      = var.oauth_jwks_url
   }
 }
 

@@ -717,6 +717,19 @@ resource "google_cloud_run_v2_service" "api" {
         value = var.oauth_user_client_id
       }
 
+      dynamic "env" {
+        for_each = var.oauth_cli_client_id == null ? [] : [var.oauth_cli_client_id]
+        content {
+          name  = "BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_ID"
+          value = env.value
+        }
+      }
+
+      env {
+        name  = "BUCEPHALUS_CLOUD_OAUTH_CLI_SCOPE"
+        value = var.oauth_cli_scope
+      }
+
       env {
         name  = "BUCEPHALUS_CLOUD_OAUTH_JWKS_URL"
         value = var.oauth_jwks_url

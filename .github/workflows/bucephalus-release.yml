@@ -19,6 +19,7 @@ permissions:
 env:
   BUCEPHALUS_IMAGE_REPOSITORY: ${{ vars.BUCEPHALUS_IMAGE_REPOSITORY }}
   BUCEPHALUS_BUN_BASE_IMAGE: ${{ vars.BUCEPHALUS_BUN_BASE_IMAGE || 'oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4' }}
+  BUCEPHALUS_HOSTED_API_URL: ${{ vars.BUCEPHALUS_HOSTED_API_URL }}
 
 jobs:
   release-gates:
@@ -75,6 +76,30 @@ jobs:
             echo "release requires repository variable BUCEPHALUS_IMAGE_REPOSITORY" >&2
             exit 1
           fi
+          if [[ -z "${BUCEPHALUS_HOSTED_API_URL}" ]]; then
+            echo "release requires repository variable BUCEPHALUS_HOSTED_API_URL so installed buc has a real hosted product URL" >&2
+            exit 1
+          fi
+          if [[ ! "${BUCEPHALUS_HOSTED_API_URL}" =~ ^https://[^[:space:]]+$ ]]; then
+            echo "BUCEPHALUS_HOSTED_API_URL must be an https URL" >&2
+            exit 1
+          fi
+          hosted_api_url="${BUCEPHALUS_HOSTED_API_URL%/}"
+          readyz="$(curl -fsS "${hosted_api_url}/readyz")"
+          printf '%s\n' "${readyz}"
+          auth_config="$(curl -fsS "${hosted_api_url}/v1/auth/config")"
+          printf '%s\n' "${auth_config}"
+          AUTH_CONFIG="${auth_config}" bun -e '
+            const config = JSON.parse(process["env"].AUTH_CONFIG ?? "{}");
+            if (config.schema_version !== "bucephalus_cloud_auth_config_v1") {
+              throw new Error("hosted auth config has unexpected schema_version");
+            }
+            for (const key of ["issuer", "client_id", "audience"]) {
+              if (typeof config[key] !== "string" || config[key].trim() === "") {
+                throw new Error(`hosted auth config is missing ${key}`);
+              }
+            }
+          '
           if [[ -z "${BUCEPHALUS_BUN_BASE_IMAGE}" ]]; then
             echo "release requires BUCEPHALUS_BUN_BASE_IMAGE" >&2
             exit 1

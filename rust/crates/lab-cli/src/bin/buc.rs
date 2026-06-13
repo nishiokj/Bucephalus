@@ -303,7 +303,7 @@ fn parse_global_args(argv: Vec<String>) -> Result<CliContext> {
         }
     }
     if api_url.trim().is_empty() {
-        api_url = cloud_login::DEFAULT_BUCEPHALUS_CLOUD_API_URL.to_string();
+        api_url = cloud_login::default_bucephalus_cloud_api_url().to_string();
     }
 
     Ok(CliContext {
@@ -318,7 +318,7 @@ fn ensure_api_configured(context: &CliContext) -> Result<()> {
     if context.api_url.trim().is_empty() {
         bail!(
             "buc needs a hosted API URL. This build defaults to {}. Override it with --api-url or {} for dev/staging/self-hosted Cloud.",
-            cloud_login::DEFAULT_BUCEPHALUS_CLOUD_API_URL,
+            cloud_login::default_bucephalus_cloud_api_url(),
             BUCEPHALUS_CLOUD_API_URL_ENV
         );
     }
@@ -4587,7 +4587,7 @@ fn print_help() {
     println!("{}", help_text());
 }
 
-fn help_text() -> &'static str {
+fn help_text() -> String {
     r#"buc - Bucephalus hosted Cloud CLI
 
 `buc` talks to the hosted Cloud API. It does not run local Core builds, start
@@ -4666,9 +4666,13 @@ Runtime options:
 Environment:
   BUCEPHALUS_CLOUD_API_URL       Development, staging, or self-hosted API
                                  override. Hosted Cloud defaults to
-                                 https://api.bucephalus.dev
+                                 {{HOSTED_API_URL}}
   BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token override
 "#
+    .replace(
+        "{{HOSTED_API_URL}}",
+        cloud_login::default_bucephalus_cloud_api_url(),
+    )
 }
 
 fn command_help_text(group: Option<&str>, command: Option<&str>) -> Option<&'static str> {

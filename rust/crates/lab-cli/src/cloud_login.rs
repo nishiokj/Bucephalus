@@ -1,9 +1,14 @@
 use anyhow::{anyhow, Context, Result};
+use base64::Engine;
+use percent_encoding::utf8_percent_encode;
+use percent_encoding::NON_ALPHANUMERIC;
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
+use sha2::Digest;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,7 +18,15 @@ pub const BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_ISSU
 pub const BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID";
 pub const BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_AUDIENCE";
 pub const BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_SCOPE";
-pub const DEFAULT_BUCEPHALUS_CLOUD_API_URL: &str = "https://api.bucephalus.dev";
+const FALLBACK_BUCEPHALUS_CLOUD_API_URL: &str = "https://api.bucephalus.dev";
+const LOGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+pub fn default_bucephalus_cloud_api_url() -> &'static str {
+    option_env!("BUCEPHALUS_HOSTED_API_URL")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(FALLBACK_BUCEPHALUS_CLOUD_API_URL)
+}
 
 #[derive(Debug, Clone)]
 pub struct DeviceLoginOptions {
@@ -46,20 +59,24 @@ pub fn run_login(options: DeviceLoginOptions) -> Result<Value> {
     let api_url = options
         .api_url
         .or_else(cloud_api_base_url)
-        .unwrap_or_else(|| DEFAULT_BUCEPHALUS_CLOUD_API_URL.to_string())
+        .unwrap_or_else(|| default_bucephalus_cloud_api_url().to_string())
         .trim_end_matches('/')
         .to_string();
-    let discovered = fetch_cloud_auth_config(&api_url).unwrap_or_default();
+    let mut discovery_error = None;
+    let discovered = match fetch_cloud_auth_config(&api_url) {
+        Ok(config) => config,
+        Err(err) => {
+            discovery_error = Some(err);
+            CloudAuthConfig::default()
+        }
+    };
     let issuer = options
         .issuer
         .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV))
         .or_else(|| lab_core::cloud_profile_string(&home, "/oauth/issuer"))
         .or(discovered.issuer)
         .ok_or_else(|| {
-            anyhow!(
-                "buc login could not discover Cloud OAuth issuer from {api_url}. Retry with --issuer, set {}, or use --api-url for a configured Cloud deployment.",
-                BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV
-            )
+            hosted_auth_discovery_error(&api_url, discovery_error.as_ref())
         })?;
     let audience = options
         .audience
@@ -73,16 +90,6 @@ pub fn run_login(options: DeviceLoginOptions) -> Result<Value> {
         .or(discovered.scope)
         .unwrap_or_else(|| "openid profile email".to_string());
     let (metadata_url, metadata) = fetch_oauth_metadata(&issuer)?;
-    let device_authorization_endpoint = metadata
-        .get("device_authorization_endpoint")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            anyhow!(
-                "OAuth metadata {} does not include device_authorization_endpoint",
-                metadata_url
-            )
-        })?
-        .to_string();
     let token_endpoint = metadata
         .get("token_endpoint")
         .and_then(Value::as_str)
@@ -101,38 +108,62 @@ pub fn run_login(options: DeviceLoginOptions) -> Result<Value> {
         .map(Ok)
         .unwrap_or_else(|| dynamic_register_oauth_client(&metadata, &issuer, &scope))?;
 
-    let device = begin_device_authorization(
-        &device_authorization_endpoint,
-        &client_id,
-        &scope,
-        audience.as_deref(),
-        Some(&api_url),
-    )?;
-    let verification_uri = device
-        .get("verification_uri")
-        .or_else(|| device.get("verification_url"))
+    let token = if let Some(authorization_endpoint) = metadata
+        .get("authorization_endpoint")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("device authorization response missing verification_uri"))?;
-    let verification_uri_complete = device
-        .get("verification_uri_complete")
-        .and_then(Value::as_str);
-    let user_code = device
-        .get("user_code")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("device authorization response missing user_code"))?;
+        .filter(|value| !value.trim().is_empty())
+    {
+        browser_authorization_code_login(
+            authorization_endpoint,
+            &token_endpoint,
+            &client_id,
+            &scope,
+            options.no_browser,
+        )?
+    } else {
+        let device_authorization_endpoint = metadata
+            .get("device_authorization_endpoint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow!(
+                    "OAuth metadata {} does not include authorization_endpoint or device_authorization_endpoint",
+                    metadata_url
+                )
+            })?
+            .to_string();
+        let device = begin_device_authorization(
+            &device_authorization_endpoint,
+            &client_id,
+            &scope,
+            audience.as_deref(),
+            Some(&api_url),
+        )?;
+        let verification_uri = device
+            .get("verification_uri")
+            .or_else(|| device.get("verification_url"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("device authorization response missing verification_uri"))?;
+        let verification_uri_complete = device
+            .get("verification_uri_complete")
+            .and_then(Value::as_str);
+        let user_code = device
+            .get("user_code")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("device authorization response missing user_code"))?;
 
-    if !options.no_browser {
-        let _ = open_login_url(verification_uri_complete.unwrap_or(verification_uri));
-    }
-    eprintln!("Bucephalus Cloud login");
-    eprintln!(
-        "Open: {}",
-        verification_uri_complete.unwrap_or(verification_uri)
-    );
-    eprintln!("Code: {user_code}");
-    eprintln!("Waiting for authorization...");
+        if !options.no_browser {
+            let _ = open_login_url(verification_uri_complete.unwrap_or(verification_uri));
+        }
+        eprintln!("Bucephalus Cloud login");
+        eprintln!(
+            "Open: {}",
+            verification_uri_complete.unwrap_or(verification_uri)
+        );
+        eprintln!("Code: {user_code}");
+        eprintln!("Waiting for authorization...");
 
-    let token = poll_device_token(&token_endpoint, &client_id, &device)?;
+        poll_device_token(&token_endpoint, &client_id, &device)?
+    };
     write_cloud_token_cache(
         &paths,
         &issuer,
@@ -386,12 +417,13 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn auth_status_for_home(home: &Path) -> Value {
     let paths = cloud_token_paths(home);
+    let api_url = effective_cloud_api_base_url();
     if std::env::var_os(crate::cloud_auth_ux::BUCEPHALUS_CLOUD_USER_TOKEN_ENV).is_some() {
         return json!({
             "status": "ready",
             "source": "env",
             "env": crate::cloud_auth_ux::BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
-            "api_url": cloud_api_base_url()
+            "api_url": api_url
         });
     }
     if paths.access.is_file() {
@@ -401,7 +433,7 @@ fn auth_status_for_home(home: &Path) -> Value {
             "path": paths.access,
             "refresh_token_path": if paths.refresh.is_file() { Some(paths.refresh.display().to_string()) } else { None },
             "cache_path": if paths.cache.is_file() { Some(paths.cache.display().to_string()) } else { None },
-            "api_url": cloud_api_base_url()
+            "api_url": api_url
         });
     }
     json!({
@@ -411,7 +443,7 @@ fn auth_status_for_home(home: &Path) -> Value {
             crate::cloud_auth_ux::BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
             paths.access.display().to_string()
         ],
-        "api_url": cloud_api_base_url(),
+        "api_url": api_url,
         "actions": [
             {
                 "type": "cli_command",
@@ -436,6 +468,19 @@ fn cloud_api_base_url() -> Option<String> {
             lab_core::cloud_profile_string(&home, "/api_url")
                 .map(|value| value.trim_end_matches('/').to_string())
         })
+}
+
+fn effective_cloud_api_base_url() -> String {
+    cloud_api_base_url().unwrap_or_else(|| default_bucephalus_cloud_api_url().to_string())
+}
+
+fn hosted_auth_discovery_error(api_url: &str, err: Option<&anyhow::Error>) -> anyhow::Error {
+    let detail = err
+        .map(|err| format!("\nCause: {err:#}"))
+        .unwrap_or_default();
+    anyhow!(
+        "Bucephalus Cloud login is unavailable because the hosted auth configuration could not be read from {api_url}/v1/auth/config.{detail}\nThis is a hosted service or release configuration problem. A normal hosted user should only need to run `buc login`."
+    )
 }
 
 fn fetch_cloud_auth_config(api_url: &str) -> Result<CloudAuthConfig> {
@@ -516,6 +561,197 @@ fn fetch_oauth_metadata(issuer: &str) -> Result<(String, Value)> {
         }
         Err(err) => Err(err),
     }
+}
+
+fn browser_authorization_code_login(
+    authorization_endpoint: &str,
+    token_endpoint: &str,
+    client_id: &str,
+    scope: &str,
+    no_browser: bool,
+) -> Result<Value> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .context("failed to bind local OAuth callback listener on 127.0.0.1")?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure local OAuth callback listener")?;
+    let redirect_uri = format!("http://{}/callback", listener.local_addr()?);
+    let state = random_url_token(32)?;
+    let code_verifier = random_url_token(64)?;
+    let code_challenge = pkce_challenge(&code_verifier);
+    let auth_url = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256&access_type=offline",
+        authorization_endpoint,
+        url_encode(client_id),
+        url_encode(&redirect_uri),
+        url_encode(scope),
+        url_encode(&state),
+        url_encode(&code_challenge),
+    );
+
+    if !no_browser {
+        let _ = open_login_url(&auth_url);
+    }
+    eprintln!("Bucephalus Cloud login");
+    eprintln!("Open: {auth_url}");
+    eprintln!("Waiting for browser authorization...");
+
+    let code = wait_for_authorization_code(&listener, &state)?;
+    exchange_authorization_code(
+        token_endpoint,
+        client_id,
+        &redirect_uri,
+        &code_verifier,
+        &code,
+    )
+}
+
+fn wait_for_authorization_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
+    let deadline = SystemTime::now() + LOGIN_CALLBACK_TIMEOUT;
+    while SystemTime::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0u8; 8192];
+                let size = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let Some(first_line) = request.lines().next() else {
+                    write_oauth_callback_response(&mut stream, 400, "Missing OAuth callback request");
+                    return Err(anyhow!("OAuth callback request was empty"));
+                };
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let target = parts.next().unwrap_or("");
+                if method != "GET" {
+                    write_oauth_callback_response(&mut stream, 405, "Unsupported OAuth callback method");
+                    return Err(anyhow!("OAuth callback used unsupported method {method}"));
+                }
+                let url = reqwest::Url::parse(&format!("http://127.0.0.1{target}"))
+                    .context("OAuth callback URL was invalid")?;
+                if url.path() != "/callback" {
+                    write_oauth_callback_response(&mut stream, 404, "Unknown OAuth callback path");
+                    continue;
+                }
+                let mut code = None;
+                let mut state = None;
+                let mut error = None;
+                let mut error_description = None;
+                for (key, value) in url.query_pairs() {
+                    match key.as_ref() {
+                        "code" => code = Some(value.into_owned()),
+                        "state" => state = Some(value.into_owned()),
+                        "error" => error = Some(value.into_owned()),
+                        "error_description" => error_description = Some(value.into_owned()),
+                        _ => {}
+                    }
+                }
+                if let Some(error) = error {
+                    write_oauth_callback_response(&mut stream, 400, "Bucephalus Cloud login was denied.");
+                    return Err(anyhow!(
+                        "OAuth authorization failed: {}",
+                        error_description.unwrap_or(error)
+                    ));
+                }
+                if state.as_deref() != Some(expected_state) {
+                    write_oauth_callback_response(&mut stream, 400, "Bucephalus Cloud login state did not match.");
+                    return Err(anyhow!("OAuth callback state did not match"));
+                }
+                let code = code.ok_or_else(|| anyhow!("OAuth callback was missing code"))?;
+                write_oauth_callback_response(&mut stream, 200, "Bucephalus Cloud login complete. You can return to the terminal.");
+                return Ok(code);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => return Err(err).context("failed while waiting for OAuth callback"),
+        }
+    }
+    Err(anyhow!("OAuth browser login timed out waiting for authorization"))
+}
+
+fn write_oauth_callback_response(stream: &mut std::net::TcpStream, status: u16, message: &str) {
+    let reason = if status == 200 { "OK" } else { "Error" };
+    let body = format!(
+        "<!doctype html><title>Bucephalus Cloud Login</title><main><h1>{}</h1><p>{}</p></main>",
+        reason,
+        html_escape(message)
+    );
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+}
+
+fn exchange_authorization_code(
+    token_endpoint: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+    code: &str,
+) -> Result<Value> {
+    let response = Client::new()
+        .post(token_endpoint)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("client_id", client_id),
+            ("code_verifier", code_verifier),
+        ])
+        .send()
+        .with_context(|| format!("failed to exchange OAuth authorization code at {}", token_endpoint))?;
+    let status = response.status().as_u16();
+    let bytes = response.bytes()?.to_vec();
+    if !(200..300).contains(&status) {
+        bail_with_status("OAuth authorization code exchange failed", status, &bytes)?;
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    let digest = sha2::Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn random_url_token(byte_count: usize) -> Result<String> {
+    let mut bytes = vec![0u8; byte_count];
+    match fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes)) {
+        Ok(()) => {}
+        Err(_) => {
+            let seed = format!(
+                "{}:{}:{:?}",
+                std::process::id(),
+                current_unix_time_ms(),
+                SystemTime::now()
+            );
+            let mut cursor = 0usize;
+            while cursor < bytes.len() {
+                let digest = sha2::Sha256::digest(format!("{seed}:{cursor}").as_bytes());
+                for byte in digest {
+                    if cursor >= bytes.len() {
+                        break;
+                    }
+                    bytes[cursor] = byte;
+                    cursor += 1;
+                }
+            }
+        }
+    }
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn url_encode(value: &str) -> String {
+    utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn http_get_json(url: &str) -> Result<Value> {
@@ -674,9 +910,14 @@ fn write_cloud_token_cache(
     token: &Value,
 ) -> Result<()> {
     let access_token = token
+        .get("id_token")
+        .and_then(Value::as_str)
+        .or_else(|| token.get("access_token").and_then(Value::as_str))
+        .ok_or_else(|| anyhow!("token response missing id_token or access_token"))?;
+    let oauth_access_token = token
         .get("access_token")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("token response missing access_token"))?;
+        .filter(|value| !value.trim().is_empty());
     let refresh_token = token.get("refresh_token").and_then(Value::as_str);
     let issued_at = current_unix_time_ms();
     let expires_at_ms = token
@@ -693,6 +934,7 @@ fn write_cloud_token_cache(
         "token_endpoint": token_endpoint,
         "token_type": token.get("token_type").and_then(Value::as_str).unwrap_or("Bearer"),
         "access_token": access_token,
+        "oauth_access_token": oauth_access_token,
         "refresh_token": refresh_token,
         "issued_at_ms": issued_at,
         "expires_at_ms": expires_at_ms
@@ -714,9 +956,14 @@ fn write_cloud_token_cache_from_existing(
     token: &Value,
 ) -> Result<()> {
     let access_token = token
+        .get("id_token")
+        .and_then(Value::as_str)
+        .or_else(|| token.get("access_token").and_then(Value::as_str))
+        .ok_or_else(|| anyhow!("token response missing id_token or access_token"))?;
+    let oauth_access_token = token
         .get("access_token")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("token response missing access_token"))?;
+        .filter(|value| !value.trim().is_empty());
     let refresh_token = token
         .get("refresh_token")
         .and_then(Value::as_str)
@@ -736,6 +983,7 @@ fn write_cloud_token_cache_from_existing(
         "token_endpoint": existing.get("token_endpoint").and_then(Value::as_str),
         "token_type": token.get("token_type").and_then(Value::as_str).unwrap_or("Bearer"),
         "access_token": access_token,
+        "oauth_access_token": oauth_access_token,
         "refresh_token": refresh_token,
         "issued_at_ms": issued_at,
         "expires_at_ms": expires_at_ms

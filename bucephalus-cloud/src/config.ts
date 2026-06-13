@@ -29,6 +29,8 @@ export interface AuthConfig {
   required: boolean;
   issuer: string | null;
   audiences: string[] | null;
+  cliClientId: string | null;
+  cliScope: string;
   jwksUrl: string | null;
 }
 
@@ -61,6 +63,8 @@ export type StorageConfig =
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const issuer = env.BUCEPHALUS_CLOUD_OAUTH_ISSUER?.trim() || null;
   const audiences = parseCsv(env.BUCEPHALUS_CLOUD_OAUTH_AUDIENCE);
+  const cliClientId = env.BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_ID?.trim() || null;
+  const cliScope = env.BUCEPHALUS_CLOUD_OAUTH_CLI_SCOPE?.trim() || "openid email";
   const explicitJwksUrl = env.BUCEPHALUS_CLOUD_OAUTH_JWKS_URL?.trim() || null;
   const authRequired = env.BUCEPHALUS_CLOUD_AUTH_REQUIRED?.trim().toLowerCase() || null;
   if (authRequired && authRequired !== "true") {
@@ -85,6 +89,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       required,
       issuer,
       audiences,
+      cliClientId,
+      cliScope,
       jwksUrl,
     },
     rateLimit: loadRateLimitConfig(env),
