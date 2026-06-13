@@ -75,9 +75,7 @@ pub fn run_login(options: DeviceLoginOptions) -> Result<Value> {
         .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV))
         .or_else(|| lab_core::cloud_profile_string(&home, "/oauth/issuer"))
         .or(discovered.issuer)
-        .ok_or_else(|| {
-            hosted_auth_discovery_error(&api_url, discovery_error.as_ref())
-        })?;
+        .ok_or_else(|| hosted_auth_discovery_error(&api_url, discovery_error.as_ref()))?;
     let audience = options
         .audience
         .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV))
@@ -616,14 +614,22 @@ fn wait_for_authorization_code(listener: &TcpListener, expected_state: &str) -> 
                 let size = stream.read(&mut buffer).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..size]);
                 let Some(first_line) = request.lines().next() else {
-                    write_oauth_callback_response(&mut stream, 400, "Missing OAuth callback request");
+                    write_oauth_callback_response(
+                        &mut stream,
+                        400,
+                        "Missing OAuth callback request",
+                    );
                     return Err(anyhow!("OAuth callback request was empty"));
                 };
                 let mut parts = first_line.split_whitespace();
                 let method = parts.next().unwrap_or("");
                 let target = parts.next().unwrap_or("");
                 if method != "GET" {
-                    write_oauth_callback_response(&mut stream, 405, "Unsupported OAuth callback method");
+                    write_oauth_callback_response(
+                        &mut stream,
+                        405,
+                        "Unsupported OAuth callback method",
+                    );
                     return Err(anyhow!("OAuth callback used unsupported method {method}"));
                 }
                 let url = reqwest::Url::parse(&format!("http://127.0.0.1{target}"))
@@ -646,18 +652,30 @@ fn wait_for_authorization_code(listener: &TcpListener, expected_state: &str) -> 
                     }
                 }
                 if let Some(error) = error {
-                    write_oauth_callback_response(&mut stream, 400, "Bucephalus Cloud login was denied.");
+                    write_oauth_callback_response(
+                        &mut stream,
+                        400,
+                        "Bucephalus Cloud login was denied.",
+                    );
                     return Err(anyhow!(
                         "OAuth authorization failed: {}",
                         error_description.unwrap_or(error)
                     ));
                 }
                 if state.as_deref() != Some(expected_state) {
-                    write_oauth_callback_response(&mut stream, 400, "Bucephalus Cloud login state did not match.");
+                    write_oauth_callback_response(
+                        &mut stream,
+                        400,
+                        "Bucephalus Cloud login state did not match.",
+                    );
                     return Err(anyhow!("OAuth callback state did not match"));
                 }
                 let code = code.ok_or_else(|| anyhow!("OAuth callback was missing code"))?;
-                write_oauth_callback_response(&mut stream, 200, "Bucephalus Cloud login complete. You can return to the terminal.");
+                write_oauth_callback_response(
+                    &mut stream,
+                    200,
+                    "Bucephalus Cloud login complete. You can return to the terminal.",
+                );
                 return Ok(code);
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -666,7 +684,9 @@ fn wait_for_authorization_code(listener: &TcpListener, expected_state: &str) -> 
             Err(err) => return Err(err).context("failed while waiting for OAuth callback"),
         }
     }
-    Err(anyhow!("OAuth browser login timed out waiting for authorization"))
+    Err(anyhow!(
+        "OAuth browser login timed out waiting for authorization"
+    ))
 }
 
 fn write_oauth_callback_response(stream: &mut std::net::TcpStream, status: u16, message: &str) {
@@ -701,7 +721,12 @@ fn exchange_authorization_code(
             ("code_verifier", code_verifier),
         ])
         .send()
-        .with_context(|| format!("failed to exchange OAuth authorization code at {}", token_endpoint))?;
+        .with_context(|| {
+            format!(
+                "failed to exchange OAuth authorization code at {}",
+                token_endpoint
+            )
+        })?;
     let status = response.status().as_u16();
     let bytes = response.bytes()?.to_vec();
     if !(200..300).contains(&status) {
