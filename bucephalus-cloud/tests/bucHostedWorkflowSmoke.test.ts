@@ -72,7 +72,7 @@ describeSmoke("buc hosted workflow smoke", () => {
       server = serveHarness(repositories);
       const apiUrl = `http://${server.hostname}:${server.port}`;
       const { packageDir, packageDigest } = await writeCloudRunnablePackage(root);
-      const { contextRoot, experimentYaml } = await writeHostedAuthoringContext(root);
+      const { experimentYaml } = await writeHostedAuthoringContext(root);
       process.env.BUCEPHALUS_CLOUD_CORE_CLI = await writeFakeHostedCoreBuilder(root, packageDir);
       process.env.BUCEPHALUS_CLOUD_AUTHORING_BUILD_TIMEOUT_MS = "60000";
       const buc = resolve(process.env.BUC_BINARY ?? join(repoRoot, "target", "debug", "buc"));
@@ -80,8 +80,6 @@ describeSmoke("buc hosted workflow smoke", () => {
       const build = await runBucJson(buc, apiUrl, [
         "build",
         experimentYaml,
-        "--context-root",
-        contextRoot,
         "--json",
       ]);
       expect(build.package_digest).toBe(packageDigest);
@@ -591,6 +589,22 @@ async function writeHostedAuthoringContext(root: string): Promise<{ contextRoot:
     "",
   ].join("\n"));
   await writeFile(join(sharedDir, "cases.jsonl"), "{\"id\":\"case-smoke-1\"}\n");
+  await writeFile(join(contextRoot, "bucephalus.project.yaml"), [
+    "schema_version: bucephalus_project_v1",
+    "project:",
+    "  id: hosted_workflow_smoke",
+    "package_sources:",
+    "  default:",
+    "    root: .",
+    "    entrypoints:",
+    "      - experiments/peter/experiment.yaml",
+    "    include:",
+    "      - experiments/peter/**",
+    "      - shared/**",
+    "targets:",
+    "  hosted_cloud: {}",
+    "",
+  ].join("\n"));
   await writeFile(join(contextRoot, ".env"), "SHOULD_NOT_UPLOAD=1\n");
   await writeFile(join(contextRoot, ".npmrc"), "//registry.example/:_authToken=SHOULD_NOT_UPLOAD\n");
   await mkdir(join(contextRoot, ".ssh"), { recursive: true });
@@ -621,6 +635,7 @@ async function writeFakeHostedCoreBuilder(root: string, packageDir: string): Pro
     "done",
     "if [ \"$entrypoint\" != \"experiments/peter/experiment.yaml\" ]; then echo \"wrong entrypoint: $entrypoint\" >&2; exit 64; fi",
     "if [ ! -f \"$entrypoint\" ]; then echo \"entrypoint missing in hosted context\" >&2; exit 65; fi",
+    "if [ ! -f \"bucephalus.project.yaml\" ]; then echo \"project manifest missing in hosted context\" >&2; exit 76; fi",
     "if [ ! -f \"shared/cases.jsonl\" ]; then echo \"shared context file missing\" >&2; exit 66; fi",
     "if [ -f \".env\" ]; then echo \".env leaked into hosted context\" >&2; exit 67; fi",
     "if [ -f \".npmrc\" ]; then echo \".npmrc leaked into hosted context\" >&2; exit 68; fi",

@@ -61,6 +61,18 @@ unsafe entry types are rejected, and local-only secret/build/dependency
 directories such as `.git`, `.env*`, `target`, `node_modules`, `.bucephalus`,
 and `.bucephalus-package` are blocked.
 
+Authoring-context archives must contain exactly one root project manifest:
+`bucephalus.project.yaml` or `bucephalus.project.yml`. The project manifest is
+the source of truth for the build boundary: project id, package source,
+entrypoints, include/exclude rules, and hosted target. It must declare
+`schema_version: bucephalus_project_v1`, `project.id`,
+`targets.hosted_cloud`, and the requested entrypoint in exactly one package
+source. Clients may send `project_manifest` evidence with the build request;
+when present, the API verifies the uploaded manifest digest and entrypoint match
+it. Either way, the API records the manifest path, digest, project id, package
+source, source root, and entrypoint in
+`build_environment.source.project_manifest` and package provenance.
+
 ## CLI
 
 ```bash

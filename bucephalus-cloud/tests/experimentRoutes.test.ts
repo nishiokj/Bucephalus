@@ -12,6 +12,21 @@ import type { RunnerRepository } from "../src/runners/repository";
 import type { CloudSecretRepository } from "../src/secrets/repository";
 import { canonicalJsonStringify, sha256Digest } from "../src/primitives";
 
+const PROJECT_MANIFEST = `schema_version: bucephalus_project_v1
+project:
+  id: test_project
+package_sources:
+  default:
+    root: .
+    entrypoints:
+      - experiment.yaml
+    include:
+      - experiment.yaml
+      - cases.jsonl
+targets:
+  hosted_cloud: {}
+`;
+
 describe("Hosted experiment routes", () => {
   test("hosted authoring build looks up source uploads under the authenticated owner before building", async () => {
     const observed: { uploadId?: string; ownerKey: string | null | undefined } = { ownerKey: undefined };
@@ -148,6 +163,7 @@ describe("Hosted experiment routes", () => {
           content_digest: sha256Digest(await readFile(contextArchive)),
           byte_size: (await readFile(contextArchive)).byteLength,
           entrypoint: "experiment.yaml",
+          project_manifest: projectManifest(),
         },
         runtime_options: {},
         builder: expect.objectContaining({
@@ -189,6 +205,7 @@ describe("Hosted experiment routes", () => {
       expect(body.authoring_build.status).toBe("succeeded");
       expect(body.authoring_build.source_upload_id).toBe("source-upload");
       expect(body.authoring_build.entrypoint).toBe("experiment.yaml");
+      expect(body.authoring_build.project_manifest).toEqual(projectManifest());
       expect(body.status).toBe("cloud_runnable");
       expect(body.package_digest).toBe(packageDigest);
       expect(body.import.status).toBe("accepted");
@@ -198,6 +215,7 @@ describe("Hosted experiment routes", () => {
         source: "hosted_core",
         input_kind: "authoring_context",
         source_upload_id: "source-upload",
+        project_manifest: projectManifest(),
       }));
     } finally {
       restoreEnv("BUCEPHALUS_CLOUD_CORE_CLI", previousCore);
@@ -1778,6 +1796,7 @@ async function writePackageDirectory(root: string): Promise<{ packageDir: string
 async function writeAuthoringContextArchive(root: string, options: { includeDotenv?: boolean; includeNodeModules?: boolean } = {}): Promise<string> {
   const contextDir = join(root, "authoring-context");
   await mkdir(contextDir, { recursive: true });
+  await writeFile(join(contextDir, "bucephalus.project.yaml"), PROJECT_MANIFEST);
   await writeFile(join(contextDir, "experiment.yaml"), "experiment:\n  id: demo\n  name: Demo\n");
   await writeFile(join(contextDir, "cases.jsonl"), "{}\n");
   if (options.includeDotenv) {
@@ -1790,6 +1809,18 @@ async function writeAuthoringContextArchive(root: string, options: { includeDote
   const archivePath = join(root, "authoring-context.tgz");
   await tar.c({ gzip: true, cwd: contextDir, file: archivePath }, (await readdir(contextDir)).sort());
   return archivePath;
+}
+
+function projectManifest() {
+  return {
+    schema_version: "bucephalus_project_v1",
+    path: "bucephalus.project.yaml",
+    digest: sha256Digest(Buffer.from(PROJECT_MANIFEST, "utf8")),
+    project_id: "test_project",
+    package_source: "default",
+    source_root: ".",
+    entrypoint: "experiment.yaml",
+  };
 }
 
 async function writeFakeCoreBuilder(root: string, packageDir: string): Promise<string> {

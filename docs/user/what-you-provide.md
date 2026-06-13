@@ -9,6 +9,7 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | Piece | Required | Example |
 | --- | --- | --- |
 | Experiment YAML | Yes | `experiment.yaml` |
+| Project manifest | For hosted Cloud YAML builds | `bucephalus.project.yaml` with `schema_version: bucephalus_project_v1`, `project.id`, `package_sources`, and `targets.hosted_cloud` |
 | Cases | Yes | `cases.jsonl` with `case_v2` rows |
 | Stages | Yes | `stages.case`, `stages.agent`; add `stages.grader` for custom grading and `stages.execution` when the agent site is not inferred |
 | Agent command | Yes | `stages.agent.command` |
@@ -23,7 +24,14 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | Compute backend | Optional | Defaults to `runtime.compute.backend: local-docker`; declare `modal` when needed |
 | Grader inputs/outputs | If benchmark scoring needs a grader | `stages.grader.inputs`, `stages.grader.outputs` |
 
-Schema files live in `schemas/`. Current case rows should use `schemas/case_v2.jsonschema` and set `schema_version: case_v2`. `case_v1` and the older `task_row_v2` row shape remain accepted for migration and existing suites. Agent responses are arbitrary JSON written to `BUCEPHALUS_RESULT_PATH`. Benchmark graders declare native outputs and metrics read from those outputs; graders do not need to emit Bucephalus-specific conclusions.
+Schema files live in `schemas/`. Current case rows should use
+`schemas/case_v2.jsonschema` and set `schema_version: case_v2`. Hosted Cloud
+YAML builds use `schemas/bucephalus_project_v1.jsonschema` for the project
+manifest that defines the upload boundary. `case_v1` and the older
+`task_row_v2` row shape remain accepted for migration and existing suites.
+Agent responses are arbitrary JSON written to `BUCEPHALUS_RESULT_PATH`.
+Benchmark graders declare native outputs and metrics read from those outputs;
+graders do not need to emit Bucephalus-specific conclusions.
 
 ## Minimal Experiment Shape
 

@@ -23,6 +23,9 @@ use cloud_auth_ux::BUCEPHALUS_CLOUD_USER_TOKEN_ENV;
 const BUCEPHALUS_CLOUD_API_URL_ENV: &str = "BUCEPHALUS_CLOUD_API_URL";
 const DEFAULT_MAX_AUTHORING_CONTEXT_ARCHIVE_ENTRIES: u64 = 10_000;
 const DEFAULT_MAX_AUTHORING_CONTEXT_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
+const PROJECT_MANIFEST_YAML: &str = "bucephalus.project.yaml";
+const PROJECT_MANIFEST_YML: &str = "bucephalus.project.yml";
+const PROJECT_MANIFEST_SCHEMA_VERSION: &str = "bucephalus_project_v1";
 
 #[derive(Clone, Debug)]
 struct CliContext {
@@ -52,6 +55,7 @@ struct PreparedAuthoringContextInput {
     archive_path: PathBuf,
     source_label: String,
     entrypoint: String,
+    project_manifest: Value,
     temp_root: PathBuf,
 }
 
@@ -66,6 +70,19 @@ struct AuthoringContextArchivePlan {
     files: Vec<String>,
     entries: u64,
     expanded_bytes: u64,
+}
+
+#[derive(Debug)]
+struct ProjectBuildContext {
+    project_root: PathBuf,
+    manifest_rel: String,
+    manifest_digest: String,
+    project_id: String,
+    package_source: String,
+    source_root: String,
+    entrypoint: String,
+    include: Vec<String>,
+    exclude: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -455,52 +472,60 @@ fn package_list(context: CliContext) -> Result<()> {
 fn experiment_build(context: CliContext) -> Result<()> {
     reject_unknown_options(&context.args, &build_value_options(), &["--json"])?;
     let path = build_input_path_arg(&context.args)?;
-    let context_root = option_value(&context.args, "--context-root")?;
     let label = option_value(&context.args, "--label")?;
     let json_output = json_requested(&context.args);
     let expected_runtime_options = Value::Object(runtime_options_from_args(&context.args)?);
     let path = Path::new(&path);
-    let (build, source_label, expected_build_kind, expected_source_kind, expected_entrypoint) =
-        if is_authoring_yaml_path(path) {
-            let prepared =
-                prepare_authoring_context_input(path, context_root.as_deref().map(Path::new))?;
-            let entrypoint = prepared.entrypoint.clone();
-            ensure_api_configured(&context)?;
-            (
-                upload_sealed_package_artifact(
-                    &context,
-                    &prepared.archive_path,
-                    label.as_deref(),
-                    "/v1/experiments/builds",
-                    Some(expected_runtime_options.clone()),
-                    Some(json!({
-                        "input_kind": "authoring_context",
-                        "entrypoint": prepared.entrypoint,
-                    })),
-                )?,
-                prepared.source_label.clone(),
-                "hosted_authoring_build",
-                "authoring_context",
-                Some(entrypoint),
-            )
-        } else {
-            let prepared = prepare_sealed_package_input(path)?;
-            ensure_api_configured(&context)?;
-            (
-                upload_sealed_package_artifact(
-                    &context,
-                    &prepared.archive_path,
-                    label.as_deref(),
-                    "/v1/experiments/builds",
-                    Some(expected_runtime_options.clone()),
-                    None,
-                )?,
-                prepared.source_label.clone(),
-                "sealed_package_import",
-                "sealed_package",
+    let (
+        build,
+        source_label,
+        expected_build_kind,
+        expected_source_kind,
+        expected_entrypoint,
+        expected_project_manifest,
+    ) = if is_authoring_yaml_path(path) {
+        let prepared = prepare_authoring_context_input(path)?;
+        let entrypoint = prepared.entrypoint.clone();
+        let project_manifest = prepared.project_manifest.clone();
+        ensure_api_configured(&context)?;
+        (
+            upload_sealed_package_artifact(
+                &context,
+                &prepared.archive_path,
+                label.as_deref(),
+                "/v1/experiments/builds",
+                Some(expected_runtime_options.clone()),
+                Some(json!({
+                    "input_kind": "authoring_context",
+                    "entrypoint": prepared.entrypoint,
+                    "project_manifest": prepared.project_manifest,
+                })),
+            )?,
+            prepared.source_label.clone(),
+            "hosted_authoring_build",
+            "authoring_context",
+            Some(entrypoint),
+            Some(project_manifest),
+        )
+    } else {
+        let prepared = prepare_sealed_package_input(path)?;
+        ensure_api_configured(&context)?;
+        (
+            upload_sealed_package_artifact(
+                &context,
+                &prepared.archive_path,
+                label.as_deref(),
+                "/v1/experiments/builds",
+                Some(expected_runtime_options.clone()),
                 None,
-            )
-        };
+            )?,
+            prepared.source_label.clone(),
+            "sealed_package_import",
+            "sealed_package",
+            None,
+            None,
+        )
+    };
     ensure_build_response_matches_input(
         &build.response,
         expected_build_kind,
@@ -510,6 +535,10 @@ fn experiment_build(context: CliContext) -> Result<()> {
     ensure_build_source_digest_matches(&build.response, &build.expected_digest)?;
     ensure_build_source_byte_size_matches(&build.response, build.expected_byte_size)?;
     ensure_build_source_entrypoint_matches(&build.response, expected_entrypoint.as_deref())?;
+    ensure_build_source_project_manifest_matches(
+        &build.response,
+        expected_project_manifest.as_ref(),
+    )?;
     ensure_build_runtime_options_match(&build.response, &expected_runtime_options)?;
     ensure_cloud_readiness_runtime_options_match(&build.response, &expected_runtime_options)?;
     ensure_build_target_matches(&build.response)?;
@@ -1079,52 +1108,303 @@ fn is_authoring_yaml_path(path: &Path) -> bool {
     lower.ends_with(".yaml") || lower.ends_with(".yml")
 }
 
-fn prepare_authoring_context_input(
-    path: &Path,
-    context_root: Option<&Path>,
-) -> Result<PreparedAuthoringContextInput> {
+fn prepare_authoring_context_input(path: &Path) -> Result<PreparedAuthoringContextInput> {
     if !path.is_file() {
         bail!("authoring YAML path does not exist: {}", path.display());
     }
-    let context_root = context_root.map(Path::to_path_buf).unwrap_or_else(|| {
-        path.parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
-    });
-    if !context_root.is_dir() {
-        bail!(
-            "authoring context root must be an existing directory: {}",
-            context_root.display()
-        );
-    }
-    let canonical_root = fs::canonicalize(&context_root).with_context(|| {
-        format!(
-            "failed to resolve authoring context root {}",
-            context_root.display()
-        )
-    })?;
-    let canonical_path = fs::canonicalize(path)
-        .with_context(|| format!("failed to resolve authoring YAML {}", path.display()))?;
-    let entrypoint_path = canonical_path
-        .strip_prefix(&canonical_root)
-        .with_context(|| {
-            format!(
-                "authoring YAML {} must be inside --context-root {}",
-                path.display(),
-                context_root.display()
-            )
-        })?;
-    let entrypoint = as_posix_relative_path(entrypoint_path)?;
+    let build_context = resolve_project_build_context(path)?;
     let temp_root = make_temp_dir("buc-authoring-context-upload")?;
     let archive_path = temp_root.join("authoring-context.tgz");
-    create_authoring_context_archive(&canonical_root, &archive_path)?;
+    create_authoring_context_archive(&build_context, &archive_path)?;
     Ok(PreparedAuthoringContextInput {
         archive_path,
         source_label: path.display().to_string(),
-        entrypoint,
+        entrypoint: build_context.entrypoint.clone(),
+        project_manifest: project_manifest_evidence(&build_context),
         temp_root,
     })
+}
+
+fn resolve_project_build_context(path: &Path) -> Result<ProjectBuildContext> {
+    let canonical_path = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve authoring YAML {}", path.display()))?;
+    let search_dir = canonical_path
+        .parent()
+        .ok_or_else(|| anyhow!("authoring YAML has no parent directory: {}", path.display()))?;
+    let manifest_path = find_project_manifest(search_dir)?.ok_or_else(|| {
+        anyhow!(
+            "hosted YAML builds require {PROJECT_MANIFEST_YAML} or {PROJECT_MANIFEST_YML}. Add a project manifest above {} that declares the build entrypoint and included files.",
+            path.display()
+        )
+    })?;
+    let project_root = manifest_path
+        .parent()
+        .ok_or_else(|| {
+            anyhow!(
+                "project manifest has no parent: {}",
+                manifest_path.display()
+            )
+        })?
+        .to_path_buf();
+    let entrypoint_path = canonical_path
+        .strip_prefix(&project_root)
+        .with_context(|| {
+            format!(
+                "authoring YAML {} must be inside project manifest root {}",
+                path.display(),
+                project_root.display()
+            )
+        })?;
+    let entrypoint = as_posix_relative_path(entrypoint_path)?;
+    let manifest_rel = as_posix_relative_path(
+        manifest_path
+            .strip_prefix(&project_root)
+            .with_context(|| "project manifest path escaped its root")?,
+    )?;
+    let raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest_yaml: serde_yaml::Value = serde_yaml::from_str(&raw).with_context(|| {
+        format!(
+            "project manifest YAML is invalid: {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: Value = serde_json::to_value(manifest_yaml)?;
+    let object = manifest.as_object().ok_or_else(|| {
+        anyhow!(
+            "project manifest must contain a YAML object: {}",
+            manifest_path.display()
+        )
+    })?;
+    let schema_version = string_field(object, "schema_version", "project manifest")?;
+    if schema_version != PROJECT_MANIFEST_SCHEMA_VERSION {
+        bail!(
+            "project manifest schema_version must be {PROJECT_MANIFEST_SCHEMA_VERSION}, got {schema_version}"
+        );
+    }
+    let targets = object
+        .get("targets")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("project manifest must declare targets.hosted_cloud"))?;
+    if !targets.get("hosted_cloud").is_some_and(Value::is_object) {
+        bail!("project manifest must declare targets.hosted_cloud");
+    }
+    let project_id = object
+        .get("project")
+        .and_then(Value::as_object)
+        .and_then(|project| project.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("project manifest must declare project.id"))?
+        .to_string();
+    if !is_valid_project_id(&project_id) {
+        bail!("project manifest project.id must start with an ASCII letter or digit and contain only ASCII letters, digits, '_', '.', or '-'");
+    }
+    let package_sources = object
+        .get("package_sources")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("project manifest must declare package_sources"))?;
+    let mut matches = Vec::new();
+    for (name, source) in package_sources {
+        let source = source
+            .as_object()
+            .ok_or_else(|| anyhow!("project manifest package_sources.{name} must be an object"))?;
+        let source_root = optional_string_field(source, "root").unwrap_or_else(|| ".".to_string());
+        let source_root =
+            validate_manifest_rel_dir(&source_root, &format!("package_sources.{name}.root"))?;
+        let entrypoints = string_array_field(
+            source,
+            "entrypoints",
+            &format!("package_sources.{name}.entrypoints"),
+        )?;
+        if !entrypoints.iter().any(|candidate| candidate == &entrypoint) {
+            continue;
+        }
+        if !entrypoint_in_source_root(&entrypoint, &source_root) {
+            bail!(
+                "project manifest package_sources.{name} declares entrypoint {entrypoint} outside root {source_root}"
+            );
+        }
+        let include = string_array_field(
+            source,
+            "include",
+            &format!("package_sources.{name}.include"),
+        )?;
+        if include.is_empty() {
+            bail!("project manifest package_sources.{name}.include must not be empty");
+        }
+        let exclude = optional_string_array_field(
+            source,
+            "exclude",
+            &format!("package_sources.{name}.exclude"),
+        )?;
+        matches.push(ProjectBuildContext {
+            project_root: project_root.clone(),
+            manifest_rel: manifest_rel.clone(),
+            manifest_digest: sha256_digest(&fs::read(&manifest_path)?),
+            project_id: project_id.clone(),
+            package_source: name.clone(),
+            source_root,
+            entrypoint: entrypoint.clone(),
+            include: normalize_manifest_patterns(
+                include,
+                &format!("package_sources.{name}.include"),
+            )?,
+            exclude: normalize_manifest_patterns(
+                exclude,
+                &format!("package_sources.{name}.exclude"),
+            )?,
+        });
+    }
+    match matches.len() {
+        0 => bail!(
+            "project manifest {} does not declare entrypoint {entrypoint} in any package source",
+            manifest_path.display()
+        ),
+        1 => Ok(matches.remove(0)),
+        _ => bail!(
+            "project manifest {} declares entrypoint {entrypoint} in multiple package sources; make the source boundary unambiguous",
+            manifest_path.display()
+        ),
+    }
+}
+
+fn find_project_manifest(start_dir: &Path) -> Result<Option<PathBuf>> {
+    let mut current = Some(start_dir);
+    while let Some(dir) = current {
+        let yaml = dir.join(PROJECT_MANIFEST_YAML);
+        let yml = dir.join(PROJECT_MANIFEST_YML);
+        let has_yaml = yaml.is_file();
+        let has_yml = yml.is_file();
+        if has_yaml && has_yml {
+            bail!(
+                "project manifest is ambiguous: both {PROJECT_MANIFEST_YAML} and {PROJECT_MANIFEST_YML} exist in {}. Keep exactly one.",
+                dir.display()
+            );
+        }
+        if has_yaml {
+            return Ok(Some(fs::canonicalize(yaml)?));
+        }
+        if has_yml {
+            return Ok(Some(fs::canonicalize(yml)?));
+        }
+        current = dir.parent();
+    }
+    Ok(None)
+}
+
+fn project_manifest_evidence(context: &ProjectBuildContext) -> Value {
+    json!({
+        "schema_version": PROJECT_MANIFEST_SCHEMA_VERSION,
+        "path": context.manifest_rel,
+        "digest": context.manifest_digest,
+        "project_id": context.project_id,
+        "package_source": context.package_source,
+        "source_root": context.source_root,
+        "entrypoint": context.entrypoint,
+    })
+}
+
+fn is_valid_project_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '-')
+}
+
+fn string_field<'a>(object: &'a Map<String, Value>, key: &str, context: &str) -> Result<&'a str> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{context}.{key} must be a non-empty string"))
+}
+
+fn optional_string_field(object: &Map<String, Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn string_array_field(
+    object: &Map<String, Value>,
+    key: &str,
+    context: &str,
+) -> Result<Vec<String>> {
+    let value = object
+        .get(key)
+        .ok_or_else(|| anyhow!("{context} is required"))?;
+    parse_string_array(value, context)
+}
+
+fn optional_string_array_field(
+    object: &Map<String, Value>,
+    key: &str,
+    context: &str,
+) -> Result<Vec<String>> {
+    match object.get(key) {
+        Some(value) => parse_string_array(value, context),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn parse_string_array(value: &Value, context: &str) -> Result<Vec<String>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("{context} must be a string array"))?;
+    let mut out = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let value = item
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{context}[{idx}] must be a non-empty string"))?;
+        out.push(value.to_string());
+    }
+    Ok(out)
+}
+
+fn validate_manifest_rel_dir(raw: &str, field: &str) -> Result<String> {
+    let normalized = validate_manifest_rel_path(raw, field)?;
+    Ok(if normalized == "." {
+        ".".to_string()
+    } else {
+        normalized
+    })
+}
+
+fn normalize_manifest_patterns(patterns: Vec<String>, field: &str) -> Result<Vec<String>> {
+    patterns
+        .into_iter()
+        .map(|pattern| validate_manifest_rel_path(&pattern, field))
+        .collect()
+}
+
+fn validate_manifest_rel_path(raw: &str, field: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.contains('\\') {
+        bail!("{field} entries must be relative POSIX paths");
+    }
+    if trimmed
+        .split('/')
+        .any(|part| part.is_empty() || part == "..")
+    {
+        bail!("{field} entries cannot contain empty or parent path segments");
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+fn entrypoint_in_source_root(entrypoint: &str, source_root: &str) -> bool {
+    source_root == "."
+        || entrypoint == source_root
+        || entrypoint.starts_with(&format!("{source_root}/"))
 }
 
 fn prepare_package_directory(package_dir: &Path) -> Result<PreparedPackageInput> {
@@ -1179,7 +1459,10 @@ fn create_package_archive(package_dir: &Path, archive_path: &Path) -> Result<()>
     Ok(())
 }
 
-fn create_authoring_context_archive(context_root: &Path, archive_path: &Path) -> Result<()> {
+fn create_authoring_context_archive(
+    context: &ProjectBuildContext,
+    archive_path: &Path,
+) -> Result<()> {
     if let Some(parent) = archive_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1188,23 +1471,37 @@ fn create_authoring_context_archive(context_root: &Path, archive_path: &Path) ->
     let mut builder = tar::Builder::new(encoder);
     builder.follow_symlinks(false);
     let mut plan = AuthoringContextArchivePlan::default();
-    collect_authoring_context_files(context_root, context_root, &mut plan)?;
+    collect_authoring_context_files(context, &context.project_root, &mut plan)?;
     if plan.files.is_empty() {
         bail!(
-            "authoring context has no uploadable files: {}",
-            context_root.display()
+            "project manifest package source {} selected no uploadable files",
+            context.package_source
+        );
+    }
+    if !plan.files.iter().any(|file| file == &context.entrypoint) {
+        bail!(
+            "project manifest package source {} did not include entrypoint {}",
+            context.package_source,
+            context.entrypoint
+        );
+    }
+    if !plan.files.iter().any(|file| file == &context.manifest_rel) {
+        bail!(
+            "project manifest package source {} did not include {}",
+            context.package_source,
+            context.manifest_rel
         );
     }
     plan.files.sort();
     for rel in plan.files {
-        builder.append_path_with_name(context_root.join(&rel), Path::new(&rel))?;
+        builder.append_path_with_name(context.project_root.join(&rel), Path::new(&rel))?;
     }
     builder.finish()?;
     Ok(())
 }
 
 fn collect_authoring_context_files(
-    root: &Path,
+    context: &ProjectBuildContext,
     dir: &Path,
     plan: &mut AuthoringContextArchivePlan,
 ) -> Result<()> {
@@ -1224,6 +1521,13 @@ fn collect_authoring_context_files(
         if should_skip_authoring_context_entry(&name, file_type.is_dir()) {
             continue;
         }
+        let rel = path
+            .strip_prefix(&context.project_root)
+            .with_context(|| format!("authoring context path escaped root: {}", path.display()))?;
+        let rel = as_posix_relative_path(rel)?;
+        if file_type.is_dir() && project_context_excludes_dir(context, &rel) {
+            continue;
+        }
         record_authoring_context_entry(plan, &path)?;
         if file_type.is_symlink() {
             bail!(
@@ -1232,7 +1536,7 @@ fn collect_authoring_context_files(
             );
         }
         if file_type.is_dir() {
-            collect_authoring_context_files(root, &path, plan)?;
+            collect_authoring_context_files(context, &path, plan)?;
             continue;
         }
         if !file_type.is_file() {
@@ -1245,13 +1549,99 @@ fn collect_authoring_context_files(
             .metadata()
             .with_context(|| format!("failed to stat authoring context file {}", path.display()))?
             .len();
+        if !project_context_includes_file(context, &rel) {
+            continue;
+        }
         record_authoring_context_bytes(plan, &path, file_size)?;
-        let rel = path
-            .strip_prefix(root)
-            .with_context(|| format!("authoring context path escaped root: {}", path.display()))?;
-        plan.files.push(as_posix_relative_path(rel)?);
+        plan.files.push(rel);
     }
     Ok(())
+}
+
+fn project_context_includes_file(context: &ProjectBuildContext, rel: &str) -> bool {
+    if rel == context.manifest_rel || rel == context.entrypoint {
+        return true;
+    }
+    if context
+        .exclude
+        .iter()
+        .any(|pattern| manifest_pattern_matches(pattern, rel))
+    {
+        return false;
+    }
+    context
+        .include
+        .iter()
+        .any(|pattern| manifest_pattern_matches(pattern, rel))
+}
+
+fn project_context_excludes_dir(context: &ProjectBuildContext, rel: &str) -> bool {
+    context
+        .exclude
+        .iter()
+        .any(|pattern| manifest_pattern_excludes_dir(pattern, rel))
+}
+
+fn manifest_pattern_excludes_dir(pattern: &str, rel: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return rel == prefix || rel.starts_with(&format!("{prefix}/"));
+    }
+    manifest_pattern_matches(pattern, rel)
+}
+
+fn manifest_pattern_matches(pattern: &str, rel: &str) -> bool {
+    if pattern == "**" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return rel == prefix || rel.starts_with(&format!("{prefix}/"));
+    }
+    glob_segments_match(
+        &pattern.split('/').collect::<Vec<_>>(),
+        &rel.split('/').collect::<Vec<_>>(),
+    )
+}
+
+fn glob_segments_match(pattern: &[&str], path: &[&str]) -> bool {
+    if pattern.is_empty() {
+        return path.is_empty();
+    }
+    if pattern[0] == "**" {
+        return glob_segments_match(&pattern[1..], path)
+            || (!path.is_empty() && glob_segments_match(pattern, &path[1..]));
+    }
+    if path.is_empty() {
+        return false;
+    }
+    glob_segment_match(pattern[0], path[0]) && glob_segments_match(&pattern[1..], &path[1..])
+}
+
+fn glob_segment_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let parts = pattern.split('*').collect::<Vec<_>>();
+    if parts.len() == 1 {
+        return pattern == value;
+    }
+    let mut rest = value;
+    for (idx, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if idx == 0 {
+            let Some(stripped) = rest.strip_prefix(part) else {
+                return false;
+            };
+            rest = stripped;
+            continue;
+        }
+        let Some(found) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[found + part.len()..];
+    }
+    pattern.ends_with('*') || rest.is_empty()
 }
 
 fn record_authoring_context_entry(
@@ -1265,7 +1655,7 @@ fn record_authoring_context_entry(
     let max_entries = max_authoring_context_archive_entries();
     if plan.entries > max_entries {
         bail!(
-            "authoring context has too many entries for hosted Cloud build: {} exceeds limit {}. Narrow --context-root or remove generated files before running `buc build`.",
+            "authoring context has too many entries for hosted Cloud build: {} exceeds limit {}. Narrow bucephalus.project.yaml include patterns or remove generated files before running `buc build`.",
             path.display(),
             max_entries
         );
@@ -1285,7 +1675,7 @@ fn record_authoring_context_bytes(
     let max_bytes = max_authoring_context_expanded_bytes();
     if plan.expanded_bytes > max_bytes {
         bail!(
-            "authoring context is too large for hosted Cloud build: {} pushes expanded size to {} bytes, above limit {}. Narrow --context-root or remove generated files before running `buc build`.",
+            "authoring context is too large for hosted Cloud build: {} pushes expanded size to {} bytes, above limit {}. Narrow bucephalus.project.yaml include patterns or remove generated files before running `buc build`.",
             path.display(),
             plan.expanded_bytes,
             max_bytes
@@ -1814,6 +2204,50 @@ fn ensure_build_source_entrypoint_matches(
             if source_entrypoint.is_some() {
                 bail!(
                     "hosted build source entrypoint mismatch: sealed package builds must not report an authoring entrypoint"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_build_source_project_manifest_matches(
+    value: &Value,
+    expected_project_manifest: Option<&Value>,
+) -> Result<()> {
+    let source_manifest = value
+        .get("build_environment")
+        .and_then(|environment| environment.get("source"))
+        .and_then(|source| source.get("project_manifest"));
+    match expected_project_manifest {
+        Some(expected) => {
+            let actual = source_manifest.ok_or_else(|| {
+                anyhow!(
+                    "hosted build response is missing build_environment.source.project_manifest"
+                )
+            })?;
+            for field in [
+                "schema_version",
+                "path",
+                "digest",
+                "project_id",
+                "package_source",
+                "source_root",
+                "entrypoint",
+            ] {
+                if actual.get(field) != expected.get(field) {
+                    bail!(
+                        "hosted build project manifest mismatch for {field}: requested {}, API built {}",
+                        compact_json_lossy(expected),
+                        compact_json_lossy(actual)
+                    );
+                }
+            }
+        }
+        None => {
+            if source_manifest.is_some() {
+                bail!(
+                    "hosted build source mismatch: sealed package builds must not report an authoring project_manifest"
                 );
             }
         }
@@ -2931,10 +3365,9 @@ fn run_value_args(args: &[String]) -> Result<(String, String)> {
     }
 }
 
-fn build_value_options() -> [&'static str; 12] {
+fn build_value_options() -> [&'static str; 11] {
     [
         "--file",
-        "--context-root",
         "--label",
         "--backend",
         "--arch",
@@ -3142,7 +3575,6 @@ fn positional_args(args: &[String]) -> Vec<String> {
         "--scope",
         "--label",
         "--file",
-        "--context-root",
         "--package-digest",
         "--run-id",
         "--secret-ref-file",
@@ -3340,6 +3772,24 @@ fn build_environment_summary_lines(environment: &Value) -> Vec<String> {
         }
         if let Some(entrypoint) = source.get("entrypoint").and_then(Value::as_str) {
             lines.push(format!("build_source_entrypoint: {entrypoint}"));
+        }
+        if let Some(project_manifest) = source.get("project_manifest") {
+            if let Some(project_id) = project_manifest.get("project_id").and_then(Value::as_str) {
+                lines.push(format!("build_source_project: {project_id}"));
+            }
+            if let Some(package_source) = project_manifest
+                .get("package_source")
+                .and_then(Value::as_str)
+            {
+                lines.push(format!("build_source_package_source: {package_source}"));
+            }
+            if let Some(path) = project_manifest.get("path").and_then(Value::as_str) {
+                if let Some(digest) = project_manifest.get("digest").and_then(Value::as_str) {
+                    lines.push(format!("build_source_manifest: {path} {digest}"));
+                } else {
+                    lines.push(format!("build_source_manifest: {path}"));
+                }
+            }
         }
     }
     if let Some(runtime_options) = environment.get("runtime_options") {
@@ -4148,7 +4598,7 @@ Usage:
   buc logout [--dry-run] [--json]
   buc auth status [--json]
   buc health
-  buc build <experiment.yaml|package-dir|package.tgz> [--context-root DIR] [--label TEXT] [--json]
+  buc build <experiment.yaml|package-dir|package.tgz> [--label TEXT] [--json]
   buc doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
   buc run <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--label TEXT] [--json]
   buc inspect <package-digest> [--json]
@@ -4174,7 +4624,7 @@ Long-form nouns:
   buc secrets list [--json]
   buc secrets put <name> (--value-file PATH|--from-env ENV|--stdin) [--json]
   buc secrets delete <name> [--json]
-  buc experiments build <experiment.yaml|package-dir|package.tgz> [--context-root DIR] [--label TEXT] [--json]
+  buc experiments build <experiment.yaml|package-dir|package.tgz> [--label TEXT] [--json]
   buc experiments doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
   buc runs list [--limit N] [--json]
   buc runs create <package-digest> [--secret-ref NAME=REF ...] [--label TEXT] [--json]
@@ -4191,12 +4641,11 @@ Cloud package boundary:
   hosted Cloud readiness for the default Cloud target.
 
 Authoring context:
-  YAML builds default to the YAML parent directory as the uploaded context. Use
-  --context-root DIR when the experiment intentionally references shared files
-  under a broader repository/workspace root. The YAML must be inside DIR, and
-  hosted Core builds the YAML entrypoint relative to DIR. Local generated and
-  credential material such as .env, .npmrc, .ssh, .aws, node_modules, and
-  target is excluded before upload; the hosted API rejects those paths too.
+  YAML builds require bucephalus.project.yaml above the entrypoint. The project
+  manifest declares package sources, entrypoints, include/exclude rules, and
+  the hosted Cloud target. Local generated and credential material such as .env,
+  .npmrc, .ssh, .aws, node_modules, and target is excluded before upload; the
+  hosted API rejects those paths too.
 
 Auth:
   Sign in with `buc login`. buc reuses the shared
@@ -4329,18 +4778,14 @@ const BUILD_HELP: &str = r#"buc build
 Build authoring YAML in hosted Cloud or import a sealed package.
 
 Usage:
-  buc build <experiment.yaml|package-dir|package.tgz> [--context-root DIR] [--label TEXT] [--json]
+  buc build <experiment.yaml|package-dir|package.tgz> [--label TEXT] [--json]
 
 Boundary:
-  YAML inputs upload the YAML directory as an authoring context and call hosted
-  Core. Package inputs upload/import an existing sealed package. Both paths fail
-  if the package is not runnable on the hosted Cloud target.
-
-Options:
-  --context-root DIR  For YAML inputs, upload DIR as the authoring context and
-                      build the YAML path relative to DIR.
-                      Local generated and credential material is excluded
-                      before upload and rejected by the hosted API.
+  YAML inputs require bucephalus.project.yaml above the entrypoint. The manifest
+  declares the upload boundary, entrypoints, package source, and target; hosted
+  Core builds from that declared project context. Package inputs upload/import
+  an existing sealed package. Both paths fail if the package is not runnable on
+  the hosted Cloud target.
 "#;
 
 const DOCTOR_HELP: &str = r#"buc doctor
@@ -4537,7 +4982,7 @@ const EXPERIMENTS_HELP: &str = r#"buc experiments
 Hosted experiment workflow commands.
 
 Usage:
-  buc experiments build <experiment.yaml|package-dir|package.tgz> [--context-root DIR] [--label TEXT] [--json]
+  buc experiments build <experiment.yaml|package-dir|package.tgz> [--label TEXT] [--json]
   buc experiments doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
 
 Secrets:
@@ -4550,16 +4995,13 @@ const EXPERIMENTS_BUILD_HELP: &str = r#"buc experiments build
 Build authoring YAML in hosted Cloud or import a sealed package.
 
 Usage:
-  buc experiments build <experiment.yaml|package-dir|package.tgz> [--context-root DIR] [--label TEXT] [--json]
+  buc experiments build <experiment.yaml|package-dir|package.tgz> [--label TEXT] [--json]
 
 Boundary:
   This command calls POST /v1/experiments/builds after upload. YAML inputs are
-  built by hosted Core from the uploaded authoring context. Sealed package
-  inputs are imported directly. Both paths report hosted Cloud readiness.
-
-Options:
-  --context-root DIR  For YAML inputs, upload DIR as the authoring context and
-                      build the YAML path relative to DIR.
+  built by hosted Core from the bucephalus.project.yaml-declared authoring
+  context. Sealed package inputs are imported directly. Both paths report
+  hosted Cloud readiness.
 "#;
 
 const EXPERIMENTS_DOCTOR_HELP: &str = r#"buc experiments doctor
@@ -4789,6 +5231,33 @@ mod tests {
         std::env::temp_dir().join(format!("buc_cli_{label}_{}_{}", std::process::id(), nanos))
     }
 
+    fn write_project_manifest(root: &Path, entrypoint: &str, include: &[&str]) {
+        let include_lines = include
+            .iter()
+            .map(|pattern| format!("      - {pattern}"))
+            .collect::<Vec<_>>();
+        let mut lines = vec![
+            format!("schema_version: {PROJECT_MANIFEST_SCHEMA_VERSION}"),
+            "project:".to_string(),
+            "  id: test_project".to_string(),
+            "package_sources:".to_string(),
+            "  default:".to_string(),
+            "    root: .".to_string(),
+            "    entrypoints:".to_string(),
+            format!("      - {entrypoint}"),
+            "    include:".to_string(),
+        ];
+        lines.extend(include_lines);
+        lines.extend([
+            "    exclude:".to_string(),
+            "      - ignored/**".to_string(),
+            "targets:".to_string(),
+            "  hosted_cloud: {}".to_string(),
+            "".to_string(),
+        ]);
+        fs::write(root.join(PROJECT_MANIFEST_YAML), lines.join("\n")).unwrap();
+    }
+
     #[test]
     fn hosted_authoring_yaml_commands_are_recognized_before_cloud_calls() {
         let _lock = lock_env();
@@ -4919,12 +5388,17 @@ mod tests {
         fs::write(root.join("target/debug/blob"), "junk").unwrap();
         fs::write(root.join("node_modules/pkg/index.js"), "junk").unwrap();
         fs::write(root.join(".git/config"), "junk").unwrap();
+        write_project_manifest(
+            &root,
+            "experiment.yaml",
+            &["experiment.yaml", "cases.jsonl"],
+        );
 
-        let prepared =
-            prepare_authoring_context_input(&root.join("experiment.yaml"), None).unwrap();
+        let prepared = prepare_authoring_context_input(&root.join("experiment.yaml")).unwrap();
 
         assert_eq!(prepared.entrypoint, "experiment.yaml");
         let entries = archive_entries(&prepared.archive_path);
+        assert!(entries.contains(&PROJECT_MANIFEST_YAML.to_string()));
         assert!(entries.contains(&"experiment.yaml".to_string()));
         assert!(entries.contains(&"cases.jsonl".to_string()));
         assert!(!entries.iter().any(|entry| entry.starts_with(".env")));
@@ -4959,13 +5433,18 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
         fs::write(root.join("cases.jsonl"), "{}\n").unwrap();
+        write_project_manifest(
+            &root,
+            "experiment.yaml",
+            &["experiment.yaml", "cases.jsonl"],
+        );
 
-        let err = prepare_authoring_context_input(&root.join("experiment.yaml"), None)
+        let err = prepare_authoring_context_input(&root.join("experiment.yaml"))
             .unwrap_err()
             .to_string();
 
         assert!(err.contains("authoring context has too many entries"));
-        assert!(err.contains("Narrow --context-root"));
+        assert!(err.contains("Narrow bucephalus.project.yaml include patterns"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4985,8 +5464,9 @@ mod tests {
         let root = temp_dir("authoring_context_byte_limit");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
 
-        let err = prepare_authoring_context_input(&root.join("experiment.yaml"), None)
+        let err = prepare_authoring_context_input(&root.join("experiment.yaml"))
             .unwrap_err()
             .to_string();
 
@@ -5019,15 +5499,19 @@ mod tests {
         fs::write(root.join(".env.local"), "SECRET=oops\n").unwrap();
         fs::write(root.join("target/debug/blob"), "junk").unwrap();
         fs::write(root.join("node_modules/pkg/index.js"), "junk").unwrap();
+        write_project_manifest(
+            &root,
+            "experiments/peter/experiment.yaml",
+            &["experiments/peter/**", "shared/**"],
+        );
 
-        let prepared = prepare_authoring_context_input(
-            &root.join("experiments/peter/experiment.yaml"),
-            Some(&root),
-        )
-        .unwrap();
+        let prepared =
+            prepare_authoring_context_input(&root.join("experiments/peter/experiment.yaml"))
+                .unwrap();
 
         assert_eq!(prepared.entrypoint, "experiments/peter/experiment.yaml");
         let entries = archive_entries(&prepared.archive_path);
+        assert!(entries.contains(&PROJECT_MANIFEST_YAML.to_string()));
         assert!(entries.contains(&"experiments/peter/experiment.yaml".to_string()));
         assert!(entries.contains(&"shared/cases.jsonl".to_string()));
         assert!(!entries.iter().any(|entry| entry.starts_with(".env")));
@@ -5040,20 +5524,56 @@ mod tests {
     }
 
     #[test]
-    fn authoring_context_root_rejects_yaml_outside_boundary() {
+    fn authoring_context_rejects_yaml_not_declared_by_project_manifest() {
         let root = temp_dir("authoring_context_root_reject");
-        let outside = temp_dir("authoring_context_outside");
         fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(outside.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        fs::create_dir_all(root.join("experiments/other")).unwrap();
+        fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        fs::write(
+            root.join("experiments/other/experiment.yaml"),
+            "experiment: {}\n",
+        )
+        .unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
 
-        let err = prepare_authoring_context_input(&outside.join("experiment.yaml"), Some(&root))
+        let err = prepare_authoring_context_input(&root.join("experiments/other/experiment.yaml"))
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("must be inside --context-root"));
+        assert!(err.contains("does not declare entrypoint experiments/other/experiment.yaml"));
         fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn authoring_context_rejects_project_manifest_without_hosted_target() {
+        let root = temp_dir("authoring_context_missing_hosted_target");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        fs::write(
+            root.join(PROJECT_MANIFEST_YAML),
+            [
+                "schema_version: bucephalus_project_v1",
+                "project:",
+                "  id: test_project",
+                "package_sources:",
+                "  default:",
+                "    root: .",
+                "    entrypoints:",
+                "      - experiment.yaml",
+                "    include:",
+                "      - experiment.yaml",
+                "",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let err = prepare_authoring_context_input(&root.join("experiment.yaml"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("project manifest must declare targets.hosted_cloud"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5069,6 +5589,11 @@ mod tests {
         .unwrap();
         fs::write(root.join("shared/cases.jsonl"), "{}\n").unwrap();
         fs::write(root.join(".env"), "SECRET=oops\n").unwrap();
+        write_project_manifest(
+            &root,
+            "experiments/peter/experiment.yaml",
+            &["experiments/peter/**", "shared/**"],
+        );
 
         let server = MockCloudServer::start(4);
         let api_url = server.api_url();
@@ -5090,8 +5615,6 @@ mod tests {
             root.join("experiments/peter/experiment.yaml")
                 .display()
                 .to_string(),
-            "--context-root".to_string(),
-            root.display().to_string(),
             "--label".to_string(),
             "demo".to_string(),
             "--memory-mb".to_string(),
@@ -5173,6 +5696,7 @@ mod tests {
         let root = temp_dir("authoring_context_wrong_kind");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let server = MockCloudServer::start_with_handler(4, mismatched_authoring_build_kind);
         let api_url = server.api_url();
         let home = temp_dir("authoring_context_wrong_kind_home");
@@ -5301,6 +5825,7 @@ mod tests {
         let root = temp_dir("authoring_context_wrong_upload_id");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let server = MockCloudServer::start_with_handler(4, mismatched_authoring_upload_id);
         let api_url = server.api_url();
         let home = temp_dir("authoring_context_wrong_upload_id_home");
@@ -5366,6 +5891,7 @@ mod tests {
         let root = temp_dir("authoring_context_wrong_source_digest");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let server = MockCloudServer::start_with_handler(4, mismatched_authoring_digest);
         let api_url = server.api_url();
         let home = temp_dir("authoring_context_wrong_source_digest_home");
@@ -5399,6 +5925,7 @@ mod tests {
         let root = temp_dir("authoring_context_wrong_source_byte_size");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let mut source_digest: Option<String> = None;
         let server = MockCloudServer::start_with_stateful_handler(4, move |request, _index| {
             if request.method == "PUT" && request.path == "/v1/uploads/upload-1/content" {
@@ -5499,6 +6026,7 @@ mod tests {
         let root = temp_dir("authoring_context_missing_source_digest");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let server = MockCloudServer::start_with_handler(4, missing_authoring_digest);
         let api_url = server.api_url();
         let home = temp_dir("authoring_context_missing_source_digest_home");
@@ -5531,6 +6059,7 @@ mod tests {
         let root = temp_dir("authoring_context_missing_source_byte_size");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let mut source_digest: Option<String> = None;
         let server = MockCloudServer::start_with_stateful_handler(4, move |request, _index| {
             if request.method == "PUT" && request.path == "/v1/uploads/upload-1/content" {
@@ -5596,6 +6125,7 @@ mod tests {
         let root = temp_dir("authoring_context_missing_source_entrypoint");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let mut source: Option<(String, u64)> = None;
         let server = MockCloudServer::start_with_stateful_handler(4, move |request, _index| {
             if request.method == "PUT" && request.path == "/v1/uploads/upload-1/content" {
@@ -5664,6 +6194,7 @@ mod tests {
         let root = temp_dir("authoring_context_wrong_source_entrypoint");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let mut source: Option<(String, u64)> = None;
         let server = MockCloudServer::start_with_stateful_handler(4, move |request, _index| {
             if request.method == "PUT" && request.path == "/v1/uploads/upload-1/content" {
@@ -5733,6 +6264,7 @@ mod tests {
         let root = temp_dir("authoring_context_wrong_runtime_options");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let mut source: Option<(String, u64)> = None;
         let server = MockCloudServer::start_with_stateful_handler(4, move |request, _index| {
             if request.method == "PUT" && request.path == "/v1/uploads/upload-1/content" {
@@ -5744,6 +6276,7 @@ mod tests {
                 ("POST", "/v1/uploads/upload-1/complete") => json!({}),
                 ("POST", "/v1/experiments/builds") => {
                     let requested_runtime = runtime_options_from_build_request(request);
+                    let project_manifest = project_manifest_from_build_request(request);
                     json!({
                         "build_id": "build-1",
                         "build_kind": "hosted_authoring_build",
@@ -5753,7 +6286,8 @@ mod tests {
                                 "input_kind": "authoring_context",
                                 "content_digest": source.as_ref().map(|(digest, _)| digest.as_str()).unwrap_or("sha256:missing-upload-content"),
                                 "byte_size": source.as_ref().map(|(_, byte_size)| *byte_size).unwrap_or(0),
-                                "entrypoint": "experiment.yaml"
+                                "entrypoint": "experiment.yaml",
+                                "project_manifest": project_manifest
                             },
                             "runtime_options": {
                                 "memory_mb": 4096
@@ -5811,6 +6345,7 @@ mod tests {
         let root = temp_dir("authoring_context_wrong_readiness_runtime_options");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let mut source: Option<(String, u64)> = None;
         let server = MockCloudServer::start_with_stateful_handler(4, move |request, _index| {
             if request.method == "PUT" && request.path == "/v1/uploads/upload-1/content" {
@@ -5822,6 +6357,7 @@ mod tests {
                 ("POST", "/v1/uploads/upload-1/complete") => json!({}),
                 ("POST", "/v1/experiments/builds") => {
                     let requested_runtime = runtime_options_from_build_request(request);
+                    let project_manifest = project_manifest_from_build_request(request);
                     json!({
                         "build_id": "build-1",
                         "build_kind": "hosted_authoring_build",
@@ -5831,7 +6367,8 @@ mod tests {
                                 "input_kind": "authoring_context",
                                 "content_digest": source.as_ref().map(|(digest, _)| digest.as_str()).unwrap_or("sha256:missing-upload-content"),
                                 "byte_size": source.as_ref().map(|(_, byte_size)| *byte_size).unwrap_or(0),
-                                "entrypoint": "experiment.yaml"
+                                "entrypoint": "experiment.yaml",
+                                "project_manifest": project_manifest
                             },
                             "runtime_options": requested_runtime
                         },
@@ -5889,6 +6426,7 @@ mod tests {
         let root = temp_dir("authoring_context_wrong_build_target");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let mut source: Option<(String, u64)> = None;
         let server = MockCloudServer::start_with_stateful_handler(4, move |request, _index| {
             if request.method == "PUT" && request.path == "/v1/uploads/upload-1/content" {
@@ -5898,49 +6436,53 @@ mod tests {
                 ("POST", "/v1/uploads") => json!({ "upload_id": "upload-1" }),
                 ("PUT", "/v1/uploads/upload-1/content") => json!({}),
                 ("POST", "/v1/uploads/upload-1/complete") => json!({}),
-                ("POST", "/v1/experiments/builds") => json!({
-                    "build_id": "build-1",
-                    "build_kind": "hosted_authoring_build",
-                    "build_environment": {
-                        "target": {
-                            "kind": "local_core",
-                            "name": "default"
-                        },
-                        "source": {
-                            "upload_id": "upload-1",
-                            "input_kind": "authoring_context",
-                            "content_digest": source.as_ref().map(|(digest, _)| digest.as_str()).unwrap_or("sha256:missing-upload-content"),
-                            "byte_size": source.as_ref().map(|(_, byte_size)| *byte_size).unwrap_or(0),
-                            "entrypoint": "experiment.yaml"
-                        },
-                        "runtime_options": {},
-                        "package_contract": {
-                            "input_kind": "authoring_context",
-                            "authoring_compiler": "core_universal_v1",
-                            "authoring_provenance": {
-                                "status": "hosted_attested",
-                                "source": "hosted_core"
+                ("POST", "/v1/experiments/builds") => {
+                    let project_manifest = project_manifest_from_build_request(request);
+                    json!({
+                        "build_id": "build-1",
+                        "build_kind": "hosted_authoring_build",
+                        "build_environment": {
+                            "target": {
+                                "kind": "local_core",
+                                "name": "default"
                             },
-                            "sealed_schema_version": "sealed_run_package_v2",
-                            "readiness_schema_version": "hosted_cloud_readiness_v1",
-                            "cloud_readiness_required": true
-                        }
-                    },
-                    "status": "cloud_runnable",
-                    "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "cloud_readiness": {
-                        "status": "cloud_runnable",
-                        "target": {
-                            "kind": "hosted_cloud",
-                            "name": "default"
+                            "source": {
+                                "upload_id": "upload-1",
+                                "input_kind": "authoring_context",
+                                "content_digest": source.as_ref().map(|(digest, _)| digest.as_str()).unwrap_or("sha256:missing-upload-content"),
+                                "byte_size": source.as_ref().map(|(_, byte_size)| *byte_size).unwrap_or(0),
+                                "entrypoint": "experiment.yaml",
+                                "project_manifest": project_manifest
+                            },
+                            "runtime_options": {},
+                            "package_contract": {
+                                "input_kind": "authoring_context",
+                                "authoring_compiler": "core_universal_v1",
+                                "authoring_provenance": {
+                                    "status": "hosted_attested",
+                                    "source": "hosted_core"
+                                },
+                                "sealed_schema_version": "sealed_run_package_v2",
+                                "readiness_schema_version": "hosted_cloud_readiness_v1",
+                                "cloud_readiness_required": true
+                            }
                         },
-                        "runtime_options": {},
-                        "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    },
-                    "import": {
-                        "status": "accepted"
-                    }
-                }),
+                        "status": "cloud_runnable",
+                        "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "cloud_readiness": {
+                            "status": "cloud_runnable",
+                            "target": {
+                                "kind": "hosted_cloud",
+                                "name": "default"
+                            },
+                            "runtime_options": {},
+                            "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        },
+                        "import": {
+                            "status": "accepted"
+                        }
+                    })
+                }
                 _ => panic!(
                     "unexpected mock Cloud API request: {} {}",
                     request.method, request.path
@@ -5979,6 +6521,7 @@ mod tests {
         let root = temp_dir("authoring_context_wrong_package_contract");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("experiment.yaml"), "experiment: {}\n").unwrap();
+        write_project_manifest(&root, "experiment.yaml", &["experiment.yaml"]);
         let mut source: Option<(String, u64)> = None;
         let server = MockCloudServer::start_with_stateful_handler(4, move |request, _index| {
             if request.method == "PUT" && request.path == "/v1/uploads/upload-1/content" {
@@ -5988,49 +6531,53 @@ mod tests {
                 ("POST", "/v1/uploads") => json!({ "upload_id": "upload-1" }),
                 ("PUT", "/v1/uploads/upload-1/content") => json!({}),
                 ("POST", "/v1/uploads/upload-1/complete") => json!({}),
-                ("POST", "/v1/experiments/builds") => json!({
-                    "build_id": "build-1",
-                    "build_kind": "hosted_authoring_build",
-                    "build_environment": {
-                        "target": {
-                            "kind": "hosted_cloud",
-                            "name": "default"
-                        },
-                        "source": {
-                            "upload_id": "upload-1",
-                            "input_kind": "authoring_context",
-                            "content_digest": source.as_ref().map(|(digest, _)| digest.as_str()).unwrap_or("sha256:missing-upload-content"),
-                            "byte_size": source.as_ref().map(|(_, byte_size)| *byte_size).unwrap_or(0),
-                            "entrypoint": "experiment.yaml"
-                        },
-                        "runtime_options": {},
-                        "package_contract": {
-                            "input_kind": "sealed_package",
-                            "authoring_compiler": "core_universal_v1",
-                            "authoring_provenance": {
-                                "status": "external_unattested",
-                                "source": "sealed_package_manifest"
+                ("POST", "/v1/experiments/builds") => {
+                    let project_manifest = project_manifest_from_build_request(request);
+                    json!({
+                        "build_id": "build-1",
+                        "build_kind": "hosted_authoring_build",
+                        "build_environment": {
+                            "target": {
+                                "kind": "hosted_cloud",
+                                "name": "default"
                             },
-                            "sealed_schema_version": "sealed_run_package_v2",
-                            "readiness_schema_version": "hosted_cloud_readiness_v1",
-                            "cloud_readiness_required": true
-                        }
-                    },
-                    "status": "cloud_runnable",
-                    "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "cloud_readiness": {
-                        "status": "cloud_runnable",
-                        "target": {
-                            "kind": "hosted_cloud",
-                            "name": "default"
+                            "source": {
+                                "upload_id": "upload-1",
+                                "input_kind": "authoring_context",
+                                "content_digest": source.as_ref().map(|(digest, _)| digest.as_str()).unwrap_or("sha256:missing-upload-content"),
+                                "byte_size": source.as_ref().map(|(_, byte_size)| *byte_size).unwrap_or(0),
+                                "entrypoint": "experiment.yaml",
+                                "project_manifest": project_manifest
+                            },
+                            "runtime_options": {},
+                            "package_contract": {
+                                "input_kind": "sealed_package",
+                                "authoring_compiler": "core_universal_v1",
+                                "authoring_provenance": {
+                                    "status": "external_unattested",
+                                    "source": "sealed_package_manifest"
+                                },
+                                "sealed_schema_version": "sealed_run_package_v2",
+                                "readiness_schema_version": "hosted_cloud_readiness_v1",
+                                "cloud_readiness_required": true
+                            }
                         },
-                        "runtime_options": {},
-                        "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    },
-                    "import": {
-                        "status": "accepted"
-                    }
-                }),
+                        "status": "cloud_runnable",
+                        "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "cloud_readiness": {
+                            "status": "cloud_runnable",
+                            "target": {
+                                "kind": "hosted_cloud",
+                                "name": "default"
+                            },
+                            "runtime_options": {},
+                            "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        },
+                        "import": {
+                            "status": "accepted"
+                        }
+                    })
+                }
                 _ => panic!(
                     "unexpected mock Cloud API request: {} {}",
                     request.method, request.path
@@ -7640,8 +8187,7 @@ mod tests {
     fn help_is_hosted_product_cli_not_operator_cli() {
         let help = help_text();
 
-        assert!(help
-            .contains("buc build <experiment.yaml|package-dir|package.tgz> [--context-root DIR]"));
+        assert!(help.contains("buc build <experiment.yaml|package-dir|package.tgz>"));
         assert!(help.contains("buc login [--no-browser] [--json]"));
         assert!(help.contains("buc logout [--dry-run]"));
         assert!(help.contains("buc auth status"));
@@ -7652,7 +8198,7 @@ mod tests {
         assert!(help.contains("--api-url URL        Development"));
         assert!(!help.contains("buc [--api-url URL]"));
         assert!(help.contains("refreshing"));
-        assert!(help.contains("--context-root DIR"));
+        assert!(!help.contains("--context-root DIR"));
         assert!(help.contains("buc run <package-digest>"));
         assert!(help.contains("Long-form nouns:"));
         assert!(help.contains("hosted Cloud readiness"));
@@ -9278,6 +9824,7 @@ mod tests {
             ("POST", "/v1/uploads/upload-1/complete") => json!({}),
             ("POST", "/v1/experiments/builds") => {
                 let runtime_options = runtime_options_from_build_request(request);
+                let project_manifest = project_manifest_from_build_request(request);
                 json!({
                     "build_id": "build-1",
                     "build_kind": "hosted_authoring_build",
@@ -9296,7 +9843,8 @@ mod tests {
                                 .map(|(digest, _byte_size)| digest.as_str())
                                 .unwrap_or("sha256:missing-upload-content"),
                             "byte_size": source.map(|(_digest, byte_size)| *byte_size).unwrap_or(0),
-                            "entrypoint": "experiments/peter/experiment.yaml"
+                            "entrypoint": "experiments/peter/experiment.yaml",
+                            "project_manifest": project_manifest
                         },
                         "runtime_options": runtime_options,
                         "builder": {
@@ -9524,6 +10072,13 @@ mod tests {
             .and_then(|body| body.get("runtime_options").cloned())
             .filter(Value::is_object)
             .unwrap_or_else(|| json!({}))
+    }
+
+    fn project_manifest_from_build_request(request: &RecordedRequest) -> Value {
+        serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .and_then(|body| body.get("project_manifest").cloned())
+            .unwrap_or_else(|| json!(null))
     }
 
     fn read_http_request(stream: &mut TcpStream) -> RecordedRequest {
