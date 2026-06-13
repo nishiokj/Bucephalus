@@ -1146,7 +1146,8 @@ if (!read("scripts/ci/smoke-buc-hosted-workflow.sh").includes("bun run check:pos
 const hostedWorkflowSmokeTest = read("bucephalus-cloud/tests/bucHostedWorkflowSmoke.test.ts");
 for (const requiredFragment of [
   "\"build\"",
-  "--context-root",
+  "bucephalus.project.yaml",
+  "project manifest missing in hosted context",
   "hosted_authoring_build",
   "/authoring_build/source_upload_id",
   "/build_environment/source/upload_id",
@@ -1163,6 +1164,9 @@ for (const requiredFragment of [
   if (!hostedWorkflowSmokeTest.includes(requiredFragment)) {
     fail(`bucephalus-cloud/tests/bucHostedWorkflowSmoke.test.ts must keep the DB-backed smoke on the hosted authoring build path and assert ${requiredFragment}`);
   }
+}
+if (hostedWorkflowSmokeTest.includes("--context-root")) {
+  fail("bucephalus-cloud/tests/bucHostedWorkflowSmoke.test.ts must not keep the removed --context-root workflow alive");
 }
 if (!cloudGatesText.includes("== Cloud Postgres readiness ==") || !cloudGatesText.includes("bun run check:postgres")) {
   fail(`${cloudGatesPath} must preflight Postgres readiness before DB-backed migration and hosted workflow tests`);
