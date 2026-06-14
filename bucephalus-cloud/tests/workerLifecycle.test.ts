@@ -6,6 +6,7 @@ import * as tar from "tar";
 import {
   applyRuntimeNetworkPolicy,
   collectRuntimeSnapshot,
+  coreProgressCompleted,
   coreRunnerEnv,
   coreRunnerFailureMessage,
   dockerRegistryAuthHeaders,
@@ -17,6 +18,12 @@ import { discoverCoreRunIdsFromRunRoot } from "../src/workerEvidence";
 import { canonicalJsonStringify, sha256Digest, type JsonObject } from "../src/primitives";
 
 describe("worker lifecycle cleanup helpers", () => {
+  test("detects Core schedule completion progress lines exactly", () => {
+    expect(coreProgressCompleted("[run] run_20260614_043632_591762_000001: progress 18/18 (100.0%) slot=17 trial=trial_18 status=completed\n")).toBe(true);
+    expect(coreProgressCompleted("[run] run_20260614_043632_591762_000001: progress 17/18 (94.4%) slot=16 trial=trial_17 status=completed\n")).toBe(false);
+    expect(coreProgressCompleted("[run] run_20260614_043632_591762_000001: progress 18/18 (100.0%) slot=17 trial=trial_18 status=failed\n")).toBe(false);
+  });
+
   test("discovers Core run IDs from the attempt run root only", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-worker-lifecycle-"));
     try {
@@ -221,6 +228,7 @@ describe("worker lifecycle cleanup helpers", () => {
     expect(config.runnerPoolId).toBe("pool-1");
     expect(config.workerImageRef).toBe("us-central1-docker.pkg.dev/project/repo/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     expect(config.coreTimeoutMs).toBe(15 * 60 * 1000);
+    expect(config.coreCompletionGraceMs).toBe(120_000);
     expect(config.capabilities.resources).not.toContain("network_perimeter");
   });
 
@@ -411,6 +419,7 @@ describe("worker lifecycle cleanup helpers", () => {
           liveEvidence: true,
           evidenceIntervalMs: 2000,
           coreTimeoutMs: 15 * 60 * 1000,
+          coreCompletionGraceMs: 120_000,
           apiRequestTimeoutMs: 30_000,
         },
         {

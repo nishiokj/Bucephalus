@@ -49,6 +49,7 @@ interface WorkerConfig {
   liveEvidence: boolean;
   evidenceIntervalMs: number;
   coreTimeoutMs: number;
+  coreCompletionGraceMs: number;
   apiRequestTimeoutMs: number;
 }
 
@@ -303,13 +304,19 @@ async function executeCoreRun(
     cwd: materialized.workspaceDir,
     env,
     timeoutMs: coreRunTimeoutMs(config, claim),
+    completionGraceMs: config.coreCompletionGraceMs,
   });
   const eventPayload = {
     exit_code: result.exitCode,
     timed_out: result.timedOut,
+    completed_by_progress_watchdog: result.completedByProgressWatchdog,
     stdout_tail: tail(result.stdout, 16_000),
     stderr_tail: tail(result.stderr, 16_000),
   };
+  if (result.completedByProgressWatchdog) {
+    await appendEvent(config, claim, "worker.core.completed_after_progress_watchdog", eventPayload);
+    return;
+  }
   if (result.timedOut) {
     await appendEvent(config, claim, "worker.core.timed_out", eventPayload);
     throw new WorkerError(`Core runner timed out after ${coreRunTimeoutMs(config, claim)} ms`);
@@ -744,8 +751,8 @@ function assertSecretId(id: string): void {
 async function runProcess(
   executable: string,
   args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs?: number },
-): Promise<{ exitCode: number; stdout: string; stderr: string; timedOut: boolean }> {
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs?: number; completionGraceMs?: number },
+): Promise<{ exitCode: number; stdout: string; stderr: string; timedOut: boolean; completedByProgressWatchdog: boolean }> {
   return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
       cwd: options.cwd,
@@ -757,23 +764,47 @@ async function runProcess(
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let timedOut = false;
+    let completedByProgressWatchdog = false;
+    let completionGraceTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearCompletionGraceTimer = () => {
+      if (completionGraceTimer) {
+        clearTimeout(completionGraceTimer);
+        completionGraceTimer = null;
+      }
+    };
+    const terminateChildProcessGroup = (signal: NodeJS.Signals) => {
+      if (!child.pid) {
+        return;
+      }
+      try {
+        process.kill(-child.pid, signal);
+      } catch {
+        child.kill(signal);
+      }
+    };
+    const startCompletionGraceTimer = () => {
+      const graceMs = options.completionGraceMs ?? 0;
+      if (completionGraceTimer || graceMs <= 0 || child.exitCode !== null) {
+        return;
+      }
+      completionGraceTimer = setTimeout(() => {
+        completedByProgressWatchdog = true;
+        terminateChildProcessGroup("SIGTERM");
+        setTimeout(() => {
+          if (child.exitCode === null) {
+            terminateChildProcessGroup("SIGKILL");
+          }
+        }, 5000).unref();
+      }, graceMs);
+      completionGraceTimer.unref();
+    };
     const timeout = options.timeoutMs && options.timeoutMs > 0
       ? setTimeout(() => {
           timedOut = true;
-          if (child.pid) {
-            try {
-              process.kill(-child.pid, "SIGTERM");
-            } catch {
-              child.kill("SIGTERM");
-            }
-          }
+          terminateChildProcessGroup("SIGTERM");
           setTimeout(() => {
-            if (child.exitCode === null && child.pid) {
-              try {
-                process.kill(-child.pid, "SIGKILL");
-              } catch {
-                child.kill("SIGKILL");
-              }
+            if (child.exitCode === null) {
+              terminateChildProcessGroup("SIGKILL");
             }
           }, 5000).unref();
         }, options.timeoutMs)
@@ -788,11 +819,15 @@ async function runProcess(
     child.stderr.on("data", (chunk: Buffer) => {
       stderr.push(chunk);
       process.stderr.write(chunk);
+      if (coreProgressCompleted(chunk.toString("utf8"))) {
+        startCompletionGraceTimer();
+      }
     });
     child.on("error", (error) => {
       if (timeout) {
         clearTimeout(timeout);
       }
+      clearCompletionGraceTimer();
       if (activeChild === child) {
         activeChild = null;
       }
@@ -802,6 +837,7 @@ async function runProcess(
       if (timeout) {
         clearTimeout(timeout);
       }
+      clearCompletionGraceTimer();
       if (activeChild === child) {
         activeChild = null;
       }
@@ -810,6 +846,7 @@ async function runProcess(
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
         timedOut,
+        completedByProgressWatchdog,
       });
     });
   });
@@ -820,6 +857,10 @@ function coreRunTimeoutMs(config: WorkerConfig, claim: RunClaim): number {
   return typeof requirementTimeout === "number" && requirementTimeout > 0
     ? requirementTimeout
     : config.coreTimeoutMs;
+}
+
+export function coreProgressCompleted(text: string): boolean {
+  return /(?:^|\n)\[run\]\s+run_[^\s:]+:\s+progress\s+(\d+)\/\1\s+\(100\.0%\)\s+slot=\d+\s+trial=\S+\s+status=completed(?:\r?\n|$)/.test(text);
 }
 
 async function claimRun(config: WorkerConfig): Promise<RunClaim | EmptyClaim> {
@@ -1598,6 +1639,7 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
     liveEvidence: booleanEnv(env.BUCEPHALUS_WORKER_LIVE_EVIDENCE, true),
     evidenceIntervalMs: numberEnv(env.BUCEPHALUS_WORKER_EVIDENCE_INTERVAL_MS, 2000),
     coreTimeoutMs: numberEnv(env.BUCEPHALUS_WORKER_CORE_TIMEOUT_MS, 15 * 60 * 1000),
+    coreCompletionGraceMs: numberEnv(env.BUCEPHALUS_WORKER_CORE_COMPLETION_GRACE_MS, 120_000),
     apiRequestTimeoutMs: numberEnv(env.BUCEPHALUS_WORKER_API_REQUEST_TIMEOUT_MS, 30_000),
   };
 }
