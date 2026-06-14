@@ -692,7 +692,7 @@ resource "google_cloud_run_v2_service" "api" {
           name = "BUCEPHALUS_CLOUD_R2_ACCESS_KEY_ID"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.control_plane["r2_access_key_id"].secret_id
+              secret  = google_secret_manager_secret.control_plane["r2_access_key_id"].id
               version = var.cloud_r2_access_key_id_secret_version
             }
           }
@@ -705,7 +705,7 @@ resource "google_cloud_run_v2_service" "api" {
           name = "BUCEPHALUS_CLOUD_R2_SECRET_ACCESS_KEY"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.control_plane["r2_secret_access_key"].secret_id
+              secret  = google_secret_manager_secret.control_plane["r2_secret_access_key"].id
               version = var.cloud_r2_secret_access_key_secret_version
             }
           }
@@ -746,7 +746,7 @@ resource "google_cloud_run_v2_service" "api" {
           name = "BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_SECRET"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.control_plane["oauth_cli_client_secret"].secret_id
+              secret  = google_secret_manager_secret.control_plane["oauth_cli_client_secret"].id
               version = env.value
             }
           }
@@ -777,7 +777,7 @@ resource "google_cloud_run_v2_service" "api" {
         name = "DATABASE_URL"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["api_database_url"].secret_id
+            secret  = google_secret_manager_secret.control_plane["api_database_url"].id
             version = var.api_database_url_secret_version
           }
         }
@@ -787,7 +787,7 @@ resource "google_cloud_run_v2_service" "api" {
         name = "BUCEPHALUS_CLOUD_WORKER_TOKEN"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["worker_token"].secret_id
+            secret  = google_secret_manager_secret.control_plane["worker_token"].id
             version = var.worker_token_secret_version
           }
         }
@@ -799,7 +799,7 @@ resource "google_cloud_run_v2_service" "api" {
           name = "BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.control_plane["runner_admin_token"].secret_id
+              secret  = google_secret_manager_secret.control_plane["runner_admin_token"].id
               version = env.value
             }
           }
@@ -1116,7 +1116,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
         name = "DATABASE_URL"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["api_database_url"].secret_id
+            secret  = google_secret_manager_secret.control_plane["api_database_url"].id
             version = var.api_database_url_secret_version
           }
         }
@@ -1126,7 +1126,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
         name = "BUCEPHALUS_CLOUD_WORKER_TOKEN"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["worker_token"].secret_id
+            secret  = google_secret_manager_secret.control_plane["worker_token"].id
             version = var.worker_token_secret_version
           }
         }
@@ -1136,7 +1136,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
         name = "BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["pool_controller_provision_cmd_json"].secret_id
+            secret  = google_secret_manager_secret.control_plane["pool_controller_provision_cmd_json"].id
             version = var.pool_controller_provision_cmd_json_secret_version
           }
         }
@@ -1146,7 +1146,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
         name = "BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["pool_controller_reap_cmd_json"].secret_id
+            secret  = google_secret_manager_secret.control_plane["pool_controller_reap_cmd_json"].id
             version = var.pool_controller_reap_cmd_json_secret_version
           }
         }
@@ -1194,7 +1194,7 @@ resource "google_cloud_run_v2_job" "migrations" {
           name = "DATABASE_URL"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.control_plane["migrator_database_url"].secret_id
+              secret  = google_secret_manager_secret.control_plane["migrator_database_url"].id
               version = var.migrator_database_url_secret_version
             }
           }
@@ -1239,7 +1239,7 @@ resource "google_cloud_run_v2_job" "worker_image_promotion" {
           name = "DATABASE_URL"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.control_plane["migrator_database_url"].secret_id
+              secret  = google_secret_manager_secret.control_plane["migrator_database_url"].id
               version = var.migrator_database_url_secret_version
             }
           }
