@@ -143,6 +143,33 @@ describe("runtime ingest against Postgres", () => {
     });
   }, 30_000);
 
+  test("trial progress counts snapshot-only completed trial summaries", async () => {
+    await withScratchDatabase(async (sql) => {
+      const runtime = new RuntimeRepository(sql);
+      const cloudRunId = await seedRunWithAnnouncement(sql);
+      await sql`
+        insert into cloud.run_events (run_id, seq, event_type, payload)
+        values (${cloudRunId}, 2, ${"worker.runtime.snapshot"}, ${sql.json({
+          core_run_id: CORE_RUN_ID,
+          trial_summaries: [
+            { trial_id: "trial-1", summary: { outcome: "success" } },
+            { trial_id: "trial-2", summary: { outcome: "success" } },
+            { trial_id: "trial-3", summary: { outcome: "failed" } },
+          ],
+        })})
+      `;
+
+      const progress = await runtime.trialProgressForCloudRuns([cloudRunId]);
+      expect(progress).toEqual([
+        {
+          cloud_run_id: cloudRunId,
+          trials_completed: 3,
+          trials_total: 3,
+        },
+      ]);
+    });
+  }, 30_000);
+
   test("rows for an unannounced core run stay invisible until discovery", async () => {
     await withScratchDatabase(async (sql) => {
       const runtime = new RuntimeRepository(sql);
