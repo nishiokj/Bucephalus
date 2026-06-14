@@ -1537,9 +1537,9 @@ if (!/variable\s+"oauth_cli_client_secret_secret_version"/.test(gcpVariablesText
   fail(`${gcpVariablesPath} must require an explicit Secret Manager version for the CLI OAuth client secret`);
 }
 if (
-  !/dynamic\s+"env"\s*\{[\s\S]*for_each\s*=\s*var\.oauth_cli_client_secret_secret_version[\s\S]*name\s*=\s*"BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_SECRET"[\s\S]*secret\s*=\s*google_secret_manager_secret\.control_plane\["oauth_cli_client_secret"\]\.secret_id/.test(gcpInfraText)
+  !/dynamic\s+"env"\s*\{[\s\S]*for_each\s*=\s*var\.oauth_cli_client_secret_secret_version[\s\S]*name\s*=\s*"BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_SECRET"[\s\S]*secret\s*=\s*google_secret_manager_secret\.control_plane\["oauth_cli_client_secret"\]\.id/.test(gcpInfraText)
 ) {
-  fail(`${gcpInfraPath} must inject the CLI OAuth client secret from Secret Manager, not Terraform state`);
+  fail(`${gcpInfraPath} must inject the CLI OAuth client secret from the project-qualified Secret Manager resource, not Terraform state`);
 }
 if (!/variable\s+"oauth_jwks_url"/.test(gcpVariablesText) || !/https:\/\/www\.googleapis\.com\/oauth2\/v3\/certs/.test(gcpVariablesText)) {
   fail(`${gcpVariablesPath} must require an explicit Google-compatible OAuth JWKS URL`);
