@@ -117,8 +117,9 @@ export async function handleRunRoute(
 
   if (request.method === "GET" && url.pathname === "/v1/packages") {
     const limit = limitFromUrl(url);
+    const includeConfig = optionalBooleanFromUrl(url, "include_config", true);
     const artifacts = await packages.listArtifacts({ limit, ownerKey });
-    return jsonResponse({ packages: artifacts.map(packageToWire) });
+    return jsonResponse({ packages: artifacts.map((artifact) => packageToWire(artifact, { includeConfig })) });
   }
 
   if (request.method === "GET" && packagePath(url.pathname)) {
@@ -130,7 +131,7 @@ export async function handleRunRoute(
     if (!artifact) {
       throw new HttpError(404, "package_not_found", "Package artifact not found");
     }
-    return jsonResponse(packageToWire(artifact));
+    return jsonResponse(packageToWire(artifact, { includeConfig: true }));
   }
 
   if (request.method === "POST" && url.pathname === "/v1/runs") {
@@ -139,9 +140,12 @@ export async function handleRunRoute(
 
   if (request.method === "GET" && url.pathname === "/v1/runs") {
     const limit = limitFromUrl(url);
-    const records = await runs.listRuns({ limit, ownerKey });
-    const enrichment = await enrichRuns(records, packages, runtime, runners, ownerKey);
-    return jsonResponse({ runs: records.map((run) => runToWire(run, enrichment.get(run.run_id))) });
+    const packageDigest = optionalPackageDigestFromUrl(url);
+    const includeRuntime = optionalBooleanFromUrl(url, "include_runtime", true);
+    const includeConfig = optionalBooleanFromUrl(url, "include_config", true);
+    const records = await runs.listRuns({ limit, ownerKey, packageDigest });
+    const enrichment = await enrichRuns(records, packages, runtime, runners, ownerKey, { includeRuntime });
+    return jsonResponse({ runs: records.map((run) => runToWire(run, enrichment.get(run.run_id), { includeConfig, includeRuntime })) });
   }
 
   const runtimeRoute = runtimePath(url.pathname);
@@ -204,6 +208,30 @@ function limitFromUrl(url: URL): number {
 
 function optionalIntFromUrl(url: URL, key: string): number | undefined {
   return optionalQueryInteger(url, key, { min: 0 });
+}
+
+function optionalPackageDigestFromUrl(url: URL): string | undefined {
+  const value = optionalString(url.searchParams.get("package_digest"), "/package_digest");
+  return value === null ? undefined : requirePackageDigest(value, "/package_digest");
+}
+
+function optionalBooleanFromUrl(url: URL, key: string, defaultValue: boolean): boolean {
+  const value = optionalString(url.searchParams.get(key), `/${key}`);
+  if (value === null) return defaultValue;
+  switch (value.trim().toLowerCase()) {
+    case "1":
+    case "true":
+    case "yes":
+    case "on":
+      return true;
+    case "0":
+    case "false":
+    case "no":
+    case "off":
+      return false;
+    default:
+      throw new HttpError(400, "invalid_request", `/${key} must be a boolean`);
+  }
 }
 
 function runtimePath(pathname: string):
@@ -1240,23 +1268,32 @@ function escapeJsonPointer(value: string): string {
   return value.replaceAll("~", "~0").replaceAll("/", "~1");
 }
 
-function packageToWire(artifact: PackageArtifactRecord) {
-  return {
+function packageToWire(artifact: PackageArtifactRecord, options: { includeConfig: boolean }) {
+  const summary = {
     package_digest: artifact.package_digest,
     name: packageName(artifact),
+    description: packageDescription(artifact),
+    tags: packageTags(artifact),
+    owner: packageOwner(artifact),
     upload_id: artifact.upload_id,
     byte_size: nullableNumber(artifact.byte_size),
     media_type: artifact.media_type,
-    manifest_json: artifact.manifest_json,
-    resolved_experiment_json: artifact.resolved_experiment_json,
     target: artifact.target,
-    image_refs: artifact.image_refs,
-    package_provenance: artifact.package_provenance,
     secret_requirements: packageSecretRequirements(artifact),
-    diagnostics: artifact.diagnostics,
     status: artifact.status,
     created_at: artifact.created_at,
     updated_at: artifact.updated_at,
+  };
+  if (!options.includeConfig) {
+    return summary;
+  }
+  return {
+    ...summary,
+    manifest_json: artifact.manifest_json,
+    resolved_experiment_json: artifact.resolved_experiment_json,
+    image_refs: artifact.image_refs,
+    package_provenance: artifact.package_provenance,
+    diagnostics: artifact.diagnostics,
   };
 }
 
@@ -1266,17 +1303,19 @@ async function enrichRuns(
   runtime: RuntimeRepository,
   runners: RunnerRepository,
   ownerKey?: string,
+  options: { includeRuntime?: boolean } = {},
 ): Promise<Map<string, RunWireEnrichment>> {
   if (runs.length === 0) {
     return new Map();
   }
   const runIds = runs.map((run) => run.run_id);
   const packageDigests = [...new Set(runs.map((run) => run.package_digest))].sort();
-  const queuedRuns = runs.filter((run) => isQueuedRunStatus(run.status));
+  const includeRuntime = options.includeRuntime ?? true;
+  const queuedRuns = includeRuntime ? runs.filter((run) => isQueuedRunStatus(run.status)) : [];
   const [artifacts, progress, pendingReasons] = await Promise.all([
     packages.listArtifactsByDigests(packageDigests, ownerKey),
-    runtime.trialProgressForCloudRuns(runIds),
-    pendingReasonsForRuns(queuedRuns, runners),
+    includeRuntime ? runtime.trialProgressForCloudRuns(runIds) : Promise.resolve([]),
+    includeRuntime ? pendingReasonsForRuns(queuedRuns, runners) : Promise.resolve(new Map<string, PendingReason>()),
   ]);
   const artifactByDigest = new Map(artifacts.map((artifact) => [artifact.package_digest, artifact]));
   const progressByRunId = new Map(progress.map((item) => [item.cloud_run_id, item]));
@@ -1305,6 +1344,46 @@ function packageName(artifact: PackageArtifactRecord): string | null {
     }
   }
   return null;
+}
+
+function packageDescription(artifact: PackageArtifactRecord): string | null {
+  for (const candidate of [
+    jsonPointerValue(artifact.manifest_json, "/description"),
+    jsonPointerValue(artifact.resolved_experiment_json, "/description"),
+    jsonPointerValue(artifact.resolved_experiment_json, "/experiment/description"),
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
+}
+
+function packageTags(artifact: PackageArtifactRecord): string[] {
+  const manifestTags = jsonPointerValue(artifact.manifest_json, "/tags");
+  const resolvedTags = jsonPointerValue(artifact.resolved_experiment_json, "/tags");
+  return [...new Set([...stringArray(manifestTags), ...stringArray(resolvedTags)])].sort();
+}
+
+function packageOwner(artifact: PackageArtifactRecord): string | null {
+  for (const candidate of [
+    artifact.owner_key,
+    jsonPointerValue(artifact.manifest_json, "/owner"),
+    jsonPointerValue(artifact.manifest_json, "/author"),
+    jsonPointerValue(artifact.resolved_experiment_json, "/owner"),
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
 }
 
 function validatePackageSecretRefs(
@@ -1400,29 +1479,79 @@ function nullableNumber(value: number | string | null): number | null {
   return typeof value === "number" ? value : Number.parseInt(value, 10);
 }
 
-function runToWire(run: CloudRunRecord, enrichment?: RunWireEnrichment) {
-  const envKeys = Object.keys(run.env ?? {}).sort();
-  const secretIds = Object.keys(run.secret_refs ?? {}).sort();
-  return {
+function runToWire(
+  run: CloudRunRecord,
+  enrichment?: RunWireEnrichment,
+  options: { includeConfig?: boolean; includeRuntime?: boolean } = {},
+) {
+  const includeConfig = options.includeConfig ?? true;
+  const includeRuntime = options.includeRuntime ?? true;
+  const summary: Record<string, unknown> = {
     run_id: run.run_id,
     package_digest: run.package_digest,
     experiment_name: enrichment?.experiment_name ?? null,
-    run_label: run.run_label,
+    variant: runVariant(run),
+    region: runRegion(run),
     status: run.status,
-    pending_reason: isQueuedRunStatus(run.status) ? enrichment?.pending_reason ?? null : null,
-    trials_completed: enrichment?.trials_completed ?? null,
-    trials_total: enrichment?.trials_total ?? null,
+    created_at: run.created_at,
+    updated_at: run.updated_at,
+  };
+  if (includeConfig || run.run_label) {
+    summary.run_label = run.run_label;
+  }
+  if (includeRuntime) {
+    summary.pending_reason = isQueuedRunStatus(run.status) ? enrichment?.pending_reason ?? null : null;
+    summary.trials_completed = enrichment?.trials_completed ?? null;
+    summary.trials_total = enrichment?.trials_total ?? null;
+  }
+  if (includeConfig || run.started_at) {
+    summary.started_at = run.started_at;
+  }
+  if (includeConfig || run.completed_at) {
+    summary.completed_at = run.completed_at;
+  }
+  if (includeConfig || run.error_message) {
+    summary.error_message = run.error_message;
+  }
+  if (!includeConfig) {
+    return summary;
+  }
+  const envKeys = Object.keys(run.env ?? {}).sort();
+  const secretIds = Object.keys(run.secret_refs ?? {}).sort();
+  return {
+    ...summary,
     env_keys: envKeys,
     secret_ids: secretIds,
     runtime_options: run.runtime_options,
     run_requirements: run.run_requirements,
     package_provenance: run.package_provenance,
-    created_at: run.created_at,
-    updated_at: run.updated_at,
-    started_at: run.started_at,
-    completed_at: run.completed_at,
-    error_message: run.error_message,
   };
+}
+
+function runVariant(run: CloudRunRecord): string | null {
+  for (const candidate of [
+    jsonPointerValue(run.runtime_options, "/variant"),
+    jsonPointerValue(run.runtime_options, "/variant_id"),
+    jsonPointerValue(run.runtime_options, "/model"),
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
+}
+
+function runRegion(run: CloudRunRecord): string | null {
+  for (const candidate of [
+    jsonPointerValue(run.runtime_options, "/region"),
+    jsonPointerValue(run.run_requirements as unknown as JsonObject, "/region"),
+    jsonPointerValue(run.run_requirements as unknown as JsonObject, "/executor"),
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
 }
 
 function runToWorkerWire(run: CloudRunRecord) {

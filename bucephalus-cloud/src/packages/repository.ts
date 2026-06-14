@@ -366,11 +366,12 @@ export class RunRepository {
     return (rows[0] as CloudRunRecord | undefined) ?? null;
   }
 
-  async listRuns(input?: { limit?: number; ownerKey?: string | undefined }): Promise<CloudRunRecord[]> {
+  async listRuns(input?: { limit?: number; ownerKey?: string | undefined; packageDigest?: string | undefined }): Promise<CloudRunRecord[]> {
     const rows = await this.sql`
       select *
       from cloud.runs
       where (${input?.ownerKey ?? null}::text is null or owner_key = ${input?.ownerKey ?? null})
+        and (${input?.packageDigest ?? null}::text is null or package_digest = ${input?.packageDigest ?? null})
       order by created_at desc
       limit ${Math.max(1, Math.min(input?.limit ?? 50, 200))}
     `;

@@ -168,6 +168,102 @@ describe("Cloud run routes", () => {
     expect(body.runs[1].trials_total).toBe(12);
   });
 
+  test("run list can skip runtime enrichment while keeping package names", async () => {
+    const run = {
+      ...runRecord(),
+      run_id: "run-1",
+      package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      status: "queued",
+    };
+    const observed: { packageDigests?: string[]; progressCalled?: boolean } = {};
+    const packages = {
+      async listArtifactsByDigests(packageDigests: string[]) {
+        observed.packageDigests = packageDigests;
+        return [{
+          ...packageRecordWithSecrets(),
+          package_digest: run.package_digest,
+          resolved_experiment_json: { experiment: { name: "Fast List Experiment" } },
+        }];
+      },
+    };
+    const runtime = {
+      async trialProgressForCloudRuns() {
+        observed.progressCalled = true;
+        throw new Error("trialProgressForCloudRuns should not be called");
+      },
+    };
+    const runs = {
+      async listRuns() {
+        return [run];
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs?include_runtime=false"),
+      new URL("https://cloud.example/v1/runs?include_runtime=false"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(observed.packageDigests).toEqual([run.package_digest]);
+    expect(observed.progressCalled).toBeUndefined();
+    expect(body.runs[0].experiment_name).toBe("Fast List Experiment");
+    expect(body.runs[0].trials_completed).toBeUndefined();
+    expect(body.runs[0].trials_total).toBeUndefined();
+    expect(body.runs[0].pending_reason).toBeUndefined();
+  });
+
+  test("run list can omit run config while preserving display fields", async () => {
+    const run = {
+      ...runRecord(),
+      runtime_options: {
+        variant: "opus-4.8",
+        region: "us-west-2",
+        params: { prompt: "large prompt config" },
+      },
+      run_requirements: {
+        ...runRecord().run_requirements,
+        executor: "runner-docker",
+      },
+    };
+    const packageRecord = packageRecordWithSecrets();
+    (packageRecord.resolved_experiment_json as Record<string, unknown>).experiment = { name: "Summary Experiment" };
+    const packages = packagesByDigest([packageRecord]);
+    const runs = {
+      async listRuns() {
+        return [run];
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs?include_runtime=false&include_config=false"),
+      new URL("https://cloud.example/v1/runs?include_runtime=false&include_config=false"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      runtimeProgress([]) as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(body.runs[0].experiment_name).toBe("Summary Experiment");
+    expect(body.runs[0].variant).toBe("opus-4.8");
+    expect(body.runs[0].region).toBe("us-west-2");
+    expect(body.runs[0].runtime_options).toBeUndefined();
+    expect(body.runs[0].run_requirements).toBeUndefined();
+    expect(body.runs[0].package_provenance).toBeUndefined();
+    expect(body.runs[0].env_keys).toBeUndefined();
+    expect(body.runs[0].secret_ids).toBeUndefined();
+    expect(body.runs[0].pending_reason).toBeUndefined();
+    expect(body.runs[0].trials_completed).toBeUndefined();
+    expect(body.runs[0].trials_total).toBeUndefined();
+    expect(body.runs[0].error_message).toBeUndefined();
+  });
+
   test("run detail includes pending reason for queued runs", async () => {
     const runs = {
       async getRun() {
@@ -224,6 +320,59 @@ describe("Cloud run routes", () => {
     const body = await response!.json();
     expect(body.runs[0].pending_reason).toBe("no_matching_runner");
     expect(body.runs[1].pending_reason).toBe("waiting_for_capacity");
+  });
+
+  test("package lists can omit full config while preserving queue fields", async () => {
+    const record = {
+      ...packageRecordWithSecrets(),
+      manifest_json: {
+        name: "Manifest Name",
+        description: "A package summary",
+        tags: ["nightly", "eval"],
+        owner: "bench-team",
+      },
+      resolved_experiment_json: {
+        experiment: { name: "Resolved Name" },
+        runtime: {
+          secrets: [{ name: "OPENAI_API_KEY", mount: { target: "/run/secrets/openai" } }],
+        },
+      },
+      diagnostics: [{ level: "info", message: "large diagnostics", code: "ok" }],
+      image_refs: ["registry.example/worker@sha256:abc"],
+      owner_key: "issuer:user-a",
+    };
+    const packages = {
+      async listArtifacts(input: { limit?: number }) {
+        expect(input.limit).toBe(5);
+        return [record];
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/packages?limit=5&include_config=false"),
+      new URL("https://cloud.example/v1/packages?limit=5&include_config=false"),
+      packages as unknown as PackageRepository,
+      {} as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(body.packages[0].name).toBe("Resolved Name");
+    expect(body.packages[0].description).toBe("A package summary");
+    expect(body.packages[0].tags).toEqual(["eval", "nightly"]);
+    expect(body.packages[0].owner).toBe("issuer:user-a");
+    expect(body.packages[0].secret_requirements).toEqual([{
+      id: "OPENAI_API_KEY",
+      target: "/run/secrets/openai",
+      required_for_variants: [],
+    }]);
+    expect(body.packages[0].manifest_json).toBeUndefined();
+    expect(body.packages[0].resolved_experiment_json).toBeUndefined();
+    expect(body.packages[0].diagnostics).toBeUndefined();
+    expect(body.packages[0].image_refs).toBeUndefined();
+    expect(body.packages[0].package_provenance).toBeUndefined();
   });
 
   test("rejects malformed pagination query values instead of silently defaulting", async () => {
@@ -740,6 +889,47 @@ describe("Cloud run routes", () => {
 
     expect(response).not.toBeNull();
     expect(observed.ownerKey).toBe("issuer:user-a");
+  });
+
+  test("filters run lists by package digest before enrichment", async () => {
+    const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const observed: { ownerKey?: string | undefined; packageDigest?: string | undefined; limit?: number | undefined } = {};
+    const runs = {
+      async listRuns(input: { ownerKey?: string | undefined; packageDigest?: string | undefined; limit?: number | undefined }) {
+        observed.ownerKey = input.ownerKey;
+        observed.packageDigest = input.packageDigest;
+        observed.limit = input.limit;
+        return [];
+      },
+    };
+    const packages = {
+      async listArtifactsByDigests() {
+        throw new Error("listArtifactsByDigests should not be called for empty run lists");
+      },
+    };
+    const runtime = {
+      async trialProgressForCloudRuns() {
+        throw new Error("trialProgressForCloudRuns should not be called for empty run lists");
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request(`https://cloud.example/v1/runs?package_digest=${encodeURIComponent(digest)}&limit=12`),
+      new URL(`https://cloud.example/v1/runs?package_digest=${encodeURIComponent(digest)}&limit=12`),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(response).not.toBeNull();
+    expect(observed).toEqual({
+      ownerKey: "issuer:user-a",
+      packageDigest: digest,
+      limit: 12,
+    });
   });
 
   test("creates runs only from packages owned by the authenticated owner", async () => {
