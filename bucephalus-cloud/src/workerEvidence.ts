@@ -35,6 +35,7 @@ export interface EvidencePumpIo {
 export interface EvidencePumpOptions {
   runRootDir: string;
   intervalMs?: number;
+  ioTimeoutMs?: number;
   maxBatchRows?: number;
   maxBytesPerRead?: number;
   maxLineBytes?: number;
@@ -50,6 +51,7 @@ export interface EvidencePumpStats {
 }
 
 const DEFAULT_INTERVAL_MS = 2_000;
+const DEFAULT_IO_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_BATCH_ROWS = 200;
 const DEFAULT_MAX_BYTES_PER_READ = 2 * 1024 * 1024;
 const DEFAULT_MAX_LINE_BYTES = 64 * 1024;
@@ -144,7 +146,11 @@ export class EvidencePump {
     const unannounced = coreRunIds.filter((id) => !this.announced.has(id));
     if (unannounced.length > 0) {
       try {
-        await this.io.announceCoreRuns(unannounced);
+        await withTimeout(
+          this.io.announceCoreRuns(unannounced),
+          this.options.ioTimeoutMs,
+          "announce_core_runs",
+        );
         unannounced.forEach((id) => this.announced.add(id));
         this.stats.core_runs_announced += unannounced.length;
       } catch (error) {
@@ -214,7 +220,11 @@ export class EvidencePump {
       for (let start = 0; start < next.rows.length; start += this.options.maxBatchRows) {
         const batch = next.rows.slice(start, start + this.options.maxBatchRows);
         try {
-          await this.io.postEventRows(batch);
+          await withTimeout(
+            this.io.postEventRows(batch),
+            this.options.ioTimeoutMs,
+            "post_event_rows",
+          );
           this.stats.batches_posted += 1;
           this.stats.rows_posted += batch.length;
         } catch (error) {
@@ -376,10 +386,29 @@ export function startEvidencePump(io: EvidencePumpIo, options: EvidencePumpOptio
   return new EvidencePump(io, {
     runRootDir: options.runRootDir,
     intervalMs: options.intervalMs ?? DEFAULT_INTERVAL_MS,
+    ioTimeoutMs: options.ioTimeoutMs ?? DEFAULT_IO_TIMEOUT_MS,
     maxBatchRows: options.maxBatchRows ?? DEFAULT_MAX_BATCH_ROWS,
     maxBytesPerRead: options.maxBytesPerRead ?? DEFAULT_MAX_BYTES_PER_READ,
     maxLineBytes: options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES,
   });
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(`${operation} timed out after ${timeoutMs} ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 export async function discoverCoreRunIdsFromRunRoot(runRootDir: string): Promise<string[]> {

@@ -49,6 +49,7 @@ interface WorkerConfig {
   liveEvidence: boolean;
   evidenceIntervalMs: number;
   coreTimeoutMs: number;
+  apiRequestTimeoutMs: number;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -1512,6 +1513,7 @@ async function cloudFetch(
     init.headers = { ...workerAuthHeaders(config, options.authToken), "content-type": "application/json" };
     init.body = JSON.stringify(options.body);
   }
+  init.signal = AbortSignal.timeout(workerApiRequestTimeoutMs(config));
   const response = await fetch(`${config.apiUrl}${path}`, init);
   const text = await response.text();
   const payload = text.trim().length > 0 ? JSON.parse(text) : null;
@@ -1535,6 +1537,7 @@ async function cloudFetchBytes(
       ...workerAuthHeaders(config, options.authToken),
       ...(options.attemptId ? { "x-bucephalus-attempt-id": options.attemptId } : {}),
     },
+    signal: AbortSignal.timeout(workerApiRequestTimeoutMs(config)),
   });
   if (!response.ok) {
     const text = await response.text();
@@ -1552,6 +1555,12 @@ async function cloudFetchBytes(
     throw new WorkerError(message);
   }
   return new Uint8Array(await response.arrayBuffer());
+}
+
+function workerApiRequestTimeoutMs(config: WorkerConfig): number {
+  return Number.isFinite(config.apiRequestTimeoutMs) && config.apiRequestTimeoutMs > 0
+    ? config.apiRequestTimeoutMs
+    : 30_000;
 }
 
 export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
@@ -1589,6 +1598,7 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
     liveEvidence: booleanEnv(env.BUCEPHALUS_WORKER_LIVE_EVIDENCE, true),
     evidenceIntervalMs: numberEnv(env.BUCEPHALUS_WORKER_EVIDENCE_INTERVAL_MS, 2000),
     coreTimeoutMs: numberEnv(env.BUCEPHALUS_WORKER_CORE_TIMEOUT_MS, 15 * 60 * 1000),
+    apiRequestTimeoutMs: numberEnv(env.BUCEPHALUS_WORKER_API_REQUEST_TIMEOUT_MS, 30_000),
   };
 }
 

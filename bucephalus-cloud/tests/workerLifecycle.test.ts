@@ -411,6 +411,7 @@ describe("worker lifecycle cleanup helpers", () => {
           liveEvidence: true,
           evidenceIntervalMs: 2000,
           coreTimeoutMs: 15 * 60 * 1000,
+          apiRequestTimeoutMs: 30_000,
         },
         {
           claimed: true,
