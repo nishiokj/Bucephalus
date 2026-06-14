@@ -2133,6 +2133,11 @@ fn record_modal_lifecycle_delta(
 }
 
 fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
+    if let Some(error) = json_string_field(value, "launcher_error") {
+        if !error.trim().is_empty() {
+            return Err(anyhow!("modal sandbox launcher failed: {error}"));
+        }
+    }
     let exec_values = value.get("execs").and_then(Value::as_array);
     let timings = match value.get("timings") {
         Some(Value::Object(values)) => values

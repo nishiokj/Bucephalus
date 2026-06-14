@@ -2417,6 +2417,28 @@ mod tests {
     }
 
     #[test]
+    fn modal_sandbox_result_preserves_launcher_error() {
+        let value = json!({
+            "sandbox_id": null,
+            "execs": [],
+            "timed_out": false,
+            "launcher_error": "create sandbox: image pull denied",
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": "2026-01-01T00:01:00Z"
+        });
+
+        let err = match parse_modal_sandbox_result_for_test(&value) {
+            Ok(_) => panic!("modal launcher errors must not be masked by missing sandbox_id"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("modal sandbox launcher failed: create sandbox: image pull denied"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn modal_sandbox_result_rejects_non_string_timings() {
         let value = json!({
             "sandbox_id": "sb-123",
