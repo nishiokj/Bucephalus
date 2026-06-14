@@ -48,6 +48,7 @@ interface WorkerConfig {
   workerImageRef: string | null;
   liveEvidence: boolean;
   evidenceIntervalMs: number;
+  coreTimeoutMs: number;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -300,12 +301,18 @@ async function executeCoreRun(
   const result = await runProcess(command.executable, command.args, {
     cwd: materialized.workspaceDir,
     env,
+    timeoutMs: coreRunTimeoutMs(config, claim),
   });
   const eventPayload = {
     exit_code: result.exitCode,
+    timed_out: result.timedOut,
     stdout_tail: tail(result.stdout, 16_000),
     stderr_tail: tail(result.stderr, 16_000),
   };
+  if (result.timedOut) {
+    await appendEvent(config, claim, "worker.core.timed_out", eventPayload);
+    throw new WorkerError(`Core runner timed out after ${coreRunTimeoutMs(config, claim)} ms`);
+  }
   if (result.exitCode !== 0) {
     await appendEvent(config, claim, "worker.core.failed", eventPayload);
     throw new WorkerError(
@@ -736,8 +743,8 @@ function assertSecretId(id: string): void {
 async function runProcess(
   executable: string,
   args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv },
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs?: number },
+): Promise<{ exitCode: number; stdout: string; stderr: string; timedOut: boolean }> {
   return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
       cwd: options.cwd,
@@ -748,6 +755,29 @@ async function runProcess(
     activeChild = child;
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
+    let timedOut = false;
+    const timeout = options.timeoutMs && options.timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          if (child.pid) {
+            try {
+              process.kill(-child.pid, "SIGTERM");
+            } catch {
+              child.kill("SIGTERM");
+            }
+          }
+          setTimeout(() => {
+            if (child.exitCode === null && child.pid) {
+              try {
+                process.kill(-child.pid, "SIGKILL");
+              } catch {
+                child.kill("SIGKILL");
+              }
+            }
+          }, 5000).unref();
+        }, options.timeoutMs)
+      : null;
+    timeout?.unref();
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     // The core runner emits its structured JSON logs on stderr (stdout carries
     // the --json result payload). Tee stderr through to the worker's own stderr
@@ -759,12 +789,18 @@ async function runProcess(
       process.stderr.write(chunk);
     });
     child.on("error", (error) => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
       if (activeChild === child) {
         activeChild = null;
       }
       reject(error);
     });
     child.on("close", (code) => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
       if (activeChild === child) {
         activeChild = null;
       }
@@ -772,9 +808,17 @@ async function runProcess(
         exitCode: code ?? 1,
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
+        timedOut,
       });
     });
   });
+}
+
+function coreRunTimeoutMs(config: WorkerConfig, claim: RunClaim): number {
+  const requirementTimeout = claim.run.run_requirements.timeout_ms;
+  return typeof requirementTimeout === "number" && requirementTimeout > 0
+    ? requirementTimeout
+    : config.coreTimeoutMs;
 }
 
 async function claimRun(config: WorkerConfig): Promise<RunClaim | EmptyClaim> {
@@ -1544,6 +1588,7 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
     workerImageRef: env.BUCEPHALUS_WORKER_IMAGE_REF?.trim() || null,
     liveEvidence: booleanEnv(env.BUCEPHALUS_WORKER_LIVE_EVIDENCE, true),
     evidenceIntervalMs: numberEnv(env.BUCEPHALUS_WORKER_EVIDENCE_INTERVAL_MS, 2000),
+    coreTimeoutMs: numberEnv(env.BUCEPHALUS_WORKER_CORE_TIMEOUT_MS, 15 * 60 * 1000),
   };
 }
 
