@@ -329,26 +329,41 @@ export function coreRunnerFailureMessage(exitCode: number, stdout: string, stder
 }
 
 function coreRunnerStdoutErrorMessage(stdout: string): string | null {
+  const fullStdoutError = coreRunnerErrorMessageFromJson(stdout.trim());
+  if (fullStdoutError) {
+    return fullStdoutError;
+  }
   for (const line of stdout.split(/\r?\n/).reverse()) {
     const trimmed = line.trim();
     if (!trimmed.startsWith("{")) {
       continue;
     }
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (!isRecord(parsed) || !isRecord(parsed.error)) {
-        continue;
-      }
-      const message = parsed.error.message;
-      const code = parsed.error.code;
-      if (typeof message === "string" && message.length > 0) {
-        return typeof code === "string" && code.length > 0
-          ? `${code}: ${message}`
-          : message;
-      }
-    } catch {
-      continue;
+    const lineError = coreRunnerErrorMessageFromJson(trimmed);
+    if (lineError) {
+      return lineError;
     }
+  }
+  return null;
+}
+
+function coreRunnerErrorMessageFromJson(raw: string): string | null {
+  if (!raw.startsWith("{")) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed) || !isRecord(parsed.error)) {
+      return null;
+    }
+    const message = parsed.error.message;
+    const code = parsed.error.code;
+    if (typeof message === "string" && message.length > 0) {
+      return typeof code === "string" && code.length > 0
+        ? `${code}: ${message}`
+        : message;
+    }
+  } catch {
+    return null;
   }
   return null;
 }

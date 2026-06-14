@@ -287,6 +287,32 @@ describe("worker lifecycle cleanup helpers", () => {
     expect(message).toContain("stderr tail: preflight complete");
   });
 
+  test("core runner failure message preserves pretty JSON stdout errors", () => {
+    const stdout = JSON.stringify(
+      {
+        command: "run",
+        error: {
+          code: "command_failed",
+          message:
+            "local trial execution failed (trial_id=trial_1, schedule_idx=0): required metric 'model_calls' resolved to null",
+        },
+        ok: false,
+      },
+      null,
+      2,
+    );
+    const stderr = [
+      "[preflight] [PASS] container_ready",
+      "[run] run_20260614_002508_955023_000001: starting schedule execution: slots=18 max_concurrency=1",
+    ].join("\n");
+
+    const message = coreRunnerFailureMessage(1, stdout, stderr);
+
+    expect(message).toContain("command_failed: local trial execution failed");
+    expect(message).toContain("required metric 'model_calls' resolved to null");
+    expect(message).toContain("stderr tail: [preflight] [PASS] container_ready");
+  });
+
   test("Docker registry auth header decodes auth-only Docker config entries", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-worker-docker-auth-"));
     const previousDockerConfig = process.env.DOCKER_CONFIG;

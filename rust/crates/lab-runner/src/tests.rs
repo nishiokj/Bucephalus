@@ -9332,6 +9332,7 @@ mod tests {
             &definitions,
             &json!({ "metrics": { "speed": 123.0 } }),
             None,
+            true,
         )
         .expect("declared metrics");
 
@@ -9346,8 +9347,13 @@ mod tests {
             "primary": false
         }]}))
         .expect("required metric definition");
-        crate::trial::events::extract_declared_metrics(&required, &json!({}), None)
+        crate::trial::events::extract_declared_metrics(&required, &json!({}), None, true)
             .expect_err("required metric should fail when missing");
+        let (relaxed_metrics, relaxed_primary) =
+            crate::trial::events::extract_declared_metrics(&required, &json!({}), None, false)
+                .expect("missing required metrics are omitted when enforcement is disabled");
+        assert_eq!(relaxed_metrics, json!({}));
+        assert_eq!(relaxed_primary, None);
 
         let missing_required = parse_metric_definitions(&json!({"metrics": [{
             "id": "score",
@@ -9404,6 +9410,7 @@ mod tests {
             &definitions,
             &json!({ "response": "ignored" }),
             Some(&trial_conclusion),
+            true,
         )
         .expect("declared grader metrics");
 
@@ -9438,6 +9445,7 @@ mod tests {
             &definitions,
             &json!({}),
             Some(&trial_conclusion),
+            true,
         )
         .expect("declared grader metric");
 
@@ -9472,6 +9480,7 @@ mod tests {
             &definitions,
             &json!({}),
             Some(&trial_conclusion),
+            true,
         )
         .expect_err("metric id should not replace the declared source pointer");
 

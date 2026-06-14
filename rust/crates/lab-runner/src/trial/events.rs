@@ -296,6 +296,7 @@ pub(crate) fn extract_declared_metrics(
     definitions: &[MetricDefinition],
     agent_response_payload: &Value,
     trial_conclusion_row: Option<&Value>,
+    enforce_required: bool,
 ) -> Result<(Value, Option<(String, Value)>)> {
     let mut metrics = serde_json::Map::new();
     let mut primary = None;
@@ -303,7 +304,7 @@ pub(crate) fn extract_declared_metrics(
     for definition in definitions {
         let value = declared_metric_value(definition, agent_response_payload, trial_conclusion_row);
         ensure!(
-            value.is_some() || !definition.required,
+            value.is_some() || !definition.required || !enforce_required,
             "required metric '{}' resolved to null",
             definition.id
         );

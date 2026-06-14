@@ -580,10 +580,12 @@ pub(crate) fn finalize_scheduled_trial(
     let (mut metrics, declared_primary) = if request.metric_definitions.is_empty() {
         (json!({}), None)
     } else {
+        let enforce_required_metrics = agent_outcome == "success" || trial_conclusion_row.is_some();
         extract_declared_metrics(
             request.metric_definitions,
             response_payload,
             trial_conclusion_row.as_ref(),
+            enforce_required_metrics,
         )?
     };
     if let Some(obj) = metrics.as_object_mut() {
