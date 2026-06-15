@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { loadConfig } from "../src/config";
-import { materializeStoredObject, putUploadObject, readStoredObject } from "../src/objectStorage";
+import { materializeStoredObject, putRuntimeObject, putUploadObject, readStoredObject } from "../src/objectStorage";
 
 describe("object storage", () => {
   test("stores uploads on the filesystem by default", async () => {
@@ -18,6 +18,40 @@ describe("object storage", () => {
       expect(await readFile(storagePath, "utf8")).toBe("package bytes");
       expect(await readStoredObject(storagePath, config)).toEqual(bytes("package bytes"));
       expect(await materializeStoredObject(storagePath, join(root, "work"), "package.blob", config)).toBe(storagePath);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("stores runtime artifacts on the filesystem by run and trial identity", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-object-storage-"));
+    try {
+      const config = loadConfig({
+        BUCEPHALUS_CLOUD_DATA_DIR: root,
+      });
+      const storagePath = await putRuntimeObject({
+        cloudRunId: "cloud-run-1",
+        attemptId: "attempt-1",
+        coreRunId: "run_20260614_051159_561175_000001",
+        trialId: "trial_1",
+        trialAttempt: 0,
+        role: "agent_result",
+        bytes: bytes("generated answer"),
+        mediaType: "application/json",
+      }, config);
+
+      expect(storagePath).toBe(join(
+        root,
+        "runtime-objects",
+        "cloud-run-1",
+        "attempt-1",
+        "run_20260614_051159_561175_000001",
+        "trial_1",
+        "0",
+        "agent_result",
+        "content.blob",
+      ));
+      expect(await readStoredObject(storagePath, config)).toEqual(bytes("generated answer"));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

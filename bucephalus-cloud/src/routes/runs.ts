@@ -1,12 +1,13 @@
 import { authOwnerKey, type AuthContext } from "../auth";
-import { HttpError, jsonResponse, optionalQueryInteger, optionalString, queryInteger, readJsonObject, requireBearerToken, requireString } from "../http";
+import { HttpError, jsonResponse, optionalQueryInteger, optionalString, queryInteger, readJsonObject, readRequestBytes, requireBearerToken, requireString } from "../http";
 import { logError, newTraceContext } from "../logging";
-import { readStoredObject } from "../objectStorage";
-import type { JsonObject, JsonValue } from "../primitives";
+import { putRuntimeObject, readStoredObject } from "../objectStorage";
+import { sha256Digest, type JsonObject, type JsonValue } from "../primitives";
 import {
   RuntimeRepository,
   type RuntimeEventRecord,
   type RuntimeEventRowInsert,
+  type RuntimeAttemptObjectContentRecord,
   type WorkerLifecycleEventRecord,
 } from "../runtime/repository";
 import { RunnerRepository, type RunnerInstanceRecord, type RunnerPoolRecord } from "../runners/repository";
@@ -77,6 +78,10 @@ export async function handleRunRoute(
 
   if (request.method === "POST" && workerAttemptPath(url.pathname, "/runtime/event-rows")) {
     return ingestRuntimeEventRows(request, url, runs, runtime);
+  }
+
+  if (request.method === "POST" && workerAttemptPath(url.pathname, "/runtime/artifacts")) {
+    return uploadRuntimeArtifact(request, url, runs, runtime);
   }
 
   if (request.method === "POST" && workerAttemptPath(url.pathname, "/complete")) {
@@ -176,6 +181,9 @@ export async function handleRunRoute(
         limit: limitFromUrl(url),
       }));
     }
+    if (runtimeRoute.kind === "artifact") {
+      return runtimeArtifactContent(url, runtimeRoute, runtime);
+    }
     return jsonResponse({
       cloud_run_id: runtimeRoute.runId,
       key: runtimeRoute.key,
@@ -238,6 +246,7 @@ function runtimePath(pathname: string):
   | { kind: "summary"; runId: string }
   | { kind: "events"; runId: string }
   | { kind: "results"; runId: string }
+  | { kind: "artifact"; runId: string; trialId: string; role: string }
   | { kind: "kv"; runId: string; key: string }
   | null {
   const prefix = "/v1/runs/";
@@ -253,6 +262,9 @@ function runtimePath(pathname: string):
   }
   if (parts.length === 3 && parts[1] === "runtime" && parts[2] === "results") {
     return { kind: "results", runId: parts[0] ?? "" };
+  }
+  if (parts.length === 5 && parts[1] === "runtime" && parts[2] === "artifacts") {
+    return { kind: "artifact", runId: parts[0] ?? "", trialId: parts[3] ?? "", role: parts[4] ?? "" };
   }
   if (parts.length === 4 && parts[1] === "runtime" && parts[2] === "kv") {
     return { kind: "kv", runId: parts[0] ?? "", key: parts[3] ?? "" };
@@ -306,6 +318,8 @@ async function appendRunEvent(
 const INGEST_MAX_ROWS_PER_BATCH = 500;
 const INGEST_MAX_ROW_PAYLOAD_BYTES = 64 * 1024;
 const CORE_RUN_ID_PATTERN = /^run_[A-Za-z0-9_.-]+$/;
+const RUNTIME_ARTIFACT_ROLE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+const DEFAULT_MAX_RUNTIME_ARTIFACT_BYTES = 16 * 1024 * 1024;
 
 async function ingestRuntimeEventRows(
   request: Request,
@@ -332,6 +346,121 @@ async function ingestRuntimeEventRows(
   );
   const upserted = await runtime.upsertEventRows(rows);
   return jsonResponse({ received: rows.length, upserted });
+}
+
+async function uploadRuntimeArtifact(
+  request: Request,
+  url: URL,
+  runs: RunRepository,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const attemptId = attemptIdFromWorkerPath(url.pathname, "/runtime/artifacts");
+  const runnerInstanceId = requireHeader(request, "x-bucephalus-runner-instance-id", "runtime artifact upload");
+  const { runId } = await requireAttemptToken(request, runs, { attemptId, runnerInstanceId });
+  const coreRunId = requireCoreRunId(requireHeader(request, "x-bucephalus-core-run-id", "runtime artifact upload"), "/headers/x-bucephalus-core-run-id");
+  const trialId = requireArtifactToken(requireHeader(request, "x-bucephalus-trial-id", "runtime artifact upload"), "/headers/x-bucephalus-trial-id");
+  const role = requireArtifactRole(requireHeader(request, "x-bucephalus-artifact-role", "runtime artifact upload"), "/headers/x-bucephalus-artifact-role");
+  const scheduleIdx = nonNegativeHeaderInt(request, "x-bucephalus-schedule-idx", "runtime artifact upload");
+  const attempt = nonNegativeHeaderInt(request, "x-bucephalus-trial-attempt", "runtime artifact upload");
+  const mediaType = request.headers.get("content-type")?.trim() || "application/octet-stream";
+  const relativePath = optionalHeader(request, "x-bucephalus-artifact-relative-path");
+  const bytes = await readRequestBytes(request, maxRuntimeArtifactBytes(), "Runtime artifact body");
+  const digest = sha256Digest(bytes);
+  const objectRef = runtimeObjectRef({
+    coreRunId,
+    trialId,
+    attempt,
+    role,
+    digest,
+  });
+  const storagePath = await putRuntimeObject({
+    cloudRunId: runId,
+    attemptId,
+    coreRunId,
+    trialId,
+    trialAttempt: attempt,
+    role,
+    bytes,
+    mediaType,
+  });
+  const metadata = {
+    source: "worker_runtime_artifact_upload",
+    cloud_run_id: runId,
+    attempt_id: attemptId,
+    runner_instance_id: runnerInstanceId,
+    relative_path: relativePath,
+    media_type: mediaType,
+    byte_size: bytes.byteLength,
+    sha256: digest,
+  };
+  const record = await runtime.upsertAttemptObjectContent({
+    core_run_id: coreRunId,
+    trial_id: trialId,
+    schedule_idx: scheduleIdx,
+    attempt,
+    role,
+    object_ref: objectRef,
+    storage_path: storagePath,
+    media_type: mediaType,
+    byte_size: bytes.byteLength,
+    sha256: digest,
+    relative_path: relativePath ?? null,
+    metadata,
+    recorded_at_ms: Date.now(),
+  });
+  return jsonResponse({ artifact: runtimeArtifactToWire(record) }, { status: 201 });
+}
+
+async function runtimeArtifactContent(
+  url: URL,
+  route: { runId: string; trialId: string; role: string },
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const trialId = requireArtifactToken(route.trialId, "/trial_id");
+  const role = requireArtifactRole(route.role, "/role");
+  const attempt = optionalQueryInteger(url, "attempt", { min: 0 });
+  const coreRunId = optionalString(url.searchParams.get("core_run_id"), "/core_run_id");
+  if (coreRunId !== null) {
+    requireCoreRunId(coreRunId, "/core_run_id");
+  }
+  const artifact = await runtime.attemptObjectContent(route.runId, {
+    trialId,
+    role,
+    ...(attempt !== undefined ? { attempt } : {}),
+    ...(coreRunId !== null ? { coreRunId } : {}),
+  });
+  if (!artifact) {
+    throw new HttpError(404, "runtime_artifact_not_found", "Runtime artifact content not found");
+  }
+  const bytes = await readStoredObject(artifact.storage_path);
+  return new Response(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer, {
+    headers: {
+      "content-type": artifact.media_type || "application/octet-stream",
+      "content-length": String(bytes.byteLength),
+      "x-bucephalus-core-run-id": artifact.core_run_id,
+      "x-bucephalus-trial-id": artifact.trial_id,
+      "x-bucephalus-artifact-role": artifact.role,
+      "x-bucephalus-object-ref": artifact.object_ref,
+      "x-bucephalus-sha256": artifact.sha256,
+    },
+  });
+}
+
+function runtimeArtifactToWire(record: RuntimeAttemptObjectContentRecord): JsonObject {
+  return {
+    core_run_id: record.core_run_id,
+    trial_id: record.trial_id,
+    schedule_idx: record.schedule_idx,
+    attempt: record.attempt,
+    role: record.role,
+    object_ref: record.object_ref,
+    content_available: true,
+    media_type: record.media_type,
+    byte_size: record.byte_size,
+    sha256: record.sha256,
+    relative_path: record.relative_path,
+    recorded_at_ms: record.recorded_at_ms,
+  };
 }
 
 function runtimeEventRowFromWire(
@@ -381,6 +510,69 @@ function nonNegativeInt(value: unknown, pointer: string): number {
     throw new HttpError(400, "invalid_integer", `${pointer} must be a non-negative integer`);
   }
   return value;
+}
+
+function nonNegativeHeaderInt(request: Request, name: string, scope: string): number {
+  const raw = requireHeader(request, name, scope);
+  if (!/^[0-9]+$/.test(raw)) {
+    throw new HttpError(400, "invalid_header", `${name} must be a non-negative integer`);
+  }
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(value)) {
+    throw new HttpError(400, "invalid_header", `${name} must be a safe integer`);
+  }
+  return value;
+}
+
+function requireCoreRunId(value: string, pointer: string): string {
+  if (!CORE_RUN_ID_PATTERN.test(value)) {
+    throw new HttpError(400, "invalid_core_run_id", `${pointer} is not a Core run id`);
+  }
+  return value;
+}
+
+function requireArtifactToken(value: string, pointer: string): string {
+  if (value.length === 0 || value.length > 256 || value.includes("\0")) {
+    throw new HttpError(400, "invalid_request", `${pointer} must be a non-empty artifact identifier`);
+  }
+  return value;
+}
+
+function requireArtifactRole(value: string, pointer: string): string {
+  if (!RUNTIME_ARTIFACT_ROLE_PATTERN.test(value)) {
+    throw new HttpError(400, "invalid_request", `${pointer} must be a lowercase runtime artifact role`);
+  }
+  return value;
+}
+
+function optionalHeader(request: Request, name: string): string | null {
+  const value = request.headers.get(name)?.trim();
+  return value && value.length > 0 ? value : null;
+}
+
+function runtimeObjectRef(input: {
+  coreRunId: string;
+  trialId: string;
+  attempt: number;
+  role: string;
+  digest: string;
+}): string {
+  return `runtime://${[
+    input.coreRunId,
+    input.trialId,
+    String(input.attempt),
+    input.role,
+    input.digest,
+  ].map(encodeURIComponent).join("/")}`;
+}
+
+function maxRuntimeArtifactBytes(): number {
+  const raw = process.env.BUCEPHALUS_CLOUD_MAX_RUNTIME_ARTIFACT_BYTES;
+  if (!raw) {
+    return DEFAULT_MAX_RUNTIME_ARTIFACT_BYTES;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_RUNTIME_ARTIFACT_BYTES;
 }
 
 /**

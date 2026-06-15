@@ -42,6 +42,59 @@ export async function putUploadObject(
   return r2Uri(config.storage.bucket, key);
 }
 
+export async function putRuntimeObject(
+  input: {
+    cloudRunId: string;
+    attemptId: string;
+    coreRunId: string;
+    trialId: string;
+    trialAttempt: number;
+    role: string;
+    bytes: Uint8Array;
+    mediaType: string;
+  },
+  config: AppConfig = loadConfig(),
+): Promise<string> {
+  const parts = [
+    "runtime-objects",
+    safeObjectSegment(input.cloudRunId),
+    safeObjectSegment(input.attemptId),
+    safeObjectSegment(input.coreRunId),
+    safeObjectSegment(input.trialId),
+    safeObjectSegment(String(input.trialAttempt)),
+    safeObjectSegment(input.role),
+    "content.blob",
+  ];
+  if (config.storage.backend === "filesystem") {
+    const storagePath = join(config.dataDir, ...parts);
+    await mkdir(join(config.dataDir, ...parts.slice(0, -1)), { recursive: true });
+    await writeFile(storagePath, input.bytes);
+    return storagePath;
+  }
+
+  const key = objectKey(config.storage.prefix, ...parts);
+  if (config.storage.backend === "gcs") {
+    await gcsRequest({
+      method: "PUT",
+      bucket: config.storage.bucket,
+      key,
+      body: input.bytes,
+      contentType: input.mediaType,
+    });
+    return gcsUri(config.storage.bucket, key);
+  }
+
+  await r2Request({
+    method: "PUT",
+    bucket: config.storage.bucket,
+    key,
+    body: input.bytes,
+    contentType: input.mediaType,
+    config,
+  });
+  return r2Uri(config.storage.bucket, key);
+}
+
 export async function readStoredObject(storagePath: string, config: AppConfig = loadConfig()): Promise<Uint8Array> {
   const gcsObject = parseGcsUri(storagePath);
   if (gcsObject) {

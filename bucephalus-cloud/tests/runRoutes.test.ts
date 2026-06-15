@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
@@ -854,6 +854,157 @@ describe("Cloud run routes", () => {
     } finally {
       globalThis.fetch = previousFetch;
       restoreEnv(previousEnv);
+    }
+  });
+
+  test("worker runtime artifact upload stores bytes and persists content metadata", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-runtime-artifact-upload-"));
+    const previousEnv = captureEnv([
+      "BUCEPHALUS_CLOUD_DATA_DIR",
+      "BUCEPHALUS_CLOUD_STORAGE_BACKEND",
+    ]);
+    process.env.BUCEPHALUS_CLOUD_DATA_DIR = root;
+    process.env.BUCEPHALUS_CLOUD_STORAGE_BACKEND = "filesystem";
+    try {
+      const observed: {
+        verify?: { token: string; attemptId: string; runnerInstanceId?: string | null };
+        persisted?: Record<string, unknown>;
+      } = {};
+      const runs = {
+        async verifyAttemptToken(input: { token: string; attemptId: string; runnerInstanceId?: string | null }) {
+          observed.verify = input;
+          return { runId: "cloud-run-1", ownerKey: "issuer:user-a", packageDigest: runRecord().package_digest };
+        },
+      };
+      const runtime = {
+        async upsertAttemptObjectContent(input: Record<string, unknown>) {
+          observed.persisted = input;
+          return {
+            core_run_id: input.core_run_id,
+            trial_id: input.trial_id,
+            schedule_idx: input.schedule_idx,
+            attempt: input.attempt,
+            role: input.role,
+            object_ref: input.object_ref,
+            storage_path: input.storage_path,
+            media_type: input.media_type,
+            byte_size: input.byte_size,
+            sha256: input.sha256,
+            relative_path: input.relative_path,
+            metadata: input.metadata,
+            recorded_at_ms: input.recorded_at_ms,
+          };
+        },
+      };
+
+      const response = await handleRunRoute(
+        new Request("https://cloud.example/v1/worker/run-attempts/attempt-1/runtime/artifacts", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer attempt-token",
+            "content-type": "application/json; charset=utf-8",
+            "x-bucephalus-runner-instance-id": "runner-instance-1",
+            "x-bucephalus-core-run-id": "run_20260614_051159_561175_000001",
+            "x-bucephalus-trial-id": "trial_1",
+            "x-bucephalus-schedule-idx": "0",
+            "x-bucephalus-trial-attempt": "0",
+            "x-bucephalus-artifact-role": "agent_result",
+            "x-bucephalus-artifact-relative-path": "agent/result.json",
+          },
+          body: JSON.stringify({ final: "generated answer" }),
+        }),
+        new URL("https://cloud.example/v1/worker/run-attempts/attempt-1/runtime/artifacts"),
+        {} as PackageRepository,
+        runs as unknown as RunRepository,
+        runtime as unknown as RuntimeRepository,
+        runnersWithDockerPool() as any,
+        "worker-token",
+      );
+
+      const body = await response!.json();
+      expect(body.artifact).toMatchObject({
+        core_run_id: "run_20260614_051159_561175_000001",
+        trial_id: "trial_1",
+        role: "agent_result",
+        content_available: true,
+        media_type: "application/json; charset=utf-8",
+        byte_size: 28,
+        relative_path: "agent/result.json",
+      });
+      expect(observed.verify).toEqual({
+        token: "attempt-token",
+        attemptId: "attempt-1",
+        runnerInstanceId: "runner-instance-1",
+      });
+      expect(String(observed.persisted?.object_ref)).toContain("runtime://run_20260614_051159_561175_000001/trial_1/0/agent_result/sha256%3A");
+      expect(await readFile(String(observed.persisted?.storage_path), "utf8")).toBe(JSON.stringify({ final: "generated answer" }));
+    } finally {
+      restoreEnv(previousEnv);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("runtime artifact content download streams persisted worker bytes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-runtime-artifact-download-"));
+    try {
+      const storagePath = join(root, "agent-result.json");
+      await writeFile(storagePath, JSON.stringify({ final: "generated answer" }));
+      const observed: Record<string, unknown> = {};
+      const runs = {
+        async getRun(runId: string, ownerKey?: string) {
+          observed.runId = runId;
+          observed.ownerKey = ownerKey;
+          return runRecord();
+        },
+      };
+      const runtime = {
+        async attemptObjectContent(runId: string, input: Record<string, unknown>) {
+          observed.contentRunId = runId;
+          observed.contentInput = input;
+          return {
+            core_run_id: "run_20260614_051159_561175_000001",
+            trial_id: "trial_1",
+            schedule_idx: 0,
+            attempt: 0,
+            role: "agent_result",
+            object_ref: "runtime://run/trial/0/agent_result/sha256",
+            storage_path: storagePath,
+            media_type: "application/json; charset=utf-8",
+            byte_size: 28,
+            sha256: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            relative_path: "agent/result.json",
+            metadata: null,
+            recorded_at_ms: 1,
+          };
+        },
+      };
+
+      const response = await handleRunRoute(
+        new Request("https://cloud.example/v1/runs/run-1/runtime/artifacts/trial_1/agent_result?attempt=0"),
+        new URL("https://cloud.example/v1/runs/run-1/runtime/artifacts/trial_1/agent_result?attempt=0"),
+        {} as PackageRepository,
+        runs as unknown as RunRepository,
+        runtime as unknown as RuntimeRepository,
+        runnersWithDockerPool() as any,
+        "worker-token",
+        authContext("user-a"),
+      );
+
+      expect(await response!.text()).toBe(JSON.stringify({ final: "generated answer" }));
+      expect(response!.headers.get("content-type")).toBe("application/json; charset=utf-8");
+      expect(response!.headers.get("x-bucephalus-artifact-role")).toBe("agent_result");
+      expect(observed).toMatchObject({
+        runId: "run-1",
+        ownerKey: "issuer:user-a",
+        contentRunId: "run-1",
+        contentInput: {
+          trialId: "trial_1",
+          role: "agent_result",
+          attempt: 0,
+        },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 

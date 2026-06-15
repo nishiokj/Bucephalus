@@ -62,8 +62,18 @@ const RUNTIME_SNAPSHOT_MAX_EVIDENCE_RECORDS = 500;
 const RUNTIME_SNAPSHOT_MAX_JSON_BYTES = 2 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_PAYLOAD_ENVELOPE_BYTES = 128 * 1024;
+const RUNTIME_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024;
 const DOCKER_SOCKET_PATH = "/var/run/docker.sock";
 const DOCKER_API_VERSION = "v1.41";
+const RUNTIME_ARTIFACT_SPECS = [
+  { role: "agent_result", relativePath: "agent/result.json", mediaType: "application/json; charset=utf-8" },
+  { role: "agent_stdout", relativePath: "agent/stdout.log", mediaType: "text/plain; charset=utf-8" },
+  { role: "agent_stderr", relativePath: "agent/stderr.log", mediaType: "text/plain; charset=utf-8" },
+  { role: "agent_events", relativePath: "agent/events.jsonl", mediaType: "application/x-ndjson; charset=utf-8" },
+  { role: "candidate_patch", relativePath: "candidate.patch", mediaType: "text/x-diff; charset=utf-8" },
+  { role: "contract_trace", relativePath: "runner/contract_trace.json", mediaType: "application/json; charset=utf-8" },
+  { role: "trial_summary", relativePath: "summary.json", mediaType: "application/json; charset=utf-8" },
+] as const;
 
 class WorkerError extends Error {
   constructor(message: string) {
@@ -221,6 +231,21 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
     }
 
     if (materialized) {
+      try {
+        const uploadSummary = await uploadRuntimeArtifacts(config, claim, materialized);
+        await appendEvent(config, claim, "worker.runtime.artifacts_uploaded", uploadSummary);
+      } catch (error) {
+        await appendEvent(config, claim, "worker.runtime.artifact_upload_failed", {
+          error: errorMessage(error),
+        }).catch((eventError) => {
+          logError("worker.artifact_upload_failure_event_failed", runContext, { error: errorMessage(eventError) });
+        });
+        if (!coreError) {
+          coreError = error;
+        } else {
+          logError("worker.runtime_artifact_upload_failed", runContext, { error: errorMessage(error) });
+        }
+      }
       try {
         await uploadRuntimeSnapshots(config, claim, materialized);
       } catch (error) {
@@ -396,6 +421,128 @@ async function uploadRuntimeSnapshots(
     const snapshot = await collectRuntimeSnapshot(materialized.runRootDir, coreRunId);
     await appendEvent(config, claim, RUNTIME_SNAPSHOT_EVENT_TYPE, snapshot);
   }
+}
+
+async function uploadRuntimeArtifacts(
+  config: WorkerConfig,
+  claim: RunClaim,
+  materialized: MaterializedPackage,
+): Promise<JsonObject> {
+  const coreRunIds = await discoverCoreRunIdsFromRunRoot(materialized.runRootDir);
+  let uploaded = 0;
+  const omitted: string[] = [];
+  for (const coreRunId of coreRunIds) {
+    const collected = await collectRuntimeArtifactUploads(materialized.runRootDir, coreRunId);
+    omitted.push(...collected.omitted);
+    for (const artifact of collected.items) {
+      const bytes = await readFile(artifact.absolutePath);
+      await uploadRuntimeArtifact(config, claim, artifact, bytes);
+      uploaded += 1;
+    }
+  }
+  return {
+    core_run_ids: coreRunIds,
+    uploaded_artifacts: uploaded,
+    omitted_artifacts: omitted,
+  };
+}
+
+export async function collectRuntimeArtifactUploads(
+  runRootDir: string,
+  coreRunId: string,
+): Promise<{ items: RuntimeArtifactUpload[]; omitted: string[] }> {
+  assertCoreRunId(coreRunId);
+  const runDir = join(runRootDir, coreRunId);
+  const trialsDir = join(runDir, "trials");
+  let entries: Dirent[];
+  try {
+    entries = await readdir(trialsDir, { withFileTypes: true });
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return { items: [], omitted: [] };
+    }
+    throw error;
+  }
+  const trialDirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+  const items: RuntimeArtifactUpload[] = [];
+  const omitted: string[] = [];
+  for (const [index, trialId] of trialDirs.entries()) {
+    const trialDir = join(trialsDir, trialId);
+    const identity = await runtimeTrialIdentity(trialDir, trialId, index);
+    for (const spec of RUNTIME_ARTIFACT_SPECS) {
+      const relativePath = spec.relativePath;
+      const absolutePath = join(trialDir, ...relativePath.split("/"));
+      let fileStat;
+      try {
+        fileStat = await stat(absolutePath);
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") {
+          continue;
+        }
+        throw error;
+      }
+      if (!fileStat.isFile()) {
+        continue;
+      }
+      if (fileStat.size > RUNTIME_ARTIFACT_MAX_BYTES) {
+        omitted.push(`trials/${trialId}/${relativePath}`);
+        continue;
+      }
+      items.push({
+        coreRunId,
+        trialId: identity.trialId,
+        scheduleIdx: identity.scheduleIdx,
+        attempt: identity.attempt,
+        role: spec.role,
+        relativePath,
+        mediaType: spec.mediaType,
+        absolutePath,
+        byteSize: fileStat.size,
+      });
+    }
+  }
+  return { items, omitted };
+}
+
+async function runtimeTrialIdentity(
+  trialDir: string,
+  fallbackTrialId: string,
+  fallbackScheduleIdx: number,
+): Promise<{ trialId: string; scheduleIdx: number; attempt: number }> {
+  const summary = await readBoundedJsonObject(join(trialDir, "summary.json"));
+  const contractTrace = await readBoundedJsonObject(join(trialDir, "runner", "contract_trace.json"));
+  const summaryObject = summary.status === "read" ? summary.object : {};
+  const contractObject = contractTrace.status === "read" ? contractTrace.object : {};
+  const summaryIds = isRecord(summaryObject.ids) ? summaryObject.ids : {};
+  const contractIds = isRecord(contractObject.ids) ? contractObject.ids : {};
+  return {
+    trialId: stringField(contractIds.trial_id) ?? stringField(summaryIds.trial_id) ?? fallbackTrialId,
+    scheduleIdx: numberField(contractIds.schedule_idx) ?? numberField(summaryIds.schedule_idx) ?? fallbackScheduleIdx,
+    attempt: numberField(contractIds.attempt) ?? numberField(summaryIds.attempt) ?? 0,
+  };
+}
+
+async function uploadRuntimeArtifact(
+  config: WorkerConfig,
+  claim: RunClaim,
+  artifact: RuntimeArtifactUpload,
+  bytes: Uint8Array,
+): Promise<void> {
+  await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/runtime/artifacts`, {
+    method: "POST",
+    authToken: claim.attempt.attempt_token,
+    rawBody: bytes,
+    headers: {
+      "content-type": artifact.mediaType,
+      "x-bucephalus-runner-instance-id": requireRunnerInstanceId(config),
+      "x-bucephalus-core-run-id": artifact.coreRunId,
+      "x-bucephalus-trial-id": artifact.trialId,
+      "x-bucephalus-schedule-idx": String(artifact.scheduleIdx),
+      "x-bucephalus-trial-attempt": String(artifact.attempt),
+      "x-bucephalus-artifact-role": artifact.role,
+      "x-bucephalus-artifact-relative-path": artifact.relativePath,
+    },
+  });
 }
 
 export async function collectRuntimeSnapshot(runRootDir: string, coreRunId: string): Promise<RuntimeSnapshotPayload> {
@@ -1544,15 +1691,23 @@ async function fail(config: WorkerConfig, claim: RunClaim, message: string): Pro
 async function cloudFetch(
   config: WorkerConfig,
   path: string,
-  options: { method?: string; body?: unknown; authToken?: string } = {},
+  options: { method?: string; body?: unknown; rawBody?: Uint8Array; headers?: Record<string, string>; authToken?: string } = {},
 ): Promise<unknown> {
   const init: RequestInit = {
     method: options.method ?? "GET",
-    headers: workerAuthHeaders(config, options.authToken),
+    headers: {
+      ...workerAuthHeaders(config, options.authToken),
+      ...(options.headers ?? {}),
+    },
   };
   if (options.body !== undefined) {
-    init.headers = { ...workerAuthHeaders(config, options.authToken), "content-type": "application/json" };
+    init.headers = { ...workerAuthHeaders(config, options.authToken), ...(options.headers ?? {}), "content-type": "application/json" };
     init.body = JSON.stringify(options.body);
+  } else if (options.rawBody !== undefined) {
+    init.body = options.rawBody.buffer.slice(
+      options.rawBody.byteOffset,
+      options.rawBody.byteOffset + options.rawBody.byteLength,
+    ) as ArrayBuffer;
   }
   init.signal = AbortSignal.timeout(workerApiRequestTimeoutMs(config));
   const response = await fetch(`${config.apiUrl}${path}`, init);
@@ -1920,6 +2075,33 @@ interface RuntimeTrialSummaryPayload extends JsonObject {
   summary: JsonObject;
   contract_trace?: JsonObject;
   trial_events?: JsonObject[];
+}
+
+interface RuntimeArtifactUpload {
+  coreRunId: string;
+  trialId: string;
+  scheduleIdx: number;
+  attempt: number;
+  role: string;
+  relativePath: string;
+  mediaType: string;
+  absolutePath: string;
+  byteSize: number;
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function numberField(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.trunc(value);
+  }
+  if (typeof value === "string" && /^[0-9]+$/.test(value)) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+  return null;
 }
 
 function stringAt(root: JsonObject, pointer: string): string | null {

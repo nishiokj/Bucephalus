@@ -33,6 +33,10 @@ export async function readJsonObject(request: Request): Promise<Record<string, u
   return value;
 }
 
+export async function readRequestBytes(request: Request, maxBytes: number, description = "Request body"): Promise<Uint8Array> {
+  return await readBoundedRequestBytes(request, maxBytes, description);
+}
+
 export function queryInteger(
   url: URL,
   key: string,
@@ -73,6 +77,11 @@ export function optionalQueryInteger(
 }
 
 async function readBoundedRequestText(request: Request, maxBytes: number): Promise<string> {
+  const bytes = await readBoundedRequestBytes(request, maxBytes, "Request JSON body");
+  return new TextDecoder().decode(bytes);
+}
+
+async function readBoundedRequestBytes(request: Request, maxBytes: number, description: string): Promise<Uint8Array> {
   const contentLength = request.headers.get("content-length");
   if (contentLength !== null) {
     const normalizedContentLength = contentLength.trim();
@@ -83,13 +92,13 @@ async function readBoundedRequestText(request: Request, maxBytes: number): Promi
       throw new HttpError(400, "invalid_content_length", "Invalid content-length");
     }
     if (declared > maxBytes) {
-      throw new HttpError(413, "request_body_too_large", "Request JSON body exceeds the configured size limit", {
-        max_json_body_bytes: maxBytes,
+      throw new HttpError(413, "request_body_too_large", `${description} exceeds the configured size limit`, {
+        max_body_bytes: maxBytes,
       });
     }
   }
   if (!request.body) {
-    return "";
+    return new Uint8Array();
   }
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -103,8 +112,8 @@ async function readBoundedRequestText(request: Request, maxBytes: number): Promi
       const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
       total += chunk.byteLength;
       if (total > maxBytes) {
-        throw new HttpError(413, "request_body_too_large", "Request JSON body exceeds the configured size limit", {
-          max_json_body_bytes: maxBytes,
+        throw new HttpError(413, "request_body_too_large", `${description} exceeds the configured size limit`, {
+          max_body_bytes: maxBytes,
         });
       }
       chunks.push(chunk);
@@ -118,7 +127,7 @@ async function readBoundedRequestText(request: Request, maxBytes: number): Promi
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return new TextDecoder().decode(bytes);
+  return bytes;
 }
 
 function parseJson(text: string): unknown {

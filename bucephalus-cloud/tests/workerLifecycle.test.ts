@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import * as tar from "tar";
 import {
   applyRuntimeNetworkPolicy,
+  collectRuntimeArtifactUploads,
   collectRuntimeSnapshot,
   coreProgressCompleted,
   coreRunnerEnv,
@@ -124,6 +125,62 @@ describe("worker lifecycle cleanup helpers", () => {
         },
       ]);
       expect(JSON.stringify(snapshot)).not.toContain(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("collects first-class runtime artifact uploads from Core trial directories", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-artifacts-"));
+    try {
+      const runRoot = join(root, "run-root");
+      const coreRunId = "run_20260529_000001_000001_000001";
+      const trialDir = join(runRoot, coreRunId, "trials", "trial-1");
+      await mkdir(join(trialDir, "agent"), { recursive: true });
+      await mkdir(join(trialDir, "runner"), { recursive: true });
+      await writeFile(join(trialDir, "summary.json"), JSON.stringify({
+        ids: {
+          trial_id: "trial-from-summary",
+        },
+        outcome: "success",
+      }));
+      await writeFile(join(trialDir, "runner", "contract_trace.json"), JSON.stringify({
+        ids: {
+          trial_id: "trial-from-contract",
+          schedule_idx: 7,
+          attempt: 2,
+        },
+      }));
+      await writeFile(join(trialDir, "agent", "result.json"), JSON.stringify({
+        final: "Peter Gregory generated answer",
+      }));
+      await writeFile(join(trialDir, "agent", "stdout.log"), "stdout\n");
+      await writeFile(join(trialDir, "agent", "stderr.log"), "stderr\n");
+      await writeFile(join(trialDir, "agent", "events.jsonl"), `${JSON.stringify({ event_type: "done" })}\n`);
+      await writeFile(join(trialDir, "candidate.patch"), "diff --git a/file b/file\n");
+
+      const uploads = await collectRuntimeArtifactUploads(runRoot, coreRunId);
+
+      expect(uploads.omitted).toEqual([]);
+      expect(uploads.items.map((item) => item.role)).toEqual([
+        "agent_result",
+        "agent_stdout",
+        "agent_stderr",
+        "agent_events",
+        "candidate_patch",
+        "contract_trace",
+        "trial_summary",
+      ]);
+      expect(uploads.items[0]).toMatchObject({
+        coreRunId,
+        trialId: "trial-from-contract",
+        scheduleIdx: 7,
+        attempt: 2,
+        role: "agent_result",
+        relativePath: "agent/result.json",
+        mediaType: "application/json; charset=utf-8",
+      });
+      expect(await readFile(uploads.items[0]!.absolutePath, "utf8")).toContain("Peter Gregory generated answer");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

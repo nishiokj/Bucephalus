@@ -86,6 +86,43 @@ export interface RuntimeAttemptObjectRecord {
   object_ref: string;
   metadata: JsonValue | null;
   recorded_at_ms: number;
+  content_available?: boolean;
+  media_type?: string | null;
+  byte_size?: number | null;
+  sha256?: string | null;
+  relative_path?: string | null;
+}
+
+export interface RuntimeAttemptObjectContentInsert {
+  core_run_id: string;
+  trial_id: string;
+  schedule_idx: number;
+  attempt: number;
+  role: string;
+  object_ref: string;
+  storage_path: string;
+  media_type: string;
+  byte_size: number;
+  sha256: string;
+  relative_path?: string | null;
+  metadata?: JsonObject | null;
+  recorded_at_ms: number;
+}
+
+export interface RuntimeAttemptObjectContentRecord {
+  core_run_id: string;
+  trial_id: string;
+  schedule_idx: number;
+  attempt: number;
+  role: string;
+  object_ref: string;
+  storage_path: string;
+  media_type: string;
+  byte_size: number;
+  sha256: string;
+  relative_path: string | null;
+  metadata: JsonValue | null;
+  recorded_at_ms: number;
 }
 
 export interface RuntimeSlotRecord {
@@ -364,7 +401,7 @@ export class RuntimeRepository {
       };
     }
     const limit = boundedLimit(input?.limit, 500);
-    const [trialRows, metricRows, contractStageRows, attemptObjectRows] = await Promise.all([
+    const [trialRows, metricRows, contractStageRows, attemptObjectRows, attemptObjectContentRows] = await Promise.all([
       this.sql`
         select
           run_id,
@@ -443,12 +480,16 @@ export class RuntimeRepository {
         order by run_id, schedule_idx, attempt, role
         limit ${limit * 10}
       `,
+      this.attemptObjectContentRows(coreRunIds, limit * 10),
     ]).catch((error) => {
       if (isMissingRuntimeStore(error)) {
-        return [[], [], [], []];
+        return [[], [], [], [], []];
       }
       throw error;
     });
+    const attemptObjectContentByKey = new Map(
+      attemptObjectContentRows.map((row) => [runtimeAttemptObjectKey(row), row]),
+    );
     const legacyTrialResults = trialRows.map((row) => ({
       core_run_id: String(row.run_id),
       trial_id: String(row.trial_id),
@@ -504,16 +545,19 @@ export class RuntimeRepository {
     const snapshotContractStages = runtimeContractStagesFromSnapshots(runtimeSnapshots)
       .filter((row) => !legacyContractStages.some((legacy) => runtimeContractStageKey(legacy) === runtimeContractStageKey(row)))
       .slice(0, Math.max(0, limit * 10 - legacyContractStages.length));
-    const legacyAttemptObjects = attemptObjectRows.map((row) => ({
-      core_run_id: String(row.run_id),
-      trial_id: String(row.trial_id),
-      schedule_idx: Number(row.schedule_idx),
-      attempt: Number(row.attempt),
-      role: String(row.role),
-      object_ref: String(row.object_ref),
-      metadata: row.metadata_json === null ? null : parseJson(row.metadata_json),
-      recorded_at_ms: Number(row.recorded_at_ms),
-    }));
+    const legacyAttemptObjects = attemptObjectRows.map((row) => {
+      const record: RuntimeAttemptObjectRecord = {
+        core_run_id: String(row.run_id),
+        trial_id: String(row.trial_id),
+        schedule_idx: Number(row.schedule_idx),
+        attempt: Number(row.attempt),
+        role: String(row.role),
+        object_ref: String(row.object_ref),
+        metadata: row.metadata_json === null ? null : parseJson(row.metadata_json),
+        recorded_at_ms: Number(row.recorded_at_ms),
+      };
+      return enrichAttemptObjectWithContent(record, attemptObjectContentByKey.get(runtimeAttemptObjectKey(record)));
+    });
     const snapshotAttemptObjects = runtimeAttemptObjectsFromSnapshots(runtimeSnapshots)
       .filter((row) => !legacyAttemptObjects.some((legacy) => runtimeAttemptObjectKey(legacy) === runtimeAttemptObjectKey(row)))
       .slice(0, Math.max(0, limit * 10 - legacyAttemptObjects.length));
@@ -638,6 +682,135 @@ export class RuntimeRepository {
         row_json = excluded.row_json
     `;
     return result.count;
+  }
+
+  async upsertAttemptObjectContent(input: RuntimeAttemptObjectContentInsert): Promise<RuntimeAttemptObjectContentRecord> {
+    const metadata = input.metadata ?? {
+      source: "worker_runtime_artifact_upload",
+      relative_path: input.relative_path ?? null,
+      byte_size: input.byte_size,
+      media_type: input.media_type,
+      sha256: input.sha256,
+    };
+    return await this.sql.begin(async (tx) => {
+      await tx`
+        insert into ${this.table("attempt_objects")} (
+          account_id,
+          run_id,
+          trial_id,
+          schedule_idx,
+          attempt,
+          role,
+          object_ref,
+          metadata_json,
+          recorded_at_ms
+        )
+        values (
+          ${WORKER_INGEST_ACCOUNT_ID},
+          ${input.core_run_id},
+          ${input.trial_id},
+          ${input.schedule_idx},
+          ${input.attempt},
+          ${input.role},
+          ${input.object_ref},
+          ${JSON.stringify(metadata)},
+          ${input.recorded_at_ms}
+        )
+        on conflict (account_id, run_id, trial_id, schedule_idx, attempt, role)
+        do update set
+          object_ref = excluded.object_ref,
+          metadata_json = excluded.metadata_json,
+          recorded_at_ms = excluded.recorded_at_ms
+      `;
+      const rows = await tx`
+        insert into ${this.table("attempt_object_contents")} (
+          account_id,
+          run_id,
+          trial_id,
+          schedule_idx,
+          attempt,
+          role,
+          object_ref,
+          storage_path,
+          media_type,
+          byte_size,
+          sha256,
+          relative_path,
+          metadata_json,
+          recorded_at_ms
+        )
+        values (
+          ${WORKER_INGEST_ACCOUNT_ID},
+          ${input.core_run_id},
+          ${input.trial_id},
+          ${input.schedule_idx},
+          ${input.attempt},
+          ${input.role},
+          ${input.object_ref},
+          ${input.storage_path},
+          ${input.media_type},
+          ${input.byte_size},
+          ${input.sha256},
+          ${input.relative_path ?? null},
+          ${JSON.stringify(metadata)},
+          ${input.recorded_at_ms}
+        )
+        on conflict (account_id, run_id, trial_id, schedule_idx, attempt, role)
+        do update set
+          object_ref = excluded.object_ref,
+          storage_path = excluded.storage_path,
+          media_type = excluded.media_type,
+          byte_size = excluded.byte_size,
+          sha256 = excluded.sha256,
+          relative_path = excluded.relative_path,
+          metadata_json = excluded.metadata_json,
+          recorded_at_ms = excluded.recorded_at_ms
+        returning *
+      `;
+      return attemptObjectContentRecordFromRow(rows[0]);
+    });
+  }
+
+  async attemptObjectContent(
+    cloudRunId: string,
+    input: { trialId: string; role: string; attempt?: number; coreRunId?: string | undefined },
+  ): Promise<RuntimeAttemptObjectContentRecord | null> {
+    const coreRunIds = await this.coreRunIdsForCloudRun(cloudRunId);
+    const scopedCoreRunIds = input.coreRunId
+      ? coreRunIds.includes(input.coreRunId) ? [input.coreRunId] : []
+      : coreRunIds;
+    if (scopedCoreRunIds.length === 0) {
+      return null;
+    }
+    const rows = await this.sql`
+      select
+        run_id,
+        trial_id,
+        schedule_idx,
+        attempt,
+        role,
+        object_ref,
+        storage_path,
+        media_type,
+        byte_size,
+        sha256,
+        relative_path,
+        metadata_json,
+        recorded_at_ms
+      from ${this.table("attempt_object_contents")}
+      where run_id = any(${scopedCoreRunIds})
+        and trial_id = ${input.trialId}
+        and role = ${input.role}
+        and (${input.attempt ?? null}::bigint is null or attempt = ${input.attempt ?? null})
+      order by run_id, schedule_idx, attempt desc
+      limit 1
+    `.catch((error) => {
+      if (isMissingRuntimeStore(error)) {
+        return [];
+      }
+      throw error;
+    });
+    return rows[0] ? attemptObjectContentRecordFromRow(rows[0]) : null;
   }
 
   /**
@@ -878,6 +1051,38 @@ export class RuntimeRepository {
     }));
   }
 
+  private async attemptObjectContentRows(coreRunIds: string[], limit: number): Promise<RuntimeAttemptObjectContentRecord[]> {
+    if (coreRunIds.length === 0) {
+      return [];
+    }
+    const rows = await this.sql`
+      select
+        run_id,
+        trial_id,
+        schedule_idx,
+        attempt,
+        role,
+        object_ref,
+        storage_path,
+        media_type,
+        byte_size,
+        sha256,
+        relative_path,
+        metadata_json,
+        recorded_at_ms
+      from ${this.table("attempt_object_contents")}
+      where run_id = any(${coreRunIds})
+      order by run_id, schedule_idx, attempt, role
+      limit ${limit}
+    `.catch((error) => {
+      if (isMissingRuntimeStore(error)) {
+        return [];
+      }
+      throw error;
+    });
+    return rows.map(attemptObjectContentRecordFromRow);
+  }
+
   private table(name: string): ReturnType<Sql["unsafe"]> {
     return this.sql.unsafe(`${quoteIdentifier(this.schema)}.${quoteIdentifier(name)}`);
   }
@@ -900,6 +1105,43 @@ function parseObject(value: unknown): JsonObject {
 
 function parseJson(value: unknown): JsonValue {
   return (typeof value === "string" ? JSON.parse(value) : value) as JsonValue;
+}
+
+function attemptObjectContentRecordFromRow(row: unknown): RuntimeAttemptObjectContentRecord {
+  const record = row as Record<string, unknown>;
+  return {
+    core_run_id: String(record.run_id),
+    trial_id: String(record.trial_id),
+    schedule_idx: numberField(record.schedule_idx) ?? 0,
+    attempt: numberField(record.attempt) ?? 0,
+    role: String(record.role),
+    object_ref: String(record.object_ref),
+    storage_path: String(record.storage_path),
+    media_type: String(record.media_type),
+    byte_size: numberField(record.byte_size) ?? 0,
+    sha256: String(record.sha256),
+    relative_path: record.relative_path === null || record.relative_path === undefined ? null : String(record.relative_path),
+    metadata: record.metadata_json === null || record.metadata_json === undefined ? null : parseJson(record.metadata_json),
+    recorded_at_ms: numberField(record.recorded_at_ms) ?? 0,
+  };
+}
+
+function enrichAttemptObjectWithContent(
+  record: RuntimeAttemptObjectRecord,
+  content: RuntimeAttemptObjectContentRecord | undefined,
+): RuntimeAttemptObjectRecord {
+  if (!content) {
+    return record;
+  }
+  return {
+    ...record,
+    object_ref: content.object_ref,
+    content_available: true,
+    media_type: content.media_type,
+    byte_size: content.byte_size,
+    sha256: content.sha256,
+    relative_path: content.relative_path,
+  };
 }
 
 function groupCoreRunIds(rows: unknown[]): Map<string, string[]> {
@@ -1249,7 +1491,18 @@ function stringField(value: unknown): string | null {
 }
 
 function numberField(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "bigint") {
+    const numeric = Number(value);
+    return Number.isSafeInteger(numeric) ? numeric : null;
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && Number.isSafeInteger(numeric) ? numeric : null;
+  }
+  return null;
 }
 
 function outcomeString(value: unknown): string {

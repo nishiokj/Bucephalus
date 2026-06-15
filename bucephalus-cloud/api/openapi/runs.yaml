@@ -369,6 +369,91 @@ paths:
           $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/artifacts/{trial_id}/{role}:
+    get:
+      operationId: downloadRunRuntimeArtifact
+      summary: Download persisted runtime artifact content for a trial.
+      description: >
+        Streams first-class artifact bytes uploaded by a worker for a completed
+        or running Cloud run. Authorization follows the owning run; private
+        object-storage paths are resolved server-side and are not exposed to the
+        caller.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: trial_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: role
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z][a-z0-9_]{0,63}$'
+        - name: attempt
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+        - name: core_run_id
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: '^run_[A-Za-z0-9_.-]+$'
+      responses:
+        '200':
+          description: Runtime artifact bytes.
+          headers:
+            X-Bucephalus-Core-Run-Id:
+              schema:
+                type: string
+            X-Bucephalus-Trial-Id:
+              schema:
+                type: string
+            X-Bucephalus-Artifact-Role:
+              schema:
+                type: string
+            X-Bucephalus-Object-Ref:
+              schema:
+                type: string
+            X-Bucephalus-Sha256:
+              schema:
+                $ref: './common.yaml#/components/schemas/Digest'
+          content:
+            application/json:
+              schema:
+                type: string
+                format: binary
+            application/x-ndjson:
+              schema:
+                type: string
+                format: binary
+            text/plain:
+              schema:
+                type: string
+                format: binary
+            text/x-diff:
+              schema:
+                type: string
+                format: binary
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
   /v1/runs/{run_id}/runtime/kv/{key}:
     get:
       operationId: getRunRuntimeKv
@@ -619,6 +704,102 @@ paths:
                     type: integer
                   upserted:
                     type: integer
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
+  /v1/worker/run-attempts/{attempt_id}/runtime/artifacts:
+    post:
+      operationId: uploadRunAttemptRuntimeArtifact
+      summary: Upload a first-class runtime artifact for a run attempt.
+      security:
+        - workerAttemptBearerAuth: []
+      description: >
+        Worker artifact ingestion. The request body is the raw artifact bytes.
+        The API verifies the attempt token, stores bytes in the configured object
+        backend, and upserts runtime attempt-object metadata so result payloads
+        can resolve content later.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+        - name: X-Bucephalus-Runner-Instance-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: X-Bucephalus-Core-Run-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: '^run_[A-Za-z0-9_.-]+$'
+        - name: X-Bucephalus-Trial-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: X-Bucephalus-Schedule-Idx
+          in: header
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: X-Bucephalus-Trial-Attempt
+          in: header
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: X-Bucephalus-Artifact-Role
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z][a-z0-9_]{0,63}$'
+        - name: X-Bucephalus-Artifact-Relative-Path
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: string
+              format: binary
+          application/x-ndjson:
+            schema:
+              type: string
+              format: binary
+          text/plain:
+            schema:
+              type: string
+              format: binary
+          text/x-diff:
+            schema:
+              type: string
+              format: binary
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: Runtime artifact stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - artifact
+                properties:
+                  artifact:
+                    $ref: '#/components/schemas/RuntimeAttemptObject'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '401':
           $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/run-attempts/{attempt_id}/complete:
@@ -1796,6 +1977,27 @@ components:
           $ref: './common.yaml#/components/schemas/AnyJson'
         recorded_at_ms:
           type: integer
+        content_available:
+          type: boolean
+          description: True when this object ref has persisted bytes available through the runtime artifact download endpoint.
+        media_type:
+          type:
+            - string
+            - 'null'
+        byte_size:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+        sha256:
+          type:
+            - string
+            - 'null'
+          pattern: '^sha256:[0-9a-f]{64}$'
+        relative_path:
+          type:
+            - string
+            - 'null'
     RunAttempt:
       type: object
       additionalProperties: false
