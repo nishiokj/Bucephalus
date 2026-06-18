@@ -178,7 +178,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.25.x"
           cache-dependency-path: modal-launcher/go.sum
 
       - name: Resolve version
@@ -200,14 +200,23 @@ jobs:
       - name: Build Rust release binaries for Cloud candidate
         env:
           RELEASE_TARGET: ${{ env.RELEASE_TARGET }}
-        run: >-
-          cargo build
-          --manifest-path Cargo.toml
-          -p bucephalus-cli
-          --release
-          --bin bucephalus
-          --bin bucephalus-worker-runner
-          --target "${RELEASE_TARGET}"
+        run: |
+          cargo build \
+            --manifest-path Cargo.toml \
+            -p bucephalus-cli \
+            --release \
+            --no-default-features \
+            --features core-cli \
+            --bin bucephalus \
+            --target "${RELEASE_TARGET}"
+          cargo build \
+            --manifest-path Cargo.toml \
+            -p bucephalus-cli \
+            --release \
+            --no-default-features \
+            --features worker-runner-postgres \
+            --bin bucephalus-worker-runner \
+            --target "${RELEASE_TARGET}"
 
       - name: Verify worker runner binary
         run: test -x "target/${RELEASE_TARGET}/release/bucephalus-worker-runner"

@@ -158,11 +158,25 @@ API as `BUCEPHALUS_CLOUD_OAUTH_AUDIENCE`, because the verifier checks the JWT
 ```hcl
 oauth_issuer         = "https://accounts.google.com"
 oauth_user_client_id = "<google-oauth-client-id>.apps.googleusercontent.com"
+oauth_cli_client_id  = "<cli-oauth-client-id>.apps.googleusercontent.com"
+oauth_cli_client_secret_secret_version = "1"
+oauth_cli_scope      = "openid email"
 oauth_jwks_url       = "https://www.googleapis.com/oauth2/v3/certs"
 ```
 
-The OAuth client ID is not a secret. OAuth client secrets, if a browser or CLI
-flow later needs one, must not be placed in Terraform variables or state.
+`oauth_user_client_id` is the accepted audience list. `oauth_cli_client_id` is
+the client `buc login` uses to obtain an ID token through the browser/loopback
+flow, and it must also appear in `oauth_user_client_id`. Keep these as separate
+inputs so web/UI clients, smoke identities, and the CLI can evolve without
+teaching users infrastructure endpoints.
+
+The OAuth client ID is not a secret. The CLI OAuth client secret is stored only
+as a Secret Manager value named `<resource-prefix>-<environment>-oauth-cli-client-secret`;
+Terraform receives only `oauth_cli_client_secret_secret_version`. The hosted API
+uses that secret to exchange browser authorization codes for Google tokens and
+then mints Bucephalus session tokens for the CLI. The CLI never receives the
+OAuth client secret, and hosted users should not provide issuer, audience, or API
+endpoint internals during normal login.
 
 ## Secret Boundary
 
@@ -172,6 +186,7 @@ Terraform creates these Secret Manager containers:
 - migrator database URL
 - worker token
 - runner admin token
+- CLI OAuth client secret
 - Modal token ID
 - Modal token secret
 - Modal S3-compatible access key ID

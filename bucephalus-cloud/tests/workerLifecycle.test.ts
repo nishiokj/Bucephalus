@@ -1,11 +1,13 @@
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
 import * as tar from "tar";
 import {
   applyRuntimeNetworkPolicy,
+  collectRuntimeArtifactUploads,
   collectRuntimeSnapshot,
+  coreProgressCompleted,
   coreRunnerEnv,
   coreRunnerFailureMessage,
   dockerRegistryAuthHeaders,
@@ -17,6 +19,12 @@ import { discoverCoreRunIdsFromRunRoot } from "../src/workerEvidence";
 import { canonicalJsonStringify, sha256Digest, type JsonObject } from "../src/primitives";
 
 describe("worker lifecycle cleanup helpers", () => {
+  test("detects Core schedule completion progress lines exactly", () => {
+    expect(coreProgressCompleted("[run] run_20260614_043632_591762_000001: progress 18/18 (100.0%) slot=17 trial=trial_18 status=completed\n")).toBe(true);
+    expect(coreProgressCompleted("[run] run_20260614_043632_591762_000001: progress 17/18 (94.4%) slot=16 trial=trial_17 status=completed\n")).toBe(false);
+    expect(coreProgressCompleted("[run] run_20260614_043632_591762_000001: progress 18/18 (100.0%) slot=17 trial=trial_18 status=failed\n")).toBe(false);
+  });
+
   test("discovers Core run IDs from the attempt run root only", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-worker-lifecycle-"));
     try {
@@ -122,6 +130,62 @@ describe("worker lifecycle cleanup helpers", () => {
     }
   });
 
+  test("collects first-class runtime artifact uploads from Core trial directories", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-artifacts-"));
+    try {
+      const runRoot = join(root, "run-root");
+      const coreRunId = "run_20260529_000001_000001_000001";
+      const trialDir = join(runRoot, coreRunId, "trials", "trial-1");
+      await mkdir(join(trialDir, "agent"), { recursive: true });
+      await mkdir(join(trialDir, "runner"), { recursive: true });
+      await writeFile(join(trialDir, "summary.json"), JSON.stringify({
+        ids: {
+          trial_id: "trial-from-summary",
+        },
+        outcome: "success",
+      }));
+      await writeFile(join(trialDir, "runner", "contract_trace.json"), JSON.stringify({
+        ids: {
+          trial_id: "trial-from-contract",
+          schedule_idx: 7,
+          attempt: 2,
+        },
+      }));
+      await writeFile(join(trialDir, "agent", "result.json"), JSON.stringify({
+        final: "Peter Gregory generated answer",
+      }));
+      await writeFile(join(trialDir, "agent", "stdout.log"), "stdout\n");
+      await writeFile(join(trialDir, "agent", "stderr.log"), "stderr\n");
+      await writeFile(join(trialDir, "agent", "events.jsonl"), `${JSON.stringify({ event_type: "done" })}\n`);
+      await writeFile(join(trialDir, "candidate.patch"), "diff --git a/file b/file\n");
+
+      const uploads = await collectRuntimeArtifactUploads(runRoot, coreRunId);
+
+      expect(uploads.omitted).toEqual([]);
+      expect(uploads.items.map((item) => item.role)).toEqual([
+        "agent_result",
+        "agent_stdout",
+        "agent_stderr",
+        "agent_events",
+        "candidate_patch",
+        "contract_trace",
+        "trial_summary",
+      ]);
+      expect(uploads.items[0]).toMatchObject({
+        coreRunId,
+        trialId: "trial-from-contract",
+        scheduleIdx: 7,
+        attempt: 2,
+        role: "agent_result",
+        relativePath: "agent/result.json",
+        mediaType: "application/json; charset=utf-8",
+      });
+      expect(await readFile(uploads.items[0]!.absolutePath, "utf8")).toContain("Peter Gregory generated answer");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("bounds runtime snapshots across many large trials", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-budget-"));
     try {
@@ -220,7 +284,20 @@ describe("worker lifecycle cleanup helpers", () => {
     expect(config.apiUrl).toBe("https://cloud.example");
     expect(config.runnerPoolId).toBe("pool-1");
     expect(config.workerImageRef).toBe("us-central1-docker.pkg.dev/project/repo/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(config.coreTimeoutMs).toBe(15 * 60 * 1000);
+    expect(config.coreCompletionGraceMs).toBe(120_000);
     expect(config.capabilities.resources).not.toContain("network_perimeter");
+  });
+
+  test("runner config allows an explicit Core process timeout", () => {
+    const config = loadWorkerConfig({
+      BUCEPHALUS_CLOUD_API_URL: "https://cloud.example",
+      BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
+      BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
+      BUCEPHALUS_WORKER_CORE_TIMEOUT_MS: "12345",
+    });
+
+    expect(config.coreTimeoutMs).toBe(12345);
   });
 
   test("runner config requires an explicit Cloud API URL", () => {
@@ -285,6 +362,32 @@ describe("worker lifecycle cleanup helpers", () => {
       "modal sandbox launcher exited before emitting BUCEPHALUS_MODAL_RESULT",
     );
     expect(message).toContain("stderr tail: preflight complete");
+  });
+
+  test("core runner failure message preserves pretty JSON stdout errors", () => {
+    const stdout = JSON.stringify(
+      {
+        command: "run",
+        error: {
+          code: "command_failed",
+          message:
+            "local trial execution failed (trial_id=trial_1, schedule_idx=0): required metric 'model_calls' resolved to null",
+        },
+        ok: false,
+      },
+      null,
+      2,
+    );
+    const stderr = [
+      "[preflight] [PASS] container_ready",
+      "[run] run_20260614_002508_955023_000001: starting schedule execution: slots=18 max_concurrency=1",
+    ].join("\n");
+
+    const message = coreRunnerFailureMessage(1, stdout, stderr);
+
+    expect(message).toContain("command_failed: local trial execution failed");
+    expect(message).toContain("required metric 'model_calls' resolved to null");
+    expect(message).toContain("stderr tail: [preflight] [PASS] container_ready");
   });
 
   test("Docker registry auth header decodes auth-only Docker config entries", async () => {
@@ -372,6 +475,9 @@ describe("worker lifecycle cleanup helpers", () => {
           workerImageRef: null,
           liveEvidence: true,
           evidenceIntervalMs: 2000,
+          coreTimeoutMs: 15 * 60 * 1000,
+          coreCompletionGraceMs: 120_000,
+          apiRequestTimeoutMs: 30_000,
         },
         {
           claimed: true,
@@ -544,6 +650,7 @@ describe("worker lifecycle cleanup helpers", () => {
 
       expect(Object.keys(files)).toEqual(["OPENAI_API_KEY"]);
       expect(files.OPENAI_API_KEY).toBe(join(root, "secrets", "OPENAI_API_KEY.secret"));
+      expect((await stat(files.OPENAI_API_KEY!)).mode & 0o777).toBe(0o444);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

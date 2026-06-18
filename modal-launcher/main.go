@@ -16,6 +16,7 @@ import (
 	"time"
 
 	modal "github.com/modal-labs/modal-client/go"
+	_ "golang.org/x/crypto/x509roots/fallback"
 )
 
 const runtimeTransferArchivePath = "/tmp/bucephalus-runtime-transfer.tar.gz"
@@ -37,6 +38,7 @@ type launchResult struct {
 	Execs                       []execRecord      `json:"execs"`
 	ExitCode                    *int              `json:"exit_code"`
 	TimedOut                    bool              `json:"timed_out"`
+	LauncherError               *string           `json:"launcher_error,omitempty"`
 	StartedAt                   string            `json:"started_at"`
 	EndedAt                     *string           `json:"ended_at"`
 	RuntimeTransferArchiveBytes int64             `json:"runtime_transfer_archive_bytes"`
@@ -1372,6 +1374,8 @@ func runLaunch(specPath string) error {
 		result.TimedOut = isTimeoutError(runErr)
 		appendLauncherError(specPath, spec, runErr)
 		if !result.TimedOut {
+			errText := runErr.Error()
+			result.LauncherError = &errText
 			fatalErr = runErr
 		}
 	}

@@ -49,7 +49,7 @@ echo "== Rust format =="
 cargo fmt --check --all --manifest-path "${ROOT_DIR}/Cargo.toml"
 
 echo "== Hosted product CLI Rust tests =="
-cargo test --manifest-path "${ROOT_DIR}/Cargo.toml" --bin buc
+cargo test --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --no-default-features --features hosted-cli --bin buc
 
 echo "== Cloud typecheck =="
 (

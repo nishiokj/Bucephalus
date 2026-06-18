@@ -11,18 +11,18 @@ Cloud API environment.
 
 ```bash
 buc build experiment.yaml
-buc build experiments/peter/experiment.yaml --context-root .
+buc build experiments/peter/experiment.yaml
 buc build .bucephalus-package
 ```
 
-For YAML, `buc` uploads an authoring context. By default the context is the
-YAML's parent directory. Use `--context-root DIR` when the experiment
-intentionally references shared files under a broader repository/workspace root;
-the YAML must be inside that root, and hosted Core builds the YAML path relative
-to it. The API runs bundled Core in an isolated workspace, imports the produced
-sealed package, and checks the package against the hosted Cloud target. For
-package directories or archives, `buc` uploads/imports the sealed package
-directly and runs the same hosted readiness checks.
+For YAML, `buc` requires a `bucephalus.project.yaml` or
+`bucephalus.project.yml` file above the entrypoint. That manifest is the source
+of truth for the uploaded authoring context:
+project id, package source, declared entrypoints, include/exclude rules, and the
+hosted Cloud target. The API runs bundled Core in an isolated workspace, imports
+the produced sealed package, and checks the package against the hosted Cloud
+target. For package directories or archives, `buc` uploads/imports the sealed
+package directly and runs the same hosted readiness checks.
 
 The YAML authoring context is a Cloud build input, not a raw directory sync.
 `buc` excludes local generated and credential material such as `.env`, `.env.*`,
@@ -32,6 +32,33 @@ paths if a context archive is crafted outside the CLI. Use hosted secrets with
 `buc secrets put` and pass `bucephalus://NAME` refs to `doctor`/`run`; do not
 upload local credential files as build inputs.
 
+Minimal `bucephalus.project.yaml`:
+
+```yaml
+schema_version: bucephalus_project_v1
+project:
+  id: my_evals
+package_sources:
+  default:
+    root: .
+    entrypoints:
+      - experiment.yaml
+      - experiments/peter/experiment.yaml
+    include:
+      - experiment.yaml
+      - cases.jsonl
+      - experiments/peter/**
+      - shared/**
+    exclude:
+      - generated/**
+targets:
+  hosted_cloud: {}
+```
+
+For nested experiments, keep the manifest at the shared project root and list
+the nested YAML as an entrypoint. Do not use command-line root overrides; the
+manifest is the build boundary.
+
 ```bash
 buc secrets put NAME --from-env NAME
 buc doctor <package-digest> --secret-ref NAME=bucephalus://NAME
@@ -40,24 +67,39 @@ buc run <package-digest> --secret-ref NAME=bucephalus://NAME
 
 ## Setup
 
-There is not a separate `buc login` command in this build. Sign-in is currently
-the shared Bucephalus Cloud auth path: log in once with the Core CLI and persist
-the hosted API URL:
+Log in once and persist the hosted API URL:
 
 ```bash
-bucephalus login --resource <api-url>
+buc login
 ```
 
-`buc` then reads the shared Cloud profile and cached OAuth files from
-`BUCEPHALUS_HOME`: `cloud.json`, `auth/cloud_user_token`,
-`auth/cloud_refresh_token`, and `auth/cloud_user_token.json`. If the cache has a
-refresh token, `buc` refreshes the access token before making Cloud API calls.
+Hosted login opens a browser OAuth flow and listens on a local loopback
+callback. No hosted user should need to provide `--api-url`; that option is only
+for development, staging, or self-hosted Cloud. The hosted API publishes the CLI
+OAuth client, scope, and server-side authorization-code exchange path from
+`/v1/auth/config`.
 
-You can also pass credentials per command:
+`buc` sends the browser authorization code and PKCE verifier back to the hosted
+API, which performs the OAuth token exchange with its own server-side secret and
+returns a Bucephalus session token. The CLI never needs the OAuth client secret
+and never asks hosted users for issuer, audience, or internal API endpoint
+details.
+
+`buc` then reads the shared Cloud profile and cached auth files from
+`BUCEPHALUS_HOME`: `cloud.json`, `auth/cloud_user_token`, and
+`auth/cloud_user_token.json`. If a self-hosted OAuth cache includes
+`auth/cloud_refresh_token`, `buc` can refresh the access token before making
+Cloud API calls.
+
+Automation can also pass a token per command:
 
 ```bash
-buc --api-url <api-url> --user-token <token> health
+buc --user-token <token> health
 ```
+
+`--api-url` is for development, staging, and self-hosted Cloud overrides. The
+installed hosted product default is baked into the release from
+`BUCEPHALUS_HOSTED_API_URL`.
 
 Environment variables:
 
@@ -72,11 +114,13 @@ Environment variables:
 Use the top-level workflow commands for day-to-day work:
 
 ```bash
+buc login
+buc auth status
 buc health
 buc author canonicalize experiment.yaml
 buc author resolve experiment.yaml
 buc author validate experiment.yaml --validation-level launch_hint
-buc build <experiment.yaml-or-package> [--context-root DIR]
+buc build <experiment.yaml-or-package>
 buc packages list
 buc inspect <package-digest>
 buc secrets put NAME --from-env NAME
@@ -87,6 +131,7 @@ buc runs list
 buc runs events <run-id>
 buc runs results <run-id>
 buc runs value <run-id> <key>
+buc logout
 ```
 
 Long-form noun commands are equivalent:
@@ -103,7 +148,7 @@ buc packages inspect <package-digest>
 buc secrets list
 buc secrets put <name> --from-env <env-var>
 buc secrets delete <name>
-buc experiments build <experiment.yaml-or-package> [--context-root DIR]
+buc experiments build <experiment.yaml-or-package>
 buc experiments doctor <package-digest> --secret-ref NAME=bucephalus://NAME
 buc runs list
 buc runs create <package-digest> --secret-ref NAME=bucephalus://NAME
@@ -140,11 +185,11 @@ buc runs value <run-id> <key>
    buc build experiment.yaml
    ```
 
-   For nested experiments that reference shared repository files, make the
-   upload boundary explicit:
+   For nested experiments that reference shared repository files, declare the
+   upload boundary in `bucephalus.project.yaml`:
 
    ```bash
-   buc build experiments/peter/experiment.yaml --context-root .
+   buc build experiments/peter/experiment.yaml
    ```
 
    The command returns a `package_digest`. If authoring build, package import,
@@ -251,14 +296,18 @@ buc doctor <package-digest> --secret-ref GEMINI_API_KEY=gcp-secret-manager://pro
 `buc build` currently means:
 
 1. Classify the input as authoring YAML or sealed package.
-2. For YAML, archive the authoring context. The default context is the YAML
-   parent directory; `--context-root DIR` uploads a broader explicit root and
-   sends the YAML path as the hosted Core entrypoint relative to that root.
-   The CLI rejects YAML outside the declared context root. The archive excludes
-   obvious local junk/secrets such as `.git`, `.env*`, `target`, and
-   `node_modules`. The CLI also preflights the context before upload with the
-   same default limits as the API: 10,000 archive entries and 256 MiB expanded
-   bytes. Operators can tune those limits with
+2. For YAML, find `bucephalus.project.yaml` or `bucephalus.project.yml` by
+   walking upward from the entrypoint. The manifest must declare
+   `schema_version: bucephalus_project_v1`, `project.id`,
+   `targets.hosted_cloud`, and the entrypoint in exactly one package source.
+   Each package source must declare non-empty include patterns. The archive root
+   is the manifest directory, not the YAML parent. The archive contains only
+   declared files plus the manifest and entrypoint, minus
+   excluded/generated/credential material such as `.git`, `.env*`, `target`,
+   and `node_modules`. The CLI also
+   preflights the context before upload with the same default limits as the API:
+   10,000 archive entries and 256 MiB expanded bytes. Operators can tune those
+   limits with
    `BUCEPHALUS_CLOUD_MAX_AUTHORING_CONTEXT_ENTRIES` and
    `BUCEPHALUS_CLOUD_MAX_AUTHORING_CONTEXT_EXPANDED_BYTES`.
 3. For sealed package directories, verify obvious package shape and archive the
@@ -318,8 +367,9 @@ and `build_kind: sealed_package_import` for package inputs. It also includes
 
 `build_environment` is the provenance/contract for the hosted build/import. It
 reports the hosted target, immutable source upload evidence (`input_kind`,
-`upload_id`, source archive/package `content_digest`, byte size, and authoring
-entrypoint when applicable), the runtime option object checked for readiness,
+`upload_id`, source archive/package `content_digest`, byte size, authoring
+entrypoint, and project manifest evidence when applicable), the runtime option
+object checked for readiness,
 builder/importer image digest when the deployment provides one, release/git
 metadata when available, and the package/readiness schema contract. For YAML
 authoring inputs, `builder.kind` is `hosted_authoring_builder` and
@@ -333,7 +383,9 @@ about the source it just uploaded: `build_environment.source.upload_id`,
 `content_digest`, and `byte_size` must be present and match the upload created
 by the command and the local archive bytes. For authoring YAML inputs,
 `build_environment.source.entrypoint` must also be present and match the
-entrypoint sent by the command. `build_environment.runtime_options` and
+entrypoint sent by the command. `build_environment.source.project_manifest`
+records the manifest path, digest, project id, package source, source root, and
+entrypoint used for the upload. `build_environment.runtime_options` and
 `cloud_readiness.runtime_options` must also match the runtime options requested
 by the command. The hosted target must be `hosted_cloud/default`, and the
 package contract must match the requested input kind, `sealed_run_package_v2`,

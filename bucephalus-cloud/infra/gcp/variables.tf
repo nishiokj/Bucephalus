@@ -123,6 +123,39 @@ variable "oauth_user_client_id" {
   }
 }
 
+variable "oauth_cli_client_id" {
+  description = "Google OAuth client ID used by the hosted buc CLI login flow. This client must support the CLI browser/loopback flow and must also be included in oauth_user_client_id."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.oauth_cli_client_id == null || (can(regex("^[A-Za-z0-9._-]+\\.apps\\.googleusercontent\\.com$", var.oauth_cli_client_id)) && !can(regex("replace-with", var.oauth_cli_client_id)))
+    error_message = "oauth_cli_client_id must be a real Google OAuth client ID ending in .apps.googleusercontent.com when set."
+  }
+}
+
+variable "oauth_cli_scope" {
+  description = "OAuth scopes requested by buc login for the CLI client."
+  type        = string
+  default     = "openid email"
+
+  validation {
+    condition     = can(regex("^openid(?:[[:space:]]+[A-Za-z0-9:./_-]+)*$", var.oauth_cli_scope))
+    error_message = "oauth_cli_scope must start with openid and contain only space-separated OAuth scope tokens."
+  }
+}
+
+variable "oauth_cli_client_secret_secret_version" {
+  description = "Secret Manager version containing the OAuth client secret used by the hosted API to exchange buc browser login codes."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.oauth_cli_client_secret_secret_version == null || can(regex("^[1-9][0-9]*$", var.oauth_cli_client_secret_secret_version))
+    error_message = "oauth_cli_client_secret_secret_version must be an explicit numeric Secret Manager version when set."
+  }
+}
+
 variable "oauth_jwks_url" {
   description = "JWKS URL used to verify user OAuth bearer tokens. For Google ID tokens this is https://www.googleapis.com/oauth2/v3/certs."
   type        = string

@@ -36,7 +36,7 @@ pub use latch::{
 pub use local_storage::{
     account_sqlite_path, bucephalus_home, cloud_profile_path, cloud_profile_string,
     default_agent_root, default_build_root, default_run_root, read_cloud_profile,
-    write_cloud_profile,
+    write_cloud_profile, BUCEPHALUS_HOME_ENV,
 };
 pub use model::{
     BuildResult, ExecutorKind, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,

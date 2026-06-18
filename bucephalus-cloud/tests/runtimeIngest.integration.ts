@@ -120,6 +120,90 @@ describe("runtime ingest against Postgres", () => {
     });
   }, 30_000);
 
+  test("attempt object content upserts, enriches results, and resolves private storage", async () => {
+    await withScratchDatabase(async (sql) => {
+      const runtime = new RuntimeRepository(sql);
+      const cloudRunId = await seedRunWithAnnouncement(sql);
+      const sha = `sha256:${"b".repeat(64)}`;
+
+      const inserted = await runtime.upsertAttemptObjectContent({
+        core_run_id: CORE_RUN_ID,
+        trial_id: "trial-001",
+        schedule_idx: 0,
+        attempt: 0,
+        role: "agent_result",
+        object_ref: `runtime://${CORE_RUN_ID}/trial-001/0/agent_result/${encodeURIComponent(sha)}`,
+        storage_path: "file:///runtime/objects/agent-result.json",
+        media_type: "application/json; charset=utf-8",
+        byte_size: 42,
+        sha256: sha,
+        relative_path: "agent/result.json",
+        metadata: { source: "integration-test" },
+        recorded_at_ms: 1_234,
+      });
+      expect(inserted.storage_path).toBe("file:///runtime/objects/agent-result.json");
+
+      const results = await runtime.results(cloudRunId, { limit: 10 });
+      expect(results.attempt_objects).toHaveLength(1);
+      expect(results.attempt_objects[0]).toMatchObject({
+        core_run_id: CORE_RUN_ID,
+        trial_id: "trial-001",
+        role: "agent_result",
+        content_available: true,
+        media_type: "application/json; charset=utf-8",
+        byte_size: 42,
+        sha256: sha,
+        relative_path: "agent/result.json",
+      });
+      expect("storage_path" in results.attempt_objects[0]!).toBe(false);
+
+      const resolved = await runtime.attemptObjectContent(cloudRunId, {
+        trialId: "trial-001",
+        role: "agent_result",
+        attempt: 0,
+      });
+      expect(resolved).toMatchObject({
+        storage_path: "file:///runtime/objects/agent-result.json",
+        metadata: { source: "integration-test" },
+      });
+
+      const hiddenByCoreRunScope = await runtime.attemptObjectContent(cloudRunId, {
+        trialId: "trial-001",
+        role: "agent_result",
+        attempt: 0,
+        coreRunId: "run_20260611_other_000001_000001",
+      });
+      expect(hiddenByCoreRunScope).toBeNull();
+
+      await runtime.upsertAttemptObjectContent({
+        core_run_id: CORE_RUN_ID,
+        trial_id: "trial-001",
+        schedule_idx: 0,
+        attempt: 0,
+        role: "agent_result",
+        object_ref: `runtime://${CORE_RUN_ID}/trial-001/0/agent_result/${encodeURIComponent(sha)}-updated`,
+        storage_path: "file:///runtime/objects/agent-result-v2.json",
+        media_type: "application/json; charset=utf-8",
+        byte_size: 84,
+        sha256: sha,
+        relative_path: "agent/result.json",
+        metadata: { source: "integration-test", version: 2 },
+        recorded_at_ms: 1_235,
+      });
+
+      const updated = await runtime.attemptObjectContent(cloudRunId, {
+        trialId: "trial-001",
+        role: "agent_result",
+      });
+      expect(updated).toMatchObject({
+        storage_path: "file:///runtime/objects/agent-result-v2.json",
+        byte_size: 84,
+        metadata: { source: "integration-test", version: 2 },
+      });
+      expect((await runtime.results(cloudRunId, { limit: 10 })).attempt_objects).toHaveLength(1);
+    });
+  }, 30_000);
+
   test("worker lifecycle events expose markers but suppress snapshot payload bodies", async () => {
     await withScratchDatabase(async (sql) => {
       const runtime = new RuntimeRepository(sql);
@@ -140,6 +224,33 @@ describe("runtime ingest against Postgres", () => {
       const snapshot = events.at(-1)!;
       expect(snapshot.payload).toEqual({ note: "runtime snapshot payload omitted from event stream" });
       expect(events[1]!.payload).toEqual({ run_root_dir: "/data/run" });
+    });
+  }, 30_000);
+
+  test("trial progress counts snapshot-only completed trial summaries", async () => {
+    await withScratchDatabase(async (sql) => {
+      const runtime = new RuntimeRepository(sql);
+      const cloudRunId = await seedRunWithAnnouncement(sql);
+      await sql`
+        insert into cloud.run_events (run_id, seq, event_type, payload)
+        values (${cloudRunId}, 2, ${"worker.runtime.snapshot"}, ${sql.json({
+          core_run_id: CORE_RUN_ID,
+          trial_summaries: [
+            { trial_id: "trial-1", summary: { outcome: "success" } },
+            { trial_id: "trial-2", summary: { outcome: "success" } },
+            { trial_id: "trial-3", summary: { outcome: "failed" } },
+          ],
+        })})
+      `;
+
+      const progress = await runtime.trialProgressForCloudRuns([cloudRunId]);
+      expect(progress).toEqual([
+        {
+          cloud_run_id: cloudRunId,
+          trials_completed: 3,
+          trials_total: 3,
+        },
+      ]);
     });
   }, 30_000);
 

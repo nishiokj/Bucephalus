@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/bucephalus_project_v1.json",
+  "title": "Bucephalus Project",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "project", "package_sources", "targets"],
+  "properties": {
+    "schema_version": { "const": "bucephalus_project_v1" },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        }
+      }
+    },
+    "package_sources": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["root", "entrypoints", "include"],
+        "properties": {
+          "root": { "$ref": "#/$defs/relativePath" },
+          "entrypoints": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/$defs/relativePath" },
+            "uniqueItems": true
+          },
+          "include": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/$defs/relativePath" },
+            "uniqueItems": true
+          },
+          "exclude": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/relativePath" },
+            "uniqueItems": true,
+            "default": []
+          }
+        }
+      }
+    },
+    "targets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hosted_cloud"],
+      "properties": {
+        "hosted_cloud": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          { "pattern": "^/" },
+          { "pattern": "\\\\" },
+          { "pattern": "(^|/)\\.\\.(/|$)" },
+          { "pattern": "(^|/)\\.(/|$)" },
+          { "pattern": "//" }
+        ]
+      }
+    }
+  }
+}

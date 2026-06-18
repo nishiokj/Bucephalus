@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
@@ -168,6 +168,102 @@ describe("Cloud run routes", () => {
     expect(body.runs[1].trials_total).toBe(12);
   });
 
+  test("run list can skip runtime enrichment while keeping package names", async () => {
+    const run = {
+      ...runRecord(),
+      run_id: "run-1",
+      package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      status: "queued",
+    };
+    const observed: { packageDigests?: string[]; progressCalled?: boolean } = {};
+    const packages = {
+      async listArtifactsByDigests(packageDigests: string[]) {
+        observed.packageDigests = packageDigests;
+        return [{
+          ...packageRecordWithSecrets(),
+          package_digest: run.package_digest,
+          resolved_experiment_json: { experiment: { name: "Fast List Experiment" } },
+        }];
+      },
+    };
+    const runtime = {
+      async trialProgressForCloudRuns() {
+        observed.progressCalled = true;
+        throw new Error("trialProgressForCloudRuns should not be called");
+      },
+    };
+    const runs = {
+      async listRuns() {
+        return [run];
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs?include_runtime=false"),
+      new URL("https://cloud.example/v1/runs?include_runtime=false"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(observed.packageDigests).toEqual([run.package_digest]);
+    expect(observed.progressCalled).toBeUndefined();
+    expect(body.runs[0].experiment_name).toBe("Fast List Experiment");
+    expect(body.runs[0].trials_completed).toBeUndefined();
+    expect(body.runs[0].trials_total).toBeUndefined();
+    expect(body.runs[0].pending_reason).toBeUndefined();
+  });
+
+  test("run list can omit run config while preserving display fields", async () => {
+    const run = {
+      ...runRecord(),
+      runtime_options: {
+        variant: "opus-4.8",
+        params: { prompt: "large prompt config" },
+      },
+      run_requirements: {
+        ...runRecord().run_requirements,
+        executor: "runner-docker",
+      },
+    };
+    const packageRecord = packageRecordWithSecrets();
+    (packageRecord.resolved_experiment_json as Record<string, unknown>).experiment = { name: "Summary Experiment" };
+    const packages = packagesByDigest([packageRecord]);
+    const runs = {
+      async listRuns() {
+        return [run];
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs?include_runtime=false&include_config=false"),
+      new URL("https://cloud.example/v1/runs?include_runtime=false&include_config=false"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      runtimeProgress([]) as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(body.runs[0].experiment_name).toBe("Summary Experiment");
+    expect(body.runs[0].variant).toBe("opus-4.8");
+    expect(body.runs[0].runtime).toBe("runner-docker");
+    expect(body.runs[0].region).toBeUndefined();
+    expect(body.runs[0].runtime_options).toBeUndefined();
+    expect(body.runs[0].run_requirements).toBeUndefined();
+    expect(body.runs[0].package_provenance).toBeUndefined();
+    expect(body.runs[0].env_keys).toBeUndefined();
+    expect(body.runs[0].secret_ids).toBeUndefined();
+    expect(body.runs[0].pending_reason).toBeUndefined();
+    expect(body.runs[0].trials_completed).toBeUndefined();
+    expect(body.runs[0].trials_total).toBeUndefined();
+    expect(body.runs[0].error_message).toBeUndefined();
+  });
+
   test("run detail includes pending reason for queued runs", async () => {
     const runs = {
       async getRun() {
@@ -224,6 +320,59 @@ describe("Cloud run routes", () => {
     const body = await response!.json();
     expect(body.runs[0].pending_reason).toBe("no_matching_runner");
     expect(body.runs[1].pending_reason).toBe("waiting_for_capacity");
+  });
+
+  test("package lists can omit full config while preserving queue fields", async () => {
+    const record = {
+      ...packageRecordWithSecrets(),
+      manifest_json: {
+        name: "Manifest Name",
+        description: "A package summary",
+        tags: ["nightly", "eval"],
+        owner: "bench-team",
+      },
+      resolved_experiment_json: {
+        experiment: { name: "Resolved Name" },
+        runtime: {
+          secrets: [{ name: "OPENAI_API_KEY", mount: { target: "/run/secrets/openai" } }],
+        },
+      },
+      diagnostics: [{ level: "info", message: "large diagnostics", code: "ok" }],
+      image_refs: ["registry.example/worker@sha256:abc"],
+      owner_key: "issuer:user-a",
+    };
+    const packages = {
+      async listArtifacts(input: { limit?: number }) {
+        expect(input.limit).toBe(5);
+        return [record];
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/packages?limit=5&include_config=false"),
+      new URL("https://cloud.example/v1/packages?limit=5&include_config=false"),
+      packages as unknown as PackageRepository,
+      {} as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(body.packages[0].name).toBe("Resolved Name");
+    expect(body.packages[0].description).toBe("A package summary");
+    expect(body.packages[0].tags).toEqual(["eval", "nightly"]);
+    expect(body.packages[0].owner).toBe("issuer:user-a");
+    expect(body.packages[0].secret_requirements).toEqual([{
+      id: "OPENAI_API_KEY",
+      target: "/run/secrets/openai",
+      required_for_variants: [],
+    }]);
+    expect(body.packages[0].manifest_json).toBeUndefined();
+    expect(body.packages[0].resolved_experiment_json).toBeUndefined();
+    expect(body.packages[0].diagnostics).toBeUndefined();
+    expect(body.packages[0].image_refs).toBeUndefined();
+    expect(body.packages[0].package_provenance).toBeUndefined();
   });
 
   test("rejects malformed pagination query values instead of silently defaulting", async () => {
@@ -708,6 +857,157 @@ describe("Cloud run routes", () => {
     }
   });
 
+  test("worker runtime artifact upload stores bytes and persists content metadata", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-runtime-artifact-upload-"));
+    const previousEnv = captureEnv([
+      "BUCEPHALUS_CLOUD_DATA_DIR",
+      "BUCEPHALUS_CLOUD_STORAGE_BACKEND",
+    ]);
+    process.env.BUCEPHALUS_CLOUD_DATA_DIR = root;
+    process.env.BUCEPHALUS_CLOUD_STORAGE_BACKEND = "filesystem";
+    try {
+      const observed: {
+        verify?: { token: string; attemptId: string; runnerInstanceId?: string | null };
+        persisted?: Record<string, unknown>;
+      } = {};
+      const runs = {
+        async verifyAttemptToken(input: { token: string; attemptId: string; runnerInstanceId?: string | null }) {
+          observed.verify = input;
+          return { runId: "cloud-run-1", ownerKey: "issuer:user-a", packageDigest: runRecord().package_digest };
+        },
+      };
+      const runtime = {
+        async upsertAttemptObjectContent(input: Record<string, unknown>) {
+          observed.persisted = input;
+          return {
+            core_run_id: input.core_run_id,
+            trial_id: input.trial_id,
+            schedule_idx: input.schedule_idx,
+            attempt: input.attempt,
+            role: input.role,
+            object_ref: input.object_ref,
+            storage_path: input.storage_path,
+            media_type: input.media_type,
+            byte_size: input.byte_size,
+            sha256: input.sha256,
+            relative_path: input.relative_path,
+            metadata: input.metadata,
+            recorded_at_ms: input.recorded_at_ms,
+          };
+        },
+      };
+
+      const response = await handleRunRoute(
+        new Request("https://cloud.example/v1/worker/run-attempts/attempt-1/runtime/artifacts", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer attempt-token",
+            "content-type": "application/json; charset=utf-8",
+            "x-bucephalus-runner-instance-id": "runner-instance-1",
+            "x-bucephalus-core-run-id": "run_20260614_051159_561175_000001",
+            "x-bucephalus-trial-id": "trial_1",
+            "x-bucephalus-schedule-idx": "0",
+            "x-bucephalus-trial-attempt": "0",
+            "x-bucephalus-artifact-role": "agent_result",
+            "x-bucephalus-artifact-relative-path": "agent/result.json",
+          },
+          body: JSON.stringify({ final: "generated answer" }),
+        }),
+        new URL("https://cloud.example/v1/worker/run-attempts/attempt-1/runtime/artifacts"),
+        {} as PackageRepository,
+        runs as unknown as RunRepository,
+        runtime as unknown as RuntimeRepository,
+        runnersWithDockerPool() as any,
+        "worker-token",
+      );
+
+      const body = await response!.json();
+      expect(body.artifact).toMatchObject({
+        core_run_id: "run_20260614_051159_561175_000001",
+        trial_id: "trial_1",
+        role: "agent_result",
+        content_available: true,
+        media_type: "application/json; charset=utf-8",
+        byte_size: 28,
+        relative_path: "agent/result.json",
+      });
+      expect(observed.verify).toEqual({
+        token: "attempt-token",
+        attemptId: "attempt-1",
+        runnerInstanceId: "runner-instance-1",
+      });
+      expect(String(observed.persisted?.object_ref)).toContain("runtime://run_20260614_051159_561175_000001/trial_1/0/agent_result/sha256%3A");
+      expect(await readFile(String(observed.persisted?.storage_path), "utf8")).toBe(JSON.stringify({ final: "generated answer" }));
+    } finally {
+      restoreEnv(previousEnv);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("runtime artifact content download streams persisted worker bytes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-runtime-artifact-download-"));
+    try {
+      const storagePath = join(root, "agent-result.json");
+      await writeFile(storagePath, JSON.stringify({ final: "generated answer" }));
+      const observed: Record<string, unknown> = {};
+      const runs = {
+        async getRun(runId: string, ownerKey?: string) {
+          observed.runId = runId;
+          observed.ownerKey = ownerKey;
+          return runRecord();
+        },
+      };
+      const runtime = {
+        async attemptObjectContent(runId: string, input: Record<string, unknown>) {
+          observed.contentRunId = runId;
+          observed.contentInput = input;
+          return {
+            core_run_id: "run_20260614_051159_561175_000001",
+            trial_id: "trial_1",
+            schedule_idx: 0,
+            attempt: 0,
+            role: "agent_result",
+            object_ref: "runtime://run/trial/0/agent_result/sha256",
+            storage_path: storagePath,
+            media_type: "application/json; charset=utf-8",
+            byte_size: 28,
+            sha256: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            relative_path: "agent/result.json",
+            metadata: null,
+            recorded_at_ms: 1,
+          };
+        },
+      };
+
+      const response = await handleRunRoute(
+        new Request("https://cloud.example/v1/runs/run-1/runtime/artifacts/trial_1/agent_result?attempt=0"),
+        new URL("https://cloud.example/v1/runs/run-1/runtime/artifacts/trial_1/agent_result?attempt=0"),
+        {} as PackageRepository,
+        runs as unknown as RunRepository,
+        runtime as unknown as RuntimeRepository,
+        runnersWithDockerPool() as any,
+        "worker-token",
+        authContext("user-a"),
+      );
+
+      expect(await response!.text()).toBe(JSON.stringify({ final: "generated answer" }));
+      expect(response!.headers.get("content-type")).toBe("application/json; charset=utf-8");
+      expect(response!.headers.get("x-bucephalus-artifact-role")).toBe("agent_result");
+      expect(observed).toMatchObject({
+        runId: "run-1",
+        ownerKey: "issuer:user-a",
+        contentRunId: "run-1",
+        contentInput: {
+          trialId: "trial_1",
+          role: "agent_result",
+          attempt: 0,
+        },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("lists only runs for the authenticated owner", async () => {
     const observed: { ownerKey?: string | undefined } = {};
     const runs = {
@@ -740,6 +1040,47 @@ describe("Cloud run routes", () => {
 
     expect(response).not.toBeNull();
     expect(observed.ownerKey).toBe("issuer:user-a");
+  });
+
+  test("filters run lists by package digest before enrichment", async () => {
+    const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const observed: { ownerKey?: string | undefined; packageDigest?: string | undefined; limit?: number | undefined } = {};
+    const runs = {
+      async listRuns(input: { ownerKey?: string | undefined; packageDigest?: string | undefined; limit?: number | undefined }) {
+        observed.ownerKey = input.ownerKey;
+        observed.packageDigest = input.packageDigest;
+        observed.limit = input.limit;
+        return [];
+      },
+    };
+    const packages = {
+      async listArtifactsByDigests() {
+        throw new Error("listArtifactsByDigests should not be called for empty run lists");
+      },
+    };
+    const runtime = {
+      async trialProgressForCloudRuns() {
+        throw new Error("trialProgressForCloudRuns should not be called for empty run lists");
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request(`https://cloud.example/v1/runs?package_digest=${encodeURIComponent(digest)}&limit=12`),
+      new URL(`https://cloud.example/v1/runs?package_digest=${encodeURIComponent(digest)}&limit=12`),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(response).not.toBeNull();
+    expect(observed).toEqual({
+      ownerKey: "issuer:user-a",
+      packageDigest: digest,
+      limit: 12,
+    });
   });
 
   test("creates runs only from packages owned by the authenticated owner", async () => {
@@ -1213,6 +1554,42 @@ describe("Cloud run routes", () => {
       "worker-token",
       authContext("user-a"),
     )).rejects.toThrow("cannot also be supplied in /secret_refs");
+  });
+
+  test("run creation rejects runtime region before queueing", async () => {
+    const packages = {
+      async getArtifact() {
+        return packageRecordWithSecrets();
+      },
+    };
+    const runs = {
+      async createRun() {
+        throw new Error("createRun should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          runtime_options: {
+            region: "us-east-1",
+          },
+          secret_refs: {
+            OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/latest",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    )).rejects.toThrow("/runtime_options/region is not supported for hosted Cloud runs");
   });
 
   test("run creation persists validated plain env separately from secret refs", async () => {

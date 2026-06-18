@@ -235,4 +235,50 @@ describe("evidence pump tailing", () => {
     expect(stats.rows_posted).toBe(3);
     expect(stats.core_runs_announced).toBe(1);
   });
+
+  test("stop does not hang forever behind a stuck event-row post", async () => {
+    const { runRoot, eventsPath } = await workspace();
+    await writeFile(eventsPath, eventLine(0));
+    const io = capturedIo();
+    io.postEventRows = async () => {
+      await new Promise(() => undefined);
+    };
+    const pump = startEvidencePump(io, {
+      runRootDir: runRoot,
+      intervalMs: 60_000,
+      ioTimeoutMs: 20,
+    });
+
+    const stats = await pump.stop();
+
+    expect(stats.post_failures).toBeGreaterThanOrEqual(1);
+    expect(stats.rows_posted).toBe(0);
+    expect(io.errors).toContainEqual(expect.objectContaining({
+      stage: "post_event_rows",
+    }));
+    expect(String(io.errors.at(-1)?.fields.error)).toContain("timed out");
+  });
+
+  test("announcement timeout keeps rows withheld without blocking shutdown", async () => {
+    const { runRoot, eventsPath } = await workspace();
+    await writeFile(eventsPath, eventLine(0));
+    const io = capturedIo();
+    io.announceCoreRuns = async () => {
+      await new Promise(() => undefined);
+    };
+    const pump = startEvidencePump(io, {
+      runRootDir: runRoot,
+      intervalMs: 60_000,
+      ioTimeoutMs: 20,
+    });
+
+    const stats = await pump.stop();
+
+    expect(stats.core_runs_announced).toBe(0);
+    expect(stats.rows_posted).toBe(0);
+    expect(io.errors).toContainEqual(expect.objectContaining({
+      stage: "announce_core_runs",
+    }));
+    expect(String(io.errors.at(-1)?.fields.error)).toContain("timed out");
+  });
 });

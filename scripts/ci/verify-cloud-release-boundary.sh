@@ -78,6 +78,10 @@ const cloudGatesPath = "scripts/ci/cloud-gates.sh";
 const cloudGatesText = read(cloudGatesPath);
 const candidateClassifierPath = "scripts/ci/classify-cloud-candidate-change.sh";
 const candidateClassifierText = read(candidateClassifierPath);
+const modalLauncherGoModPath = "modal-launcher/go.mod";
+const modalLauncherGoModText = read(modalLauncherGoModPath);
+const modalLauncherMainPath = "modal-launcher/main.go";
+const modalLauncherMainText = read(modalLauncherMainPath);
 const deployTfvarsWriterPath = "scripts/deploy/write-gcp-deploy-tfvars.sh";
 const deployTfvarsWriterText = read(deployTfvarsWriterPath);
 const installScriptPath = "scripts/install.sh";
@@ -181,6 +185,21 @@ if (releaseInputNames.length !== 1 || releaseWorkflowInputs.version || releaseWo
 }
 if (!releaseWorkflowText.includes("scripts/release/resolve-release-version.sh")) {
   fail(`${releaseWorkflowPath} must resolve artifact versions from tags or tracked package metadata`);
+}
+if ((releaseWorkflowText.match(/go-version: "1\.25\.x"/g) ?? []).length < 2) {
+  fail(`${releaseWorkflowPath} must build Modal launcher artifacts with Go 1.25.x for embedded fallback root support`);
+}
+if (!candidateWorkflowText.includes('go-version: "1.25.x"')) {
+  fail(`${candidateWorkflowPath} must build Modal launcher candidate artifacts with Go 1.25.x for embedded fallback root support`);
+}
+if (!/^go 1\.25\.0$/m.test(modalLauncherGoModText)) {
+  fail(`${modalLauncherGoModPath} must declare Go 1.25.0 for the fallback root bundle dependency`);
+}
+if (!modalLauncherGoModText.includes("golang.org/x/crypto/x509roots/fallback")) {
+  fail(`${modalLauncherGoModPath} must depend on the maintained fallback root bundle`);
+}
+if (!modalLauncherMainText.includes('_ "golang.org/x/crypto/x509roots/fallback"')) {
+  fail(`${modalLauncherMainPath} must embed fallback TLS roots for worker images without an OS CA bundle`);
 }
 for (const inputName of [
   "cloudflare_worker_name",
@@ -356,6 +375,8 @@ for (const requiredEnv of [
   "BUCEPHALUS_DEPLOYMENT_ENVIRONMENT",
   "BUCEPHALUS_GCP_RESOURCE_PREFIX",
   "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID",
+  "BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_ID",
+  "BUCEPHALUS_GOOGLE_OAUTH_CLI_CLIENT_SECRET_VERSION",
   "BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION",
   "BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION",
   "BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION",
@@ -1146,7 +1167,8 @@ if (!read("scripts/ci/smoke-buc-hosted-workflow.sh").includes("bun run check:pos
 const hostedWorkflowSmokeTest = read("bucephalus-cloud/tests/bucHostedWorkflowSmoke.test.ts");
 for (const requiredFragment of [
   "\"build\"",
-  "--context-root",
+  "bucephalus.project.yaml",
+  "project manifest missing in hosted context",
   "hosted_authoring_build",
   "/authoring_build/source_upload_id",
   "/build_environment/source/upload_id",
@@ -1163,6 +1185,9 @@ for (const requiredFragment of [
   if (!hostedWorkflowSmokeTest.includes(requiredFragment)) {
     fail(`bucephalus-cloud/tests/bucHostedWorkflowSmoke.test.ts must keep the DB-backed smoke on the hosted authoring build path and assert ${requiredFragment}`);
   }
+}
+if (hostedWorkflowSmokeTest.includes("--context-root")) {
+  fail("bucephalus-cloud/tests/bucHostedWorkflowSmoke.test.ts must not keep the removed --context-root workflow alive");
 }
 if (!cloudGatesText.includes("== Cloud Postgres readiness ==") || !cloudGatesText.includes("bun run check:postgres")) {
   fail(`${cloudGatesPath} must preflight Postgres readiness before DB-backed migration and hosted workflow tests`);
@@ -1267,15 +1292,16 @@ if (/runCommand\("docker"|spawn\("docker"/.test(workerText)) {
 
 const runtimePackage = JSON.parse(read("bucephalus-cloud/package.runtime.json"));
 const runtimeDependencies = Object.keys(runtimePackage.dependencies ?? {}).sort();
-if (JSON.stringify(runtimeDependencies) !== JSON.stringify(["postgres", "tar"])) {
-  fail("bucephalus-cloud/package.runtime.json must contain only backend runtime dependencies postgres and tar");
+if (JSON.stringify(runtimeDependencies) !== JSON.stringify(["postgres", "tar", "yaml"])) {
+  fail("bucephalus-cloud/package.runtime.json must contain only backend runtime dependencies postgres, tar, and yaml");
 }
 for (const forbiddenRuntimeDependency of ["react", "react-dom", "vite", "@vitejs/plugin-react", "tailwindcss", "lucide-react", "recharts"]) {
   if (runtimeDependencies.includes(forbiddenRuntimeDependency)) {
     fail(`bucephalus-cloud/package.runtime.json must not include frontend dependency ${forbiddenRuntimeDependency}`);
   }
 }
-if (!read("bucephalus-cloud/bun.runtime.lock").includes('"postgres"') || !read("bucephalus-cloud/bun.runtime.lock").includes('"tar"')) {
+const runtimeLockText = read("bucephalus-cloud/bun.runtime.lock");
+if (!runtimeLockText.includes('"postgres"') || !runtimeLockText.includes('"tar"') || !runtimeLockText.includes('"yaml"')) {
   fail("bucephalus-cloud/bun.runtime.lock must lock backend runtime dependencies");
 }
 
@@ -1506,6 +1532,14 @@ if (!/resource\s+"terraform_data"\s+"deploy_input_preflight"/.test(gcpInfraText)
 }
 if (!/BUCEPHALUS_CLOUD_OAUTH_AUDIENCE[\s\S]*var\.oauth_user_client_id/.test(gcpInfraText)) {
   fail(`${gcpInfraPath} must inject the user OAuth client ID as the API OAuth audience`);
+}
+if (!/variable\s+"oauth_cli_client_secret_secret_version"/.test(gcpVariablesText)) {
+  fail(`${gcpVariablesPath} must require an explicit Secret Manager version for the CLI OAuth client secret`);
+}
+if (
+  !/dynamic\s+"env"\s*\{[\s\S]*for_each\s*=\s*var\.oauth_cli_client_secret_secret_version[\s\S]*name\s*=\s*"BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_SECRET"[\s\S]*secret\s*=\s*google_secret_manager_secret\.control_plane\["oauth_cli_client_secret"\]\.id/.test(gcpInfraText)
+) {
+  fail(`${gcpInfraPath} must inject the CLI OAuth client secret from the project-qualified Secret Manager resource, not Terraform state`);
 }
 if (!/variable\s+"oauth_jwks_url"/.test(gcpVariablesText) || !/https:\/\/www\.googleapis\.com\/oauth2\/v3\/certs/.test(gcpVariablesText)) {
   fail(`${gcpVariablesPath} must require an explicit Google-compatible OAuth JWKS URL`);

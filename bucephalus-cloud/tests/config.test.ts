@@ -42,6 +42,19 @@ describe("config", () => {
     ]);
   });
 
+  test("loads separate CLI OAuth client settings", () => {
+    const config = loadConfig({
+      BUCEPHALUS_CLOUD_OAUTH_AUDIENCE: "web-client.apps.googleusercontent.com, sdk-client.apps.googleusercontent.com",
+      BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_ID: "sdk-client.apps.googleusercontent.com",
+      BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_SECRET: "client-secret",
+      BUCEPHALUS_CLOUD_OAUTH_CLI_SCOPE: "openid email",
+    });
+
+    expect(config.auth.cliClientId).toBe("sdk-client.apps.googleusercontent.com");
+    expect(config.auth.cliClientSecret).toBe("client-secret");
+    expect(config.auth.cliScope).toBe("openid email");
+  });
+
   test("loads an optional runner admin token separately from the worker token", () => {
     const config = loadConfig({
       BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",

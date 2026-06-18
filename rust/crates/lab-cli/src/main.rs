@@ -1758,7 +1758,7 @@ fn auth_status(home: &Path) -> Value {
         "actions": [
             {
                 "type": "cli_command",
-                "command": "bucephalus login",
+                "command": "buc login",
                 "description": "Start OAuth device login and cache Cloud tokens for this user."
             }
         ],
@@ -5763,7 +5763,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     result["auth"]["status"].as_str().unwrap_or("unknown")
                 );
                 if result["auth"]["status"].as_str() == Some("missing") {
-                    println!("auth_next: bucephalus login");
+                    println!("auth_next: buc login");
                 }
                 if let Some(clients) = result["mcp"]["clients"].as_array() {
                     for client in clients {
@@ -5848,7 +5848,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 result["auth"]["status"].as_str().unwrap_or("unknown")
             );
             if result["auth"]["status"].as_str() == Some("missing") {
-                println!("auth_next: bucephalus login");
+                println!("auth_next: buc login");
             }
             return Ok(Some(result));
         }
@@ -11944,7 +11944,7 @@ mod tests {
             !note.contains("resolution and upload"),
             "auth status should not imply the retired Cloud upload workflow is required: {note}"
         );
-        assert_eq!(status["actions"][0]["command"], "bucephalus login");
+        assert_eq!(status["actions"][0]["command"], "buc login");
     }
 
     #[test]
@@ -11992,9 +11992,9 @@ mod tests {
             Some("Cloud API requires OAuth bearer authentication"),
         );
         assert!(message.contains("Cloud upload requires Cloud authentication"));
-        assert!(message.contains("bucephalus login --resource <hosted-api-url>"));
+        assert!(message.contains("buc login"));
         assert!(message.contains("BUCEPHALUS_CLOUD_USER_TOKEN"));
-        assert!(message.contains("bucephalus setup status"));
+        assert!(message.contains("buc auth status"));
         assert!(message.contains("buc health"));
     }
 

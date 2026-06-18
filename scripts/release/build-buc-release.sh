@@ -129,6 +129,17 @@ sha256_tree() {
   ) | sha256_text
 }
 
+runtime_dist_cache_manifest() {
+  local root="$1"
+  cat <<EOF
+build_script_sha256=$(sha256_file "${ROOT_DIR}/scripts/release/build-buc-release.sh")
+package_runtime_sha256=$(sha256_file "${root}/bucephalus-cloud/package.runtime.json")
+bun_runtime_lock_sha256=$(sha256_file "${root}/bucephalus-cloud/bun.runtime.lock")
+tsconfig_sha256=$(sha256_file "${root}/bucephalus-cloud/tsconfig.json")
+src_tree_sha256=$(sha256_tree "${root}/bucephalus-cloud/src")
+EOF
+}
+
 require_command cargo
 require_command bun
 require_command git
@@ -138,13 +149,20 @@ require_command tar
 
 runtime_dist_ready() {
   local dir="$1"
+  local expected
+  local actual
   [[ -f "${dir}/server.js" \
     && -f "${dir}/worker.js" \
     && -f "${dir}/db/migrate.js" \
     && -f "${dir}/db/promoteWorkerImage.js" \
     && -f "${dir}/poolController.js" \
     && -f "${dir}/secretResolver.js" \
-    && -f "${dir}/networkPolicyClient.js" ]]
+    && -f "${dir}/networkPolicyClient.js" \
+    && -f "${dir}/.cache-inputs" ]] || return 1
+
+  expected="$(runtime_dist_cache_manifest "${RELEASE_DIR}")"
+  actual="$(cat "${dir}/.cache-inputs")"
+  [[ "${actual}" == "${expected}" ]]
 }
 
 CARGO_BUILD_SUBCOMMAND="${BUCEPHALUS_RELEASE_CARGO_BUILD_SUBCOMMAND:-build}"
@@ -221,10 +239,10 @@ if [[ -n "${WORKER_RUNNER_BIN_INPUT}" ]]; then
 else
   echo "== Building bucephalus-worker-runner ${VERSION} =="
   if [[ -n "${TARGET}" ]]; then
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus-worker-runner --target "${TARGET}"
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features worker-runner-postgres --bin bucephalus-worker-runner --target "${TARGET}"
     WORKER_RUNNER_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus-worker-runner"
   else
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus-worker-runner
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --no-default-features --features worker-runner-postgres --bin bucephalus-worker-runner
     WORKER_RUNNER_BIN="${ROOT_DIR}/target/release/bucephalus-worker-runner"
   fi
 fi
@@ -328,6 +346,7 @@ else
   )
   rm -rf "${RUNTIME_BUILD_DIR}"
   RUNTIME_BUILD_DIR=""
+  runtime_dist_cache_manifest "${RELEASE_DIR}" > "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/.cache-inputs"
   if [[ -n "${RUNTIME_DIST_CACHE_DIR}" ]]; then
     rm -rf "${RUNTIME_DIST_CACHE_DIR}"
     mkdir -p "${RUNTIME_DIST_CACHE_DIR}"

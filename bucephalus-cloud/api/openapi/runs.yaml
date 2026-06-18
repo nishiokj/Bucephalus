@@ -19,6 +19,13 @@ paths:
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - $ref: './common.yaml#/components/parameters/Limit'
+        - name: include_config
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+          description: Include full manifest, resolved experiment, diagnostics, provenance, and image metadata.
       responses:
         '200':
           description: Package artifacts.
@@ -121,6 +128,26 @@ paths:
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - $ref: './common.yaml#/components/parameters/Limit'
+        - name: package_digest
+          in: query
+          required: false
+          schema:
+            $ref: './common.yaml#/components/schemas/Digest'
+          description: Restrict results to runs created from a specific package artifact.
+        - name: include_runtime
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+          description: Include runtime progress and queued pending-reason enrichment.
+        - name: include_config
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+          description: Include run config blobs such as runtime options, requirements, provenance, and env/secret key summaries.
       responses:
         '200':
           description: Run records.
@@ -338,6 +365,91 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RuntimeResults'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/artifacts/{trial_id}/{role}:
+    get:
+      operationId: downloadRunRuntimeArtifact
+      summary: Download persisted runtime artifact content for a trial.
+      description: >
+        Streams first-class artifact bytes uploaded by a worker for a completed
+        or running Cloud run. Authorization follows the owning run; private
+        object-storage paths are resolved server-side and are not exposed to the
+        caller.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: trial_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: role
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z][a-z0-9_]{0,63}$'
+        - name: attempt
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+        - name: core_run_id
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: '^run_[A-Za-z0-9_.-]+$'
+      responses:
+        '200':
+          description: Runtime artifact bytes.
+          headers:
+            X-Bucephalus-Core-Run-Id:
+              schema:
+                type: string
+            X-Bucephalus-Trial-Id:
+              schema:
+                type: string
+            X-Bucephalus-Artifact-Role:
+              schema:
+                type: string
+            X-Bucephalus-Object-Ref:
+              schema:
+                type: string
+            X-Bucephalus-Sha256:
+              schema:
+                $ref: './common.yaml#/components/schemas/Digest'
+          content:
+            application/json:
+              schema:
+                type: string
+                format: binary
+            application/x-ndjson:
+              schema:
+                type: string
+                format: binary
+            text/plain:
+              schema:
+                type: string
+                format: binary
+            text/x-diff:
+              schema:
+                type: string
+                format: binary
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
         '400':
           $ref: './common.yaml#/components/responses/BadRequest'
         '404':
@@ -592,6 +704,102 @@ paths:
                     type: integer
                   upserted:
                     type: integer
+        '401':
+          $ref: './common.yaml#/components/responses/Unauthorized'
+  /v1/worker/run-attempts/{attempt_id}/runtime/artifacts:
+    post:
+      operationId: uploadRunAttemptRuntimeArtifact
+      summary: Upload a first-class runtime artifact for a run attempt.
+      security:
+        - workerAttemptBearerAuth: []
+      description: >
+        Worker artifact ingestion. The request body is the raw artifact bytes.
+        The API verifies the attempt token, stores bytes in the configured object
+        backend, and upserts runtime attempt-object metadata so result payloads
+        can resolve content later.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+        - name: X-Bucephalus-Runner-Instance-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: X-Bucephalus-Core-Run-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: '^run_[A-Za-z0-9_.-]+$'
+        - name: X-Bucephalus-Trial-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: X-Bucephalus-Schedule-Idx
+          in: header
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: X-Bucephalus-Trial-Attempt
+          in: header
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: X-Bucephalus-Artifact-Role
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z][a-z0-9_]{0,63}$'
+        - name: X-Bucephalus-Artifact-Relative-Path
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: string
+              format: binary
+          application/x-ndjson:
+            schema:
+              type: string
+              format: binary
+          text/plain:
+            schema:
+              type: string
+              format: binary
+          text/x-diff:
+            schema:
+              type: string
+              format: binary
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: Runtime artifact stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - artifact
+                properties:
+                  artifact:
+                    $ref: '#/components/schemas/RuntimeAttemptObject'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '401':
           $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/worker/run-attempts/{attempt_id}/complete:
@@ -1098,10 +1306,6 @@ components:
       required:
         - package_digest
         - status
-        - package_provenance
-        - manifest_json
-        - resolved_experiment_json
-        - diagnostics
         - created_at
         - updated_at
       properties:
@@ -1114,6 +1318,21 @@ components:
           description: >
             Human-readable package identity, taken from the resolved
             experiment's name sealed inside the package.
+        description:
+          type:
+            - string
+            - 'null'
+          description: Short package summary when available.
+        tags:
+          type: array
+          items:
+            type: string
+          description: Package tags from manifest or resolved experiment metadata.
+        owner:
+          type:
+            - string
+            - 'null'
+          description: Owning principal or manifest-declared owner when available.
         upload_id:
           type:
             - string
@@ -1147,6 +1366,24 @@ components:
           description: Task/runtime container image references discovered in the sealed package.
         package_provenance:
           $ref: '#/components/schemas/CloudPackageProvenance'
+        secret_requirements:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - id
+              - target
+              - required_for_variants
+            properties:
+              id:
+                type: string
+              target:
+                type: string
+              required_for_variants:
+                type: array
+                items:
+                  type: string
         status:
           type: string
           enum:
@@ -1165,14 +1402,9 @@ components:
         - run_id
         - package_digest
         - experiment_name
+        - variant
+        - runtime
         - status
-        - pending_reason
-        - trials_completed
-        - trials_total
-        - package_provenance
-        - env
-        - secret_refs
-        - runtime_options
         - created_at
         - updated_at
       properties:
@@ -1193,6 +1425,16 @@ components:
           type:
             - string
             - 'null'
+        variant:
+          type:
+            - string
+            - 'null'
+          description: Lightweight display variant extracted from runtime options when available.
+        runtime:
+          type:
+            - string
+            - 'null'
+          description: Lightweight display runtime executor extracted from run requirements when available.
         status:
           type: string
           enum:
@@ -1212,7 +1454,7 @@ components:
             - null
           description: >
             Queue diagnosis for created or waiting_for_runner runs. Null for
-            non-queued runs.
+            non-queued runs. Omitted when include_runtime is false.
         trials_completed:
           type:
             - integer
@@ -1221,6 +1463,7 @@ components:
           description: >
             Count of completed trial schedule slots observed in runtime
             conclusion rows. Null when runtime progress is not yet known.
+            Omitted when include_runtime is false.
         trials_total:
           type:
             - integer
@@ -1229,28 +1472,23 @@ components:
           description: >
             Total trial schedule slots observed from runtime
             schedule_progress_v2.total_slots. Null before the run emits its
-            first schedule progress snapshot.
-        env:
-          type: object
-          additionalProperties:
-            type: string
-            maxLength: 32768
-          description: >
-            Plain non-secret environment values supplied for this run. Keys
-            obey the same constraints as the create-run request and never
-            overlap with secret_refs keys.
-        secret_refs:
-          type: object
-          additionalProperties:
+            first schedule progress snapshot. Omitted when include_runtime is
+            false.
+        env_keys:
+          type: array
+          items:
             type: string
           description: >
-            Attempt-scoped secret declarations. Values are provider/control-plane
-            references, not runner-local file paths; hosted bucephalus:// refs
-            are already translated to backing provider refs by run creation.
-            Workers must materialize them through the configured secret resolver
-            for the claimed attempt. Provider refs currently include GCP Secret
-            Manager and AWS Secrets Manager forms; env/file refs require
-            explicit local-development opt-in.
+            Plain non-secret environment keys supplied for this run. Present
+            only when include_config is true; values are never exposed.
+        secret_ids:
+          type: array
+          items:
+            type: string
+          description: >
+            Attempt-scoped secret ids supplied for this run. Present only when
+            include_config is true; provider refs are never exposed in public
+            run responses.
         runtime_options:
           $ref: '#/components/schemas/CloudRuntimeOptions'
         run_requirements:
@@ -1739,6 +1977,27 @@ components:
           $ref: './common.yaml#/components/schemas/AnyJson'
         recorded_at_ms:
           type: integer
+        content_available:
+          type: boolean
+          description: True when this object ref has persisted bytes available through the runtime artifact download endpoint.
+        media_type:
+          type:
+            - string
+            - 'null'
+        byte_size:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+        sha256:
+          type:
+            - string
+            - 'null'
+          pattern: '^sha256:[0-9a-f]{64}$'
+        relative_path:
+          type:
+            - string
+            - 'null'
     RunAttempt:
       type: object
       additionalProperties: false

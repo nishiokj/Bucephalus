@@ -1,12 +1,13 @@
 import { authOwnerKey, type AuthContext } from "../auth";
-import { HttpError, jsonResponse, optionalQueryInteger, optionalString, queryInteger, readJsonObject, requireBearerToken, requireString } from "../http";
+import { HttpError, jsonResponse, optionalQueryInteger, optionalString, queryInteger, readJsonObject, readRequestBytes, requireBearerToken, requireString } from "../http";
 import { logError, newTraceContext } from "../logging";
-import { readStoredObject } from "../objectStorage";
-import type { JsonObject, JsonValue } from "../primitives";
+import { putRuntimeObject, readStoredObject } from "../objectStorage";
+import { sha256Digest, type JsonObject, type JsonValue } from "../primitives";
 import {
   RuntimeRepository,
   type RuntimeEventRecord,
   type RuntimeEventRowInsert,
+  type RuntimeAttemptObjectContentRecord,
   type WorkerLifecycleEventRecord,
 } from "../runtime/repository";
 import { RunnerRepository, type RunnerInstanceRecord, type RunnerPoolRecord } from "../runners/repository";
@@ -79,6 +80,10 @@ export async function handleRunRoute(
     return ingestRuntimeEventRows(request, url, runs, runtime);
   }
 
+  if (request.method === "POST" && workerAttemptPath(url.pathname, "/runtime/artifacts")) {
+    return uploadRuntimeArtifact(request, url, runs, runtime);
+  }
+
   if (request.method === "POST" && workerAttemptPath(url.pathname, "/complete")) {
     return completeAttempt(request, url, runs);
   }
@@ -117,8 +122,9 @@ export async function handleRunRoute(
 
   if (request.method === "GET" && url.pathname === "/v1/packages") {
     const limit = limitFromUrl(url);
+    const includeConfig = optionalBooleanFromUrl(url, "include_config", true);
     const artifacts = await packages.listArtifacts({ limit, ownerKey });
-    return jsonResponse({ packages: artifacts.map(packageToWire) });
+    return jsonResponse({ packages: artifacts.map((artifact) => packageToWire(artifact, { includeConfig })) });
   }
 
   if (request.method === "GET" && packagePath(url.pathname)) {
@@ -130,7 +136,7 @@ export async function handleRunRoute(
     if (!artifact) {
       throw new HttpError(404, "package_not_found", "Package artifact not found");
     }
-    return jsonResponse(packageToWire(artifact));
+    return jsonResponse(packageToWire(artifact, { includeConfig: true }));
   }
 
   if (request.method === "POST" && url.pathname === "/v1/runs") {
@@ -139,9 +145,12 @@ export async function handleRunRoute(
 
   if (request.method === "GET" && url.pathname === "/v1/runs") {
     const limit = limitFromUrl(url);
-    const records = await runs.listRuns({ limit, ownerKey });
-    const enrichment = await enrichRuns(records, packages, runtime, runners, ownerKey);
-    return jsonResponse({ runs: records.map((run) => runToWire(run, enrichment.get(run.run_id))) });
+    const packageDigest = optionalPackageDigestFromUrl(url);
+    const includeRuntime = optionalBooleanFromUrl(url, "include_runtime", true);
+    const includeConfig = optionalBooleanFromUrl(url, "include_config", true);
+    const records = await runs.listRuns({ limit, ownerKey, packageDigest });
+    const enrichment = await enrichRuns(records, packages, runtime, runners, ownerKey, { includeRuntime });
+    return jsonResponse({ runs: records.map((run) => runToWire(run, enrichment.get(run.run_id), { includeConfig, includeRuntime })) });
   }
 
   const runtimeRoute = runtimePath(url.pathname);
@@ -171,6 +180,9 @@ export async function handleRunRoute(
       return jsonResponse(await runtime.results(runtimeRoute.runId, {
         limit: limitFromUrl(url),
       }));
+    }
+    if (runtimeRoute.kind === "artifact") {
+      return runtimeArtifactContent(url, runtimeRoute, runtime);
     }
     return jsonResponse({
       cloud_run_id: runtimeRoute.runId,
@@ -206,10 +218,35 @@ function optionalIntFromUrl(url: URL, key: string): number | undefined {
   return optionalQueryInteger(url, key, { min: 0 });
 }
 
+function optionalPackageDigestFromUrl(url: URL): string | undefined {
+  const value = optionalString(url.searchParams.get("package_digest"), "/package_digest");
+  return value === null ? undefined : requirePackageDigest(value, "/package_digest");
+}
+
+function optionalBooleanFromUrl(url: URL, key: string, defaultValue: boolean): boolean {
+  const value = optionalString(url.searchParams.get(key), `/${key}`);
+  if (value === null) return defaultValue;
+  switch (value.trim().toLowerCase()) {
+    case "1":
+    case "true":
+    case "yes":
+    case "on":
+      return true;
+    case "0":
+    case "false":
+    case "no":
+    case "off":
+      return false;
+    default:
+      throw new HttpError(400, "invalid_request", `/${key} must be a boolean`);
+  }
+}
+
 function runtimePath(pathname: string):
   | { kind: "summary"; runId: string }
   | { kind: "events"; runId: string }
   | { kind: "results"; runId: string }
+  | { kind: "artifact"; runId: string; trialId: string; role: string }
   | { kind: "kv"; runId: string; key: string }
   | null {
   const prefix = "/v1/runs/";
@@ -225,6 +262,9 @@ function runtimePath(pathname: string):
   }
   if (parts.length === 3 && parts[1] === "runtime" && parts[2] === "results") {
     return { kind: "results", runId: parts[0] ?? "" };
+  }
+  if (parts.length === 5 && parts[1] === "runtime" && parts[2] === "artifacts") {
+    return { kind: "artifact", runId: parts[0] ?? "", trialId: parts[3] ?? "", role: parts[4] ?? "" };
   }
   if (parts.length === 4 && parts[1] === "runtime" && parts[2] === "kv") {
     return { kind: "kv", runId: parts[0] ?? "", key: parts[3] ?? "" };
@@ -278,6 +318,8 @@ async function appendRunEvent(
 const INGEST_MAX_ROWS_PER_BATCH = 500;
 const INGEST_MAX_ROW_PAYLOAD_BYTES = 64 * 1024;
 const CORE_RUN_ID_PATTERN = /^run_[A-Za-z0-9_.-]+$/;
+const RUNTIME_ARTIFACT_ROLE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+const DEFAULT_MAX_RUNTIME_ARTIFACT_BYTES = 16 * 1024 * 1024;
 
 async function ingestRuntimeEventRows(
   request: Request,
@@ -304,6 +346,121 @@ async function ingestRuntimeEventRows(
   );
   const upserted = await runtime.upsertEventRows(rows);
   return jsonResponse({ received: rows.length, upserted });
+}
+
+async function uploadRuntimeArtifact(
+  request: Request,
+  url: URL,
+  runs: RunRepository,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const attemptId = attemptIdFromWorkerPath(url.pathname, "/runtime/artifacts");
+  const runnerInstanceId = requireHeader(request, "x-bucephalus-runner-instance-id", "runtime artifact upload");
+  const { runId } = await requireAttemptToken(request, runs, { attemptId, runnerInstanceId });
+  const coreRunId = requireCoreRunId(requireHeader(request, "x-bucephalus-core-run-id", "runtime artifact upload"), "/headers/x-bucephalus-core-run-id");
+  const trialId = requireArtifactToken(requireHeader(request, "x-bucephalus-trial-id", "runtime artifact upload"), "/headers/x-bucephalus-trial-id");
+  const role = requireArtifactRole(requireHeader(request, "x-bucephalus-artifact-role", "runtime artifact upload"), "/headers/x-bucephalus-artifact-role");
+  const scheduleIdx = nonNegativeHeaderInt(request, "x-bucephalus-schedule-idx", "runtime artifact upload");
+  const attempt = nonNegativeHeaderInt(request, "x-bucephalus-trial-attempt", "runtime artifact upload");
+  const mediaType = request.headers.get("content-type")?.trim() || "application/octet-stream";
+  const relativePath = optionalHeader(request, "x-bucephalus-artifact-relative-path");
+  const bytes = await readRequestBytes(request, maxRuntimeArtifactBytes(), "Runtime artifact body");
+  const digest = sha256Digest(bytes);
+  const objectRef = runtimeObjectRef({
+    coreRunId,
+    trialId,
+    attempt,
+    role,
+    digest,
+  });
+  const storagePath = await putRuntimeObject({
+    cloudRunId: runId,
+    attemptId,
+    coreRunId,
+    trialId,
+    trialAttempt: attempt,
+    role,
+    bytes,
+    mediaType,
+  });
+  const metadata = {
+    source: "worker_runtime_artifact_upload",
+    cloud_run_id: runId,
+    attempt_id: attemptId,
+    runner_instance_id: runnerInstanceId,
+    relative_path: relativePath,
+    media_type: mediaType,
+    byte_size: bytes.byteLength,
+    sha256: digest,
+  };
+  const record = await runtime.upsertAttemptObjectContent({
+    core_run_id: coreRunId,
+    trial_id: trialId,
+    schedule_idx: scheduleIdx,
+    attempt,
+    role,
+    object_ref: objectRef,
+    storage_path: storagePath,
+    media_type: mediaType,
+    byte_size: bytes.byteLength,
+    sha256: digest,
+    relative_path: relativePath ?? null,
+    metadata,
+    recorded_at_ms: Date.now(),
+  });
+  return jsonResponse({ artifact: runtimeArtifactToWire(record) }, { status: 201 });
+}
+
+async function runtimeArtifactContent(
+  url: URL,
+  route: { runId: string; trialId: string; role: string },
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const trialId = requireArtifactToken(route.trialId, "/trial_id");
+  const role = requireArtifactRole(route.role, "/role");
+  const attempt = optionalQueryInteger(url, "attempt", { min: 0 });
+  const coreRunId = optionalString(url.searchParams.get("core_run_id"), "/core_run_id");
+  if (coreRunId !== null) {
+    requireCoreRunId(coreRunId, "/core_run_id");
+  }
+  const artifact = await runtime.attemptObjectContent(route.runId, {
+    trialId,
+    role,
+    ...(attempt !== undefined ? { attempt } : {}),
+    ...(coreRunId !== null ? { coreRunId } : {}),
+  });
+  if (!artifact) {
+    throw new HttpError(404, "runtime_artifact_not_found", "Runtime artifact content not found");
+  }
+  const bytes = await readStoredObject(artifact.storage_path);
+  return new Response(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer, {
+    headers: {
+      "content-type": artifact.media_type || "application/octet-stream",
+      "content-length": String(bytes.byteLength),
+      "x-bucephalus-core-run-id": artifact.core_run_id,
+      "x-bucephalus-trial-id": artifact.trial_id,
+      "x-bucephalus-artifact-role": artifact.role,
+      "x-bucephalus-object-ref": artifact.object_ref,
+      "x-bucephalus-sha256": artifact.sha256,
+    },
+  });
+}
+
+function runtimeArtifactToWire(record: RuntimeAttemptObjectContentRecord): JsonObject {
+  return {
+    core_run_id: record.core_run_id,
+    trial_id: record.trial_id,
+    schedule_idx: record.schedule_idx,
+    attempt: record.attempt,
+    role: record.role,
+    object_ref: record.object_ref,
+    content_available: true,
+    media_type: record.media_type,
+    byte_size: record.byte_size,
+    sha256: record.sha256,
+    relative_path: record.relative_path,
+    recorded_at_ms: record.recorded_at_ms,
+  };
 }
 
 function runtimeEventRowFromWire(
@@ -353,6 +510,69 @@ function nonNegativeInt(value: unknown, pointer: string): number {
     throw new HttpError(400, "invalid_integer", `${pointer} must be a non-negative integer`);
   }
   return value;
+}
+
+function nonNegativeHeaderInt(request: Request, name: string, scope: string): number {
+  const raw = requireHeader(request, name, scope);
+  if (!/^[0-9]+$/.test(raw)) {
+    throw new HttpError(400, "invalid_header", `${name} must be a non-negative integer`);
+  }
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(value)) {
+    throw new HttpError(400, "invalid_header", `${name} must be a safe integer`);
+  }
+  return value;
+}
+
+function requireCoreRunId(value: string, pointer: string): string {
+  if (!CORE_RUN_ID_PATTERN.test(value)) {
+    throw new HttpError(400, "invalid_core_run_id", `${pointer} is not a Core run id`);
+  }
+  return value;
+}
+
+function requireArtifactToken(value: string, pointer: string): string {
+  if (value.length === 0 || value.length > 256 || value.includes("\0")) {
+    throw new HttpError(400, "invalid_request", `${pointer} must be a non-empty artifact identifier`);
+  }
+  return value;
+}
+
+function requireArtifactRole(value: string, pointer: string): string {
+  if (!RUNTIME_ARTIFACT_ROLE_PATTERN.test(value)) {
+    throw new HttpError(400, "invalid_request", `${pointer} must be a lowercase runtime artifact role`);
+  }
+  return value;
+}
+
+function optionalHeader(request: Request, name: string): string | null {
+  const value = request.headers.get(name)?.trim();
+  return value && value.length > 0 ? value : null;
+}
+
+function runtimeObjectRef(input: {
+  coreRunId: string;
+  trialId: string;
+  attempt: number;
+  role: string;
+  digest: string;
+}): string {
+  return `runtime://${[
+    input.coreRunId,
+    input.trialId,
+    String(input.attempt),
+    input.role,
+    input.digest,
+  ].map(encodeURIComponent).join("/")}`;
+}
+
+function maxRuntimeArtifactBytes(): number {
+  const raw = process.env.BUCEPHALUS_CLOUD_MAX_RUNTIME_ARTIFACT_BYTES;
+  if (!raw) {
+    return DEFAULT_MAX_RUNTIME_ARTIFACT_BYTES;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_RUNTIME_ARTIFACT_BYTES;
 }
 
 /**
@@ -1240,23 +1460,32 @@ function escapeJsonPointer(value: string): string {
   return value.replaceAll("~", "~0").replaceAll("/", "~1");
 }
 
-function packageToWire(artifact: PackageArtifactRecord) {
-  return {
+function packageToWire(artifact: PackageArtifactRecord, options: { includeConfig: boolean }) {
+  const summary = {
     package_digest: artifact.package_digest,
     name: packageName(artifact),
+    description: packageDescription(artifact),
+    tags: packageTags(artifact),
+    owner: packageOwner(artifact),
     upload_id: artifact.upload_id,
     byte_size: nullableNumber(artifact.byte_size),
     media_type: artifact.media_type,
-    manifest_json: artifact.manifest_json,
-    resolved_experiment_json: artifact.resolved_experiment_json,
     target: artifact.target,
-    image_refs: artifact.image_refs,
-    package_provenance: artifact.package_provenance,
     secret_requirements: packageSecretRequirements(artifact),
-    diagnostics: artifact.diagnostics,
     status: artifact.status,
     created_at: artifact.created_at,
     updated_at: artifact.updated_at,
+  };
+  if (!options.includeConfig) {
+    return summary;
+  }
+  return {
+    ...summary,
+    manifest_json: artifact.manifest_json,
+    resolved_experiment_json: artifact.resolved_experiment_json,
+    image_refs: artifact.image_refs,
+    package_provenance: artifact.package_provenance,
+    diagnostics: artifact.diagnostics,
   };
 }
 
@@ -1266,17 +1495,19 @@ async function enrichRuns(
   runtime: RuntimeRepository,
   runners: RunnerRepository,
   ownerKey?: string,
+  options: { includeRuntime?: boolean } = {},
 ): Promise<Map<string, RunWireEnrichment>> {
   if (runs.length === 0) {
     return new Map();
   }
   const runIds = runs.map((run) => run.run_id);
   const packageDigests = [...new Set(runs.map((run) => run.package_digest))].sort();
-  const queuedRuns = runs.filter((run) => isQueuedRunStatus(run.status));
+  const includeRuntime = options.includeRuntime ?? true;
+  const queuedRuns = includeRuntime ? runs.filter((run) => isQueuedRunStatus(run.status)) : [];
   const [artifacts, progress, pendingReasons] = await Promise.all([
     packages.listArtifactsByDigests(packageDigests, ownerKey),
-    runtime.trialProgressForCloudRuns(runIds),
-    pendingReasonsForRuns(queuedRuns, runners),
+    includeRuntime ? runtime.trialProgressForCloudRuns(runIds) : Promise.resolve([]),
+    includeRuntime ? pendingReasonsForRuns(queuedRuns, runners) : Promise.resolve(new Map<string, PendingReason>()),
   ]);
   const artifactByDigest = new Map(artifacts.map((artifact) => [artifact.package_digest, artifact]));
   const progressByRunId = new Map(progress.map((item) => [item.cloud_run_id, item]));
@@ -1305,6 +1536,46 @@ function packageName(artifact: PackageArtifactRecord): string | null {
     }
   }
   return null;
+}
+
+function packageDescription(artifact: PackageArtifactRecord): string | null {
+  for (const candidate of [
+    jsonPointerValue(artifact.manifest_json, "/description"),
+    jsonPointerValue(artifact.resolved_experiment_json, "/description"),
+    jsonPointerValue(artifact.resolved_experiment_json, "/experiment/description"),
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
+}
+
+function packageTags(artifact: PackageArtifactRecord): string[] {
+  const manifestTags = jsonPointerValue(artifact.manifest_json, "/tags");
+  const resolvedTags = jsonPointerValue(artifact.resolved_experiment_json, "/tags");
+  return [...new Set([...stringArray(manifestTags), ...stringArray(resolvedTags)])].sort();
+}
+
+function packageOwner(artifact: PackageArtifactRecord): string | null {
+  for (const candidate of [
+    artifact.owner_key,
+    jsonPointerValue(artifact.manifest_json, "/owner"),
+    jsonPointerValue(artifact.manifest_json, "/author"),
+    jsonPointerValue(artifact.resolved_experiment_json, "/owner"),
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
 }
 
 function validatePackageSecretRefs(
@@ -1400,29 +1671,79 @@ function nullableNumber(value: number | string | null): number | null {
   return typeof value === "number" ? value : Number.parseInt(value, 10);
 }
 
-function runToWire(run: CloudRunRecord, enrichment?: RunWireEnrichment) {
-  const envKeys = Object.keys(run.env ?? {}).sort();
-  const secretIds = Object.keys(run.secret_refs ?? {}).sort();
-  return {
+function runToWire(
+  run: CloudRunRecord,
+  enrichment?: RunWireEnrichment,
+  options: { includeConfig?: boolean; includeRuntime?: boolean } = {},
+) {
+  const includeConfig = options.includeConfig ?? true;
+  const includeRuntime = options.includeRuntime ?? true;
+  const summary: Record<string, unknown> = {
     run_id: run.run_id,
     package_digest: run.package_digest,
     experiment_name: enrichment?.experiment_name ?? null,
-    run_label: run.run_label,
+    variant: runVariant(run),
+    runtime: runRuntime(run),
     status: run.status,
-    pending_reason: isQueuedRunStatus(run.status) ? enrichment?.pending_reason ?? null : null,
-    trials_completed: enrichment?.trials_completed ?? null,
-    trials_total: enrichment?.trials_total ?? null,
+    created_at: run.created_at,
+    updated_at: run.updated_at,
+  };
+  if (includeConfig || run.run_label) {
+    summary.run_label = run.run_label;
+  }
+  if (includeRuntime) {
+    summary.pending_reason = isQueuedRunStatus(run.status) ? enrichment?.pending_reason ?? null : null;
+    summary.trials_completed = enrichment?.trials_completed ?? null;
+    summary.trials_total = enrichment?.trials_total ?? null;
+  }
+  if (includeConfig || run.started_at) {
+    summary.started_at = run.started_at;
+  }
+  if (includeConfig || run.completed_at) {
+    summary.completed_at = run.completed_at;
+  }
+  if (includeConfig || run.error_message) {
+    summary.error_message = run.error_message;
+  }
+  if (!includeConfig) {
+    return summary;
+  }
+  const envKeys = Object.keys(run.env ?? {}).sort();
+  const secretIds = Object.keys(run.secret_refs ?? {}).sort();
+  return {
+    ...summary,
     env_keys: envKeys,
     secret_ids: secretIds,
     runtime_options: run.runtime_options,
     run_requirements: run.run_requirements,
     package_provenance: run.package_provenance,
-    created_at: run.created_at,
-    updated_at: run.updated_at,
-    started_at: run.started_at,
-    completed_at: run.completed_at,
-    error_message: run.error_message,
   };
+}
+
+function runVariant(run: CloudRunRecord): string | null {
+  for (const candidate of [
+    jsonPointerValue(run.runtime_options, "/variant"),
+    jsonPointerValue(run.runtime_options, "/variant_id"),
+    jsonPointerValue(run.runtime_options, "/model"),
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
+}
+
+function runRuntime(run: CloudRunRecord): string | null {
+  for (const candidate of [
+    jsonPointerValue(run.run_requirements as unknown as JsonObject, "/executor"),
+    jsonPointerValue(run.runtime_options, "/backend"),
+    jsonPointerValue(run.runtime_options, "/executor"),
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
 }
 
 function runToWorkerWire(run: CloudRunRecord) {

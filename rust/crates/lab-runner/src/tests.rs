@@ -2417,6 +2417,28 @@ mod tests {
     }
 
     #[test]
+    fn modal_sandbox_result_preserves_launcher_error() {
+        let value = json!({
+            "sandbox_id": null,
+            "execs": [],
+            "timed_out": false,
+            "launcher_error": "create sandbox: image pull denied",
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": "2026-01-01T00:01:00Z"
+        });
+
+        let err = match parse_modal_sandbox_result_for_test(&value) {
+            Ok(_) => panic!("modal launcher errors must not be masked by missing sandbox_id"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("modal sandbox launcher failed: create sandbox: image pull denied"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn modal_sandbox_result_rejects_non_string_timings() {
         let value = json!({
             "sandbox_id": "sb-123",
@@ -9332,6 +9354,7 @@ mod tests {
             &definitions,
             &json!({ "metrics": { "speed": 123.0 } }),
             None,
+            true,
         )
         .expect("declared metrics");
 
@@ -9346,8 +9369,13 @@ mod tests {
             "primary": false
         }]}))
         .expect("required metric definition");
-        crate::trial::events::extract_declared_metrics(&required, &json!({}), None)
+        crate::trial::events::extract_declared_metrics(&required, &json!({}), None, true)
             .expect_err("required metric should fail when missing");
+        let (relaxed_metrics, relaxed_primary) =
+            crate::trial::events::extract_declared_metrics(&required, &json!({}), None, false)
+                .expect("missing required metrics are omitted when enforcement is disabled");
+        assert_eq!(relaxed_metrics, json!({}));
+        assert_eq!(relaxed_primary, None);
 
         let missing_required = parse_metric_definitions(&json!({"metrics": [{
             "id": "score",
@@ -9404,6 +9432,7 @@ mod tests {
             &definitions,
             &json!({ "response": "ignored" }),
             Some(&trial_conclusion),
+            true,
         )
         .expect("declared grader metrics");
 
@@ -9438,6 +9467,7 @@ mod tests {
             &definitions,
             &json!({}),
             Some(&trial_conclusion),
+            true,
         )
         .expect("declared grader metric");
 
@@ -9472,6 +9502,7 @@ mod tests {
             &definitions,
             &json!({}),
             Some(&trial_conclusion),
+            true,
         )
         .expect_err("metric id should not replace the declared source pointer");
 

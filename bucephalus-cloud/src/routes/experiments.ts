@@ -5,7 +5,12 @@ import * as tar from "tar";
 import { authOwnerKey, type AuthContext } from "../auth";
 import { loadConfig } from "../config";
 import { HttpError, jsonResponse, optionalString, readJsonObject, requireString } from "../http";
-import { extractAuthoringContextArchive, safeAuthoringContextPath } from "../imports/authoringContext";
+import {
+  extractAuthoringContextArchive,
+  safeAuthoringContextPath,
+  validateProjectManifestEvidence,
+  type AuthoringProjectManifestEvidence,
+} from "../imports/authoringContext";
 import { ImportRepository, type UploadRecord } from "../imports/repository";
 import { redactSensitiveText } from "../jsonRedaction";
 import { importJobToWire, importSealedPackageUpload } from "./imports";
@@ -136,6 +141,15 @@ async function hostedAuthoringBuildUpload(
 ): Promise<Record<string, unknown>> {
   const sourceUploadId = requireString(body.upload_id, "/upload_id");
   const entrypoint = safeAuthoringContextPath(requireString(body.entrypoint, "/entrypoint"), "/entrypoint");
+  const requestedProjectManifest = body.project_manifest === undefined || body.project_manifest === null
+    ? null
+    : validateProjectManifestEvidence(body.project_manifest, "/project_manifest");
+  if (requestedProjectManifest && requestedProjectManifest.entrypoint !== entrypoint) {
+    throw new HttpError(400, "project_manifest_entrypoint_mismatch", "project_manifest.entrypoint must match entrypoint", {
+      entrypoint,
+      project_manifest_entrypoint: requestedProjectManifest.entrypoint,
+    });
+  }
   const sourceUpload = await imports.getUpload(sourceUploadId, ownerKey);
   if (!sourceUpload) {
     throw new HttpError(404, "upload_not_found", "Upload not found");
@@ -145,7 +159,9 @@ async function hostedAuthoringBuildUpload(
   }
 
   const runtimeOptions = optionalJsonObject(body.runtime_options as JsonObject | undefined, "/runtime_options");
-  const source = hostedBuildSource("authoring_context", sourceUpload, entrypoint);
+  let source = hostedBuildSource("authoring_context", sourceUpload, requestedProjectManifest
+    ? { entrypoint, projectManifest: requestedProjectManifest }
+    : { entrypoint });
   const buildEnvironment = hostedBuildEnvironment({
     inputKind: "authoring_context",
     runtimeOptions,
@@ -170,7 +186,13 @@ async function hostedAuthoringBuildUpload(
       archivePath,
       workDir: contextDir,
       entrypoint,
+      projectManifest: requestedProjectManifest,
     });
+    source = hostedBuildSource("authoring_context", sourceUpload, {
+      entrypoint,
+      projectManifest: contextInspection.projectManifest,
+    });
+    buildEnvironment.source = source;
     const coreResult = await runCoreAuthoringBuild({
       coreCli: coreCliPath(),
       cwd: contextDir,
@@ -223,6 +245,7 @@ async function hostedAuthoringBuildUpload(
       status: "succeeded",
       source_upload_id: sourceUploadId,
       entrypoint: contextInspection.entrypoint,
+      project_manifest: contextInspection.projectManifest,
       context_entries: contextInspection.entries,
       context_expanded_bytes: contextInspection.expandedBytes,
       core: coreResult,
@@ -341,6 +364,7 @@ function packageProvenanceFromBuildEnvironment(environment: HostedBuildEnvironme
     input_kind: environment.source.input_kind,
     source_upload_id: environment.source.upload_id,
     source_content_digest: environment.source.content_digest,
+    ...(environment.source.project_manifest ? { project_manifest: { ...environment.source.project_manifest } } : {}),
     builder: environment.builder,
     core: environment.core,
   };
@@ -605,7 +629,10 @@ function packageAuthoringProvenance(
 function hostedBuildSource(
   inputKind: "sealed_package" | "authoring_context",
   upload: UploadRecord,
-  entrypoint?: string,
+  authoring?: {
+    entrypoint: string;
+    projectManifest?: AuthoringProjectManifestEvidence;
+  },
 ): HostedBuildEnvironment["source"] {
   const evidence = requireHostedBuildSourceEvidence(upload);
   return {
@@ -615,7 +642,7 @@ function hostedBuildSource(
     media_type: upload.media_type,
     content_digest: evidence.contentDigest,
     byte_size: evidence.byteSize,
-    ...(entrypoint ? { entrypoint } : {}),
+    ...(authoring ? { entrypoint: authoring.entrypoint, project_manifest: authoring.projectManifest } : {}),
   };
 }
 
@@ -772,6 +799,7 @@ interface HostedBuildEnvironment {
     content_digest: string;
     byte_size: number;
     entrypoint?: string;
+    project_manifest?: AuthoringProjectManifestEvidence;
   };
   runtime_options: JsonObject;
   builder: {

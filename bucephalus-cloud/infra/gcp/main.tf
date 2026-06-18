@@ -46,6 +46,7 @@ locals {
     runner_admin_token                  = "${local.name_prefix}-runner-admin-token"
     r2_access_key_id                    = "${local.name_prefix}-r2-access-key-id"
     r2_secret_access_key                = "${local.name_prefix}-r2-secret-access-key"
+    oauth_cli_client_secret             = "${local.name_prefix}-oauth-cli-client-secret"
     modal_token_id                      = "${local.name_prefix}-modal-token-id"
     modal_token_secret                  = "${local.name_prefix}-modal-token-secret"
     modal_s3_access_key_id              = "${local.name_prefix}-modal-s3-access-key-id"
@@ -74,6 +75,10 @@ locals {
     }
     r2_secret_access_key_api = {
       secret_key = "r2_secret_access_key"
+      member     = "serviceAccount:${google_service_account.api.email}"
+    }
+    oauth_cli_client_secret_api = {
+      secret_key = "oauth_cli_client_secret"
       member     = "serviceAccount:${google_service_account.api.email}"
     }
     api_database_url_pool_controller = {
@@ -135,6 +140,7 @@ resource "terraform_data" "deploy_input_preflight" {
     migration_image_digest   = var.migration_image_digest
     worker_image_digest      = var.worker_image_digest
     oauth_user_client_id     = var.oauth_user_client_id
+    oauth_cli_client_secret  = var.oauth_cli_client_secret_secret_version
     runner_pool_id           = var.pool_controller_runner_pool_id
     api_database_secret      = var.api_database_url_secret_version
     migrator_database_secret = var.migrator_database_url_secret_version
@@ -176,6 +182,10 @@ resource "terraform_data" "deploy_input_preflight" {
     precondition {
       condition     = !local.deploy_api_services || var.oauth_user_client_id != null
       error_message = "oauth_user_client_id is required when API services are deployed."
+    }
+    precondition {
+      condition     = !local.deploy_api_services || var.oauth_cli_client_id == null || var.oauth_cli_client_secret_secret_version != null
+      error_message = "oauth_cli_client_secret_secret_version is required when API services are deployed with oauth_cli_client_id."
     }
     precondition {
       condition     = !local.deploy_api_services || var.api_database_url_secret_version != null
@@ -682,7 +692,7 @@ resource "google_cloud_run_v2_service" "api" {
           name = "BUCEPHALUS_CLOUD_R2_ACCESS_KEY_ID"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.control_plane["r2_access_key_id"].secret_id
+              secret  = google_secret_manager_secret.control_plane["r2_access_key_id"].id
               version = var.cloud_r2_access_key_id_secret_version
             }
           }
@@ -695,7 +705,7 @@ resource "google_cloud_run_v2_service" "api" {
           name = "BUCEPHALUS_CLOUD_R2_SECRET_ACCESS_KEY"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.control_plane["r2_secret_access_key"].secret_id
+              secret  = google_secret_manager_secret.control_plane["r2_secret_access_key"].id
               version = var.cloud_r2_secret_access_key_secret_version
             }
           }
@@ -715,6 +725,32 @@ resource "google_cloud_run_v2_service" "api" {
       env {
         name  = "BUCEPHALUS_CLOUD_OAUTH_AUDIENCE"
         value = var.oauth_user_client_id
+      }
+
+      dynamic "env" {
+        for_each = var.oauth_cli_client_id == null ? [] : [var.oauth_cli_client_id]
+        content {
+          name  = "BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_ID"
+          value = env.value
+        }
+      }
+
+      env {
+        name  = "BUCEPHALUS_CLOUD_OAUTH_CLI_SCOPE"
+        value = var.oauth_cli_scope
+      }
+
+      dynamic "env" {
+        for_each = var.oauth_cli_client_secret_secret_version == null ? [] : [var.oauth_cli_client_secret_secret_version]
+        content {
+          name = "BUCEPHALUS_CLOUD_OAUTH_CLI_CLIENT_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.control_plane["oauth_cli_client_secret"].id
+              version = env.value
+            }
+          }
+        }
       }
 
       env {
@@ -741,7 +777,7 @@ resource "google_cloud_run_v2_service" "api" {
         name = "DATABASE_URL"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["api_database_url"].secret_id
+            secret  = google_secret_manager_secret.control_plane["api_database_url"].id
             version = var.api_database_url_secret_version
           }
         }
@@ -751,7 +787,7 @@ resource "google_cloud_run_v2_service" "api" {
         name = "BUCEPHALUS_CLOUD_WORKER_TOKEN"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["worker_token"].secret_id
+            secret  = google_secret_manager_secret.control_plane["worker_token"].id
             version = var.worker_token_secret_version
           }
         }
@@ -763,7 +799,7 @@ resource "google_cloud_run_v2_service" "api" {
           name = "BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.control_plane["runner_admin_token"].secret_id
+              secret  = google_secret_manager_secret.control_plane["runner_admin_token"].id
               version = env.value
             }
           }
@@ -1080,7 +1116,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
         name = "DATABASE_URL"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["api_database_url"].secret_id
+            secret  = google_secret_manager_secret.control_plane["api_database_url"].id
             version = var.api_database_url_secret_version
           }
         }
@@ -1090,7 +1126,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
         name = "BUCEPHALUS_CLOUD_WORKER_TOKEN"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["worker_token"].secret_id
+            secret  = google_secret_manager_secret.control_plane["worker_token"].id
             version = var.worker_token_secret_version
           }
         }
@@ -1100,7 +1136,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
         name = "BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["pool_controller_provision_cmd_json"].secret_id
+            secret  = google_secret_manager_secret.control_plane["pool_controller_provision_cmd_json"].id
             version = var.pool_controller_provision_cmd_json_secret_version
           }
         }
@@ -1110,7 +1146,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
         name = "BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.control_plane["pool_controller_reap_cmd_json"].secret_id
+            secret  = google_secret_manager_secret.control_plane["pool_controller_reap_cmd_json"].id
             version = var.pool_controller_reap_cmd_json_secret_version
           }
         }
@@ -1158,7 +1194,7 @@ resource "google_cloud_run_v2_job" "migrations" {
           name = "DATABASE_URL"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.control_plane["migrator_database_url"].secret_id
+              secret  = google_secret_manager_secret.control_plane["migrator_database_url"].id
               version = var.migrator_database_url_secret_version
             }
           }
@@ -1203,7 +1239,7 @@ resource "google_cloud_run_v2_job" "worker_image_promotion" {
           name = "DATABASE_URL"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.control_plane["migrator_database_url"].secret_id
+              secret  = google_secret_manager_secret.control_plane["migrator_database_url"].id
               version = var.migrator_database_url_secret_version
             }
           }

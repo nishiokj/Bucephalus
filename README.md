@@ -115,7 +115,7 @@ bucephalus run <package_dir> --materialize full --json
 For hosted Cloud runs, use `buc` against the hosted API:
 
 ```bash
-bucephalus login --resource <api-url>
+buc login
 buc build experiment.yaml
 buc secrets put NAME --from-env NAME
 buc doctor <package-digest> --secret-ref NAME=bucephalus://NAME
@@ -129,9 +129,11 @@ with `buc build <package-dir>`, but Cloud treats that path as an externally
 authored sealed-package import: it verifies package integrity and hosted
 readiness without claiming the local authoring environment, Core version,
 platform, or target. YAML builds are the hosted-attested Cloud authoring path.
-For nested experiments that reference shared repo files, use
-`buc build path/to/experiment.yaml --context-root .` so the Cloud build receives
-the intended authoring tree. Local generated and credential material such as
+For nested experiments that reference shared repo files, place a
+`bucephalus.project.yaml` or `bucephalus.project.yml` file at the shared project
+root. The manifest is the Cloud build boundary: it declares package sources,
+entrypoints, include/exclude rules, and the hosted target. Local generated and
+credential material such as
 `.env`, `.npmrc`, `.ssh`, `.aws`, `node_modules`, and `target` is excluded from
 YAML context uploads and rejected by the hosted API. Hosted secrets are
 write-only:
@@ -167,7 +169,7 @@ Common operator commands:
 | Command | Purpose |
 | --- | --- |
 | `bucephalus init` | Generate an experiment, cases, and adapter from an agent client workflow. |
-| `bucephalus login` / `bucephalus logout` | Cache or remove Cloud OAuth credentials for first-party Cloud flows. |
+| `buc login` / `buc logout` | Cache or remove hosted Cloud OAuth credentials. |
 | `bucephalus dev` | Build, check, preflight, and smoke-test a YAML experiment. |
 | `bucephalus doctor` | Diagnose build/check/preflight readiness without launching a full run. |
 | `bucephalus run` | Run YAML directly or execute a sealed package. |

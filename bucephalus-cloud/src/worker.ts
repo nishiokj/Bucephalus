@@ -10,6 +10,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { inspectSealedPackageArchive } from "./imports/sealedPackage";
 import { redactSensitiveJsonObject } from "./jsonRedaction";
 import { releaseIdentity } from "./release";
+import { SECRET_FILE_MODE } from "./secretFiles";
 import {
   discoverCoreRunIdsFromRunRoot,
   startEvidencePump,
@@ -47,6 +48,9 @@ interface WorkerConfig {
   workerImageRef: string | null;
   liveEvidence: boolean;
   evidenceIntervalMs: number;
+  coreTimeoutMs: number;
+  coreCompletionGraceMs: number;
+  apiRequestTimeoutMs: number;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -58,8 +62,18 @@ const RUNTIME_SNAPSHOT_MAX_EVIDENCE_RECORDS = 500;
 const RUNTIME_SNAPSHOT_MAX_JSON_BYTES = 2 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_PAYLOAD_ENVELOPE_BYTES = 128 * 1024;
+const RUNTIME_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024;
 const DOCKER_SOCKET_PATH = "/var/run/docker.sock";
 const DOCKER_API_VERSION = "v1.41";
+const RUNTIME_ARTIFACT_SPECS = [
+  { role: "agent_result", relativePath: "agent/result.json", mediaType: "application/json; charset=utf-8" },
+  { role: "agent_stdout", relativePath: "agent/stdout.log", mediaType: "text/plain; charset=utf-8" },
+  { role: "agent_stderr", relativePath: "agent/stderr.log", mediaType: "text/plain; charset=utf-8" },
+  { role: "agent_events", relativePath: "agent/events.jsonl", mediaType: "application/x-ndjson; charset=utf-8" },
+  { role: "candidate_patch", relativePath: "candidate.patch", mediaType: "text/x-diff; charset=utf-8" },
+  { role: "contract_trace", relativePath: "runner/contract_trace.json", mediaType: "application/json; charset=utf-8" },
+  { role: "trial_summary", relativePath: "summary.json", mediaType: "application/json; charset=utf-8" },
+] as const;
 
 class WorkerError extends Error {
   constructor(message: string) {
@@ -218,6 +232,21 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
 
     if (materialized) {
       try {
+        const uploadSummary = await uploadRuntimeArtifacts(config, claim, materialized);
+        await appendEvent(config, claim, "worker.runtime.artifacts_uploaded", uploadSummary);
+      } catch (error) {
+        await appendEvent(config, claim, "worker.runtime.artifact_upload_failed", {
+          error: errorMessage(error),
+        }).catch((eventError) => {
+          logError("worker.artifact_upload_failure_event_failed", runContext, { error: errorMessage(eventError) });
+        });
+        if (!coreError) {
+          coreError = error;
+        } else {
+          logError("worker.runtime_artifact_upload_failed", runContext, { error: errorMessage(error) });
+        }
+      }
+      try {
         await uploadRuntimeSnapshots(config, claim, materialized);
       } catch (error) {
         await appendEvent(config, claim, "worker.runtime.snapshot_failed", {
@@ -299,12 +328,24 @@ async function executeCoreRun(
   const result = await runProcess(command.executable, command.args, {
     cwd: materialized.workspaceDir,
     env,
+    timeoutMs: coreRunTimeoutMs(config, claim),
+    completionGraceMs: config.coreCompletionGraceMs,
   });
   const eventPayload = {
     exit_code: result.exitCode,
+    timed_out: result.timedOut,
+    completed_by_progress_watchdog: result.completedByProgressWatchdog,
     stdout_tail: tail(result.stdout, 16_000),
     stderr_tail: tail(result.stderr, 16_000),
   };
+  if (result.completedByProgressWatchdog) {
+    await appendEvent(config, claim, "worker.core.completed_after_progress_watchdog", eventPayload);
+    return;
+  }
+  if (result.timedOut) {
+    await appendEvent(config, claim, "worker.core.timed_out", eventPayload);
+    throw new WorkerError(`Core runner timed out after ${coreRunTimeoutMs(config, claim)} ms`);
+  }
   if (result.exitCode !== 0) {
     await appendEvent(config, claim, "worker.core.failed", eventPayload);
     throw new WorkerError(
@@ -328,26 +369,41 @@ export function coreRunnerFailureMessage(exitCode: number, stdout: string, stder
 }
 
 function coreRunnerStdoutErrorMessage(stdout: string): string | null {
+  const fullStdoutError = coreRunnerErrorMessageFromJson(stdout.trim());
+  if (fullStdoutError) {
+    return fullStdoutError;
+  }
   for (const line of stdout.split(/\r?\n/).reverse()) {
     const trimmed = line.trim();
     if (!trimmed.startsWith("{")) {
       continue;
     }
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (!isRecord(parsed) || !isRecord(parsed.error)) {
-        continue;
-      }
-      const message = parsed.error.message;
-      const code = parsed.error.code;
-      if (typeof message === "string" && message.length > 0) {
-        return typeof code === "string" && code.length > 0
-          ? `${code}: ${message}`
-          : message;
-      }
-    } catch {
-      continue;
+    const lineError = coreRunnerErrorMessageFromJson(trimmed);
+    if (lineError) {
+      return lineError;
     }
+  }
+  return null;
+}
+
+function coreRunnerErrorMessageFromJson(raw: string): string | null {
+  if (!raw.startsWith("{")) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed) || !isRecord(parsed.error)) {
+      return null;
+    }
+    const message = parsed.error.message;
+    const code = parsed.error.code;
+    if (typeof message === "string" && message.length > 0) {
+      return typeof code === "string" && code.length > 0
+        ? `${code}: ${message}`
+        : message;
+    }
+  } catch {
+    return null;
   }
   return null;
 }
@@ -365,6 +421,128 @@ async function uploadRuntimeSnapshots(
     const snapshot = await collectRuntimeSnapshot(materialized.runRootDir, coreRunId);
     await appendEvent(config, claim, RUNTIME_SNAPSHOT_EVENT_TYPE, snapshot);
   }
+}
+
+async function uploadRuntimeArtifacts(
+  config: WorkerConfig,
+  claim: RunClaim,
+  materialized: MaterializedPackage,
+): Promise<JsonObject> {
+  const coreRunIds = await discoverCoreRunIdsFromRunRoot(materialized.runRootDir);
+  let uploaded = 0;
+  const omitted: string[] = [];
+  for (const coreRunId of coreRunIds) {
+    const collected = await collectRuntimeArtifactUploads(materialized.runRootDir, coreRunId);
+    omitted.push(...collected.omitted);
+    for (const artifact of collected.items) {
+      const bytes = await readFile(artifact.absolutePath);
+      await uploadRuntimeArtifact(config, claim, artifact, bytes);
+      uploaded += 1;
+    }
+  }
+  return {
+    core_run_ids: coreRunIds,
+    uploaded_artifacts: uploaded,
+    omitted_artifacts: omitted,
+  };
+}
+
+export async function collectRuntimeArtifactUploads(
+  runRootDir: string,
+  coreRunId: string,
+): Promise<{ items: RuntimeArtifactUpload[]; omitted: string[] }> {
+  assertCoreRunId(coreRunId);
+  const runDir = join(runRootDir, coreRunId);
+  const trialsDir = join(runDir, "trials");
+  let entries: Dirent[];
+  try {
+    entries = await readdir(trialsDir, { withFileTypes: true });
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return { items: [], omitted: [] };
+    }
+    throw error;
+  }
+  const trialDirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+  const items: RuntimeArtifactUpload[] = [];
+  const omitted: string[] = [];
+  for (const [index, trialId] of trialDirs.entries()) {
+    const trialDir = join(trialsDir, trialId);
+    const identity = await runtimeTrialIdentity(trialDir, trialId, index);
+    for (const spec of RUNTIME_ARTIFACT_SPECS) {
+      const relativePath = spec.relativePath;
+      const absolutePath = join(trialDir, ...relativePath.split("/"));
+      let fileStat;
+      try {
+        fileStat = await stat(absolutePath);
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") {
+          continue;
+        }
+        throw error;
+      }
+      if (!fileStat.isFile()) {
+        continue;
+      }
+      if (fileStat.size > RUNTIME_ARTIFACT_MAX_BYTES) {
+        omitted.push(`trials/${trialId}/${relativePath}`);
+        continue;
+      }
+      items.push({
+        coreRunId,
+        trialId: identity.trialId,
+        scheduleIdx: identity.scheduleIdx,
+        attempt: identity.attempt,
+        role: spec.role,
+        relativePath,
+        mediaType: spec.mediaType,
+        absolutePath,
+        byteSize: fileStat.size,
+      });
+    }
+  }
+  return { items, omitted };
+}
+
+async function runtimeTrialIdentity(
+  trialDir: string,
+  fallbackTrialId: string,
+  fallbackScheduleIdx: number,
+): Promise<{ trialId: string; scheduleIdx: number; attempt: number }> {
+  const summary = await readBoundedJsonObject(join(trialDir, "summary.json"));
+  const contractTrace = await readBoundedJsonObject(join(trialDir, "runner", "contract_trace.json"));
+  const summaryObject = summary.status === "read" ? summary.object : {};
+  const contractObject = contractTrace.status === "read" ? contractTrace.object : {};
+  const summaryIds = isRecord(summaryObject.ids) ? summaryObject.ids : {};
+  const contractIds = isRecord(contractObject.ids) ? contractObject.ids : {};
+  return {
+    trialId: stringField(contractIds.trial_id) ?? stringField(summaryIds.trial_id) ?? fallbackTrialId,
+    scheduleIdx: numberField(contractIds.schedule_idx) ?? numberField(summaryIds.schedule_idx) ?? fallbackScheduleIdx,
+    attempt: numberField(contractIds.attempt) ?? numberField(summaryIds.attempt) ?? 0,
+  };
+}
+
+async function uploadRuntimeArtifact(
+  config: WorkerConfig,
+  claim: RunClaim,
+  artifact: RuntimeArtifactUpload,
+  bytes: Uint8Array,
+): Promise<void> {
+  await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/runtime/artifacts`, {
+    method: "POST",
+    authToken: claim.attempt.attempt_token,
+    rawBody: bytes,
+    headers: {
+      "content-type": artifact.mediaType,
+      "x-bucephalus-runner-instance-id": requireRunnerInstanceId(config),
+      "x-bucephalus-core-run-id": artifact.coreRunId,
+      "x-bucephalus-trial-id": artifact.trialId,
+      "x-bucephalus-schedule-idx": String(artifact.scheduleIdx),
+      "x-bucephalus-trial-attempt": String(artifact.attempt),
+      "x-bucephalus-artifact-role": artifact.role,
+      "x-bucephalus-artifact-relative-path": artifact.relativePath,
+    },
+  });
 }
 
 export async function collectRuntimeSnapshot(runRootDir: string, coreRunId: string): Promise<RuntimeSnapshotPayload> {
@@ -720,8 +898,8 @@ function assertSecretId(id: string): void {
 async function runProcess(
   executable: string,
   args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv },
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs?: number; completionGraceMs?: number },
+): Promise<{ exitCode: number; stdout: string; stderr: string; timedOut: boolean; completedByProgressWatchdog: boolean }> {
   return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
       cwd: options.cwd,
@@ -732,6 +910,53 @@ async function runProcess(
     activeChild = child;
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
+    let timedOut = false;
+    let completedByProgressWatchdog = false;
+    let completionGraceTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearCompletionGraceTimer = () => {
+      if (completionGraceTimer) {
+        clearTimeout(completionGraceTimer);
+        completionGraceTimer = null;
+      }
+    };
+    const terminateChildProcessGroup = (signal: NodeJS.Signals) => {
+      if (!child.pid) {
+        return;
+      }
+      try {
+        process.kill(-child.pid, signal);
+      } catch {
+        child.kill(signal);
+      }
+    };
+    const startCompletionGraceTimer = () => {
+      const graceMs = options.completionGraceMs ?? 0;
+      if (completionGraceTimer || graceMs <= 0 || child.exitCode !== null) {
+        return;
+      }
+      completionGraceTimer = setTimeout(() => {
+        completedByProgressWatchdog = true;
+        terminateChildProcessGroup("SIGTERM");
+        setTimeout(() => {
+          if (child.exitCode === null) {
+            terminateChildProcessGroup("SIGKILL");
+          }
+        }, 5000).unref();
+      }, graceMs);
+      completionGraceTimer.unref();
+    };
+    const timeout = options.timeoutMs && options.timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          terminateChildProcessGroup("SIGTERM");
+          setTimeout(() => {
+            if (child.exitCode === null) {
+              terminateChildProcessGroup("SIGKILL");
+            }
+          }, 5000).unref();
+        }, options.timeoutMs)
+      : null;
+    timeout?.unref();
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     // The core runner emits its structured JSON logs on stderr (stdout carries
     // the --json result payload). Tee stderr through to the worker's own stderr
@@ -741,14 +966,25 @@ async function runProcess(
     child.stderr.on("data", (chunk: Buffer) => {
       stderr.push(chunk);
       process.stderr.write(chunk);
+      if (coreProgressCompleted(chunk.toString("utf8"))) {
+        startCompletionGraceTimer();
+      }
     });
     child.on("error", (error) => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      clearCompletionGraceTimer();
       if (activeChild === child) {
         activeChild = null;
       }
       reject(error);
     });
     child.on("close", (code) => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      clearCompletionGraceTimer();
       if (activeChild === child) {
         activeChild = null;
       }
@@ -756,9 +992,22 @@ async function runProcess(
         exitCode: code ?? 1,
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
+        timedOut,
+        completedByProgressWatchdog,
       });
     });
   });
+}
+
+function coreRunTimeoutMs(config: WorkerConfig, claim: RunClaim): number {
+  const requirementTimeout = claim.run.run_requirements.timeout_ms;
+  return typeof requirementTimeout === "number" && requirementTimeout > 0
+    ? requirementTimeout
+    : config.coreTimeoutMs;
+}
+
+export function coreProgressCompleted(text: string): boolean {
+  return /(?:^|\n)\[run\]\s+run_[^\s:]+:\s+progress\s+(\d+)\/\1\s+\(100\.0%\)\s+slot=\d+\s+trial=\S+\s+status=completed(?:\r?\n|$)/.test(text);
 }
 
 async function claimRun(config: WorkerConfig): Promise<RunClaim | EmptyClaim> {
@@ -924,7 +1173,7 @@ export async function materializeAttemptSecrets(
     if (!fileStat.isFile()) {
       throw new WorkerError(`Secret resolver output for '${id}' is not a file`);
     }
-    await chmod(outputPath, 0o600);
+    await chmod(outputPath, SECRET_FILE_MODE);
     files[id] = outputPath;
   }
   const missing = secretEntries.map(([id]) => id).filter((id) => !files[id]);
@@ -1442,16 +1691,25 @@ async function fail(config: WorkerConfig, claim: RunClaim, message: string): Pro
 async function cloudFetch(
   config: WorkerConfig,
   path: string,
-  options: { method?: string; body?: unknown; authToken?: string } = {},
+  options: { method?: string; body?: unknown; rawBody?: Uint8Array; headers?: Record<string, string>; authToken?: string } = {},
 ): Promise<unknown> {
   const init: RequestInit = {
     method: options.method ?? "GET",
-    headers: workerAuthHeaders(config, options.authToken),
+    headers: {
+      ...workerAuthHeaders(config, options.authToken),
+      ...(options.headers ?? {}),
+    },
   };
   if (options.body !== undefined) {
-    init.headers = { ...workerAuthHeaders(config, options.authToken), "content-type": "application/json" };
+    init.headers = { ...workerAuthHeaders(config, options.authToken), ...(options.headers ?? {}), "content-type": "application/json" };
     init.body = JSON.stringify(options.body);
+  } else if (options.rawBody !== undefined) {
+    init.body = options.rawBody.buffer.slice(
+      options.rawBody.byteOffset,
+      options.rawBody.byteOffset + options.rawBody.byteLength,
+    ) as ArrayBuffer;
   }
+  init.signal = AbortSignal.timeout(workerApiRequestTimeoutMs(config));
   const response = await fetch(`${config.apiUrl}${path}`, init);
   const text = await response.text();
   const payload = text.trim().length > 0 ? JSON.parse(text) : null;
@@ -1475,6 +1733,7 @@ async function cloudFetchBytes(
       ...workerAuthHeaders(config, options.authToken),
       ...(options.attemptId ? { "x-bucephalus-attempt-id": options.attemptId } : {}),
     },
+    signal: AbortSignal.timeout(workerApiRequestTimeoutMs(config)),
   });
   if (!response.ok) {
     const text = await response.text();
@@ -1492,6 +1751,12 @@ async function cloudFetchBytes(
     throw new WorkerError(message);
   }
   return new Uint8Array(await response.arrayBuffer());
+}
+
+function workerApiRequestTimeoutMs(config: WorkerConfig): number {
+  return Number.isFinite(config.apiRequestTimeoutMs) && config.apiRequestTimeoutMs > 0
+    ? config.apiRequestTimeoutMs
+    : 30_000;
 }
 
 export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
@@ -1528,6 +1793,9 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
     workerImageRef: env.BUCEPHALUS_WORKER_IMAGE_REF?.trim() || null,
     liveEvidence: booleanEnv(env.BUCEPHALUS_WORKER_LIVE_EVIDENCE, true),
     evidenceIntervalMs: numberEnv(env.BUCEPHALUS_WORKER_EVIDENCE_INTERVAL_MS, 2000),
+    coreTimeoutMs: numberEnv(env.BUCEPHALUS_WORKER_CORE_TIMEOUT_MS, 15 * 60 * 1000),
+    coreCompletionGraceMs: numberEnv(env.BUCEPHALUS_WORKER_CORE_COMPLETION_GRACE_MS, 120_000),
+    apiRequestTimeoutMs: numberEnv(env.BUCEPHALUS_WORKER_API_REQUEST_TIMEOUT_MS, 30_000),
   };
 }
 
@@ -1807,6 +2075,33 @@ interface RuntimeTrialSummaryPayload extends JsonObject {
   summary: JsonObject;
   contract_trace?: JsonObject;
   trial_events?: JsonObject[];
+}
+
+interface RuntimeArtifactUpload {
+  coreRunId: string;
+  trialId: string;
+  scheduleIdx: number;
+  attempt: number;
+  role: string;
+  relativePath: string;
+  mediaType: string;
+  absolutePath: string;
+  byteSize: number;
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function numberField(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.trunc(value);
+  }
+  if (typeof value === "string" && /^[0-9]+$/.test(value)) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+  return null;
 }
 
 function stringAt(root: JsonObject, pointer: string): string | null {
