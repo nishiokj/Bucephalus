@@ -222,7 +222,6 @@ describe("Cloud run routes", () => {
       ...runRecord(),
       runtime_options: {
         variant: "opus-4.8",
-        region: "us-west-2",
         params: { prompt: "large prompt config" },
       },
       run_requirements: {
@@ -252,7 +251,8 @@ describe("Cloud run routes", () => {
     const body = await response!.json();
     expect(body.runs[0].experiment_name).toBe("Summary Experiment");
     expect(body.runs[0].variant).toBe("opus-4.8");
-    expect(body.runs[0].region).toBe("us-west-2");
+    expect(body.runs[0].runtime).toBe("runner-docker");
+    expect(body.runs[0].region).toBeUndefined();
     expect(body.runs[0].runtime_options).toBeUndefined();
     expect(body.runs[0].run_requirements).toBeUndefined();
     expect(body.runs[0].package_provenance).toBeUndefined();
@@ -1554,6 +1554,42 @@ describe("Cloud run routes", () => {
       "worker-token",
       authContext("user-a"),
     )).rejects.toThrow("cannot also be supplied in /secret_refs");
+  });
+
+  test("run creation rejects runtime region before queueing", async () => {
+    const packages = {
+      async getArtifact() {
+        return packageRecordWithSecrets();
+      },
+    };
+    const runs = {
+      async createRun() {
+        throw new Error("createRun should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          runtime_options: {
+            region: "us-east-1",
+          },
+          secret_refs: {
+            OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/latest",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    )).rejects.toThrow("/runtime_options/region is not supported for hosted Cloud runs");
   });
 
   test("run creation persists validated plain env separately from secret refs", async () => {

@@ -1683,7 +1683,7 @@ function runToWire(
     package_digest: run.package_digest,
     experiment_name: enrichment?.experiment_name ?? null,
     variant: runVariant(run),
-    region: runRegion(run),
+    runtime: runRuntime(run),
     status: run.status,
     created_at: run.created_at,
     updated_at: run.updated_at,
@@ -1733,11 +1733,11 @@ function runVariant(run: CloudRunRecord): string | null {
   return null;
 }
 
-function runRegion(run: CloudRunRecord): string | null {
+function runRuntime(run: CloudRunRecord): string | null {
   for (const candidate of [
-    jsonPointerValue(run.runtime_options, "/region"),
-    jsonPointerValue(run.run_requirements as unknown as JsonObject, "/region"),
     jsonPointerValue(run.run_requirements as unknown as JsonObject, "/executor"),
+    jsonPointerValue(run.runtime_options, "/backend"),
+    jsonPointerValue(run.runtime_options, "/executor"),
   ]) {
     if (typeof candidate === "string" && candidate.trim()) {
       return candidate.trim();

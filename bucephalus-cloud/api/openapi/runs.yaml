@@ -1403,7 +1403,7 @@ components:
         - package_digest
         - experiment_name
         - variant
-        - region
+        - runtime
         - status
         - created_at
         - updated_at
@@ -1430,11 +1430,11 @@ components:
             - string
             - 'null'
           description: Lightweight display variant extracted from runtime options when available.
-        region:
+        runtime:
           type:
             - string
             - 'null'
-          description: Lightweight display region or executor extracted from runtime options/requirements when available.
+          description: Lightweight display runtime executor extracted from run requirements when available.
         status:
           type: string
           enum:

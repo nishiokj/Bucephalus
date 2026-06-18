@@ -258,6 +258,8 @@ describe("Cloud run requirements", () => {
   });
 
   test("rejects unknown runtime option keys instead of silently ignoring typos", () => {
+    expect(() => runRequirementsForArtifact(artifact(), { region: "us-east-1" }))
+      .toThrow("/runtime_options/region is not supported");
     expect(() => runRequirementsForArtifact(artifact(), { memory_mbb: 8192 }))
       .toThrow("/runtime_options/memory_mbb is not supported");
 
