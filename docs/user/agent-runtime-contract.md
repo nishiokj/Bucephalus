@@ -1,16 +1,17 @@
 # Agent Runtime Contract
 
 The agent runtime is your application. Bucephalus talks to it through
-`stages.agent.command`, which launches once per trial with runner-owned
-input/output paths in the environment.
+`stages.agent.command`, or through a built-in `stages.agent.adapter` that lowers
+to a command contract. The launched process runs once per trial with
+runner-owned input/output paths in the environment.
 
 ## Config Fields
 
 ```yaml
-ephemerals:
+services:
   mcp-bash:
     image: ghcr.io/acme/mcp-bash-server:v0.4
-    lifecycle: per-trial
+    lifecycle: trial
     expose:
       MCP_URL: http://mcp-bash:8080
 
@@ -30,7 +31,7 @@ stages:
       workdir:
         from: case_row
   agent:
-    ephemerals: [mcp-bash]
+    services: [mcp-bash]
     mount:
       source: ./agent
       mount:
@@ -49,8 +50,9 @@ stages:
 | Field | Meaning |
 | --- | --- |
 | `stages.agent.command` | Process argv for command agents. `$NAME` resolves from variant config or explicit launch-time `--env` / `--env-file` inputs. Use this for non-secret variant configuration. |
+| `stages.agent.adapter` | Built-in launch adapter for a known agent CLI. The adapter owns the runner contract argv and result normalization. `kind: nova` is currently supported. |
 | `stages.agent.image` | Container image for the agent process. Implies `agent_site: agent_container` when `stages.execution.agent_site` is omitted; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
-| `stages.agent.ephemerals` | Optional list of top-level ephemeral ids attached to the agent stage. Local Docker injects each ephemeral's `expose` env into the agent process. Forbidden when `agent_site: host`. |
+| `stages.agent.services` | Optional list of top-level service ids attached to the agent stage. The runner injects each service's `expose` env into the agent process. Forbidden when `agent_site: host`. |
 | `stages.agent.mount` | Optional explicit agent file mount object. Omit for image-native agents. |
 | `stages.agent.mount.source` | Source path or agent build id to stage. |
 | `stages.agent.mount.mount.path` | Absolute runtime mount path, such as `/opt/agent`. |
@@ -62,7 +64,35 @@ stages:
 
 If `policy.sanitization_profile` is `hermetic_functional`, `runtime.network.task_sandbox` and `runtime.network.agent` must both be `none`.
 
-Removed execution-shaping fields such as `workspace_patches`, `launch`, `protocol`, `env_from_host`, `binding_args`, `support_files`, `secret_env`, and `trial_runtime.agent.network` are rejected. Use `command`, `env`, `output_mounts`, `runtime.network`, and explicit case/grader surfaces instead.
+Removed execution-shaping fields such as `workspace_patches`, `launch`, `protocol`, `env_from_host`, `binding_args`, `support_files`, `secret_env`, and `trial_runtime.agent.network` are rejected. Use `command` or `adapter`, `env`, `output_mounts`, `runtime.network`, and explicit case/grader surfaces instead.
+
+## Agent Adapters
+
+Use an adapter when the platform knows how to launch and normalize a specific
+agent CLI. This keeps runner-owned paths, result envelope conversion, and trace
+argv out of cookbook YAML.
+
+```yaml
+stages:
+  agent:
+    adapter:
+      kind: nova
+      config: /opt/agent/nova-config.json
+      mcp_config: /opt/agent/mcp.json
+      timeout_ms: 540000
+      dangerous: true
+      provider_env:
+        gemini: GOOGLE_API_KEY
+    env:
+      GOOGLE_API_KEY: "$GEMINI_API_KEY"
+```
+
+`kind: nova` lowers to a sealed command that reads the trial input and writes
+the canonical result. When the agent has a declared event sink, the adapter also
+passes the trace path; set `adapter.events: false` to suppress that argv, or
+`adapter.events: true` to require a declared sink. The runner normalizes Nova's
+native result into the structured JSON artifact contract after execution.
+Declare either `command` or `adapter`, not both.
 
 ## Agent Site
 
@@ -78,28 +108,28 @@ image means `task_runtime`, and an input-only case without an agent image means
 `host`. Declare `stages.execution.agent_site` when those rules do not apply,
 for example read-only file cases without an agent image.
 
-## Ephemerals
+## Services
 
 An agent may attach per-trial service containers declared at top level:
 
 ```yaml
-ephemerals:
+services:
   mcp-bash:
     image: ghcr.io/acme/mcp-bash-server:v0.4
-    lifecycle: per-trial
+    lifecycle: trial
     expose:
       MCP_URL: http://mcp-bash:8080
 
 stages:
   agent:
-    ephemerals: [mcp-bash]
+    services: [mcp-bash]
 ```
 
-The ephemeral id is the hostname alias on the per-trial network. `expose` values
-become agent env vars only for the stages that list the ephemeral. Stage-level
-`ephemerals` lists are duplicate-free, and attached ephemerals must expose
+The service id is the hostname alias on the per-trial network. `expose` values
+become agent env vars only for the stages that list the service. Stage-level
+`services` lists are duplicate-free, and attached services must expose
 unique env names within that stage. If the agent runs on the host, it cannot
-attach container ephemerals.
+attach container services.
 
 ## Output Mounts
 
@@ -245,8 +275,11 @@ stream is append-heavy, and blob-storage mounts (such as the Modal
 `CloudBucketMount` used for `/bucephalus/out`) reject incremental appends. Your
 agent just appends line-by-line to the injected path and never thinks about
 where the bytes ultimately land.
-Command YAML must use the declared sink placeholder form; the generic
-`__BUCEPHALUS_TRAJECTORY_PATH__` command placeholder is rejected.
+Command YAML may use either the declared sink placeholder form or the generic
+`__BUCEPHALUS_TRAJECTORY_PATH__` contract placeholder when an agent event sink
+is declared. Prefer the named sink form for custom event ids and the generic
+placeholder for the default trajectory sink created by `traces.source:
+protocol`.
 
 The runner owns the rest of the lifecycle: it tails the scratch file into the
 account SQLite database while the trial runs (local executor) or collects it

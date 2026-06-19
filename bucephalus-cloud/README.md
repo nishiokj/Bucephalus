@@ -112,9 +112,20 @@ bucephalus-cloud import sealed-package /tmp/package.tgz --label smoke
 bucephalus-cloud import inspect <import-id>
 bucephalus-cloud import inspect <import-id> --json
 bucephalus-cloud package get sha256:...
-bucephalus-cloud run create --package-digest sha256:... --backend runner-docker --env OPENAI_BASE_URL=https://api.openai.com
+bucephalus-cloud run create --package-digest sha256:... --env OPENAI_BASE_URL=https://api.openai.com
 bucephalus-cloud run get <run-id>
 ```
+
+`run create` rejects unknown runtime-placement flags before queueing. Hosted
+Cloud does not support `--region`, `--executor`, or `--cpu` aliases; declare
+compute intent in the sealed package or use the supported Cloud runtime option
+names shown by `bucephalus-cloud help`.
+
+Hosted Cloud runs do not accept runtime placement selectors such as `region`,
+`runtime_region`, `placement`, or `zone`. Runner placement is controlled by
+runner pools and the Cloud scheduler; clients must not expose those fields until
+Cloud has a supported placement contract. The API rejects unsupported placement
+fields with pointers such as `/runtime_options/region`.
 
 ## Cloud Worker Runtime
 

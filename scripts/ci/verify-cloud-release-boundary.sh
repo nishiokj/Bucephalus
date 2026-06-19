@@ -93,6 +93,22 @@ const gcpInfraPath = "bucephalus-cloud/infra/gcp/main.tf";
 const gcpInfraText = read(gcpInfraPath);
 const gcpVariablesPath = "bucephalus-cloud/infra/gcp/variables.tf";
 const gcpVariablesText = read(gcpVariablesPath);
+const cloudCliBinPath = "rust/crates/lab-cli/src/bin/bucephalus-cloud.rs";
+const cloudCliBinText = read(cloudCliBinPath);
+const cloudReadmePath = "bucephalus-cloud/README.md";
+const cloudReadmeText = read(cloudReadmePath);
+const runsRoutePath = "bucephalus-cloud/src/routes/runs.ts";
+const runsRouteText = read(runsRoutePath);
+const runsOpenApiPath = "bucephalus-cloud/api/openapi/runs.yaml";
+const runsOpenApiText = read(runsOpenApiPath);
+const cloudCliDocPath = "docs/user/cloud-cli.md";
+const cloudCliDocText = read(cloudCliDocPath);
+const runRequirementsTestText = read("bucephalus-cloud/tests/runRequirements.test.ts");
+const runRoutesTestText = read("bucephalus-cloud/tests/runRoutes.test.ts");
+const rootCargoTomlText = read("Cargo.toml");
+const labCliCargoTomlText = read("rust/crates/lab-cli/Cargo.toml");
+const coreCliText = read("rust/crates/lab-cli/src/main.rs");
+const labCliSrcFiles = listFiles("rust/crates/lab-cli/src");
 
 for (const forbidden of [
   /\bscp\b/,
@@ -365,6 +381,95 @@ for (const inputName of [
 ]) {
   if (deployWorkflowInputs[inputName]) {
     fail(`${deployWorkflowPath} must not ask operators for ${inputName}; deploy config belongs in the GitHub environment`);
+  }
+}
+for (const forbiddenRunCreateUsage of [
+  /run create[^\n]*\[--region\b/,
+  /run create[^\n]*\[--executor\b/,
+  /run create[^\n]*\[--cpu\s/,
+  /run create[^\n]*--backend runner-docker/,
+]) {
+  if (cloudReadmeText.match(forbiddenRunCreateUsage) || cloudCliBinText.match(forbiddenRunCreateUsage)) {
+    fail(`Cloud run create docs/help must not expose unsupported hosted runtime placement flag ${forbiddenRunCreateUsage}`);
+  }
+}
+for (const requiredCloudCreateGuard of [
+  "fn validate_run_create_args",
+  "run create option {option} is not supported",
+  "Hosted Cloud does not support user-selected regions",
+  "run_create_rejects_unsupported_runtime_placement_flags",
+  "run_create_rejects_unknown_options_and_positionals",
+]) {
+  if (!cloudCliBinText.includes(requiredCloudCreateGuard)) {
+    fail(`${cloudCliBinPath} must reject unsupported hosted runtime placement before queueing runs: ${requiredCloudCreateGuard}`);
+  }
+}
+for (const requiredCloudCreateDoc of [
+  "Hosted",
+  "Cloud does not support `--region`, `--executor`, or `--cpu` aliases",
+  "/runtime_options/region",
+]) {
+  if (!cloudReadmeText.includes(requiredCloudCreateDoc)) {
+    fail(`${cloudReadmePath} must document unsupported hosted runtime placement contract: ${requiredCloudCreateDoc}`);
+  }
+}
+for (const forbiddenRuntimeAliasImplementation of [
+  /optionalString\(runtimeOptions\.executor/,
+  /positiveInt\(runtimeOptions\.cpu\)/,
+  /jsonPointerValue\(run\.runtime_options,\s*"\/executor"\)/,
+  /"executor",\s*\n\s*"arch"/,
+  /"cpu",\s*\n\s*"memory_mb"/,
+]) {
+  if (forbiddenRuntimeAliasImplementation.test(runsRouteText)) {
+    fail(`${runsRoutePath} must not implement hosted runtime compatibility alias ${forbiddenRuntimeAliasImplementation}`);
+  }
+}
+const cloudRuntimeOptionsSchemaText = runsOpenApiText
+  .split("    CloudRuntimeOptions:")[1]
+  ?.split("\n    ")[0] ?? "";
+for (const forbiddenRuntimeAliasSchema of [
+  /\n        executor:\n          type: string\n/,
+  /\n        cpu:\n          \$ref: '#\/components\/schemas\/PositiveIntegerLike'\n/,
+]) {
+  if (forbiddenRuntimeAliasSchema.test(cloudRuntimeOptionsSchemaText)) {
+    fail(`${runsOpenApiPath} must not advertise hosted runtime compatibility alias ${forbiddenRuntimeAliasSchema}`);
+  }
+}
+for (const requiredAliasRejectionEvidence of [
+  "/runtime_options/executor is not supported",
+  "/runtime_options/cpu is not supported",
+  "Hosted Cloud does not accept the compatibility aliases `executor` or `cpu`",
+]) {
+  if (!runsRouteText.includes(requiredAliasRejectionEvidence)
+    && !cloudCliDocText.includes(requiredAliasRejectionEvidence)
+    && !cloudReadmeText.includes(requiredAliasRejectionEvidence)
+    && !cloudCliBinText.includes(requiredAliasRejectionEvidence)
+    && !runRequirementsTestText.includes(requiredAliasRejectionEvidence)
+    && !runRoutesTestText.includes(requiredAliasRejectionEvidence)) {
+    fail(`hosted runtime alias rejection evidence is missing: ${requiredAliasRejectionEvidence}`);
+  }
+}
+for (const retiredTuiFile of [
+  "rust/crates/lab-cli/src/tui.rs",
+  "rust/crates/lab-cli/src/view_layout.rs",
+]) {
+  if (labCliSrcFiles.includes(retiredTuiFile)) {
+    fail(`${retiredTuiFile} must stay removed; Cloud/runtime inspection must use scriptable resource views, not an alternate-screen TUI`);
+  }
+}
+for (const forbiddenTuiSource of [
+  "mod tui",
+  "tui::",
+  "run_views_browser",
+  "run_interactive_views_browser",
+]) {
+  if (coreCliText.includes(forbiddenTuiSource)) {
+    fail(`core CLI must not retain retired TUI source path: ${forbiddenTuiSource}`);
+  }
+}
+for (const forbiddenTuiDependency of ["crossterm", "ratatui"]) {
+  if (rootCargoTomlText.includes(forbiddenTuiDependency) || labCliCargoTomlText.includes(forbiddenTuiDependency)) {
+    fail(`retired TUI dependency must not be declared: ${forbiddenTuiDependency}`);
   }
 }
 for (const requiredEnv of [
@@ -1990,7 +2095,6 @@ const hostedCliText = read("rust/crates/lab-cli/src/bin/buc.rs");
 const packageRepositoryText = read("bucephalus-cloud/src/packages/repository.ts");
 const packageProvenanceMigrationText = read("bucephalus-cloud/db/migrations/0021_package_provenance.sql");
 const readmeText = read("README.md");
-const runsOpenApiText = read("bucephalus-cloud/api/openapi/runs.yaml");
 const cloudConfigText = read("bucephalus-cloud/src/config.ts");
 for (const required of [
   "BUCEPHALUS_RELEASE_GIT_SHA",
@@ -2055,7 +2159,6 @@ for (const required of [
     fail(`package provenance migration must persist owner-scoped provenance: ${required}`);
   }
 }
-const cloudCliDocText = read("docs/user/cloud-cli.md");
 for (const required of [
   "authenticated",
   "knowing another user's upload id is not a",

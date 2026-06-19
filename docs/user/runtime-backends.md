@@ -34,7 +34,8 @@ Backend `config` objects are currently closed and empty for implemented backends
 
 The CLI `--executor` flag is an operator override for an existing package. It uses CLI enum spelling, such as `--executor local_docker` or `--executor modal`, while YAML uses backend spelling, such as `local-docker` or `modal`.
 
-Modal support is not identical to Local Docker: ephemerals are rejected until backend-native service attachment exists.
+Modal support is not identical to Local Docker: it supports `placement:
+same_sandbox` services, but not separate service sandboxes yet.
 
 The Modal backend launches sandboxes through a packaged `bucephalus-modal-launcher` helper built from Modal's official Go SDK. Release archives install it next to `bucephalus`; override the helper path with `BUCEPHALUS_MODAL_LAUNCHER` for development or custom packaging. Modal authentication uses the SDK's standard environment, for example `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`.
 
@@ -52,8 +53,8 @@ Modal Secret named by `BUCEPHALUS_MODAL_GCS_SECRET`.
 
 The runner enforces a simple active-resource cap before launching a trial:
 
-- Local Docker defaults to `24` active Bucephalus-owned containers on the Docker daemon. A trial counts its case sandbox, any ephemerals, and a separate grader sandbox when `stages.grader.strategy: separate` is used. Override with `BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS`.
-- Modal defaults to `64` active sandboxes per runner process. A trial counts its case sandbox and a separate grader sandbox when one is needed. Override with `BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES`.
+- Local Docker defaults to `24` active Bucephalus-owned containers on the Docker daemon. A trial counts its case sandbox, any service containers, and a separate grader sandbox when `stages.grader.strategy: separate` is used. Override with `BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS`.
+- Modal defaults to `64` active sandboxes per runner process. A trial counts its case sandbox and a separate grader sandbox when one is needed; same-sandbox services do not add a sandbox. Override with `BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES`.
 
 These caps are intentionally coarse safety rails. They prevent a high-concurrency run from silently multiplying containers or Modal sandboxes faster than the runner can clean them up. More granular CPU, memory, and backend quota scheduling can be layered on later without changing experiment YAML.
 

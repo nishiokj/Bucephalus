@@ -2,13 +2,30 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RuntimeSidecarReadinessPlan {
-    pub(crate) command: Vec<String>,
-    pub(crate) timeout_ms: Option<u64>,
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RuntimeSidecarHttpReadinessPlan {
+    pub(crate) url: String,
+    pub(crate) method: String,
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) body: Option<String>,
+    pub(crate) json: Option<Value>,
+    pub(crate) expect_status: u64,
+    pub(crate) interval_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RuntimeSidecarReadinessPlan {
+    Command {
+        command: Vec<String>,
+        timeout_ms: Option<u64>,
+    },
+    Http {
+        http: RuntimeSidecarHttpReadinessPlan,
+        timeout_ms: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RuntimeSidecarPlan {
     pub(crate) id: String,
     pub(crate) image: String,
@@ -60,6 +77,63 @@ fn parse_string_map(value: Option<&Value>, context: &str) -> Result<BTreeMap<Str
         .collect()
 }
 
+fn parse_http_readiness(value: &Value, context: &str) -> Result<RuntimeSidecarHttpReadinessPlan> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{} must be an object", context))?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "url" | "method" | "headers" | "body" | "json" | "expect_status" | "interval_ms"
+        ) {
+            return Err(anyhow!("{}.{} is not supported", context, key));
+        }
+    }
+    let url = object
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{}.url is required", context))?;
+    let method = object
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("GET");
+    if object.contains_key("body") && object.contains_key("json") {
+        return Err(anyhow!("{} cannot declare both body and json", context));
+    }
+    let body = object
+        .get("body")
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| anyhow!("{}.body must be a string", context))
+        })
+        .transpose()?;
+    let expect_status = object
+        .get("expect_status")
+        .and_then(Value::as_u64)
+        .unwrap_or(200);
+    if !(100..=599).contains(&expect_status) {
+        return Err(anyhow!(
+            "{}.expect_status must be an HTTP status code",
+            context
+        ));
+    }
+    Ok(RuntimeSidecarHttpReadinessPlan {
+        url: url.to_string(),
+        method: method.to_string(),
+        headers: parse_string_map(object.get("headers"), &format!("{}.headers", context))?,
+        body,
+        json: object.get("json").cloned(),
+        expect_status,
+        interval_ms: object.get("interval_ms").and_then(Value::as_u64),
+    })
+}
+
 fn parse_string_array(value: Option<&Value>, context: &str) -> Result<Vec<String>> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -93,18 +167,49 @@ fn parse_readiness(
         .as_object()
         .ok_or_else(|| anyhow!("{} must be an object", context))?;
     for key in object.keys() {
-        if !matches!(key.as_str(), "command" | "timeout_ms") {
+        if !matches!(key.as_str(), "command" | "http" | "timeout_ms") {
             return Err(anyhow!("{}.{} is not supported", context, key));
         }
     }
-    let command = parse_string_array(object.get("command"), &format!("{}.command", context))?;
-    if command.is_empty() {
-        return Err(anyhow!("{}.command is required", context));
+    let has_command = object.contains_key("command");
+    let has_http = object.contains_key("http");
+    match (has_command, has_http) {
+        (true, true) => {
+            return Err(anyhow!(
+                "{} must declare exactly one readiness probe: command or http",
+                context
+            ));
+        }
+        (false, false) => {
+            return Err(anyhow!(
+                "{} must declare exactly one readiness probe: command or http",
+                context
+            ));
+        }
+        (true, false) => {
+            let command =
+                parse_string_array(object.get("command"), &format!("{}.command", context))?;
+            if command.is_empty() {
+                return Err(anyhow!("{}.command is required", context));
+            }
+            Ok(Some(RuntimeSidecarReadinessPlan::Command {
+                command,
+                timeout_ms: object.get("timeout_ms").and_then(Value::as_u64),
+            }))
+        }
+        (false, true) => {
+            let http = parse_http_readiness(
+                object
+                    .get("http")
+                    .ok_or_else(|| anyhow!("{}.http is required", context))?,
+                &format!("{}.http", context),
+            )?;
+            Ok(Some(RuntimeSidecarReadinessPlan::Http {
+                http,
+                timeout_ms: object.get("timeout_ms").and_then(Value::as_u64),
+            }))
+        }
     }
-    Ok(Some(RuntimeSidecarReadinessPlan {
-        command,
-        timeout_ms: object.get("timeout_ms").and_then(Value::as_u64),
-    }))
 }
 
 pub(crate) fn sidecar_plan(experiment: &Value, id: &str) -> Result<RuntimeSidecarPlan> {

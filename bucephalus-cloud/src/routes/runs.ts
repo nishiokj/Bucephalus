@@ -8,6 +8,11 @@ import {
   type RuntimeEventRecord,
   type RuntimeEventRowInsert,
   type RuntimeAttemptObjectContentRecord,
+  type RuntimeAttemptObjectRecord,
+  type RuntimeContractStageRecord,
+  type RuntimeMetricObservationRecord,
+  type RuntimeResults,
+  type RuntimeTrialResultRecord,
   type WorkerLifecycleEventRecord,
 } from "../runtime/repository";
 import { RunnerRepository, type RunnerInstanceRecord, type RunnerPoolRecord } from "../runners/repository";
@@ -51,6 +56,78 @@ interface RunWireEnrichment {
   pending_reason: PendingReason | null;
 }
 
+interface RuntimeResource {
+  apiVersion: "bucephalus.dev/v1alpha1";
+  kind: string;
+  metadata: {
+    name: string;
+    uid: string;
+    generation: number;
+    resourceVersion?: string;
+    labels: Record<string, string>;
+    annotations: Record<string, string>;
+    ownerReferences: RuntimeResourceRef[];
+    created_at?: string;
+    updated_at?: string;
+  };
+  spec: JsonObject;
+  status: JsonObject;
+  audit: JsonObject;
+}
+
+interface RuntimeResourceRef {
+  apiVersion: "bucephalus.dev/v1alpha1";
+  kind: string;
+  name: string;
+  uid?: string;
+}
+
+interface RuntimeResourceInventory {
+  cloud_run_id: string;
+  core_run_ids: string[];
+  resources: RuntimeResource[];
+}
+
+interface RuntimeResourceListWire extends RuntimeResourceInventory {
+  apiVersion: "bucephalus.dev/v1alpha1";
+  kind: "RuntimeResourceList";
+  metadata: RuntimeCollectionMetadata;
+}
+
+interface RuntimeCollectionMetadata {
+  resourceVersion: string;
+  continue: string | null;
+  remainingItemCount: number;
+  total: number;
+  returned: number;
+}
+
+interface RuntimeHealthRowWire extends Record<string, unknown> {
+  health: "ready" | "degraded" | "problem" | "unknown";
+  observed: "current" | "stale" | "unknown";
+  access: JsonObject;
+  actions: string[];
+}
+
+type RuntimeResourceRoute =
+  | { kind: "resource-list"; runId: string }
+  | { kind: "resource-health"; runId: string }
+  | { kind: "resource-watch"; runId: string }
+  | { kind: "resource-metrics-list"; runId: string }
+  | { kind: "resource-item"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-status"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-events"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-logs"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-metrics"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-content"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-operation"; runId: string; resourceKind: string; resourceName: string; operation: string }
+  | { kind: "resource-action"; runId: string; resourceKind: string; resourceName: string; action: string }
+  | { kind: "resource-port-forward"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-exec"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "api-resources"; runId: string }
+  | { kind: "api-resource"; runId: string; resourceKind: string }
+  | { kind: "inspect"; runId: string };
+
 export async function handleRunRoute(
   request: Request,
   url: URL,
@@ -92,9 +169,47 @@ export async function handleRunRoute(
     return failAttempt(request, url, runs);
   }
 
+  const workerPortForwardRoute = workerPortForwardPath(url.pathname);
+  if (workerPortForwardRoute) {
+    if (request.method === "GET" && workerPortForwardRoute.kind === "list") {
+      return workerListPortForwards(request, workerPortForwardRoute, runs, runtime);
+    }
+    if (request.method === "POST" && workerPortForwardRoute.kind === "update") {
+      return workerUpdatePortForward(request, workerPortForwardRoute, runs, runtime);
+    }
+    throw new HttpError(405, "worker_runtime_method_not_allowed", "Worker runtime endpoint does not support this method", {
+      method: request.method,
+      path: url.pathname,
+    });
+  }
+
+  const workerExecRoute = workerExecPath(url.pathname);
+  if (workerExecRoute) {
+    if (request.method === "GET" && workerExecRoute.kind === "list") {
+      return workerListExecRequests(request, workerExecRoute, runs, runtime);
+    }
+    if (request.method === "POST" && workerExecRoute.kind === "update") {
+      return workerUpdateExecRequest(request, workerExecRoute, runs, runtime);
+    }
+    throw new HttpError(405, "worker_runtime_method_not_allowed", "Worker runtime endpoint does not support this method", {
+      method: request.method,
+      path: url.pathname,
+    });
+  }
+
+  if (isWorkerRuntimeSubpath(url.pathname)) {
+    throw new HttpError(404, "worker_runtime_endpoint_not_found", "Worker runtime endpoint not found; use resource-native worker runtime paths", {
+      path: url.pathname,
+      resource_apis: [
+        "/v1/worker/run-attempts/{attempt_id}/runtime/resources/PortForward",
+        "/v1/worker/run-attempts/{attempt_id}/runtime/resources/Exec",
+      ],
+    });
+  }
+
   if (request.method === "POST" && url.pathname === "/v1/worker/runs/expire-leases") {
     requireBearerToken(request, workerToken, "worker lease expiration");
-    return expireLeases(runs);
+    return expireLeases(runs, runtime);
   }
 
   if (request.method === "GET" && packageContentPath(url.pathname)) {
@@ -153,6 +268,89 @@ export async function handleRunRoute(
     return jsonResponse({ runs: records.map((run) => runToWire(run, enrichment.get(run.run_id), { includeConfig, includeRuntime })) });
   }
 
+  const runtimeResourceRoute = runtimeResourcePath(url.pathname);
+  if (runtimeResourceRoute) {
+    const run = await runs.getRun(runtimeResourceRoute.runId, ownerKey);
+    if (!run) {
+      throw new HttpError(404, "run_not_found", "Run not found");
+    }
+    if (request.method === "GET") {
+      return runtimeResourceResponse(url, runtimeResourceRoute, runtime);
+    }
+    if (request.method === "DELETE" && runtimeResourceRoute.kind === "resource-item") {
+      const body = await optionalJsonBody(request);
+      return jsonResponse(await runtime.cancelRuntimeAccessResource({
+        run,
+        resourceKind: runtimeResourceRoute.resourceKind,
+        resourceName: runtimeResourceRoute.resourceName,
+        resourceVersion: body ? optionalString(body.resource_version, "/resource_version") : null,
+        requester: ownerKey ?? null,
+        reason: body ? optionalString(body.reason, "/reason") : null,
+      }));
+    }
+    if (request.method === "POST" && runtimeResourceRoute.kind === "resource-action") {
+      const body = await optionalJsonBody(request);
+      const input = {
+        run,
+        resourceKind: runtimeResourceRoute.resourceKind,
+        resourceName: runtimeResourceRoute.resourceName,
+        resourceVersion: body ? optionalString(body.resource_version, "/resource_version") : null,
+        requester: ownerKey ?? null,
+        reason: body ? optionalString(body.reason, "/reason") : null,
+      };
+      switch (runtimeResourceRoute.action) {
+        case "cordon":
+          return jsonResponse(await runtime.cordonRunnerInstanceResource(input));
+        case "drain":
+          return jsonResponse(await runtime.drainRunnerInstanceResource(input));
+        case "uncordon":
+          return jsonResponse(await runtime.uncordonRunnerInstanceResource(input));
+        case "cancel":
+          return jsonResponse(await runtime.cancelRuntimeAccessResource(input));
+        default:
+          throw new HttpError(404, "runtime_resource_action_not_found", "Runtime resource action not found", {
+            action: runtimeResourceRoute.action,
+          });
+      }
+    }
+    if (request.method === "POST" && runtimeResourceRoute.kind === "resource-port-forward") {
+      const body = await readJsonObject(request);
+      assertRuntimeAccessBodyHasNoTarget(body);
+      const portForward = await runtime.createPortForwardRequest({
+        run,
+        targetPort: requirePort(body.target_port, "/target_port"),
+        localPort: optionalPort(body.local_port, "/local_port"),
+        resourceKind: runtimeResourceRoute.resourceKind,
+        resourceName: runtimeResourceRoute.resourceName,
+        resourceVersion: optionalString(body.resource_version, "/resource_version"),
+        protocol: optionalString(body.protocol, "/protocol"),
+        ttlSeconds: optionalPositiveInt(body.ttl_seconds, "/ttl_seconds"),
+        requester: ownerKey ?? null,
+        reason: optionalString(body.reason, "/reason"),
+      });
+      return jsonResponse({ resource: runtime.runtimeAccessRequestResource(run, portForward) }, { status: 201 });
+    }
+    if (request.method === "POST" && runtimeResourceRoute.kind === "resource-exec") {
+      const body = await readJsonObject(request);
+      assertRuntimeAccessBodyHasNoTarget(body);
+      const exec = await runtime.createExecRequest({
+        run,
+        command: requireStringArray(body.command, "/command"),
+        resourceKind: runtimeResourceRoute.resourceKind,
+        resourceName: runtimeResourceRoute.resourceName,
+        resourceVersion: optionalString(body.resource_version, "/resource_version"),
+        ttlSeconds: optionalPositiveInt(body.ttl_seconds, "/ttl_seconds"),
+        requester: ownerKey ?? null,
+        reason: optionalString(body.reason, "/reason"),
+      });
+      return jsonResponse({ resource: runtime.runtimeAccessRequestResource(run, exec) }, { status: 201 });
+    }
+    throw new HttpError(405, "runtime_method_not_allowed", "Runtime resource endpoint does not support this method", {
+      method: request.method,
+      path: url.pathname,
+    });
+  }
+
   const runtimeRoute = runtimePath(url.pathname);
   if (request.method === "GET" && runtimeRoute) {
     const run = await runs.getRun(runtimeRoute.runId, ownerKey);
@@ -171,10 +369,7 @@ export async function handleRunRoute(
         }),
         runtime.workerLifecycleEvents(runtimeRoute.runId, { limit }),
       ]);
-      return jsonResponse({
-        cloud_run_id: runtimeRoute.runId,
-        events: runtimeEventStreamToWire(trialRows, workerEvents, limit),
-      });
+      return jsonResponse(runtimeEventListToWire(runtimeRoute.runId, [], trialRows, workerEvents, url, limit));
     }
     if (runtimeRoute.kind === "results") {
       return jsonResponse(await runtime.results(runtimeRoute.runId, {
@@ -268,6 +463,77 @@ function runtimePath(pathname: string):
   }
   if (parts.length === 4 && parts[1] === "runtime" && parts[2] === "kv") {
     return { kind: "kv", runId: parts[0] ?? "", key: parts[3] ?? "" };
+  }
+  return null;
+}
+
+function runtimeResourcePath(pathname: string): RuntimeResourceRoute | null {
+  const prefix = "/v1/runs/";
+  if (!pathname.startsWith(prefix)) {
+    return null;
+  }
+  const parts = pathname.slice(prefix.length).split("/").map(decodeURIComponent);
+  const runId = parts[0] ?? "";
+  if (parts[1] !== "runtime") {
+    return null;
+  }
+  if (parts.length === 3 && parts[2] === "inspect") {
+    return { kind: "inspect", runId };
+  }
+  if (parts.length === 3 && parts[2] === "api-resources") {
+    return { kind: "api-resources", runId };
+  }
+  if (parts.length === 4 && parts[2] === "api-resources") {
+    return { kind: "api-resource", runId, resourceKind: parts[3] ?? "" };
+  }
+  if (parts[2] !== "resources") {
+    return null;
+  }
+  if (parts.length === 3) {
+    return { kind: "resource-list", runId };
+  }
+  if (parts.length === 4 && parts[3] === "health") {
+    return { kind: "resource-health", runId };
+  }
+  if (parts.length === 4 && parts[3] === "watch") {
+    return { kind: "resource-watch", runId };
+  }
+  if (parts.length === 4 && parts[3] === "metrics") {
+    return { kind: "resource-metrics-list", runId };
+  }
+  const resourceKind = parts[3] ?? "";
+  const resourceName = parts[4] ?? "";
+  if (!resourceKind || !resourceName) {
+    return null;
+  }
+  if (parts.length === 5) {
+    return { kind: "resource-item", runId, resourceKind, resourceName };
+  }
+  if (parts.length === 7 && parts[5] === "actions") {
+    return { kind: "resource-action", runId, resourceKind, resourceName, action: parts[6] ?? "" };
+  }
+  if (parts.length === 6) {
+    switch (parts[5]) {
+      case "status":
+        return { kind: "resource-status", runId, resourceKind, resourceName };
+      case "events":
+        return { kind: "resource-events", runId, resourceKind, resourceName };
+      case "logs":
+        return { kind: "resource-logs", runId, resourceKind, resourceName };
+      case "metrics":
+        return { kind: "resource-metrics", runId, resourceKind, resourceName };
+      case "content":
+        return { kind: "resource-content", runId, resourceKind, resourceName };
+      case "port-forward":
+        return { kind: "resource-port-forward", runId, resourceKind, resourceName };
+      case "exec":
+        return { kind: "resource-exec", runId, resourceKind, resourceName };
+      default:
+        return null;
+    }
+  }
+  if (parts.length === 7 && parts[5] === "operations") {
+    return { kind: "resource-operation", runId, resourceKind, resourceName, operation: parts[6] ?? "" };
   }
   return null;
 }
@@ -463,6 +729,1440 @@ function runtimeArtifactToWire(record: RuntimeAttemptObjectContentRecord): JsonO
   };
 }
 
+async function runtimeResourceResponse(
+  url: URL,
+  route: RuntimeResourceRoute,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const inventory = await runtimeResourceInventoryForRun(route.runId, runtime);
+  switch (route.kind) {
+    case "resource-list":
+      return jsonResponse(runtimeResourceListToWire(inventory, url));
+    case "resource-health":
+      return jsonResponse(runtimeResourceHealthToWire(inventory, url));
+    case "resource-watch":
+      return jsonResponse(runtimeResourceWatchToWire(inventory, url));
+    case "resource-metrics-list":
+      return jsonResponse(runtimeResourceMetricsListToWire(inventory, url));
+    case "api-resources":
+      return jsonResponse(runtimeApiResourceListToWire(inventory));
+    case "api-resource": {
+      const resource = runtimeApiResourceListToWire(inventory).resources
+        .find((item) => runtimeApiResourceMatchesKind(item as JsonObject, route.resourceKind));
+      if (!resource) {
+        throw new HttpError(404, "runtime_api_resource_not_found", "Runtime API resource kind not found");
+      }
+      return jsonResponse(resource);
+    }
+    case "inspect":
+      return jsonResponse(await runtimeInspectBundleToWire(route.runId, runtime, inventory, url));
+    case "resource-item": {
+      const resource = requireRuntimeResource(inventory, route.resourceKind, route.resourceName);
+      if (url.searchParams.get("view") === "resource") {
+        return jsonResponse(resource);
+      }
+      return jsonResponse(runtimeResourceDescribeToWire(inventory, resource, url));
+    }
+    case "resource-status":
+      return jsonResponse(runtimeResourceStatusToWire(inventory, requireRuntimeResource(inventory, route.resourceKind, route.resourceName)));
+    case "resource-events": {
+      const resource = requireRuntimeResource(inventory, route.resourceKind, route.resourceName);
+      const limit = limitFromUrl(url);
+      const [trialRows, workerEvents] = await Promise.all([
+        runtime.eventRows(route.runId, { limit, afterRowSeq: optionalIntFromUrl(url, "after_row_seq") }),
+        runtime.workerLifecycleEvents(route.runId, { limit }),
+      ]);
+      return jsonResponse(runtimeResourceEventListToWire(inventory, resource, trialRows, workerEvents, url, limit));
+    }
+    case "resource-logs":
+      return runtimeResourceLogsResponse(route.runId, runtime, requireRuntimeResource(inventory, route.resourceKind, route.resourceName), url);
+    case "resource-content":
+      return runtimeResourceContentResponse(route.runId, runtime, requireRuntimeResource(inventory, route.resourceKind, route.resourceName));
+    case "resource-metrics":
+      return jsonResponse(runtimeResourceMetricsToWire(
+        inventory,
+        requireRuntimeResource(inventory, route.resourceKind, route.resourceName),
+      ));
+    case "resource-operation":
+      return jsonResponse(runtimeResourceOperationReviewToWire(
+        route.runId,
+        requireRuntimeResource(inventory, route.resourceKind, route.resourceName),
+        route.operation,
+      ));
+    case "resource-action":
+    case "resource-port-forward":
+    case "resource-exec":
+      throw new HttpError(405, "runtime_method_not_allowed", "Runtime resource endpoint does not support this method", {
+        method: "GET",
+        resource_kind: route.resourceKind,
+        resource_name: route.resourceName,
+      });
+  }
+}
+
+async function runtimeResourceInventoryForRun(
+  cloudRunId: string,
+  runtime: RuntimeRepository,
+): Promise<RuntimeResourceInventory> {
+  const results = await runtime.results(cloudRunId, { limit: 1000 });
+  return {
+    cloud_run_id: cloudRunId,
+    core_run_ids: results.core_run_ids,
+    resources: runtimeResourcesFromResults(cloudRunId, results).map(withRuntimeResourceVersion),
+  };
+}
+
+function runtimeResourcesFromResults(cloudRunId: string, results: RuntimeResults): RuntimeResource[] {
+  return [
+    ...results.trial_results.map((row) => runtimeTrialResource(cloudRunId, row)),
+    ...results.metric_observations.map((row) => runtimeMetricObservationResource(cloudRunId, row)),
+    ...results.contract_stages.map((row) => runtimeTrialStageResource(cloudRunId, row)),
+    ...results.attempt_objects.map((row) => runtimeTrialArtifactResource(cloudRunId, row)),
+  ];
+}
+
+function runtimeTrialResource(cloudRunId: string, row: RuntimeTrialResultRecord): RuntimeResource {
+  const phase = runtimeTrialPhase(row);
+  const ready = runtimeReadyCondition(phase, `Trial ${row.trial_id} ${phase}`, null);
+  const labels = runtimeTrialLabels(cloudRunId, row);
+  const updatedAt = runtimeRowTimestamp(row.row);
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "Trial",
+    metadata: {
+      name: runtimeTrialResourceName(row.trial_id, row.attempt),
+      uid: runtimeResourceUid("Trial", cloudRunId, row.core_run_id, row.trial_id, String(row.attempt)),
+      generation: 1,
+      labels,
+      annotations: {
+        "bucephalus.dev/source": stringField(row.row.source) ?? "runtime_results",
+      },
+      ownerReferences: [],
+      ...(updatedAt ? { updated_at: updatedAt } : {}),
+    },
+    spec: {
+      core_run_id: row.core_run_id,
+      trial_id: row.trial_id,
+      schedule_idx: row.schedule_idx,
+      attempt: row.attempt,
+      row_seq: row.row_seq,
+      variant_id: row.variant_id,
+      task_id: row.task_id,
+      repl_idx: row.repl_idx,
+      bindings: jsonObjectOrEmpty(row.bindings),
+    },
+    status: {
+      phase,
+      outcome: row.outcome,
+      primary_metric_name: row.primary_metric_name,
+      primary_metric_value: row.primary_metric_value,
+      metrics: row.metrics,
+      events_total: row.events_total,
+      has_events: row.has_events,
+      row_seq: row.row_seq,
+      observedGeneration: 1,
+      conditions: [ready],
+      access: runtimeUnavailableAccess("runtime_access_not_connected", "Runner VM access resources are not connected for this Trial yet."),
+    },
+    audit: {
+      source: stringField(row.row.source) ?? "runtime_results",
+      row: row.row,
+    },
+  };
+}
+
+function runtimeMetricObservationResource(cloudRunId: string, row: RuntimeMetricObservationRecord): RuntimeResource {
+  const trialName = runtimeTrialResourceName(row.trial_id, row.attempt);
+  const trialRef = runtimeOwnerRef("Trial", trialName, runtimeResourceUid("Trial", cloudRunId, row.core_run_id, row.trial_id, String(row.attempt)));
+  const updatedAt = runtimeRowTimestamp(row.row);
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "MetricObservation",
+    metadata: {
+      name: runtimeResourceName(`${trialName}-${row.metric_name}-${row.row_seq}`),
+      uid: runtimeResourceUid("MetricObservation", cloudRunId, row.core_run_id, row.trial_id, String(row.attempt), row.metric_name, String(row.row_seq)),
+      generation: 1,
+      labels: {
+        ...runtimeTrialLabels(cloudRunId, row),
+        "bucephalus.dev/metric-name": row.metric_name,
+      },
+      annotations: {
+        "bucephalus.dev/source": row.metric_source ?? stringField(row.row.source) ?? "runtime_results",
+      },
+      ownerReferences: [trialRef],
+      ...(updatedAt ? { updated_at: updatedAt } : {}),
+    },
+    spec: {
+      core_run_id: row.core_run_id,
+      trial_id: row.trial_id,
+      schedule_idx: row.schedule_idx,
+      attempt: row.attempt,
+      row_seq: row.row_seq,
+      variant_id: row.variant_id,
+      task_id: row.task_id,
+      repl_idx: row.repl_idx,
+      metric_name: row.metric_name,
+      metric_source: row.metric_source,
+    },
+    status: {
+      phase: "recorded",
+      outcome: row.outcome,
+      metric_value: row.metric_value,
+      observedGeneration: 1,
+      conditions: [runtimeCondition("Ready", "True", "Recorded", `Metric ${row.metric_name} was recorded.`)],
+    },
+    audit: {
+      source: row.metric_source ?? stringField(row.row.source) ?? "runtime_results",
+      row: row.row,
+    },
+  };
+}
+
+function runtimeTrialStageResource(cloudRunId: string, row: RuntimeContractStageRecord): RuntimeResource {
+  const trialName = runtimeTrialResourceName(row.trial_id, row.attempt);
+  const phase = row.status || "unknown";
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "TrialStage",
+    metadata: {
+      name: runtimeResourceName(`${trialName}-${row.stage}`),
+      uid: runtimeResourceUid("TrialStage", cloudRunId, row.core_run_id, row.trial_id, String(row.attempt), row.stage),
+      generation: 1,
+      labels: {
+        ...runtimeTrialLabels(cloudRunId, row),
+        "bucephalus.dev/stage": row.stage,
+      },
+      annotations: {
+        "bucephalus.dev/source": stringField(row.row.source) ?? "runtime_results",
+      },
+      ownerReferences: [runtimeOwnerRef("Trial", trialName, runtimeResourceUid("Trial", cloudRunId, row.core_run_id, row.trial_id, String(row.attempt)))],
+      ...(row.recorded_at ? { created_at: row.recorded_at, updated_at: row.recorded_at } : {}),
+    },
+    spec: {
+      core_run_id: row.core_run_id,
+      trial_id: row.trial_id,
+      schedule_idx: row.schedule_idx,
+      attempt: row.attempt,
+      row_seq: row.row_seq,
+      variant_id: row.variant_id,
+      task_id: row.task_id,
+      repl_idx: row.repl_idx,
+      stage: row.stage,
+    },
+    status: {
+      phase,
+      status: row.status,
+      detail: row.detail,
+      recorded_at: row.recorded_at,
+      observedGeneration: 1,
+      conditions: [runtimeReadyCondition(phase, `Stage ${row.stage} ${phase}`, row.recorded_at)],
+    },
+    audit: {
+      source: stringField(row.row.source) ?? "runtime_results",
+      row: row.row,
+    },
+  };
+}
+
+function runtimeTrialArtifactResource(cloudRunId: string, row: RuntimeAttemptObjectRecord): RuntimeResource {
+  const trialName = runtimeTrialResourceName(row.trial_id, row.attempt);
+  const recordedAt = row.recorded_at_ms > 0 ? new Date(row.recorded_at_ms).toISOString() : undefined;
+  const contentAvailable = row.content_available === true;
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "TrialArtifact",
+    metadata: {
+      name: runtimeResourceName(`${trialName}-${row.role}`),
+      uid: runtimeResourceUid("TrialArtifact", cloudRunId, row.core_run_id, row.trial_id, String(row.attempt), row.role),
+      generation: 1,
+      labels: {
+        "bucephalus.dev/run-id": cloudRunId,
+        "bucephalus.dev/core-run-id": row.core_run_id,
+        "bucephalus.dev/trial-id": row.trial_id,
+        "bucephalus.dev/attempt": String(row.attempt),
+        "bucephalus.dev/schedule-idx": String(row.schedule_idx),
+        "bucephalus.dev/artifact-role": row.role,
+        ...(row.sha256 ? { "bucephalus.dev/sha256": row.sha256 } : {}),
+      },
+      annotations: {
+        "bucephalus.dev/object-ref": row.object_ref,
+        ...(row.relative_path ? { "bucephalus.dev/relative-path": row.relative_path } : {}),
+      },
+      ownerReferences: [runtimeOwnerRef("Trial", trialName, runtimeResourceUid("Trial", cloudRunId, row.core_run_id, row.trial_id, String(row.attempt)))],
+      ...(recordedAt ? { created_at: recordedAt, updated_at: recordedAt } : {}),
+    },
+    spec: {
+      core_run_id: row.core_run_id,
+      trial_id: row.trial_id,
+      schedule_idx: row.schedule_idx,
+      attempt: row.attempt,
+      role: row.role,
+      object_ref: row.object_ref,
+      metadata: row.metadata ?? null,
+    },
+    status: {
+      phase: contentAvailable ? "available" : "referenced",
+      content_available: contentAvailable,
+      media_type: row.media_type ?? null,
+      byte_size: row.byte_size ?? null,
+      sha256: row.sha256 ?? null,
+      relative_path: row.relative_path ?? null,
+      recorded_at_ms: row.recorded_at_ms,
+      observedGeneration: 1,
+      conditions: [
+        runtimeCondition(
+          "Ready",
+          contentAvailable ? "True" : "Unknown",
+          contentAvailable ? "ContentAvailable" : "ExternalReference",
+          contentAvailable ? "Artifact content is persisted by Cloud." : "Artifact is referenced by runtime evidence but content is not persisted by Cloud.",
+          recordedAt,
+        ),
+      ],
+    },
+    audit: {
+      source: contentAvailable ? "worker_runtime_artifact_upload" : "runtime_results",
+    },
+  };
+}
+
+function runtimeResourceListToWire(
+  inventory: RuntimeResourceInventory,
+  url: URL,
+): RuntimeResourceListWire {
+  const filtered = filterRuntimeResources(inventory.resources, url);
+  const { items, metadata } = paginateRuntimeResources(filtered, url);
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeResourceList",
+    metadata,
+    cloud_run_id: inventory.cloud_run_id,
+    core_run_ids: inventory.core_run_ids,
+    resources: items,
+  };
+}
+
+function runtimeResourceWatchToWire(inventory: RuntimeResourceInventory, url: URL): Record<string, unknown> {
+  const resourceInventory = runtimeResourceListToWire(inventory, url);
+  const known = knownRuntimeResourceVersions(url);
+  const resourceVersions = Object.fromEntries(
+    resourceInventory.resources.map((resource) => [runtimeResourceIdentity(resource), resource.metadata.resourceVersion ?? ""]),
+  );
+  const events = resourceInventory.resources.flatMap((resource) => {
+    const identity = runtimeResourceIdentity(resource);
+    const previous = known.get(identity);
+    const current = resource.metadata.resourceVersion ?? "";
+    if (previous && previous === current) {
+      return [];
+    }
+    return [{
+      type: previous ? "MODIFIED" : "ADDED",
+      resource_ref: runtimeResourceRef(resource),
+      resource_version: current,
+      ...(previous ? { previous_resource_version: previous } : {}),
+      resource,
+    }];
+  });
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeResourceWatchList",
+    cloud_run_id: inventory.cloud_run_id,
+    generated_at: new Date().toISOString(),
+    core_run_ids: inventory.core_run_ids,
+    resource_versions: resourceVersions,
+    events,
+    resource_inventory: resourceInventory,
+  };
+}
+
+function runtimeResourceHealthToWire(inventory: RuntimeResourceInventory, url: URL): Record<string, unknown> {
+  const resources = filterRuntimeResources(inventory.resources, url);
+  const rows = resources.map(runtimeResourceHealthRow);
+  const summary = rows.reduce((acc, row) => {
+    acc.total += 1;
+    acc[row.health] += 1;
+    if (Object.keys(row.access).length > 0) acc.access_targets += 1;
+    if (row.access.reachable === true) acc.reachable_access_targets += 1;
+    if (row.access.port_forward === true) acc.port_forward_ready += 1;
+    if (row.access.exec === true) acc.exec_ready += 1;
+    acc.actions_available += row.actions.length;
+    acc.observed_resources += 1;
+    if (row.observed === "current") acc.observed_current += 1;
+    if (row.observed === "stale") acc.observed_stale += 1;
+    if (row.observed === "unknown") acc.observed_unknown += 1;
+    return acc;
+  }, {
+    total: 0,
+    ready: 0,
+    degraded: 0,
+    problem: 0,
+    unknown: 0,
+    access_targets: 0,
+    reachable_access_targets: 0,
+    port_forward_ready: 0,
+    exec_ready: 0,
+    actions_available: 0,
+    observed_resources: 0,
+    observed_current: 0,
+    observed_stale: 0,
+    observed_unknown: 0,
+  } satisfies Record<string, number>);
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeResourceHealth",
+    cloud_run_id: inventory.cloud_run_id,
+    generated_at: new Date().toISOString(),
+    core_run_ids: inventory.core_run_ids,
+    summary,
+    resources: rows,
+  };
+}
+
+function runtimeResourceHealthRow(resource: RuntimeResource): RuntimeHealthRowWire {
+  const ready = runtimeReadyConditionForResource(resource);
+  const degraded = runtimeResourceConditions(resource).filter((condition) =>
+    condition.type !== "Ready" && condition.status !== "True"
+  );
+  const health = runtimeResourceHealthState(resource, ready, degraded);
+  const phase = stringField(resource.status.phase);
+  const reason = stringField(resource.status.reason) ?? stringField(ready?.reason);
+  const message = stringField(resource.status.message) ?? stringField(ready?.message);
+  const access = jsonObjectOrEmpty(resource.status.access);
+  return {
+    resource: `${resource.kind}/${resource.metadata.name}`,
+    resource_ref: runtimeResourceRef(resource),
+    health,
+    observed: runtimeResourceObserved(resource),
+    phase,
+    ready: ready ?? null,
+    reason,
+    message,
+    condition_summary: ready ? `${ready.status} ${ready.reason}` : null,
+    degraded_conditions: degraded,
+    actions: runtimeResourceActions(resource),
+    access,
+    access_summary: runtimeAccessSummary(access),
+    source: stringField(resource.metadata.annotations["bucephalus.dev/source"]) ?? stringField(resource.audit.source),
+    updated_at: resource.metadata.updated_at ?? null,
+    resource_version: resource.metadata.resourceVersion ?? null,
+  };
+}
+
+function runtimeResourceStatusToWire(inventory: RuntimeResourceInventory, resource: RuntimeResource): Record<string, unknown> {
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeResourceStatus",
+    cloud_run_id: inventory.cloud_run_id,
+    core_run_ids: inventory.core_run_ids,
+    resource_ref: runtimeResourceRef(resource),
+    generation: resource.metadata.generation ?? null,
+    observedGeneration: numberField(resource.status.observedGeneration),
+    resourceVersion: resource.metadata.resourceVersion ?? null,
+    phase: stringField(resource.status.phase),
+    reason: stringField(resource.status.reason),
+    message: stringField(resource.status.message),
+    conditions: runtimeResourceConditions(resource),
+    actions: runtimeResourceActions(resource),
+    status: resource.status,
+    audit: resource.audit,
+  };
+}
+
+function runtimeResourceDescribeToWire(
+  inventory: RuntimeResourceInventory,
+  resource: RuntimeResource,
+  url: URL,
+): Record<string, unknown> {
+  const operations = runtimeResourceDescribeOperations(inventory.cloud_run_id, resource);
+  const related = runtimeRelatedResources(inventory, resource);
+  const eventLimit = queryInteger(url, "event_limit", { defaultValue: 25, min: 1, max: 250 });
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeResourceDescribe",
+    cloud_run_id: inventory.cloud_run_id,
+    core_run_ids: inventory.core_run_ids,
+    resource,
+    operations,
+    related_resources: related,
+    event_list: {
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "RuntimeResourceEventList",
+      cloud_run_id: inventory.cloud_run_id,
+      generated_at: new Date().toISOString(),
+      core_run_ids: inventory.core_run_ids,
+      resource,
+      event_filter: runtimeEventFilterToWire(url, resource),
+      metadata: runtimeEventMetadata([], eventLimit, null),
+      events: [],
+    },
+  };
+}
+
+function runtimeResourceEventListToWire(
+  inventory: RuntimeResourceInventory,
+  resource: RuntimeResource,
+  trialRows: RuntimeEventRecord[],
+  workerEvents: WorkerLifecycleEventRecord[],
+  url: URL,
+  limit: number,
+): Record<string, unknown> {
+  const events = runtimeEventStreamToWire(trialRows, workerEvents, limit)
+    .filter((event) => runtimeEventMatchesFilters(event, url, resource));
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeResourceEventList",
+    cloud_run_id: inventory.cloud_run_id,
+    generated_at: new Date().toISOString(),
+    core_run_ids: inventory.core_run_ids,
+    resource,
+    event_filter: runtimeEventFilterToWire(url, resource),
+    metadata: runtimeEventMetadata(events, limit, optionalIntFromUrl(url, "after_row_seq") ?? null),
+    events,
+  };
+}
+
+function runtimeEventListToWire(
+  cloudRunId: string,
+  coreRunIds: string[],
+  trialRows: RuntimeEventRecord[],
+  workerEvents: WorkerLifecycleEventRecord[],
+  url: URL,
+  limit: number,
+): Record<string, unknown> {
+  const events = runtimeEventStreamToWire(trialRows, workerEvents, limit)
+    .filter((event) => runtimeEventMatchesFilters(event, url));
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeEventList",
+    cloud_run_id: cloudRunId,
+    generated_at: new Date().toISOString(),
+    event_filter: runtimeEventFilterToWire(url),
+    metadata: runtimeEventMetadata(events, limit, optionalIntFromUrl(url, "after_row_seq") ?? null),
+    core_run_ids: coreRunIds,
+    events,
+  };
+}
+
+function runtimeEventMetadata(events: JsonObject[], limit: number, afterRowSeq: number | null): Record<string, unknown> {
+  const rowSeqs = events
+    .map((event) => numberField(event.row_seq))
+    .filter((value): value is number => value !== null);
+  const next = rowSeqs.length > 0 ? Math.max(...rowSeqs) : null;
+  return {
+    resourceVersion: runtimeCollectionResourceVersion(events),
+    continue: null,
+    remainingItemCount: null,
+    limit,
+    returned: events.length,
+    after_row_seq: afterRowSeq,
+    next_after_row_seq: next,
+  };
+}
+
+function runtimeEventFilterToWire(url: URL, resource?: RuntimeResource): Record<string, unknown> {
+  return {
+    event_types: url.searchParams.getAll("event_type").flatMap(splitCsv).sort(),
+    sources: url.searchParams.getAll("source").flatMap(splitCsv).sort(),
+    resource_kind: resource?.kind ?? optionalString(url.searchParams.get("resource_kind"), "/resource_kind"),
+    resource_name: resource?.metadata.name ?? optionalString(url.searchParams.get("resource_name"), "/resource_name"),
+    trial_id: optionalString(url.searchParams.get("trial_id"), "/trial_id"),
+    task_id: optionalString(url.searchParams.get("task_id"), "/task_id"),
+  };
+}
+
+function runtimeEventMatchesFilters(event: JsonObject, url: URL, resource?: RuntimeResource): boolean {
+  const types = url.searchParams.getAll("event_type").flatMap(splitCsv);
+  const sources = url.searchParams.getAll("source").flatMap(splitCsv);
+  if (types.length > 0 && !types.includes(String(event.event_type))) return false;
+  if (sources.length > 0 && !sources.includes(String(event.source))) return false;
+  const trialId = optionalString(url.searchParams.get("trial_id"), "/trial_id");
+  if (trialId !== null && event.trial_id !== trialId) return false;
+  const taskId = optionalString(url.searchParams.get("task_id"), "/task_id");
+  if (taskId !== null && event.task_id !== taskId) return false;
+  if (resource) {
+    return runtimeEventReferencesResource(event, resource);
+  }
+  const resourceKind = optionalString(url.searchParams.get("resource_kind"), "/resource_kind");
+  const resourceName = optionalString(url.searchParams.get("resource_name"), "/resource_name");
+  if (resourceKind === null && resourceName === null) return true;
+  return (Array.isArray(event.resource_refs) ? event.resource_refs : []).some((ref) =>
+    isRecord(ref)
+    && (resourceKind === null || ref.kind === resourceKind)
+    && (resourceName === null || ref.name === resourceName)
+  );
+}
+
+function runtimeEventReferencesResource(event: JsonObject, resource: RuntimeResource): boolean {
+  if (resource.kind === "Trial" && event.trial_id === resource.spec.trial_id) return true;
+  if (resource.kind === "MetricObservation" && event.trial_id === resource.spec.trial_id) return true;
+  if (resource.kind === "TrialStage" && event.trial_id === resource.spec.trial_id) return true;
+  if (resource.kind === "TrialArtifact" && event.trial_id === resource.spec.trial_id) return true;
+  return (Array.isArray(event.resource_refs) ? event.resource_refs : []).some((ref) =>
+    isRecord(ref) && ref.kind === resource.kind && ref.name === resource.metadata.name
+  );
+}
+
+async function runtimeResourceLogsResponse(
+  cloudRunId: string,
+  runtime: RuntimeRepository,
+  resource: RuntimeResource,
+  url: URL,
+): Promise<Response> {
+  const stream = runtimeLogStream(url.searchParams.get("stream"));
+  if (resource.kind !== "Trial" && resource.kind !== "TrialArtifact") {
+    throw new HttpError(404, "runtime_logs_not_found", `Logs are not available for ${resource.kind}`);
+  }
+  const role = resource.kind === "TrialArtifact"
+    ? stringField(resource.spec.role) ?? stream
+    : stream;
+  const artifact = await runtime.attemptObjectContent(cloudRunId, {
+    trialId: requireArtifactToken(String(resource.spec.trial_id ?? ""), "/resource/spec/trial_id"),
+    role,
+    ...(numberField(resource.spec.attempt) !== null ? { attempt: numberField(resource.spec.attempt)! } : {}),
+    ...(stringField(resource.spec.core_run_id) !== null ? { coreRunId: stringField(resource.spec.core_run_id)! } : {}),
+  });
+  if (!artifact) {
+    throw new HttpError(404, "runtime_logs_not_found", `No ${role} runtime log content found for ${resource.kind}/${resource.metadata.name}`);
+  }
+  return runtimeArtifactContentResponse(artifact, {
+    "x-bucephalus-log-stream": role === "stderr" ? "stderr" : "stdout",
+    "x-bucephalus-resource-kind": resource.kind,
+    "x-bucephalus-resource-name": resource.metadata.name,
+  });
+}
+
+async function runtimeResourceContentResponse(
+  cloudRunId: string,
+  runtime: RuntimeRepository,
+  resource: RuntimeResource,
+): Promise<Response> {
+  if (resource.kind !== "TrialArtifact") {
+    throw new HttpError(404, "runtime_content_not_found", `Content is not available for ${resource.kind}`);
+  }
+  const artifact = await runtime.attemptObjectContent(cloudRunId, {
+    trialId: requireArtifactToken(String(resource.spec.trial_id ?? ""), "/resource/spec/trial_id"),
+    role: requireArtifactRole(String(resource.spec.role ?? ""), "/resource/spec/role"),
+    ...(numberField(resource.spec.attempt) !== null ? { attempt: numberField(resource.spec.attempt)! } : {}),
+    ...(stringField(resource.spec.core_run_id) !== null ? { coreRunId: stringField(resource.spec.core_run_id)! } : {}),
+  });
+  if (!artifact) {
+    throw new HttpError(404, "runtime_content_not_found", `Runtime artifact content not found for ${resource.kind}/${resource.metadata.name}`);
+  }
+  return runtimeArtifactContentResponse(artifact, {
+    "x-bucephalus-resource-kind": resource.kind,
+    "x-bucephalus-resource-name": resource.metadata.name,
+  });
+}
+
+async function runtimeArtifactContentResponse(
+  artifact: RuntimeAttemptObjectContentRecord,
+  headers: Record<string, string> = {},
+): Promise<Response> {
+  const bytes = await readStoredObject(artifact.storage_path);
+  return new Response(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer, {
+    headers: {
+      "content-type": artifact.media_type || "application/octet-stream",
+      "content-length": String(bytes.byteLength),
+      "x-bucephalus-core-run-id": artifact.core_run_id,
+      "x-bucephalus-trial-id": artifact.trial_id,
+      "x-bucephalus-artifact-role": artifact.role,
+      "x-bucephalus-object-ref": artifact.object_ref,
+      "x-bucephalus-sha256": artifact.sha256,
+      "x-bucephalus-artifact-sha256": artifact.sha256,
+      ...headers,
+    },
+  });
+}
+
+function runtimeLogStream(value: string | null): "stdout" | "stderr" {
+  if (value === null || value === "" || value === "stdout") return "stdout";
+  if (value === "stderr") return "stderr";
+  throw new HttpError(400, "invalid_runtime_log_stream", "/stream must be stdout or stderr");
+}
+
+function runtimeResourceMetricsListToWire(inventory: RuntimeResourceInventory, url: URL): Record<string, unknown> {
+  const filtered = filterRuntimeResources(inventory.resources, url);
+  const { items, metadata } = paginateRuntimeResources(filtered, url);
+  const resources = items.map((resource) => runtimeResourceMetricsToWire(inventory, resource));
+  const summary = resources.reduce<Record<string, number>>((acc, item) => {
+    const itemSummary = item.summary as Record<string, number | undefined>;
+    for (const key of [
+      "metrics_total",
+      "lifecycle_metrics",
+      "condition_metrics",
+      "access_metrics",
+      "event_metrics",
+      "numeric_spec_metrics",
+      "numeric_status_metrics",
+      "events_total",
+    ]) {
+      acc[key] = (acc[key] ?? 0) + (itemSummary[key] ?? 0);
+    }
+    return acc;
+  }, {
+    resources_total: filtered.length,
+    resources_returned: resources.length,
+    metrics_total: 0,
+    lifecycle_metrics: 0,
+    condition_metrics: 0,
+    access_metrics: 0,
+    event_metrics: 0,
+    numeric_spec_metrics: 0,
+    numeric_status_metrics: 0,
+    events_total: 0,
+  } as Record<string, number>);
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeResourceMetricsList",
+    cloud_run_id: inventory.cloud_run_id,
+    generated_at: new Date().toISOString(),
+    core_run_ids: inventory.core_run_ids,
+    metadata,
+    summary,
+    resources,
+  };
+}
+
+function runtimeResourceMetricsToWire(inventory: RuntimeResourceInventory, resource: RuntimeResource): Record<string, unknown> {
+  const metrics = runtimeResourceMetrics(resource);
+  const summary = {
+    metrics_total: metrics.length,
+    lifecycle_metrics: metrics.filter((metric) => metric.source === "lifecycle").length,
+    condition_metrics: metrics.filter((metric) => metric.source === "condition").length,
+    access_metrics: metrics.filter((metric) => metric.source === "access").length,
+    event_metrics: metrics.filter((metric) => metric.source === "event").length,
+    numeric_spec_metrics: metrics.filter((metric) => metric.source === "spec").length,
+    numeric_status_metrics: metrics.filter((metric) => metric.source === "status").length,
+    events_total: numberField(resource.status.events_total) ?? 0,
+  };
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeResourceMetrics",
+    cloud_run_id: inventory.cloud_run_id,
+    generated_at: new Date().toISOString(),
+    core_run_ids: inventory.core_run_ids,
+    resource_ref: runtimeResourceRef(resource),
+    resource_version: resource.metadata.resourceVersion ?? null,
+    phase: stringField(resource.status.phase),
+    summary,
+    metrics,
+  };
+}
+
+function runtimeResourceMetrics(resource: RuntimeResource): Array<Record<string, unknown>> {
+  const labels = {
+    kind: resource.kind,
+    name: resource.metadata.name,
+    ...resource.metadata.labels,
+  };
+  const rows: Array<Record<string, unknown>> = [];
+  const phase = stringField(resource.status.phase);
+  rows.push({ name: "phase", value: phase, unit: null, source: "lifecycle", path: ".status.phase", labels });
+  for (const condition of runtimeResourceConditions(resource)) {
+    rows.push({
+      name: `condition_${runtimeResourceName(String(condition.type))}`,
+      value: condition.status === "True",
+      unit: null,
+      source: "condition",
+      path: `.status.conditions[?type=${condition.type}]`,
+      labels: { ...labels, condition: String(condition.type ?? ""), reason: String(condition.reason ?? "") },
+    });
+  }
+  const access = jsonObjectOrEmpty(resource.status.access);
+  for (const key of ["reachable", "port_forward", "exec"]) {
+    if (typeof access[key] === "boolean") {
+      rows.push({ name: `access_${key}`, value: access[key], unit: null, source: "access", path: `.status.access.${key}`, labels });
+    }
+  }
+  if (numberField(resource.status.events_total) !== null) {
+    rows.push({ name: "events_total", value: numberField(resource.status.events_total), unit: "events", source: "event", path: ".status.events_total", labels });
+  }
+  for (const [key, value] of Object.entries(resource.spec)) {
+    if (typeof value === "number") {
+      rows.push({ name: key, value, unit: null, source: "spec", path: `.spec.${key}`, labels });
+    }
+  }
+  for (const [key, value] of Object.entries(resource.status)) {
+    if (typeof value === "number") {
+      rows.push({ name: key, value, unit: null, source: "status", path: `.status.${key}`, labels });
+    }
+  }
+  return rows;
+}
+
+function runtimeApiResourceListToWire(inventory: RuntimeResourceInventory): Record<string, unknown> & { resources: Array<Record<string, unknown>> } {
+  const byKind = new Map<string, RuntimeResource[]>();
+  for (const resource of inventory.resources) {
+    byKind.set(resource.kind, [...(byKind.get(resource.kind) ?? []), resource]);
+  }
+  const resources = runtimeApiResourceKinds().map((kind) =>
+    runtimeApiResourceToWire(inventory.cloud_run_id, kind, byKind.get(kind) ?? []),
+  );
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeApiResourceList",
+    cloud_run_id: inventory.cloud_run_id,
+    resources,
+  };
+}
+
+function runtimeApiResourceKinds(): string[] {
+  return ["Trial", "MetricObservation", "TrialStage", "TrialArtifact"];
+}
+
+function runtimeApiResourceToWire(cloudRunId: string, kind: string, resources: RuntimeResource[]): Record<string, unknown> {
+  const lower = kind.replace(/[A-Z]/g, (match, index) => `${index === 0 ? "" : "-"}${match.toLowerCase()}`);
+  const plural = `${lower}s`;
+  const subresources = ["status", "events", "metrics"];
+  if (kind === "Trial" || kind === "TrialArtifact") {
+    subresources.push("logs");
+  }
+  if (kind === "TrialArtifact") {
+    subresources.push("content");
+  }
+  const access = kind === "Trial" ? ["port-forward", "exec"] : [];
+  return {
+    group: "bucephalus.dev",
+    version: "v1alpha1",
+    name: plural,
+    singularName: lower,
+    namespaced: false,
+    scope: "run",
+    kind,
+    shortNames: runtimeApiShortNames(kind),
+    categories: runtimeApiCategories(kind),
+    verbs: ["list", "get", "watch"],
+    subresources,
+    actions: [],
+    access,
+    supports: {
+      list: true,
+      get: true,
+      watch: true,
+      describe: true,
+      create: false,
+      delete: false,
+      actions: false,
+      access: access.length > 0,
+      labelSelector: true,
+      fieldSelector: true,
+    },
+    pathTemplates: {
+      collection: `/v1/runs/${cloudRunId}/runtime/resources?kind=${encodeURIComponent(kind)}`,
+      resource: `/v1/runs/${cloudRunId}/runtime/resources/${kind}/{name}`,
+      describe: `/v1/runs/${cloudRunId}/runtime/resources/${kind}/{name}`,
+      operationReview: `/v1/runs/${cloudRunId}/runtime/resources/${kind}/{name}/operations/{operation}`,
+      watch: `/v1/runs/${cloudRunId}/runtime/resources/watch?kind=${encodeURIComponent(kind)}`,
+      subresources: Object.fromEntries(subresources.map((subresource) => [
+        subresource,
+        `/v1/runs/${cloudRunId}/runtime/resources/${kind}/{name}/${subresource}`,
+      ])),
+    },
+    exampleCommands: runtimeApiExampleCommands(cloudRunId, kind),
+    printerColumns: runtimeApiPrinterColumns(kind),
+    fieldSelectors: ["metadata.name", "kind", "status.phase", "spec.trial_id", "spec.task_id", "spec.variant_id"],
+    labelSelectors: [
+      "bucephalus.dev/run-id",
+      "bucephalus.dev/core-run-id",
+      "bucephalus.dev/trial-id",
+      "bucephalus.dev/task-id",
+      "bucephalus.dev/variant-id",
+      "bucephalus.dev/artifact-role",
+      "bucephalus.dev/stage",
+    ],
+    labelSelector: true,
+    count: resources.length,
+    description: runtimeApiResourceDescription(kind),
+  };
+}
+
+function runtimeInspectBundleToWire(
+  cloudRunId: string,
+  runtime: RuntimeRepository,
+  inventory: RuntimeResourceInventory,
+  url: URL,
+): Promise<Record<string, unknown>> {
+  const eventLimit = queryInteger(url, "event_limit", { defaultValue: 100, min: 1, max: 1000 });
+  return Promise.all([
+    runtime.eventRows(cloudRunId, { limit: eventLimit }),
+    runtime.workerLifecycleEvents(cloudRunId, { limit: eventLimit }),
+  ]).then(([trialRows, workerEvents]) => {
+    const resourceInventory = runtimeResourceListToWire(inventory, url);
+    const resourceHealth = runtimeResourceHealthToWire(inventory, url);
+    const resourceMetrics = runtimeResourceMetricsListToWire(inventory, url);
+    return {
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "RuntimeInspectBundle",
+      cloud_run_id: cloudRunId,
+      generated_at: new Date().toISOString(),
+      resource_filter: {
+        kinds: url.searchParams.getAll("kind").flatMap(splitCsv),
+        label_selector: optionalString(url.searchParams.get("label_selector"), "/label_selector"),
+        field_selector: optionalString(url.searchParams.get("field_selector"), "/field_selector"),
+      },
+      api_resources: runtimeApiResourceListToWire(inventory),
+      resource_inventory: resourceInventory,
+      resource_health: resourceHealth,
+      resource_metrics: resourceMetrics,
+      event_list: runtimeEventListToWire(cloudRunId, inventory.core_run_ids, trialRows, workerEvents, url, eventLimit),
+      log_refs: inventory.resources
+        .filter((resource) => resource.kind === "Trial" || resource.kind === "TrialArtifact")
+        .map((resource) => ({
+          resource: runtimeResourceRef(resource),
+          streams: ["stdout", "stderr"],
+          urls: {
+            stdout: `/v1/runs/${cloudRunId}/runtime/resources/${resource.kind}/${encodeURIComponent(resource.metadata.name)}/logs?stream=stdout`,
+            stderr: `/v1/runs/${cloudRunId}/runtime/resources/${resource.kind}/${encodeURIComponent(resource.metadata.name)}/logs?stream=stderr`,
+          },
+        })),
+    };
+  });
+}
+
+function runtimeResourceOperationReviewToWire(
+  cloudRunId: string,
+  resource: RuntimeResource,
+  operation: string,
+): Record<string, unknown> {
+  const normalized = operation.trim();
+  const base = runtimeResourceOperationFor(cloudRunId, resource, normalized);
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeResourceOperationReview",
+    cloud_run_id: cloudRunId,
+    resource_ref: runtimeResourceRef(resource),
+    resource_version: resource.metadata.resourceVersion ?? "",
+    resource_generation: resource.metadata.generation ?? null,
+    observed_generation: numberField(resource.status.observedGeneration),
+    operation: normalized,
+    matched_operation: stringField(base.purpose),
+    supported: base.supported === true,
+    reason: stringField(base.reason),
+    message: stringField(base.message),
+    command: stringField(base.command),
+    verb: stringField(base.verb),
+    subresource: stringField(base.subresource),
+    action: stringField(base.action),
+    requires_active_run: base.requires_active_run === true,
+  };
+}
+
+function runtimeResourceDescribeOperations(cloudRunId: string, resource: RuntimeResource): Array<Record<string, unknown>> {
+  return [
+    "get",
+    "status",
+    "events",
+    ...(resource.kind === "Trial" || resource.kind === "TrialArtifact" ? ["logs/stdout", "logs/stderr"] : []),
+    ...(resource.kind === "TrialArtifact" ? ["content"] : []),
+    ...(resource.kind === "Trial" ? ["port-forward", "exec"] : []),
+  ].map((operation) => runtimeResourceOperationFor(cloudRunId, resource, operation));
+}
+
+function runtimeResourceOperationFor(cloudRunId: string, resource: RuntimeResource, operation: string): Record<string, unknown> {
+  const resourcePath = `/v1/runs/${cloudRunId}/runtime/resources/${resource.kind}/${encodeURIComponent(resource.metadata.name)}`;
+  const commandPrefix = `bucephalus-cloud run`;
+  const target = `${resource.kind}/${resource.metadata.name}`;
+  switch (operation) {
+    case "get":
+      return runtimeOperation("get", `${commandPrefix} resource get ${cloudRunId} ${target}`, true, "get", null, null, false);
+    case "status":
+      return runtimeOperation("status", `${commandPrefix} resource status ${cloudRunId} ${target}`, true, "get", "status", null, false);
+    case "events":
+      return runtimeOperation("events", `${commandPrefix} resource events ${cloudRunId} ${target}`, true, "get", "events", null, false);
+    case "logs":
+    case "logs/stdout":
+      return runtimeOperation("logs/stdout", `${commandPrefix} logs ${cloudRunId} ${target} --stream stdout`, runtimeResourceSupportsLogs(resource), "get", "logs", null, false);
+    case "logs/stderr":
+      return runtimeOperation("logs/stderr", `${commandPrefix} logs ${cloudRunId} ${target} --stream stderr`, runtimeResourceSupportsLogs(resource), "get", "logs", null, false);
+    case "content":
+      return runtimeOperation("content", `${commandPrefix} resource content ${cloudRunId} ${target}`, resource.kind === "TrialArtifact", "get", "content", null, false);
+    case "port-forward":
+      return {
+        ...runtimeOperation(
+          "port-forward",
+          `${commandPrefix} port-forward ${cloudRunId} ${target} --target-port PORT`,
+          false,
+          "create",
+          "port-forward",
+          null,
+          true,
+        ),
+        reason: "runtime_access_not_connected",
+        message: "Port-forward access resources are modeled in the API contract, but worker-side tunnel creation is not connected yet.",
+      };
+    case "exec":
+      return {
+        ...runtimeOperation(
+          "exec",
+          `${commandPrefix} exec ${cloudRunId} ${target} -- COMMAND [ARG...]`,
+          false,
+          "create",
+          "exec",
+          null,
+          true,
+        ),
+        reason: "runtime_access_not_connected",
+        message: "Exec access resources are modeled in the API contract, but worker-side command execution is not connected yet.",
+      };
+    default:
+      return {
+        ...runtimeOperation(operation, `${resourcePath}/operations/${encodeURIComponent(operation)}`, false, null, null, null, false),
+        reason: "unknown_operation",
+        message: `Runtime operation '${operation}' is not supported for ${resource.kind}.`,
+      };
+  }
+}
+
+function runtimeOperation(
+  purpose: string,
+  command: string,
+  supported: boolean,
+  verb: string | null,
+  subresource: string | null,
+  action: string | null,
+  requiresActiveRun: boolean,
+): Record<string, unknown> {
+  return {
+    purpose,
+    command,
+    supported,
+    reason: supported ? null : "unsupported_runtime_operation",
+    message: supported ? null : `Operation '${purpose}' is not supported for this resource.`,
+    verb,
+    subresource,
+    action,
+    requires_active_run: requiresActiveRun,
+  };
+}
+
+function runtimeResourceSupportsLogs(resource: RuntimeResource): boolean {
+  return resource.kind === "Trial" || resource.kind === "TrialArtifact";
+}
+
+function runtimeApiResourceMatchesKind(resource: JsonObject, kind: string): boolean {
+  const wanted = kind.trim().toLowerCase();
+  const candidates = [
+    resource.kind,
+    resource.name,
+    resource.singularName,
+    ...(Array.isArray(resource.shortNames) ? resource.shortNames : []),
+  ].map((item) => String(item).toLowerCase());
+  return candidates.includes(wanted);
+}
+
+function runtimeApiShortNames(kind: string): string[] {
+  switch (kind) {
+    case "Trial":
+      return ["trial", "tr"];
+    case "MetricObservation":
+      return ["metric", "mo"];
+    case "TrialStage":
+      return ["stage", "ts"];
+    case "TrialArtifact":
+      return ["artifact", "ta"];
+    default:
+      return [];
+  }
+}
+
+function runtimeApiCategories(kind: string): string[] {
+  switch (kind) {
+    case "Trial":
+      return ["workload", "result"];
+    case "MetricObservation":
+      return ["result", "metric"];
+    case "TrialStage":
+      return ["lifecycle", "debug"];
+    case "TrialArtifact":
+      return ["artifact", "debug"];
+    default:
+      return ["runtime"];
+  }
+}
+
+function runtimeApiExampleCommands(cloudRunId: string, kind: string): JsonObject[] {
+  const target = `${kind}/{name}`;
+  return [
+    { purpose: "list", command: `bucephalus-cloud run resources ${cloudRunId} --kind ${kind}` },
+    { purpose: "get", command: `bucephalus-cloud run resource get ${cloudRunId} ${target}` },
+    { purpose: "events", command: `bucephalus-cloud run resource events ${cloudRunId} ${target}` },
+    ...(kind === "Trial" || kind === "TrialArtifact"
+      ? [{ purpose: "logs", command: `bucephalus-cloud run logs ${cloudRunId} ${target} --stream stdout` }]
+      : []),
+    ...(kind === "Trial"
+      ? [
+        { purpose: "port-forward", command: `bucephalus-cloud run port-forward ${cloudRunId} ${target} --target-port PORT` },
+        { purpose: "exec", command: `bucephalus-cloud run exec ${cloudRunId} ${target} -- COMMAND [ARG...]` },
+      ]
+      : []),
+  ];
+}
+
+function runtimeApiPrinterColumns(kind: string): JsonObject[] {
+  const base = [
+    { name: "Name", type: "string", jsonPath: ".metadata.name", description: "Resource name", priority: 0 },
+    { name: "Phase", type: "string", jsonPath: ".status.phase", description: "Runtime phase", priority: 0 },
+    { name: "Age", type: "date", jsonPath: ".metadata.created_at", description: "Creation timestamp", priority: 1 },
+  ];
+  switch (kind) {
+    case "Trial":
+      return [
+        ...base,
+        { name: "Task", type: "string", jsonPath: ".spec.task_id", description: "Task id", priority: 0 },
+        { name: "Variant", type: "string", jsonPath: ".spec.variant_id", description: "Variant id", priority: 0 },
+        { name: "Outcome", type: "string", jsonPath: ".status.outcome", description: "Trial outcome", priority: 0 },
+      ];
+    case "MetricObservation":
+      return [
+        ...base,
+        { name: "Metric", type: "string", jsonPath: ".spec.metric_name", description: "Metric name", priority: 0 },
+        { name: "Value", type: "string", jsonPath: ".status.metric_value", description: "Metric value", priority: 0 },
+      ];
+    case "TrialStage":
+      return [
+        ...base,
+        { name: "Stage", type: "string", jsonPath: ".spec.stage", description: "Contract stage", priority: 0 },
+        { name: "Status", type: "string", jsonPath: ".status.status", description: "Stage status", priority: 0 },
+      ];
+    case "TrialArtifact":
+      return [
+        ...base,
+        { name: "Role", type: "string", jsonPath: ".spec.role", description: "Artifact role", priority: 0 },
+        { name: "Bytes", type: "integer", jsonPath: ".status.byte_size", description: "Artifact byte size", priority: 0 },
+      ];
+    default:
+      return base;
+  }
+}
+
+function runtimeApiResourceDescription(kind: string): string {
+  switch (kind) {
+    case "Trial":
+      return "A scheduled experiment trial and its observed outcome, metrics, lifecycle, and access posture.";
+    case "MetricObservation":
+      return "A single metric emitted by a Trial.";
+    case "TrialStage":
+      return "A contract-stage lifecycle record for a Trial.";
+    case "TrialArtifact":
+      return "An artifact reference or persisted artifact object produced by a Trial.";
+    default:
+      return "Runtime resource.";
+  }
+}
+
+function runtimeRelatedResources(inventory: RuntimeResourceInventory, resource: RuntimeResource): Array<Record<string, unknown>> {
+  const resourceRef = runtimeResourceRef(resource);
+  const owners = resource.metadata.ownerReferences.flatMap((owner) => {
+    const found = inventory.resources.find((candidate) =>
+      candidate.kind === owner.kind && candidate.metadata.name === owner.name
+    );
+    return found ? [{ relationship: "owner", resource: found }] : [];
+  });
+  const dependents = inventory.resources
+    .filter((candidate) => candidate.metadata.ownerReferences.some((owner) =>
+      owner.kind === resourceRef.kind && owner.name === resourceRef.name
+    ))
+    .map((candidate) => ({ relationship: "dependent", resource: candidate }));
+  return [...owners, ...dependents];
+}
+
+function requireRuntimeResource(inventory: RuntimeResourceInventory, kind: string, name: string): RuntimeResource {
+  const resource = inventory.resources.find((candidate) =>
+    candidate.kind === kind && candidate.metadata.name === name
+  );
+  if (!resource) {
+    throw new HttpError(404, "runtime_resource_not_found", `Runtime resource ${kind}/${name} not found`);
+  }
+  return resource;
+}
+
+function filterRuntimeResources(resources: RuntimeResource[], url: URL): RuntimeResource[] {
+  const kinds = new Set(url.searchParams.getAll("kind").flatMap(splitCsv));
+  const labelSelectors = parseRuntimeSelectors(url.searchParams.get("label_selector"));
+  const fieldSelectors = parseRuntimeSelectors(url.searchParams.get("field_selector"));
+  return resources.filter((resource) => {
+    if (kinds.size > 0 && !kinds.has(resource.kind)) return false;
+    for (const [key, value] of labelSelectors) {
+      if (resource.metadata.labels[key] !== value) return false;
+    }
+    for (const [key, value] of fieldSelectors) {
+      if (runtimeFieldSelectorValue(resource, key) !== value) return false;
+    }
+    return true;
+  });
+}
+
+function paginateRuntimeResources(resources: RuntimeResource[], url: URL): { items: RuntimeResource[]; metadata: RuntimeCollectionMetadata } {
+  const limit = limitFromUrl(url);
+  const offset = runtimeContinueOffset(url.searchParams.get("continue"));
+  const items = resources.slice(offset, offset + limit);
+  const nextOffset = offset + items.length;
+  const remaining = Math.max(0, resources.length - nextOffset);
+  return {
+    items,
+    metadata: {
+      resourceVersion: runtimeCollectionResourceVersion(resources),
+      continue: remaining > 0 ? String(nextOffset) : null,
+      remainingItemCount: remaining,
+      total: resources.length,
+      returned: items.length,
+    },
+  };
+}
+
+function runtimeContinueOffset(value: string | null): number {
+  if (value === null || value === "") return 0;
+  if (!/^[0-9]+$/.test(value)) {
+    throw new HttpError(400, "invalid_query", "/continue must be a non-negative integer cursor");
+  }
+  return Number.parseInt(value, 10);
+}
+
+function parseRuntimeSelectors(value: string | null): Array<[string, string]> {
+  if (!value?.trim()) return [];
+  return value.split(",").flatMap((part) => {
+    const [rawKey, rawValue] = part.split("=", 2);
+    const key = rawKey?.trim();
+    const selectorValue = rawValue?.trim();
+    if (!key || selectorValue === undefined) {
+      throw new HttpError(400, "invalid_runtime_selector", "Runtime selectors must use key=value clauses");
+    }
+    return [[key, selectorValue] as [string, string]];
+  });
+}
+
+function runtimeFieldSelectorValue(resource: RuntimeResource, key: string): string | undefined {
+  if (key === "kind") return resource.kind;
+  if (key === "metadata.name") return resource.metadata.name;
+  if (key === "metadata.uid") return resource.metadata.uid;
+  if (key.startsWith("metadata.labels.")) return resource.metadata.labels[key.slice("metadata.labels.".length)];
+  if (key.startsWith("spec.")) return primitiveString(jsonPathValue(resource.spec, key.slice("spec.".length)));
+  if (key.startsWith("status.")) return primitiveString(jsonPathValue(resource.status, key.slice("status.".length)));
+  return undefined;
+}
+
+function jsonPathValue(root: JsonObject, path: string): unknown {
+  return path.split(".").reduce<unknown>((current, segment) => {
+    if (!isRecord(current)) return undefined;
+    return current[segment];
+  }, root);
+}
+
+function primitiveString(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return undefined;
+}
+
+function splitCsv(value: string): string[] {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function knownRuntimeResourceVersions(url: URL): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const item of url.searchParams.getAll("known_resource")) {
+    const [identity, version] = item.split("=", 2);
+    if (identity && version) out.set(identity, version);
+  }
+  return out;
+}
+
+function withRuntimeResourceVersion(resource: RuntimeResource): RuntimeResource {
+  const stable = {
+    ...resource,
+    metadata: {
+      ...resource.metadata,
+      resourceVersion: undefined,
+    },
+  };
+  const resourceVersion = sha256Digest(JSON.stringify(stable)).slice("sha256:".length, "sha256:".length + 16);
+  return {
+    ...resource,
+    metadata: {
+      ...resource.metadata,
+      resourceVersion,
+    },
+  };
+}
+
+function runtimeCollectionResourceVersion(values: unknown[]): string {
+  return sha256Digest(JSON.stringify(values)).slice("sha256:".length, "sha256:".length + 16);
+}
+
+function runtimeTrialLabels(
+  cloudRunId: string,
+  row: Pick<RuntimeTrialResultRecord, "core_run_id" | "trial_id" | "schedule_idx" | "attempt" | "variant_id" | "task_id" | "repl_idx">,
+): Record<string, string> {
+  return {
+    "bucephalus.dev/run-id": cloudRunId,
+    "bucephalus.dev/core-run-id": row.core_run_id,
+    "bucephalus.dev/trial-id": row.trial_id,
+    "bucephalus.dev/schedule-idx": String(row.schedule_idx),
+    "bucephalus.dev/attempt": String(row.attempt),
+    "bucephalus.dev/variant-id": row.variant_id,
+    "bucephalus.dev/task-id": row.task_id,
+    "bucephalus.dev/repl-idx": String(row.repl_idx),
+  };
+}
+
+function runtimeTrialPhase(row: RuntimeTrialResultRecord): string {
+  const outcome = row.outcome.trim().toLowerCase();
+  if (["success", "succeeded", "pass", "passed"].includes(outcome)) return "succeeded";
+  if (["failure", "failed", "error", "errored"].includes(outcome)) return "failed";
+  if (["timeout", "timed_out"].includes(outcome)) return "failed";
+  return outcome || "unknown";
+}
+
+function runtimeReadyCondition(phase: string, message: string, timestamp: string | null): JsonObject {
+  const normalized = phase.toLowerCase();
+  if (["succeeded", "available", "recorded", "ok", "passed", "success"].includes(normalized)) {
+    return runtimeCondition("Ready", "True", "Completed", message, timestamp ?? undefined);
+  }
+  if (["failed", "error", "errored", "timeout", "cancelled"].includes(normalized)) {
+    return runtimeCondition("Ready", "False", "Failed", message, timestamp ?? undefined);
+  }
+  return runtimeCondition("Ready", "Unknown", "Observed", message, timestamp ?? undefined);
+}
+
+function runtimeCondition(
+  type: string,
+  status: "True" | "False" | "Unknown",
+  reason: string,
+  message: string,
+  lastTransitionTime?: string,
+): JsonObject {
+  return {
+    type,
+    status,
+    reason,
+    message,
+    ...(lastTransitionTime ? { lastTransitionTime } : {}),
+  };
+}
+
+function runtimeReadyConditionForResource(resource: RuntimeResource): JsonObject | null {
+  return runtimeResourceConditions(resource).find((condition) => condition.type === "Ready") ?? null;
+}
+
+function runtimeResourceConditions(resource: RuntimeResource): JsonObject[] {
+  return Array.isArray(resource.status.conditions)
+    ? resource.status.conditions.filter((item): item is JsonObject => isRecord(item))
+    : [];
+}
+
+function runtimeResourceHealthState(
+  resource: RuntimeResource,
+  ready: JsonObject | null,
+  degraded: JsonObject[],
+): "ready" | "degraded" | "problem" | "unknown" {
+  if (ready?.status === "True" && degraded.length === 0) return "ready";
+  if (ready?.status === "False") return "problem";
+  if (degraded.length > 0) return "degraded";
+  const phase = String(resource.status.phase ?? "").toLowerCase();
+  if (["failed", "error", "errored"].includes(phase)) return "problem";
+  if (["running", "pending", "referenced"].includes(phase)) return "degraded";
+  return "unknown";
+}
+
+function runtimeResourceObserved(resource: RuntimeResource): "current" | "stale" | "unknown" {
+  const generation = numberField(resource.metadata.generation);
+  const observed = numberField(resource.status.observedGeneration);
+  if (generation === null || observed === null) return "unknown";
+  return generation === observed ? "current" : "stale";
+}
+
+function runtimeResourceActions(_resource: RuntimeResource): string[] {
+  return [];
+}
+
+function runtimeAccessSummary(access: JsonObject): string | null {
+  if (Object.keys(access).length === 0) return null;
+  const parts = [
+    access.reachable === true ? "reachable" : "not reachable",
+    access.port_forward === true ? "port-forward" : "",
+    access.exec === true ? "exec" : "",
+    stringField(access.reason),
+  ].filter((item): item is string => Boolean(item));
+  return parts.join(", ");
+}
+
+function runtimeUnavailableAccess(reason: string, message: string): JsonObject {
+  return {
+    reachable: false,
+    reason,
+    message,
+    port_forward: false,
+    exec: false,
+  };
+}
+
+function runtimeTrialResourceName(trialId: string, attempt: number): string {
+  const base = runtimeResourceName(trialId);
+  return attempt > 0 ? runtimeResourceName(`${base}-attempt-${attempt}`) : base;
+}
+
+function runtimeResourceName(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/^sha256:/, "sha256-")
+    .replace(/[^a-z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 96) || "resource";
+}
+
+function runtimeResourceUid(...parts: string[]): string {
+  return sha256Digest(parts.join("\0"));
+}
+
+function runtimeOwnerRef(kind: string, name: string, uid: string): RuntimeResourceRef {
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind,
+    name,
+    uid,
+  };
+}
+
+function runtimeResourceRef(resource: RuntimeResource): RuntimeResourceRef {
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: resource.kind,
+    name: resource.metadata.name,
+    uid: resource.metadata.uid,
+  };
+}
+
+function runtimeResourceIdentity(resource: RuntimeResource): string {
+  return `${resource.apiVersion}/${resource.kind}/${resource.metadata.name}`;
+}
+
+function runtimeRowTimestamp(row: JsonObject): string | undefined {
+  for (const candidate of [
+    row.recorded_at,
+    row.ts,
+    row.timestamp,
+    row.created_at,
+    row.updated_at,
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return undefined;
+}
+
+function jsonObjectOrEmpty(value: unknown): JsonObject {
+  return isRecord(value) ? value : {};
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function numberField(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && /^-?\d+(\.\d+)?$/.test(value)) return Number(value);
+  return null;
+}
+
 function runtimeEventRowFromWire(
   value: unknown,
   pointer: string,
@@ -589,6 +2289,11 @@ function runtimeEventStreamToWire(
     source: "trial",
     event_id: `trial:${row.core_run_id}:${row.trial_id}:${row.schedule_idx}:${row.attempt}:${row.row_seq}`,
     recorded_at: row.ts,
+    resource_refs: [runtimeOwnerRef(
+      "Trial",
+      runtimeTrialResourceName(row.trial_id, row.attempt),
+      runtimeResourceUid("Trial", "", row.core_run_id, row.trial_id, String(row.attempt)),
+    )],
   }));
   const workerWire = workerEvents.map((event) => ({
     source: "worker",
@@ -606,6 +2311,7 @@ function runtimeEventStreamToWire(
     event_type: event.event_type,
     ts: event.created_at,
     recorded_at: event.created_at,
+    resource_refs: [],
     payload: event.payload,
     row: { source: "worker_lifecycle" },
   }));
@@ -659,10 +2365,100 @@ async function failAttempt(
   return jsonResponse(claimToWire(result));
 }
 
-async function expireLeases(runs: RunRepository): Promise<Response> {
-  const expired = await runs.expireLeases();
+async function workerListPortForwards(
+  request: Request,
+  route: { attemptId: string },
+  runs: RunRepository,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const runnerInstanceId = requireString(new URL(request.url).searchParams.get("runner_instance_id"), "/runner_instance_id");
+  await requireAttemptToken(request, runs, {
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  const requests = await runtime.portForwardRequestsForAttempt({
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  return jsonResponse({
+    resources: requests.map((item) => runtime.runtimeAccessRequestResourceForRunId(item.run_id, item)),
+  });
+}
+
+async function workerUpdatePortForward(
+  request: Request,
+  route: { attemptId: string; accessRequestId: string; action: string },
+  runs: RunRepository,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const body = await readJsonObject(request);
+  const runnerInstanceId = requireString(body.runner_instance_id, "/runner_instance_id");
+  await requireAttemptToken(request, runs, {
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  const portForward = await runtime.updatePortForwardRequest({
+    attemptId: route.attemptId,
+    runnerInstanceId,
+    accessRequestId: route.accessRequestId,
+    status: portForwardStatusForWorkerAction(route.action),
+    connection: body.connection === undefined ? null : optionalJsonObject(body.connection as JsonValue | undefined, "/connection"),
+    errorMessage: optionalString(body.error_message, "/error_message"),
+  });
+  return jsonResponse({ resource: runtime.runtimeAccessRequestResourceForRunId(portForward.run_id, portForward) });
+}
+
+async function workerListExecRequests(
+  request: Request,
+  route: { attemptId: string },
+  runs: RunRepository,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const runnerInstanceId = requireString(new URL(request.url).searchParams.get("runner_instance_id"), "/runner_instance_id");
+  await requireAttemptToken(request, runs, {
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  const requests = await runtime.execRequestsForAttempt({
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  return jsonResponse({
+    resources: requests.map((item) => runtime.runtimeAccessRequestResourceForRunId(item.run_id, item)),
+  });
+}
+
+async function workerUpdateExecRequest(
+  request: Request,
+  route: { attemptId: string; accessRequestId: string; action: string },
+  runs: RunRepository,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const body = await readJsonObject(request);
+  const runnerInstanceId = requireString(body.runner_instance_id, "/runner_instance_id");
+  await requireAttemptToken(request, runs, {
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  const exec = await runtime.updateExecRequest({
+    attemptId: route.attemptId,
+    runnerInstanceId,
+    accessRequestId: route.accessRequestId,
+    status: execStatusForWorkerAction(route.action),
+    connection: body.connection === undefined ? null : optionalJsonObject(body.connection as JsonValue | undefined, "/connection"),
+    errorMessage: optionalString(body.error_message, "/error_message"),
+  });
+  return jsonResponse({ resource: runtime.runtimeAccessRequestResourceForRunId(exec.run_id, exec) });
+}
+
+async function expireLeases(runs: RunRepository, runtime: RuntimeRepository): Promise<Response> {
+  const [expired, expiredAccessRequests] = await Promise.all([
+    runs.expireLeases(),
+    runtime.expireRuntimeAccessRequests(),
+  ]);
   return jsonResponse({
     expired: expired.map((item) => claimToWire(item)),
+    expired_access_resources: expiredAccessRequests.map((item) => runtime.runtimeAccessRequestResourceForRunId(item.run_id, item)),
   });
 }
 
@@ -896,7 +2692,6 @@ export function runRequirementsForArtifact(
 ): RunRequirements {
   validateCloudRuntimeOptions(runtimeOptions);
   const requestedBackend = optionalString(runtimeOptions.backend, "/runtime_options/backend")
-    ?? optionalString(runtimeOptions.executor, "/runtime_options/executor")
     ?? packageComputeBackend(artifact);
   const executor = cloudExecutorForBackend(requestedBackend);
   rejectUnsupportedCloudTrialRuntime(artifact, runtimeOptions);
@@ -965,7 +2760,7 @@ export function runRequirementsForArtifact(
     sidecars,
     accelerators,
     arch: resolvedArch,
-    cpu_count: positiveInt(runtimeOptions.cpu_count) ?? positiveInt(runtimeOptions.cpu) ?? positiveInt(packageRuntimeValue(artifact, "cpu_count")) ?? 1,
+    cpu_count: positiveInt(runtimeOptions.cpu_count) ?? positiveInt(packageRuntimeValue(artifact, "cpu_count")) ?? 1,
     memory_mb: positiveInt(runtimeOptions.memory_mb) ?? positiveInt(packageRuntimeValue(artifact, "memory_mb")) ?? 1024,
     disk_mb: positiveInt(runtimeOptions.disk_mb) ?? positiveInt(packageRuntimeValue(artifact, "disk_mb")) ?? 20480,
     isolation: networkPerimeter.egress_hosts.length > 0
@@ -980,10 +2775,8 @@ export function runRequirementsForArtifact(
 
 const CLOUD_RUNTIME_OPTION_KEYS = new Set([
   "backend",
-  "executor",
   "arch",
   "cpu_count",
-  "cpu",
   "memory_mb",
   "disk_mb",
   "isolation",
@@ -1016,41 +2809,17 @@ function validateCloudRuntimeOptions(runtimeOptions: JsonObject): void {
     }
     validateCloudRuntimeOptionValue(key, value);
   }
-  rejectAmbiguousCloudRuntimeOptions(runtimeOptions);
-}
-
-function rejectAmbiguousCloudRuntimeOptions(runtimeOptions: JsonObject): void {
-  if (
-    Object.prototype.hasOwnProperty.call(runtimeOptions, "backend")
-    && Object.prototype.hasOwnProperty.call(runtimeOptions, "executor")
-  ) {
-    throw new HttpError(
-      400,
-      "ambiguous_cloud_runtime_option",
-      "/runtime_options/backend and /runtime_options/executor cannot both be provided; use /runtime_options/backend",
-    );
-  }
-  if (
-    Object.prototype.hasOwnProperty.call(runtimeOptions, "cpu_count")
-    && Object.prototype.hasOwnProperty.call(runtimeOptions, "cpu")
-  ) {
-    throw new HttpError(
-      400,
-      "ambiguous_cloud_runtime_option",
-      "/runtime_options/cpu_count and /runtime_options/cpu cannot both be provided; use /runtime_options/cpu_count",
-    );
-  }
 }
 
 function validateCloudRuntimeOptionValue(key: string, value: unknown): void {
   const pointer = `/runtime_options/${escapeJsonPointer(key)}`;
-  if (["backend", "executor", "arch", "isolation"].includes(key)) {
+  if (["backend", "arch", "isolation"].includes(key)) {
     if (typeof value !== "string" || value.trim().length === 0) {
       throw new HttpError(400, "invalid_cloud_runtime_option", `${pointer} must be a non-empty string`);
     }
     return;
   }
-  if (["cpu_count", "cpu", "memory_mb", "disk_mb", "timeout_ms", "max_parallel_trials"].includes(key)) {
+  if (["cpu_count", "memory_mb", "disk_mb", "timeout_ms", "max_parallel_trials"].includes(key)) {
     if (positiveInt(value) === null) {
       throw new HttpError(400, "invalid_cloud_runtime_option", `${pointer} must be a positive integer`);
     }
@@ -1737,7 +3506,6 @@ function runRuntime(run: CloudRunRecord): string | null {
   for (const candidate of [
     jsonPointerValue(run.run_requirements as unknown as JsonObject, "/executor"),
     jsonPointerValue(run.runtime_options, "/backend"),
-    jsonPointerValue(run.runtime_options, "/executor"),
   ]) {
     if (typeof candidate === "string" && candidate.trim()) {
       return candidate.trim();
@@ -1837,12 +3605,191 @@ function leaseSecondsFromBody(value: unknown): number {
   return Math.min(Math.max(Math.floor(value), 5), 3600);
 }
 
+async function optionalJsonBody(request: Request): Promise<JsonObject | null> {
+  const raw = await request.text();
+  if (!raw.trim()) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new HttpError(400, "invalid_json", "Request body must be valid JSON");
+  }
+  return optionalJsonObject(parsed as JsonValue, "/");
+}
+
+function requirePort(value: unknown, pointer: string): number {
+  const parsed = parsePort(value);
+  if (parsed === null) {
+    throw new HttpError(400, "invalid_port", `${pointer} must be an integer from 1 to 65535`);
+  }
+  return parsed;
+}
+
+function optionalPort(value: unknown, pointer: string): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const parsed = parsePort(value);
+  if (parsed === null) {
+    throw new HttpError(400, "invalid_port", `${pointer} must be an integer from 1 to 65535`);
+  }
+  return parsed;
+}
+
+function optionalPositiveInt(value: unknown, pointer: string): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const parsed = typeof value === "number"
+    ? value
+    : typeof value === "string" && /^\d+$/.test(value)
+      ? Number.parseInt(value, 10)
+      : NaN;
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new HttpError(400, "invalid_positive_integer", `${pointer} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function parsePort(value: unknown): number | null {
+  const parsed = typeof value === "number"
+    ? value
+    : typeof value === "string" && /^\d+$/.test(value)
+      ? Number.parseInt(value, 10)
+      : NaN;
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : null;
+}
+
+function requireStringArray(value: unknown, pointer: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new HttpError(400, "invalid_string_array", `${pointer} must be a non-empty string array`);
+  }
+  const strings = value.map((item) => typeof item === "string" ? item.trim() : "");
+  if (strings.length === 0 || strings.some((item) => item.length === 0)) {
+    throw new HttpError(400, "invalid_string_array", `${pointer} must be a non-empty string array`);
+  }
+  return strings;
+}
+
+function portForwardStatusForWorkerAction(action: string): "accepted" | "active" | "failed" | "expired" {
+  switch (action) {
+    case "accept":
+    case "accepted":
+      return "accepted";
+    case "active":
+      return "active";
+    case "fail":
+    case "failed":
+      return "failed";
+    case "expire":
+    case "expired":
+      return "expired";
+    default:
+      throw new HttpError(404, "unknown_port_forward_action", "Unknown port-forward worker action");
+  }
+}
+
+function execStatusForWorkerAction(action: string): "accepted" | "active" | "completed" | "failed" | "expired" {
+  switch (action) {
+    case "accept":
+    case "accepted":
+      return "accepted";
+    case "active":
+      return "active";
+    case "complete":
+    case "completed":
+      return "completed";
+    case "fail":
+    case "failed":
+      return "failed";
+    case "expire":
+    case "expired":
+      return "expired";
+    default:
+      throw new HttpError(404, "unknown_exec_action", "Unknown exec worker action");
+  }
+}
+
 function workerAttemptPath(pathname: string, suffix: string): boolean {
-  return pathname.startsWith("/v1/worker/run-attempts/") && pathname.endsWith(suffix);
+  if (!pathname.startsWith("/v1/worker/run-attempts/") || !pathname.endsWith(suffix)) {
+    return false;
+  }
+  return !pathname.slice("/v1/worker/run-attempts/".length, -suffix.length).includes("/");
 }
 
 function attemptIdFromWorkerPath(pathname: string, suffix: string): string {
   return decodeURIComponent(pathname.slice("/v1/worker/run-attempts/".length, -suffix.length));
+}
+
+function workerPortForwardPath(pathname: string):
+  | { kind: "list"; attemptId: string }
+  | { kind: "update"; attemptId: string; accessRequestId: string; action: string }
+  | null {
+  const prefix = "/v1/worker/run-attempts/";
+  if (!pathname.startsWith(prefix)) {
+    return null;
+  }
+  const parts = pathname.slice(prefix.length).split("/").map(decodeURIComponent);
+  if (parts.length === 4 && parts[1] === "runtime" && parts[2] === "resources" && parts[3] === "PortForward") {
+    return { kind: "list", attemptId: parts[0] ?? "" };
+  }
+  if (parts.length === 6 && parts[1] === "runtime" && parts[2] === "resources" && parts[3] === "PortForward") {
+    return {
+      kind: "update",
+      attemptId: parts[0] ?? "",
+      accessRequestId: parts[4] ?? "",
+      action: parts[5] ?? "",
+    };
+  }
+  return null;
+}
+
+function workerExecPath(pathname: string):
+  | { kind: "list"; attemptId: string }
+  | { kind: "update"; attemptId: string; accessRequestId: string; action: string }
+  | null {
+  const prefix = "/v1/worker/run-attempts/";
+  if (!pathname.startsWith(prefix)) {
+    return null;
+  }
+  const parts = pathname.slice(prefix.length).split("/").map(decodeURIComponent);
+  if (parts.length === 4 && parts[1] === "runtime" && parts[2] === "resources" && parts[3] === "Exec") {
+    return { kind: "list", attemptId: parts[0] ?? "" };
+  }
+  if (parts.length === 6 && parts[1] === "runtime" && parts[2] === "resources" && parts[3] === "Exec") {
+    return {
+      kind: "update",
+      attemptId: parts[0] ?? "",
+      accessRequestId: parts[4] ?? "",
+      action: parts[5] ?? "",
+    };
+  }
+  return null;
+}
+
+function isWorkerRuntimeSubpath(pathname: string): boolean {
+  const prefix = "/v1/worker/run-attempts/";
+  if (!pathname.startsWith(prefix)) {
+    return false;
+  }
+  const parts = pathname.slice(prefix.length).split("/").map(decodeURIComponent);
+  return parts.length >= 3 && parts[1] === "runtime";
+}
+
+function assertRuntimeAccessBodyHasNoTarget(body: Record<string, unknown>): void {
+  const fields = ["/resource_kind", "/resource_name"].filter((field) =>
+    Object.prototype.hasOwnProperty.call(body, field.slice(1))
+  );
+  if (fields.length > 0) {
+    throw new HttpError(
+      400,
+      "runtime_access_body_target_removed",
+      "Runtime access targets are selected by the resource path; remove resource_kind/resource_name from the request body",
+      { fields },
+    );
+  }
 }
 
 function packageContentPath(pathname: string): boolean {

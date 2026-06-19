@@ -1435,7 +1435,13 @@ mod tests {
                     "env": {"SERVICE_MODE": "test"},
                     "expose": {"PG_DATA_API_URL": "http://127.0.0.1:9757"},
                     "readiness": {
-                        "command": ["python3", "-c", "print('ready')"],
+                        "http": {
+                            "url": "http://127.0.0.1:9757",
+                            "method": "POST",
+                            "json": {"case_id": "pg_001", "command": "overview"},
+                            "expect_status": 200,
+                            "interval_ms": 200
+                        },
                         "timeout_ms": 5000
                     }
                 }
@@ -1505,6 +1511,14 @@ mod tests {
         assert_eq!(
             spec.pointer("/ephemerals/0/readiness/timeout_seconds"),
             Some(&json!(5))
+        );
+        assert_eq!(
+            spec.pointer("/ephemerals/0/readiness/http/url"),
+            Some(&json!("http://127.0.0.1:9757"))
+        );
+        assert_eq!(
+            spec.pointer("/ephemerals/0/readiness/http/json/case_id"),
+            Some(&json!("pg_001"))
         );
         assert_eq!(
             spec.pointer("/ephemerals/0/stdout/remote_path"),
@@ -6653,8 +6667,8 @@ mod tests {
             msg
         );
         assert!(
-            msg.contains("/stages/agent/command"),
-            "missing agent command should use public path: {}",
+            msg.contains("/stages/agent") && msg.contains("command") && msg.contains("adapter"),
+            "missing agent launch contract should use public path and name command/adapter: {}",
             msg
         );
         assert!(
@@ -9661,6 +9675,62 @@ mod tests {
                 .to_string()
                 .contains("artifact_type 'answer' is not supported"),
             "unexpected error: {unknown}"
+        );
+    }
+
+    #[test]
+    fn nova_result_adapter_normalizes_native_response_to_artifact_envelope() {
+        let root = TempDirGuard::new("bucephalus_nova_result_adapter");
+        let result_path = root.path.join("result.json");
+        fs::write(
+            &result_path,
+            serde_json::to_vec_pretty(&json!({
+                "model": {"provider": "gemini", "model": "gemini-2.5-flash"},
+                "request_id": "req_1",
+                "response": "{\"alerts\":[],\"no_alert_paths_considered\":[]}",
+                "usage": {
+                    "latency_ms": 1234,
+                    "model_calls": 2,
+                    "tokens_in": 10,
+                    "tokens_out": 20,
+                    "tool_calls": 3
+                }
+            }))
+            .expect("raw nova result"),
+        )
+        .expect("write raw nova result");
+        let runtime_experiment = json!({
+            "trial_runtime": {
+                "agent": {
+                    "adapter": {
+                        "kind": "nova",
+                        "result": "structured_json"
+                    }
+                }
+            }
+        });
+
+        crate::trial::artifacts::normalize_agent_result_adapter(&runtime_experiment, &result_path)
+            .expect("normalize Nova result");
+
+        let normalized: Value =
+            serde_json::from_slice(&fs::read(&result_path).expect("normalized result bytes"))
+                .expect("normalized result JSON");
+        assert_eq!(
+            normalized.pointer("/schema_version"),
+            Some(&json!("artifact_envelope_v1"))
+        );
+        assert_eq!(
+            normalized.pointer("/artifact_type"),
+            Some(&json!("structured_json"))
+        );
+        assert_eq!(
+            normalized.pointer("/artifact/usage/tool_calls"),
+            Some(&json!(3))
+        );
+        assert_eq!(
+            normalized.pointer("/metadata/metrics/turn_count"),
+            Some(&json!(2))
         );
     }
 
@@ -18596,8 +18666,8 @@ mod tests {
     }
 
     #[test]
-    fn build_experiment_package_rejects_legacy_trajectory_placeholder() {
-        let root = create_dx_authoring_fixture("bucephalus_build_legacy_trajectory_placeholder");
+    fn build_experiment_package_accepts_trajectory_contract_placeholder() {
+        let root = create_dx_authoring_fixture("bucephalus_build_trajectory_contract_placeholder");
         let mut spec = minimal_dx_spec();
         spec.pointer_mut("/stages/agent/command")
             .and_then(Value::as_array_mut)
@@ -18612,17 +18682,19 @@ mod tests {
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
 
-        let err = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
-            .expect_err("legacy trajectory placeholder should fail at package build");
-        let msg = err.to_string();
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("trajectory contract placeholder should be accepted");
+        let manifest = load_json_file(&build.manifest_path).expect("manifest json");
+        let command = manifest
+            .pointer("/resolved_experiment/trial_runtime/agent/command")
+            .and_then(Value::as_array)
+            .expect("resolved command");
         assert!(
-            msg.contains("removed placeholders")
-                && msg.contains("__BUCEPHALUS_TRAJECTORY_PATH__"),
-            "unexpected error: {msg}"
-        );
-        assert!(
-            !msg.contains("trial_runtime"),
-            "authoring error should not expose trial_runtime paths: {msg}"
+            command
+                .iter()
+                .any(|part| part == "__BUCEPHALUS_TRAJECTORY_PATH__"),
+            "resolved command should preserve trajectory contract placeholder: {:?}",
+            command
         );
     }
 
@@ -21532,15 +21604,16 @@ mod tests {
         };
 
         let err = resolve_runtime_agent_command(&request)
-            .expect_err("trajectory placeholder should be removed");
+            .expect_err("trajectory placeholder without events should fail");
         assert!(
-            err.to_string().contains("removed __BUCEPHALUS_TRAJECTORY_PATH__ placeholder"),
+            err.to_string()
+                .contains("__BUCEPHALUS_TRAJECTORY_PATH__ but no agent events are declared"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn resolve_runtime_agent_command_rejects_declared_legacy_trajectory_placeholder() {
+    fn resolve_runtime_agent_command_renders_declared_trajectory_placeholder() {
         let (_root, paths) = create_trial_paths_fixture("bucephalus_agent_declared_trajectory");
         let mut runtime = legacy_contract_runtime_fixture();
         runtime.command_raw = vec![
@@ -21585,12 +21658,88 @@ mod tests {
             agent_artifact_read_only: true,
         };
 
-        let err = resolve_runtime_agent_command(&request)
-            .expect_err("legacy trajectory placeholder should not render");
+        let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
         assert!(
-            err.to_string().contains("removed __BUCEPHALUS_TRAJECTORY_PATH__ placeholder"),
-            "unexpected error: {err}"
+            command_contains_flag_value(&resolved, "--events", lab_core::BUCEPHALUS_TRAJECTORY_PATH),
+            "agent command should receive runner-owned trajectory path: {:?}",
+            resolved
         );
+    }
+
+    #[test]
+    fn resolve_runtime_agent_command_renders_standard_contract_placeholders() {
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_agent_contract_placeholders");
+        let mut runtime = legacy_contract_runtime_fixture();
+        runtime.command_raw = vec![
+            "agentctl".to_string(),
+            "run".to_string(),
+            "--input-file".to_string(),
+            "__BUCEPHALUS_TRIAL_INPUT_PATH__".to_string(),
+            "--output".to_string(),
+            "__BUCEPHALUS_RESULT_PATH__".to_string(),
+            "--events".to_string(),
+            "__BUCEPHALUS_TRAJECTORY_PATH__".to_string(),
+            "--working-dir".to_string(),
+            "__BUCEPHALUS_TASK_WORKDIR__".to_string(),
+        ];
+        runtime.event_sinks.push(AgentRuntimeEventSink {
+            id: "trajectory".to_string(),
+            format: "jsonl".to_string(),
+            path: lab_core::BUCEPHALUS_TRAJECTORY_PATH.to_string(),
+            mode: "jsonl".to_string(),
+            persist: true,
+            ingest: true,
+        });
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.out.join("agent-events.jsonl"),
+        );
+        let empty_json = json!({});
+        let request = TrialRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &BTreeMap::new(),
+            runtime_overrides_env: &BTreeMap::new(),
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            grader: None,
+            grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+
+        let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
+
+        assert!(command_contains_flag_value(
+            &resolved,
+            "--input-file",
+            lab_core::BUCEPHALUS_TRIAL_INPUT_PATH
+        ));
+        assert!(command_contains_flag_value(
+            &resolved,
+            "--output",
+            lab_core::BUCEPHALUS_RESULT_PATH
+        ));
+        assert!(command_contains_flag_value(
+            &resolved,
+            "--events",
+            lab_core::BUCEPHALUS_TRAJECTORY_PATH
+        ));
+        assert!(command_contains_flag_value(
+            &resolved,
+            "--working-dir",
+            "/workspace/task"
+        ));
     }
 
     #[test]
@@ -27883,8 +28032,8 @@ metrics:
             msg
         );
         assert!(
-            msg.contains("/stages/agent/command"),
-            "missing agent command should use public path: {}",
+            msg.contains("/stages/agent") && msg.contains("command") && msg.contains("adapter"),
+            "missing agent launch contract should use public path and name command/adapter: {}",
             msg
         );
         assert!(
@@ -28038,7 +28187,7 @@ stages:
     sidecars: ["svc"]
 "#,
                 "/stages/agent/sidecars",
-                "/stages/agent/ephemerals",
+                "/stages/agent/services",
             ),
             (
                 r#"
@@ -28096,7 +28245,7 @@ matrix:
           sidecars: ["svc"]
 "#,
                 "/matrix/variants/0/overrides/grader/sidecars",
-                "/matrix/variants/0/overrides/grader/ephemerals",
+                "/matrix/variants/0/overrides/grader/services",
             ),
             (
                 r#"

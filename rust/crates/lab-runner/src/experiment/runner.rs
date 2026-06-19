@@ -1560,9 +1560,14 @@ impl StdoutRunProgress {
         let remaining_value = remaining.to_string();
         let progress_value = format_progress_bar(completed, self.total_slots, 24);
         let active_detail = format_active_trials(active_trials, schedule);
-        let monitor = format!("bucephalus views-live {} run_progress", run_id);
-        let trust = format!("bucephalus views-live {} health", run_id);
-        let agent_output_view = format!("bucephalus views-live {} latest_agent_output", run_id);
+        let monitor = "bucephalus-cloud run watch <cloud-run-id> --resources-only".to_string();
+        let resources = "bucephalus-cloud run resources <cloud-run-id> --kind Trial".to_string();
+        let health = "bucephalus-cloud run health <cloud-run-id>".to_string();
+        let audit = "bucephalus-cloud run audit <cloud-run-id> --limit 100".to_string();
+        let local_trials = format!(
+            "bucephalus query {} \"SELECT * FROM trials LIMIT 20\"",
+            run_id
+        );
         let mut rows = vec![
             ("Run", run_id),
             ("Stage", stage),
@@ -1584,9 +1589,11 @@ impl StdoutRunProgress {
         if !agent_output_capture.trim().is_empty() {
             rows.push(("Agent result capture", agent_output_capture));
         }
-        rows.push(("Monitor", monitor.as_str()));
-        rows.push(("Agent output view", agent_output_view.as_str()));
-        rows.push(("Trust", trust.as_str()));
+        rows.push(("Cloud monitor", monitor.as_str()));
+        rows.push(("Cloud trials", resources.as_str()));
+        rows.push(("Cloud health", health.as_str()));
+        rows.push(("Cloud audit", audit.as_str()));
+        rows.push(("Local SQL", local_trials.as_str()));
         print_ascii_table("Bucephalus run progress", &rows);
     }
 }

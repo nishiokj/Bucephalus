@@ -24,15 +24,12 @@ use lab_schemas as schemas;
 
 mod cloud_auth_ux;
 mod latch_daemon;
-mod tui;
-mod view_layout;
 mod view_spec;
 
 use crate::cloud_auth_ux::BUCEPHALUS_CLOUD_USER_TOKEN_ENV;
 use crate::view_spec::{
-    present_table, renderer_for_resolved, resolve_requested_view, resolved_view_from_spec,
-    standard_view_source_label, standard_views_for_set, ResolvedView, ResolvedViewPlan,
-    ViewRenderer,
+    present_table, resolve_requested_view, resolved_view_from_spec, standard_view_source_label,
+    standard_views_for_set, ResolvedView, ResolvedViewPlan,
 };
 
 #[derive(Parser)]
@@ -482,7 +479,7 @@ enum Commands {
         #[arg(long)]
         csv: bool,
     },
-    #[command(about = "Show standardized views for a run; omit run in a TTY to browse and pick")]
+    #[command(about = "Show standardized scriptable views for a run")]
     Views {
         run: Option<String>,
         view: Option<String>,
@@ -499,9 +496,7 @@ enum Commands {
         #[arg(long)]
         html: bool,
     },
-    #[command(
-        about = "Live refresh for a view; omit run/view in a TTY to browse active runs and views"
-    )]
+    #[command(about = "Live-refresh a scriptable view for a run")]
     ViewsLive {
         run: Option<String>,
         view: Option<String>,
@@ -623,7 +618,6 @@ enum TableRenderFormat {
 
 #[derive(Clone, Debug, Default)]
 struct RunControlSummary {
-    status: String,
     status_display: String,
     live_summary: String,
     active_trials: usize,
@@ -669,23 +663,6 @@ struct CleanRunsReport {
     run_count: usize,
     active_runs: Vec<String>,
     removed: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ViewsBrowserScreen {
-    RunPicker,
-    ViewPicker,
-    Viewer,
-    Detail,
-}
-
-#[derive(Clone, Debug)]
-struct DetailSnapshot {
-    view_name: String,
-    run_id_label: String,
-    row_label: String,
-    fields: Vec<(String, String)>,
-    payload: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -6887,20 +6864,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let (run_dir, view) = if let Some(run_str) = run {
                 (resolve_run_dir_arg(&run_str)?, view)
             } else {
-                if all {
-                    return Err(anyhow::anyhow!("--all requires a run id argument"));
-                }
-                if view.is_some() {
-                    return Err(anyhow::anyhow!("view name requires a run id argument"));
-                }
-                if !stdout_is_tty() {
-                    return Err(anyhow::anyhow!(
-                        "run is required when not connected to a TTY; pass a run id or path"
-                    ));
-                }
-                let project_root = resolve_project_root(std::env::current_dir()?.as_path());
-                run_views_browser(&project_root)?;
-                return Ok(None);
+                return Err(anyhow::anyhow!(
+                    "run is required; the interactive TUI view browser has been removed. Use `bucephalus runs` to list local runs, then `bucephalus views <run>` or `bucephalus views <run> <view>`."
+                ));
             };
 
             let run_view_set = analysis::run_view_set(&run_dir)?;
@@ -7069,68 +7035,55 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         } => {
             let sleep_interval = Duration::from_secs(interval_seconds.max(1));
             let resolved_limit = limit.max(1);
-            let use_tui = !once && !no_clear && stdout_is_tty();
-            let run_dir = match run.as_deref() {
-                Some(run_arg) => Some(resolve_run_dir_arg(run_arg)?),
-                None => None,
-            };
-
-            if use_tui {
-                let project_root = resolve_project_root(std::env::current_dir()?.as_path());
-                run_interactive_views_browser(
-                    &project_root,
-                    run_dir,
-                    view.as_deref(),
-                    sleep_interval,
-                    resolved_limit,
-                )?;
-            } else {
-                let run_dir = run_dir.ok_or_else(|| {
+            let run_dir = run
+                .as_deref()
+                .map(resolve_run_dir_arg)
+                .transpose()?
+                .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "run is required when interactive TUI selection is unavailable; pass a run id/path or use a TTY without --once/--no-clear"
+                        "run is required; the interactive TUI view browser has been removed. Use `bucephalus runs` to list local runs, then pass a run id/path."
                     )
                 })?;
-                let run_view_set = analysis::run_view_set(&run_dir)?;
-                let raw_view_names = list_available_analysis_views(&run_dir);
-                let resolved_view = match view.as_deref() {
-                    Some(requested) => {
-                        resolve_requested_view(run_view_set, &raw_view_names, requested)?
-                    }
-                    None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
-                };
-                loop {
-                    let table = query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
-                    if !no_clear {
-                        print!("\x1B[2J\x1B[H");
-                        if let Err(err) = std::io::stdout().flush() {
-                            eprintln!("warning: failed to flush live view clear: {}", err);
-                        }
-                    }
-                    println!("run_dir: {}", run_dir.display());
-                    println!("status: {}", read_run_status(&run_dir));
-                    println!("updated_unix_s: {}", unix_now_seconds());
-                    println!("view: {}", resolved_view.name);
-                    if let Some(source) = resolved_view.source.as_deref() {
-                        if source != resolved_view.name {
-                            println!("source_view: {}", source);
-                        }
-                    }
-                    println!("limit: {}", resolved_limit);
-                    println!(
-                        "refresh_interval_seconds: {} (Ctrl-C to stop)",
-                        sleep_interval.as_secs()
-                    );
-                    println!();
-                    if !print_special_split_view(&run_dir, &resolved_view.name, &table) {
-                        let display = present_display_table(&resolved_view, &table);
-                        print_query_table(&display);
-                    }
-
-                    if once {
-                        break;
-                    }
-                    std::thread::sleep(sleep_interval);
+            let run_view_set = analysis::run_view_set(&run_dir)?;
+            let raw_view_names = list_available_analysis_views(&run_dir);
+            let resolved_view = match view.as_deref() {
+                Some(requested) => {
+                    resolve_requested_view(run_view_set, &raw_view_names, requested)?
                 }
+                None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
+            };
+            loop {
+                let table = query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
+                if !no_clear {
+                    print!("\x1B[2J\x1B[H");
+                    if let Err(err) = std::io::stdout().flush() {
+                        eprintln!("warning: failed to flush live view clear: {}", err);
+                    }
+                }
+                println!("run_dir: {}", run_dir.display());
+                println!("status: {}", read_run_status(&run_dir));
+                println!("updated_unix_s: {}", unix_now_seconds());
+                println!("view: {}", resolved_view.name);
+                if let Some(source) = resolved_view.source.as_deref() {
+                    if source != resolved_view.name {
+                        println!("source_view: {}", source);
+                    }
+                }
+                println!("limit: {}", resolved_limit);
+                println!(
+                    "refresh_interval_seconds: {} (Ctrl-C to stop)",
+                    sleep_interval.as_secs()
+                );
+                println!();
+                if !print_special_split_view(&run_dir, &resolved_view.name, &table) {
+                    let display = present_display_table(&resolved_view, &table);
+                    print_query_table(&display);
+                }
+
+                if once {
+                    break;
+                }
+                std::thread::sleep(sleep_interval);
             }
         }
         Commands::Query {
@@ -7753,666 +7706,6 @@ fn present_display_table(
     table: &analysis::QueryTable,
 ) -> analysis::QueryTable {
     present_table(resolved.spec, table).table
-}
-
-fn run_interactive_views_browser(
-    project_root: &Path,
-    initial_run_dir: Option<PathBuf>,
-    initial_view: Option<&str>,
-    sleep_interval: Duration,
-    limit: usize,
-) -> Result<()> {
-    let mut term = tui::Term::new()?;
-    let can_return_to_run_picker = initial_run_dir.is_none();
-    let mut run_entries = collect_run_inventory(project_root)?;
-    let mut current_run_dir = initial_run_dir;
-    let mut current_view = None;
-    let mut selected_run_idx = 0usize;
-    let mut selected_view_idx = 0usize;
-    let mut detail_snapshot: Option<DetailSnapshot> = None;
-    let mut viewer_table_cursor: usize = 0;
-
-    if let Some(run_dir) = current_run_dir.as_ref() {
-        if let Some(idx) = run_entries
-            .iter()
-            .position(|entry| entry.run_dir == *run_dir)
-        {
-            selected_run_idx = idx;
-        }
-        if let Some(requested_view) = initial_view {
-            let run_view_set = analysis::run_view_set(run_dir)?;
-            let raw_view_names = list_available_analysis_views(run_dir);
-            let resolved = resolve_requested_view(run_view_set, &raw_view_names, requested_view)?;
-            selected_view_idx = standard_views_for_set(run_view_set)
-                .iter()
-                .position(|def| def.name == resolved.name)
-                .unwrap_or(0);
-            current_view = Some(resolved);
-        }
-    }
-
-    let mut screen = match (&current_run_dir, &current_view) {
-        (Some(_), Some(_)) => ViewsBrowserScreen::Viewer,
-        (Some(_), None) => ViewsBrowserScreen::ViewPicker,
-        (None, _) => ViewsBrowserScreen::RunPicker,
-    };
-    term.set_selected(match screen {
-        ViewsBrowserScreen::RunPicker => selection_for_len(
-            selected_run_idx,
-            run_entries
-                .iter()
-                .filter(|entry| show_in_live_run_picker(entry))
-                .count(),
-        ),
-        ViewsBrowserScreen::ViewPicker => Some(selected_view_idx),
-        ViewsBrowserScreen::Viewer | ViewsBrowserScreen::Detail => Some(0),
-    });
-
-    loop {
-        match screen {
-            ViewsBrowserScreen::RunPicker => {
-                run_entries = collect_run_inventory(project_root)?;
-                let active_run_entries = run_entries
-                    .iter()
-                    .filter(|entry| show_in_live_run_picker(entry))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                selected_run_idx = resolve_run_selection(
-                    current_run_dir.as_deref(),
-                    &active_run_entries,
-                    selected_run_idx,
-                );
-                let run_items = build_run_browser_items(&active_run_entries);
-                term.set_selected(selection_for_len(
-                    selected_run_idx,
-                    active_run_entries.len(),
-                ));
-                term.draw(&tui::Screen::RunBrowser(tui::RunBrowserState {
-                    items: &run_items,
-                    refresh_secs: sleep_interval.as_secs(),
-                    chrome_title: "Bucephalus",
-                    description: "Live and interrupted runs are pinned first. Pick one, then choose the exact view you want to inspect.",
-                }))?;
-
-                match term.poll(sleep_interval)? {
-                    tui::Action::Quit => break,
-                    tui::Action::Back => break,
-                    tui::Action::Select => {
-                        if let Some(entry) = active_run_entries.get(selected_run_idx) {
-                            current_run_dir = Some(entry.run_dir.clone());
-                            selected_view_idx = 0;
-                            screen = ViewsBrowserScreen::ViewPicker;
-                            term.set_selected(Some(0));
-                        }
-                    }
-                    tui::Action::ScrollUp => {
-                        term.scroll_up();
-                        selected_run_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::ScrollDown => {
-                        term.scroll_down(active_run_entries.len());
-                        selected_run_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::PageUp => {
-                        term.page_up();
-                        selected_run_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::PageDown => {
-                        term.page_down(active_run_entries.len());
-                        selected_run_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::Refresh | tui::Action::Tick => {}
-                }
-            }
-            ViewsBrowserScreen::ViewPicker => {
-                let run_dir = current_run_dir
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("interactive view picker requires a selected run"))?;
-                let run_entry = lookup_run_inventory(&run_entries, run_dir)
-                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir, None));
-                let run_view_set = analysis::run_view_set(run_dir)?;
-                let standard_views = standard_views_for_set(run_view_set);
-                selected_view_idx = clamp_index(selected_view_idx, standard_views.len());
-                let view_items = build_view_browser_items(run_view_set);
-                term.set_selected(selection_for_len(selected_view_idx, standard_views.len()));
-                term.draw(&tui::Screen::ViewBrowser(tui::ViewBrowserState {
-                    run_id: &run_entry.run_id,
-                    experiment: &run_entry.experiment,
-                    started_at: &run_entry.started_at_display,
-                    status: &run_entry.control.status_display,
-                    items: &view_items,
-                    refresh_secs: sleep_interval.as_secs(),
-                    chrome_title: "Bucephalus",
-                }))?;
-
-                match term.poll(sleep_interval)? {
-                    tui::Action::Quit => break,
-                    tui::Action::Back => {
-                        if can_return_to_run_picker {
-                            current_run_dir = None;
-                            screen = ViewsBrowserScreen::RunPicker;
-                            let active_len = run_entries
-                                .iter()
-                                .filter(|entry| show_in_live_run_picker(entry))
-                                .count();
-                            term.set_selected(selection_for_len(selected_run_idx, active_len));
-                        } else {
-                            break;
-                        }
-                    }
-                    tui::Action::Select => {
-                        if let Some(def) = standard_views.get(selected_view_idx) {
-                            current_view = Some(resolved_view_from_spec(run_view_set, def));
-                            screen = ViewsBrowserScreen::Viewer;
-                            term.set_selected(Some(0));
-                        }
-                    }
-                    tui::Action::ScrollUp => {
-                        term.scroll_up();
-                        selected_view_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::ScrollDown => {
-                        term.scroll_down(standard_views.len());
-                        selected_view_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::PageUp => {
-                        term.page_up();
-                        selected_view_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::PageDown => {
-                        term.page_down(standard_views.len());
-                        selected_view_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::Refresh | tui::Action::Tick => {}
-                }
-            }
-            ViewsBrowserScreen::Viewer => {
-                let run_dir = current_run_dir
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("interactive viewer requires a selected run"))?;
-                let run_entry = lookup_run_inventory(&run_entries, run_dir)
-                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir, None));
-                let run_view_set = analysis::run_view_set(run_dir)?;
-                let raw_view_names = list_available_analysis_views(run_dir);
-                let resolved_view = match current_view.clone() {
-                    Some(view) => view,
-                    None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
-                };
-                current_view = Some(resolved_view.clone());
-
-                let table = query_resolved_view(run_dir, &resolved_view, limit)?;
-                let display_mode = display_mode_for_view(&resolved_view);
-                let (display, legend, split_labels) =
-                    if resolved_view.name == "trace" && has_ab_trace_columns(&table) {
-                        let (d, l, s) = prepare_trace_split_view(&table);
-                        (d, l, Some(s))
-                    } else {
-                        let presented = present_table(resolved_view.spec, &table);
-                        (presented.table, presented.legend, None)
-                    };
-
-                let split_refs = split_labels.as_ref().map(|(l, r)| (l.as_str(), r.as_str()));
-                let hints_with_detail = [
-                    tui::KeyHint {
-                        key: "Enter",
-                        label: "detail",
-                    },
-                    tui::KeyHint {
-                        key: "Esc",
-                        label: "views",
-                    },
-                    tui::KeyHint {
-                        key: "q",
-                        label: "quit",
-                    },
-                    tui::KeyHint {
-                        key: "r",
-                        label: "refresh",
-                    },
-                ];
-                term.draw(&tui::Screen::LiveView(tui::ViewState {
-                    run_id: &run_entry.run_id,
-                    status: &run_entry.control.status_display,
-                    started_at: &run_entry.started_at_display,
-                    view_name: &resolved_view.name,
-                    interval_secs: sleep_interval.as_secs(),
-                    table: &display,
-                    display_mode,
-                    progress: read_run_progress(run_dir),
-                    legend: &legend,
-                    split_labels: split_refs,
-                    hints: &hints_with_detail,
-                }))?;
-                match term.poll(sleep_interval)? {
-                    tui::Action::Quit => break,
-                    tui::Action::Back => {
-                        selected_view_idx = standard_views_for_set(run_view_set)
-                            .iter()
-                            .position(|def| def.name == resolved_view.name)
-                            .unwrap_or(0);
-                        screen = ViewsBrowserScreen::ViewPicker;
-                        term.set_selected(Some(selected_view_idx));
-                    }
-                    tui::Action::ScrollUp => term.scroll_up(),
-                    tui::Action::ScrollDown => term.scroll_down(display.rows.len()),
-                    tui::Action::PageUp => term.page_up(),
-                    tui::Action::PageDown => term.page_down(display.rows.len()),
-                    tui::Action::Select => {
-                        viewer_table_cursor = term.selected().unwrap_or(0);
-                        if let Some(snap) = build_detail_snapshot(
-                            &resolved_view.name,
-                            &run_entry.run_id,
-                            &table,
-                            viewer_table_cursor,
-                        ) {
-                            detail_snapshot = Some(snap);
-                            screen = ViewsBrowserScreen::Detail;
-                        }
-                    }
-                    tui::Action::Refresh | tui::Action::Tick => {}
-                }
-            }
-            ViewsBrowserScreen::Detail => {
-                let Some(snap) = detail_snapshot.as_ref() else {
-                    screen = ViewsBrowserScreen::Viewer;
-                    continue;
-                };
-                let fields_borrow: &[(String, String)] = &snap.fields;
-                term.draw(&tui::Screen::Detail(tui::DetailState {
-                    run_id: &snap.run_id_label,
-                    view_name: &snap.view_name,
-                    row_label: &snap.row_label,
-                    fields: fields_borrow,
-                    payload: snap.payload.as_deref(),
-                }))?;
-
-                match term.poll(sleep_interval)? {
-                    tui::Action::Quit => break,
-                    tui::Action::Back => {
-                        screen = ViewsBrowserScreen::Viewer;
-                        term.set_selected(Some(viewer_table_cursor));
-                        detail_snapshot = None;
-                    }
-                    tui::Action::Refresh
-                    | tui::Action::Tick
-                    | tui::Action::ScrollUp
-                    | tui::Action::ScrollDown
-                    | tui::Action::PageUp
-                    | tui::Action::PageDown
-                    | tui::Action::Select => {}
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn run_views_browser(project_root: &Path) -> Result<()> {
-    let mut term = tui::Term::new()?;
-    let mut run_entries = collect_run_inventory(project_root)?;
-    let mut selected_run_idx = 0usize;
-    let mut selected_view_idx = 0usize;
-    let mut current_run_dir: Option<PathBuf> = None;
-    let mut current_view: Option<ResolvedView> = None;
-    let poll_timeout = Duration::from_secs(120);
-    let mut detail_snapshot: Option<DetailSnapshot> = None;
-    let mut viewer_table_cursor: usize = 0;
-
-    enum BrowserScreen {
-        RunPicker,
-        ViewPicker,
-        Viewer,
-        Detail,
-    }
-    let mut screen = BrowserScreen::RunPicker;
-    term.set_selected(selection_for_len(0, run_entries.len()));
-
-    loop {
-        match screen {
-            BrowserScreen::RunPicker => {
-                selected_run_idx = resolve_run_selection(
-                    current_run_dir.as_deref(),
-                    &run_entries,
-                    selected_run_idx,
-                );
-                let run_items = build_run_browser_items(&run_entries);
-                term.set_selected(selection_for_len(selected_run_idx, run_entries.len()));
-                term.draw(&tui::Screen::RunBrowser(tui::RunBrowserState {
-                    items: &run_items,
-                    refresh_secs: 0,
-                    chrome_title: "Bucephalus",
-                    description:
-                        "Most recent runs first. Pick a run, then choose the view to display.",
-                }))?;
-
-                match term.poll(poll_timeout)? {
-                    tui::Action::Quit | tui::Action::Back => break,
-                    tui::Action::Select => {
-                        if let Some(entry) = run_entries.get(selected_run_idx) {
-                            current_run_dir = Some(entry.run_dir.clone());
-                            selected_view_idx = 0;
-                            screen = BrowserScreen::ViewPicker;
-                            term.set_selected(Some(0));
-                        }
-                    }
-                    tui::Action::ScrollUp => {
-                        term.scroll_up();
-                        selected_run_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::ScrollDown => {
-                        term.scroll_down(run_entries.len());
-                        selected_run_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::PageUp => {
-                        term.page_up();
-                        selected_run_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::PageDown => {
-                        term.page_down(run_entries.len());
-                        selected_run_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::Refresh => {
-                        run_entries = collect_run_inventory(project_root)?;
-                    }
-                    tui::Action::Tick => {}
-                }
-            }
-            BrowserScreen::ViewPicker => {
-                let run_dir = current_run_dir
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("interactive view picker requires a selected run"))?;
-                let run_entry = lookup_run_inventory(&run_entries, run_dir)
-                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir, None));
-                let run_view_set = analysis::run_view_set(run_dir)?;
-                let standard_views = standard_views_for_set(run_view_set);
-                selected_view_idx = clamp_index(selected_view_idx, standard_views.len());
-                let view_items = build_view_browser_items(run_view_set);
-                term.set_selected(selection_for_len(selected_view_idx, standard_views.len()));
-                term.draw(&tui::Screen::ViewBrowser(tui::ViewBrowserState {
-                    run_id: &run_entry.run_id,
-                    experiment: &run_entry.experiment,
-                    started_at: &run_entry.started_at_display,
-                    status: &run_entry.control.status_display,
-                    items: &view_items,
-                    refresh_secs: 0,
-                    chrome_title: "Bucephalus",
-                }))?;
-
-                match term.poll(poll_timeout)? {
-                    tui::Action::Quit => break,
-                    tui::Action::Back => {
-                        current_run_dir = None;
-                        screen = BrowserScreen::RunPicker;
-                        term.set_selected(selection_for_len(selected_run_idx, run_entries.len()));
-                    }
-                    tui::Action::Select => {
-                        if let Some(def) = standard_views.get(selected_view_idx) {
-                            current_view = Some(resolved_view_from_spec(run_view_set, def));
-                            screen = BrowserScreen::Viewer;
-                            term.set_selected(Some(0));
-                        }
-                    }
-                    tui::Action::ScrollUp => {
-                        term.scroll_up();
-                        selected_view_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::ScrollDown => {
-                        term.scroll_down(standard_views.len());
-                        selected_view_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::PageUp => {
-                        term.page_up();
-                        selected_view_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::PageDown => {
-                        term.page_down(standard_views.len());
-                        selected_view_idx = term.selected().unwrap_or(0);
-                    }
-                    tui::Action::Refresh | tui::Action::Tick => {}
-                }
-            }
-            BrowserScreen::Viewer => {
-                let run_dir = current_run_dir
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("interactive viewer requires a selected run"))?;
-                let run_entry = lookup_run_inventory(&run_entries, run_dir)
-                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir, None));
-                let run_view_set = analysis::run_view_set(run_dir)?;
-                let resolved_view = match current_view.clone() {
-                    Some(view) => view,
-                    None => {
-                        let raw = list_available_analysis_views(run_dir);
-                        resolve_requested_view(run_view_set, &raw, "run_progress")?
-                    }
-                };
-                current_view = Some(resolved_view.clone());
-
-                let table = query_resolved_view(run_dir, &resolved_view, 0)?;
-                let display_mode = display_mode_for_view(&resolved_view);
-                let (display, legend, split_labels) =
-                    if resolved_view.name == "trace" && has_ab_trace_columns(&table) {
-                        let (d, l, s) = prepare_trace_split_view(&table);
-                        (d, l, Some(s))
-                    } else {
-                        let presented = present_table(resolved_view.spec, &table);
-                        (presented.table, presented.legend, None)
-                    };
-
-                let split_refs = split_labels.as_ref().map(|(l, r)| (l.as_str(), r.as_str()));
-                let hints_with_detail = [
-                    tui::KeyHint {
-                        key: "Enter",
-                        label: "detail",
-                    },
-                    tui::KeyHint {
-                        key: "Esc",
-                        label: "views",
-                    },
-                    tui::KeyHint {
-                        key: "q",
-                        label: "quit",
-                    },
-                    tui::KeyHint {
-                        key: "r",
-                        label: "refresh",
-                    },
-                ];
-                term.draw(&tui::Screen::LiveView(tui::ViewState {
-                    run_id: &run_entry.run_id,
-                    status: &run_entry.control.status_display,
-                    started_at: &run_entry.started_at_display,
-                    view_name: &resolved_view.name,
-                    interval_secs: 0,
-                    table: &display,
-                    display_mode,
-                    progress: read_run_progress(run_dir),
-                    legend: &legend,
-                    split_labels: split_refs,
-                    hints: &hints_with_detail,
-                }))?;
-                match term.poll(poll_timeout)? {
-                    tui::Action::Quit => break,
-                    tui::Action::Back => {
-                        selected_view_idx = standard_views_for_set(run_view_set)
-                            .iter()
-                            .position(|def| def.name == resolved_view.name)
-                            .unwrap_or(0);
-                        screen = BrowserScreen::ViewPicker;
-                        term.set_selected(Some(selected_view_idx));
-                    }
-                    tui::Action::ScrollUp => term.scroll_up(),
-                    tui::Action::ScrollDown => term.scroll_down(display.rows.len()),
-                    tui::Action::PageUp => term.page_up(),
-                    tui::Action::PageDown => term.page_down(display.rows.len()),
-                    tui::Action::Select => {
-                        viewer_table_cursor = term.selected().unwrap_or(0);
-                        if let Some(snap) = build_detail_snapshot(
-                            &resolved_view.name,
-                            &run_entry.run_id,
-                            &table,
-                            viewer_table_cursor,
-                        ) {
-                            detail_snapshot = Some(snap);
-                            screen = BrowserScreen::Detail;
-                        }
-                    }
-                    tui::Action::Refresh | tui::Action::Tick => {}
-                }
-            }
-            BrowserScreen::Detail => {
-                let Some(snap) = detail_snapshot.as_ref() else {
-                    screen = BrowserScreen::Viewer;
-                    continue;
-                };
-                let fields_borrow: &[(String, String)] = &snap.fields;
-                term.draw(&tui::Screen::Detail(tui::DetailState {
-                    run_id: &snap.run_id_label,
-                    view_name: &snap.view_name,
-                    row_label: &snap.row_label,
-                    fields: fields_borrow,
-                    payload: snap.payload.as_deref(),
-                }))?;
-                match term.poll(poll_timeout)? {
-                    tui::Action::Quit => break,
-                    tui::Action::Back => {
-                        screen = BrowserScreen::Viewer;
-                        term.set_selected(Some(viewer_table_cursor));
-                        detail_snapshot = None;
-                    }
-                    tui::Action::Refresh
-                    | tui::Action::Tick
-                    | tui::Action::ScrollUp
-                    | tui::Action::ScrollDown
-                    | tui::Action::PageUp
-                    | tui::Action::PageDown
-                    | tui::Action::Select => {}
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn selection_for_len(index: usize, len: usize) -> Option<usize> {
-    if len == 0 {
-        None
-    } else {
-        Some(clamp_index(index, len))
-    }
-}
-
-fn clamp_index(index: usize, len: usize) -> usize {
-    if len == 0 {
-        0
-    } else {
-        index.min(len.saturating_sub(1))
-    }
-}
-
-fn resolve_run_selection(
-    anchor_run_dir: Option<&Path>,
-    entries: &[RunInventoryEntry],
-    selected_idx: usize,
-) -> usize {
-    clamp_index(
-        if let Some(run_dir) = anchor_run_dir {
-            entries
-                .iter()
-                .position(|e| e.run_dir == *run_dir)
-                .unwrap_or(selected_idx)
-        } else {
-            selected_idx
-        },
-        entries.len(),
-    )
-}
-
-fn build_run_browser_items(entries: &[RunInventoryEntry]) -> Vec<tui::RunBrowserItem> {
-    entries
-        .iter()
-        .map(|entry| tui::RunBrowserItem {
-            run_id: entry.run_id.clone(),
-            experiment: display_or_dash(&entry.experiment),
-            started_at: entry.started_at_display.clone(),
-            status: entry.control.status.clone(),
-            status_detail: entry.control.status_display.clone(),
-            active_trials: entry.control.active_trials,
-        })
-        .collect()
-}
-
-fn show_in_live_run_picker(entry: &RunInventoryEntry) -> bool {
-    entry.control.is_active || entry.control.status == "interrupted"
-}
-
-fn build_view_browser_items(view_set: analysis::ViewSet) -> Vec<tui::ViewBrowserItem> {
-    standard_views_for_set(view_set)
-        .iter()
-        .map(|def| tui::ViewBrowserItem {
-            name: def.name.to_string(),
-            purpose: def.purpose.to_string(),
-            category: Some(def.category),
-        })
-        .collect()
-}
-
-fn build_detail_snapshot(
-    view_name: &str,
-    run_id_label: &str,
-    table: &analysis::QueryTable,
-    row_idx: usize,
-) -> Option<DetailSnapshot> {
-    let row = table.rows.get(row_idx)?;
-    let row_label = ["trial_id", "task_id", "variant_id", "run_id", "row_seq"]
-        .iter()
-        .find_map(|key| {
-            let idx = table.columns.iter().position(|c| c == key)?;
-            let raw = row.get(idx).map(render_json_cell).unwrap_or_default();
-            if raw.is_empty() {
-                None
-            } else {
-                Some(format!("{key}={}", view_layout::compact_identifier(&raw)))
-            }
-        })
-        .unwrap_or_else(|| format!("row {}", row_idx + 1));
-
-    let mut fields = Vec::with_capacity(table.columns.len());
-    let mut payload: Option<String> = None;
-    for (idx, column) in table.columns.iter().enumerate() {
-        let value = row.get(idx).cloned().unwrap_or(Value::Null);
-        if column == "payload_json" || column == "payload" {
-            let pretty = view_layout::pretty_payload(&value);
-            if !pretty.trim().is_empty() && pretty != "null" {
-                payload = Some(pretty);
-            }
-            continue;
-        }
-        let rendered = render_json_cell(&value);
-        if rendered.is_empty() {
-            continue;
-        }
-        fields.push((column.clone(), rendered));
-    }
-
-    Some(DetailSnapshot {
-        view_name: view_name.to_string(),
-        run_id_label: run_id_label.to_string(),
-        row_label,
-        fields,
-        payload,
-    })
-}
-
-fn lookup_run_inventory(
-    entries: &[RunInventoryEntry],
-    run_dir: &Path,
-) -> Option<RunInventoryEntry> {
-    entries
-        .iter()
-        .find(|entry| entry.run_dir == run_dir)
-        .cloned()
 }
 
 fn query_source_view(
@@ -9719,148 +9012,11 @@ fn preview_agent_output_value(value: &Value) -> String {
         .collect()
 }
 
-fn stdout_is_tty() -> bool {
-    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
-}
-
 fn unix_now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-fn prepare_trace_split_view(
-    table: &analysis::QueryTable,
-) -> (
-    analysis::QueryTable,
-    Vec<(String, String)>,
-    (String, String),
-) {
-    let idx = |name: &str| table.columns.iter().position(|c| c == name);
-    let get = |row: &[Value], col: Option<usize>| -> Value {
-        col.and_then(|i| row.get(i)).cloned().unwrap_or(Value::Null)
-    };
-    let task_id = idx("task_id");
-    let a_id = idx("variant_a_id");
-    let b_id = idx("variant_b_id");
-    let a_event = idx("variant_a_event_type");
-    let b_event = idx("variant_b_event_type");
-    let a_turn = idx("variant_a_turn_index");
-    let b_turn = idx("variant_b_turn_index");
-    let a_tool = idx("variant_a_tool");
-    let b_tool = idx("variant_b_tool");
-    let a_status = idx("variant_a_status");
-    let b_status = idx("variant_b_status");
-
-    let (left_label, right_label) = table
-        .rows
-        .first()
-        .map(|first| {
-            let a = a_id
-                .and_then(|i| first.get(i))
-                .and_then(Value::as_str)
-                .unwrap_or("variant a")
-                .to_string();
-            let b = b_id
-                .and_then(|i| first.get(i))
-                .and_then(Value::as_str)
-                .unwrap_or("variant b")
-                .to_string();
-            (a, b)
-        })
-        .unwrap_or_else(|| ("variant a".into(), "variant b".into()));
-
-    let to_dot = |row: &[Value], col: Option<usize>| -> Value {
-        match col
-            .and_then(|i| row.get(i))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-        {
-            "" => Value::Null,
-            s if s.contains("success") || s == "ok" || s.starts_with('2') || s == "pass" => {
-                Value::String("●".to_string())
-            }
-            _ => Value::String("✗".to_string()),
-        }
-    };
-
-    let columns = vec![
-        "task".into(),
-        "event".into(),
-        "turn".into(),
-        "tool".into(),
-        "st".into(),
-        "┃".into(),
-        "event".into(),
-        "turn".into(),
-        "tool".into(),
-        "st".into(),
-    ];
-
-    let rows: Vec<Vec<Value>> = table
-        .rows
-        .iter()
-        .map(|row| {
-            vec![
-                get(row, task_id),
-                get(row, a_event),
-                get(row, a_turn),
-                get(row, a_tool),
-                to_dot(row, a_status),
-                Value::String("┃".to_string()),
-                get(row, b_event),
-                get(row, b_turn),
-                get(row, b_tool),
-                to_dot(row, b_status),
-            ]
-        })
-        .collect();
-
-    let compact = analysis::QueryTable { columns, rows };
-
-    let task_col = 0;
-    let task_is_constant = compact.rows.len() > 1 && {
-        let first = compact.rows[0].get(task_col);
-        compact.rows.iter().all(|r| r.get(task_col) == first)
-    };
-
-    let (filtered, legend) = if task_is_constant {
-        let val = compact.rows[0]
-            .get(task_col)
-            .map(render_json_cell)
-            .unwrap_or_default();
-        let legend = vec![("task".to_string(), val)];
-        let columns = compact.columns[1..].to_vec();
-        let rows = compact
-            .rows
-            .into_iter()
-            .map(|mut r| {
-                r.remove(0);
-                r
-            })
-            .collect();
-        (analysis::QueryTable { columns, rows }, legend)
-    } else {
-        (compact, Vec::new())
-    };
-
-    (filtered, legend, (left_label, right_label))
-}
-
-fn has_ab_trace_columns(table: &analysis::QueryTable) -> bool {
-    let has = |name: &str| table.columns.iter().any(|c| c == name);
-    has("variant_a_event_type") && has("variant_b_event_type")
-}
-
-fn display_mode_for_view(resolved: &ResolvedView) -> tui::DisplayMode {
-    match renderer_for_resolved(resolved) {
-        ViewRenderer::Overview => tui::DisplayMode::Overview,
-        ViewRenderer::Timeline => tui::DisplayMode::Timeline,
-        ViewRenderer::Comparison => tui::DisplayMode::Comparison,
-        ViewRenderer::Scoreboard => tui::DisplayMode::Scoreboard,
-        ViewRenderer::Table => tui::DisplayMode::Table,
-    }
 }
 
 fn display_column_name(name: &str) -> String {
@@ -11584,7 +10740,6 @@ fn summarize_run_lifecycle_inner(
 ) -> RunControlSummary {
     let Some(parsed) = parsed else {
         return RunControlSummary {
-            status: "unknown".to_string(),
             status_display: "unknown".to_string(),
             live_summary: "idle".to_string(),
             active_trials: 0,
@@ -11634,7 +10789,6 @@ fn summarize_run_lifecycle_inner(
             format!("stale owner / {} recorded", active_trials)
         };
         return RunControlSummary {
-            status: "interrupted".to_string(),
             status_display,
             live_summary,
             active_trials: 0,
@@ -11664,7 +10818,6 @@ fn summarize_run_lifecycle_inner(
     let is_active = matches!(status.as_str(), "running" | "paused") || active_trials > 0;
 
     RunControlSummary {
-        status,
         status_display,
         live_summary,
         active_trials,
@@ -13093,7 +12246,6 @@ mod tests {
         });
 
         let summary = summarize_run_control(Some(&control));
-        assert_eq!(summary.status, "running");
         assert_eq!(summary.active_trials, 1);
         assert_eq!(
             summary.status_display,
@@ -13131,7 +12283,6 @@ mod tests {
 
         let summary = summarize_run_lifecycle(Some(&control), Some(&lease), now);
 
-        assert_eq!(summary.status, "interrupted");
         assert_eq!(
             summary.status_display,
             "interrupted (stale running lease, stale_active_trials=1)"
@@ -13139,26 +12290,6 @@ mod tests {
         assert_eq!(summary.live_summary, "stale owner / 1 recorded");
         assert_eq!(summary.active_trials, 0);
         assert!(!summary.is_active);
-    }
-
-    #[test]
-    fn live_run_picker_keeps_interrupted_runtime_records_visible() {
-        let entry = RunInventoryEntry {
-            run_id: "run_1".to_string(),
-            run_dir: PathBuf::from("/tmp/run_1"),
-            experiment: "exp".to_string(),
-            started_at: "2026-03-09T17:00:00Z".to_string(),
-            started_at_display: "2026-03-09 17:00:00Z".to_string(),
-            control: RunControlSummary {
-                status: "interrupted".to_string(),
-                status_display: "interrupted (stale running lease)".to_string(),
-                live_summary: "stale owner".to_string(),
-                active_trials: 0,
-                is_active: false,
-            },
-        };
-
-        assert!(show_in_live_run_picker(&entry));
     }
 
     #[test]
@@ -13181,7 +12312,6 @@ mod tests {
 
         let summary = summarize_run_lifecycle(Some(&control), Some(&lease), now);
 
-        assert_eq!(summary.status, "running");
         assert_eq!(summary.status_display, "running");
         assert!(summary.is_active);
     }
@@ -13214,7 +12344,7 @@ mod tests {
         assert_eq!(entry.experiment, "exp_browser");
         assert_eq!(entry.started_at, "2026-03-09T17:33:12Z");
         assert_eq!(entry.started_at_display, "2026-03-09 17:33:12Z");
-        assert_eq!(entry.control.status, "unknown");
+        assert_eq!(entry.control.status_display, "unknown");
 
         let _ = std::fs::remove_dir_all(&run_dir);
     }
@@ -13291,32 +12421,6 @@ mod tests {
         assert_eq!(trace.name, "trace");
         assert_eq!(trace.source.as_deref(), Some("ab_trace_row_side_by_side"));
         assert!(trace.standardize_ab_terms);
-    }
-
-    #[test]
-    fn standardized_views_choose_dense_display_modes() {
-        let raw = vec!["events".to_string(), "run_progress".to_string()];
-        let events = resolve_requested_view(analysis::ViewSet::CoreOnly, &raw, "events")
-            .expect("events view");
-        assert_eq!(display_mode_for_view(&events), tui::DisplayMode::Timeline);
-
-        let progress = resolve_requested_view(analysis::ViewSet::CoreOnly, &raw, "run_progress")
-            .expect("progress view");
-        assert_eq!(display_mode_for_view(&progress), tui::DisplayMode::Overview);
-
-        let scoreboard = resolve_requested_view(analysis::ViewSet::CoreOnly, &raw, "scoreboard")
-            .expect("scoreboard view");
-        assert_eq!(
-            display_mode_for_view(&scoreboard),
-            tui::DisplayMode::Scoreboard
-        );
-
-        let task_metrics = resolve_requested_view(analysis::ViewSet::AbTest, &raw, "task_metrics")
-            .expect("task metrics view");
-        assert_eq!(
-            display_mode_for_view(&task_metrics),
-            tui::DisplayMode::Comparison
-        );
     }
 
     #[test]
@@ -14130,48 +13234,6 @@ runtime:
         }
     }
 
-    #[test]
-    fn display_column_name_preserves_metric_color_coding() {
-        let metric_columns = [
-            "pass_rate",
-            "success_rate",
-            "primary_metric_mean",
-            "win_rate",
-            "loss_rate",
-            "tie_rate",
-            "effect_size",
-        ];
-        for canonical in metric_columns {
-            let display = display_column_name(canonical);
-            assert!(
-                tui::is_metric_column(&display),
-                "display name {:?} (from {:?}) is not recognized as a metric column",
-                display,
-                canonical
-            );
-        }
-    }
-
-    #[test]
-    fn display_column_name_preserves_outcome_color_coding() {
-        assert!(tui::is_outcome_column(&display_column_name("outcome")));
-        assert!(tui::is_outcome_column(&display_column_name(
-            "variant_a_outcome"
-        )));
-        assert!(tui::is_outcome_column(&display_column_name(
-            "variant_b_outcome"
-        )));
-    }
-
-    #[test]
-    fn display_column_name_preserves_status_color_coding() {
-        assert!(tui::is_status_column(&display_column_name("status_code")));
-    }
-
-    fn fake_run_entries(dirs: &[&str]) -> Vec<RunInventoryEntry> {
-        dirs.iter().map(|d| fake_run_entry(d, false)).collect()
-    }
-
     fn fake_run_entry(dir: &str, active: bool) -> RunInventoryEntry {
         RunInventoryEntry {
             run_dir: PathBuf::from(dir),
@@ -14180,7 +13242,6 @@ runtime:
             started_at: "2026-01-01T00:00:00Z".to_string(),
             started_at_display: "now".to_string(),
             control: RunControlSummary {
-                status: if active { "running" } else { "completed" }.to_string(),
                 status_display: if active { "running" } else { "completed" }.to_string(),
                 live_summary: String::new(),
                 active_trials: if active { 1 } else { 0 },
@@ -14257,55 +13318,6 @@ runtime:
         .expect("explicit override should allow active clean preflight");
         assert!(forced.force);
         assert!(forced.include_active);
-    }
-
-    #[test]
-    fn resolve_run_selection_preserves_index_when_no_anchor() {
-        let entries = fake_run_entries(&["/a", "/b", "/c", "/d"]);
-        assert_eq!(resolve_run_selection(None, &entries, 0), 0);
-        assert_eq!(resolve_run_selection(None, &entries, 2), 2);
-        assert_eq!(resolve_run_selection(None, &entries, 3), 3);
-    }
-
-    #[test]
-    fn resolve_run_selection_snaps_to_anchor_position() {
-        let entries = fake_run_entries(&["/a", "/b", "/c", "/d"]);
-        assert_eq!(resolve_run_selection(Some(Path::new("/c")), &entries, 0), 2);
-        assert_eq!(resolve_run_selection(Some(Path::new("/a")), &entries, 3), 0);
-    }
-
-    #[test]
-    fn resolve_run_selection_falls_back_when_anchor_missing() {
-        let entries = fake_run_entries(&["/a", "/b", "/c"]);
-        assert_eq!(
-            resolve_run_selection(Some(Path::new("/missing")), &entries, 1),
-            1
-        );
-    }
-
-    #[test]
-    fn resolve_run_selection_clamps_to_bounds() {
-        let entries = fake_run_entries(&["/a", "/b"]);
-        assert_eq!(resolve_run_selection(None, &entries, 99), 1);
-        assert_eq!(resolve_run_selection(None, &[], 5), 0);
-    }
-
-    #[test]
-    fn resolve_run_selection_scroll_free_after_anchor_cleared() {
-        let entries = fake_run_entries(&["/a", "/b", "/c", "/d"]);
-
-        let idx = resolve_run_selection(Some(Path::new("/b")), &entries, 0);
-        assert_eq!(idx, 1);
-
-        let idx = resolve_run_selection(None, &entries, idx);
-        assert_eq!(idx, 1);
-
-        let scrolled = idx + 1; // simulate scroll_down
-        let idx = resolve_run_selection(None, &entries, scrolled);
-        assert_eq!(
-            idx, 2,
-            "scroll must not be overridden after anchor is cleared"
-        );
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

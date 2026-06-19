@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use lab_core::BUCEPHALUS_CONTRACT_OUT_DIR;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::Path;
 
@@ -43,6 +43,223 @@ pub(crate) fn load_agent_response_resilient(path: &Path) -> Result<AgentResponse
                 parse_error: Some(detail),
             })
         }
+    }
+}
+
+pub(crate) fn normalize_agent_result_adapter(
+    runtime_experiment: &Value,
+    result_path: &Path,
+) -> Result<()> {
+    let Some(adapter) = runtime_experiment.pointer("/trial_runtime/agent/adapter") else {
+        return Ok(());
+    };
+    if adapter.get("kind").and_then(Value::as_str) != Some("nova") {
+        return Ok(());
+    }
+    let result_kind = adapter
+        .get("result")
+        .and_then(Value::as_str)
+        .unwrap_or("structured_json");
+    if result_kind != "structured_json" || !result_path.exists() {
+        return Ok(());
+    }
+    let raw: Value = serde_json::from_slice(&fs::read(result_path)?)
+        .with_context(|| format!("failed to parse Nova result at {}", result_path.display()))?;
+    if raw.get("schema_version").and_then(Value::as_str) == Some("artifact_envelope_v1") {
+        return Ok(());
+    }
+    let normalized = normalize_nova_structured_json_result(&raw).with_context(|| {
+        format!(
+            "failed to normalize Nova result at {}",
+            result_path.display()
+        )
+    })?;
+    fs::write(result_path, serde_json::to_vec_pretty(&normalized)?)?;
+    Ok(())
+}
+
+fn normalize_nova_structured_json_result(raw: &Value) -> Result<Value> {
+    let response = raw
+        .get("response")
+        .ok_or_else(|| anyhow!("Nova result missing /response"))?;
+    let mut artifact = parse_nova_response_artifact(response)?;
+    let usage = normalized_nova_usage(raw);
+    artifact.insert("usage".to_string(), usage.clone());
+    let mut metadata = Map::new();
+    if let Some(raw_object) = raw.as_object() {
+        for (key, value) in raw_object {
+            if key != "response" {
+                metadata.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    metadata.insert("metrics".to_string(), normalized_nova_metrics(raw, &usage));
+    Ok(json!({
+        "schema_version": "artifact_envelope_v1",
+        "artifact_type": "structured_json",
+        "artifact": Value::Object(artifact),
+        "metadata": Value::Object(metadata),
+    }))
+}
+
+fn parse_nova_response_artifact(response: &Value) -> Result<Map<String, Value>> {
+    if let Some(object) = response.as_object() {
+        return Ok(object.clone());
+    }
+    let Some(text) = response.as_str() else {
+        return Err(anyhow!("Nova /response must be an object or JSON string"));
+    };
+    let mut candidates = vec![text.trim().to_string(), strip_code_fence(text)];
+    if let Some(embedded) = first_json_object(text) {
+        candidates.push(embedded);
+    }
+    let mut errors = Vec::new();
+    for candidate in candidates {
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(candidate) {
+            Ok(Value::Object(object)) => return Ok(object),
+            Ok(other) => errors.push(format!(
+                "parsed response was {}, not object",
+                value_type_name(&other)
+            )),
+            Err(err) => errors.push(err.to_string()),
+        }
+    }
+    let detail = errors
+        .into_iter()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(anyhow!(
+        "Nova response did not contain a JSON object{}",
+        if detail.is_empty() {
+            "".to_string()
+        } else {
+            format!(": {detail}")
+        }
+    ))
+}
+
+fn strip_code_fence(text: &str) -> String {
+    let stripped = text.trim();
+    if !stripped.starts_with("```") {
+        return stripped.to_string();
+    }
+    let lines = stripped.lines().collect::<Vec<_>>();
+    if lines.len() >= 2 && lines.last().is_some_and(|line| line.trim() == "```") {
+        return lines[1..lines.len() - 1].join("\n").trim().to_string();
+    }
+    stripped.to_string()
+}
+
+fn first_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let mut depth = 0_i64;
+    let mut in_string = false;
+    let mut escape = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[start..start + offset + ch.len_utf8()].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn normalized_nova_usage(raw: &Value) -> Value {
+    let source = raw
+        .get("usage")
+        .and_then(Value::as_object)
+        .or_else(|| raw.get("metrics").and_then(Value::as_object));
+    json!({
+        "latency_ms": numeric_metric(source, &["latency_ms"]),
+        "model_calls": numeric_metric(source, &["model_calls", "model_call_count", "turn_count"]),
+        "tokens_in": numeric_metric(source, &["tokens_in", "input_tokens", "prompt_tokens"]),
+        "tokens_out": numeric_metric(source, &["tokens_out", "output_tokens", "completion_tokens"]),
+        "tool_calls": numeric_metric(source, &["tool_calls", "tool_call_count"]),
+    })
+}
+
+fn normalized_nova_metrics(raw: &Value, usage: &Value) -> Value {
+    let mut metrics = raw
+        .get("metrics")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(usage) = usage.as_object() {
+        metrics.insert(
+            "latency_ms".to_string(),
+            usage.get("latency_ms").cloned().unwrap_or_else(|| json!(0)),
+        );
+        metrics.insert(
+            "turn_count".to_string(),
+            usage
+                .get("model_calls")
+                .cloned()
+                .unwrap_or_else(|| json!(0)),
+        );
+        metrics.insert(
+            "tokens_in".to_string(),
+            usage.get("tokens_in").cloned().unwrap_or_else(|| json!(0)),
+        );
+        metrics.insert(
+            "tokens_out".to_string(),
+            usage.get("tokens_out").cloned().unwrap_or_else(|| json!(0)),
+        );
+        metrics.insert(
+            "tool_call_count".to_string(),
+            usage.get("tool_calls").cloned().unwrap_or_else(|| json!(0)),
+        );
+    }
+    Value::Object(metrics)
+}
+
+fn numeric_metric(source: Option<&Map<String, Value>>, keys: &[&str]) -> Value {
+    let Some(source) = source else {
+        return json!(0);
+    };
+    for key in keys {
+        if let Some(value) = source.get(*key) {
+            if value.is_number() {
+                return value.clone();
+            }
+        }
+    }
+    json!(0)
+}
+
+fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 

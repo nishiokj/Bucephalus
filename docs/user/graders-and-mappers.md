@@ -78,7 +78,7 @@ See [Grader Transport](grader-transport.md) for the full transport model.
 
 `in_task_runtime` and `injected` require `stages.case.interface: writable_workspace` and `stages.case.workspace.source: container_image`. `separate` uses the run's effective network mode. `host` graders receive launch env such as `--env ANTHROPIC_API_KEY=...`, but their contract paths point to host filesystem paths.
 
-Container grader stages may attach top-level `ephemerals` with `stages.grader.ephemerals`. Attached ephemerals expose env only to the grader stage that declares them. `strategy: host` cannot attach container ephemerals.
+Container grader stages may attach top-level `services` with `stages.grader.services`. Attached services expose env only to the grader stage that declares them. `strategy: host` cannot attach container services.
 
 ## Strategy Declarations
 
@@ -182,7 +182,7 @@ stages:
 
 The separate grader container uses the run's effective network mode.
 
-If the separate grader attaches ephemerals, Local Docker places the grader and those services on the same per-trial network so the grader can call each service by ephemeral id.
+If the separate grader attaches services, Local Docker places the grader and those services on the same per-trial network so the grader can call each service by service id.
 
 ### Host
 

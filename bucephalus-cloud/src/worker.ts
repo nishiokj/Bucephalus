@@ -40,6 +40,8 @@ interface WorkerConfig {
   workerToken: string;
   secretResolverCommand: string[] | null;
   networkPolicyCommand: string[] | null;
+  portForwardCommand: string[] | null;
+  execCommand: string[] | null;
   capabilities: WorkerCapabilities;
   minFreeBytes: number;
   retainAttemptWorkspaces: boolean;
@@ -63,6 +65,8 @@ const RUNTIME_SNAPSHOT_MAX_JSON_BYTES = 2 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_PAYLOAD_ENVELOPE_BYTES = 128 * 1024;
 const RUNTIME_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024;
+const WORKER_JSON_COMMAND_MAX_STDOUT_BYTES = 1024 * 1024;
+const WORKER_JSON_COMMAND_MAX_STDERR_BYTES = 128 * 1024;
 const DOCKER_SOCKET_PATH = "/var/run/docker.sock";
 const DOCKER_API_VERSION = "v1.41";
 const RUNTIME_ARTIFACT_SPECS = [
@@ -79,6 +83,18 @@ class WorkerError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "WorkerError";
+  }
+}
+
+class CloudApiError extends WorkerError {
+  constructor(
+    public readonly status: number,
+    public readonly code: string | null,
+    message: string,
+    public readonly detail: JsonObject | null,
+  ) {
+    super(message);
+    this.name = "CloudApiError";
   }
 }
 
@@ -186,6 +202,16 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         return;
       }
       await heartbeat(config, claim);
+      if (materialized && config.portForwardCommand) {
+        await processPortForwardRequests(config, claim, materialized).catch((error) => {
+          logError("worker.runtime_port_forward_poll_failed", runContext, { error: errorMessage(error) });
+        });
+      }
+      if (materialized && config.execCommand) {
+        await processExecRequests(config, claim, materialized).catch((error) => {
+          logError("worker.runtime_exec_poll_failed", runContext, { error: errorMessage(error) });
+        });
+      }
     }
   })();
 
@@ -212,6 +238,12 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
       evidencePump = startLiveEvidencePump(config, claim, materialized, runContext);
       await prePullRunImages(config, claim);
       await applyRuntimeNetworkPolicy(config, claim, materialized);
+      if (config.portForwardCommand) {
+        await processPortForwardRequests(config, claim, materialized);
+      }
+      if (config.execCommand) {
+        await processExecRequests(config, claim, materialized);
+      }
       await executeCoreRun(config, claim, materialized, runContext);
     } catch (error) {
       coreError = error;

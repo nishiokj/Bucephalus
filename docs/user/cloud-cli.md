@@ -334,15 +334,15 @@ buc doctor <package-digest> --secret-ref GEMINI_API_KEY=gcp-secret-manager://pro
    Hosted runtime options are closed over the Cloud API contract. Unknown keys
    and malformed values are rejected instead of ignored, so a typo such as
    `memory_mbb` cannot silently fall back to the default runner size. The
-   supported keys are `backend`, `executor`, `arch`, `cpu_count`, `cpu`,
+   supported keys are `backend`, `arch`, `cpu_count`,
    `memory_mb`, `disk_mb`, `isolation`, `timeout_ms`,
    `max_parallel_trials`, `network`, `sidecars`, and `accelerators`.
    With `--runtime-option`, scalar keys use `KEY=VALUE`, list keys use
    comma-separated values such as `sidecars=redis,postgres`, and `network`
    uses a JSON object such as
    `network={"default":"allowlist_enforced","egress":["api.openai.com"]}`.
-   Do not provide both aliases for the same meaning: use `backend` rather than
-   `executor`, and `cpu_count` rather than `cpu`, when both could apply.
+   Hosted Cloud does not accept the compatibility aliases `executor` or `cpu`;
+   use canonical `backend` and `cpu_count`.
    Hosted `buc` does not accept `--smoke-test` until Cloud has a real hosted
    smoke-test primitive.
 8. Fail the CLI command if authoring build/package inspection did not pass

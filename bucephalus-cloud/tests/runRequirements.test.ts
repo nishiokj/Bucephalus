@@ -260,6 +260,10 @@ describe("Cloud run requirements", () => {
   test("rejects unknown runtime option keys instead of silently ignoring typos", () => {
     expect(() => runRequirementsForArtifact(artifact(), { region: "us-east-1" }))
       .toThrow("/runtime_options/region is not supported");
+    expect(() => runRequirementsForArtifact(artifact(), { executor: "modal" }))
+      .toThrow("/runtime_options/executor is not supported");
+    expect(() => runRequirementsForArtifact(artifact(), { cpu: 2 }))
+      .toThrow("/runtime_options/cpu is not supported");
     expect(() => runRequirementsForArtifact(artifact(), { memory_mbb: 8192 }))
       .toThrow("/runtime_options/memory_mbb is not supported");
 
@@ -280,18 +284,6 @@ describe("Cloud run requirements", () => {
       .toThrow("/runtime_options/isolation must be a non-empty string");
     expect(() => runRequirementsForArtifact(artifact(), { sidecars: "redis" }))
       .toThrow("/runtime_options/sidecars must be an array of strings");
-  });
-
-  test("rejects ambiguous runtime option aliases instead of choosing precedence", () => {
-    expect(() => runRequirementsForArtifact(artifact(), {
-      backend: "runner-docker",
-      executor: "modal",
-    })).toThrow("/runtime_options/backend and /runtime_options/executor cannot both be provided");
-
-    expect(() => runRequirementsForArtifact(artifact(), {
-      cpu_count: 4,
-      cpu: 2,
-    })).toThrow("/runtime_options/cpu_count and /runtime_options/cpu cannot both be provided");
   });
 
   test("rejects unknown nested network runtime option keys", () => {

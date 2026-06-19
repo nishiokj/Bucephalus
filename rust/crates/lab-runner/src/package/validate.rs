@@ -92,28 +92,25 @@ pub(crate) fn public_authoring_error(err: anyhow::Error, authoring_surface: bool
     }
     let mut message = err.to_string();
     for (internal, public) in [
-        ("/trial_runtime/agent/sidecars", "/stages/agent/ephemerals"),
-        (
-            "/trial_runtime/grader/sidecars",
-            "/stages/grader/ephemerals",
-        ),
+        ("/trial_runtime/agent/sidecars", "/stages/agent/services"),
+        ("/trial_runtime/grader/sidecars", "/stages/grader/services"),
         ("/trial_runtime/task", "/stages/case"),
         ("/trial_runtime/agent", "/stages/agent"),
         ("/trial_runtime/execution", "/stages/execution"),
         ("/trial_runtime/grader", "/stages/grader"),
         ("/trial_runtime", "/stages"),
         ("/matrix/tasks", "/matrix/cases"),
-        ("/sidecars", "/ephemerals"),
-        ("trial_runtime.agent.sidecars", "stages.agent.ephemerals"),
-        ("trial_runtime.grader.sidecars", "stages.grader.ephemerals"),
+        ("/sidecars", "/services"),
+        ("trial_runtime.agent.sidecars", "stages.agent.services"),
+        ("trial_runtime.grader.sidecars", "stages.grader.services"),
         ("trial_runtime.task", "stages.case"),
         ("trial_runtime.agent", "stages.agent"),
         ("trial_runtime.execution", "stages.execution"),
         ("trial_runtime.grader", "stages.grader"),
         ("trial_runtime", "stages"),
         ("matrix.tasks", "matrix.cases"),
-        ("sidecars", "ephemerals"),
-        ("sidecar", "ephemeral"),
+        ("sidecars", "services"),
+        ("sidecar", "service"),
     ] {
         message = message.replace(internal, public);
     }
@@ -1090,10 +1087,10 @@ fn validate_resolved_event_placeholders(value: &Value, context: &str) -> Result<
         return Ok(());
     };
 
-    let mut removed_placeholders = Vec::new();
     let mut unknown_events = Vec::new();
     let mut malformed = Vec::new();
     let mut unsupported_env = Vec::new();
+    let mut missing_trajectory_sink = Vec::new();
     for (variant_idx, variant) in variants.iter().enumerate() {
         let variant_id = variant
             .pointer("/id")
@@ -1112,10 +1109,8 @@ fn validate_resolved_event_placeholders(value: &Value, context: &str) -> Result<
             merge_event_env_placeholders(&base_env_refs, variant.pointer("/overrides/agent/env"));
 
         for (field, refs) in command_refs {
-            if refs.removed_trajectory_placeholder {
-                removed_placeholders.push(format!(
-                    "{variant_id}: {field}: __BUCEPHALUS_TRAJECTORY_PATH__"
-                ));
+            if refs.trajectory_placeholder && event_ids.is_empty() {
+                missing_trajectory_sink.push(format!("{variant_id}: {field}"));
             }
             if refs.malformed {
                 malformed.push(format!("{variant_id}: {field}"));
@@ -1131,15 +1126,15 @@ fn validate_resolved_event_placeholders(value: &Value, context: &str) -> Result<
         }
     }
 
-    if !removed_placeholders.is_empty()
-        || !unknown_events.is_empty()
+    if !unknown_events.is_empty()
         || !malformed.is_empty()
         || !unsupported_env.is_empty()
+        || !missing_trajectory_sink.is_empty()
     {
         return Err(anyhow!(
-            "resolved experiment schema validation failed ({}): agent command event placeholders must use declared __BUCEPHALUS_EVENT_PATH_<id>__ sinks, and agent env values must not contain event path placeholders (removed placeholders: {}; unknown event ids: {}; malformed placeholders: {}; unsupported env placeholders: {})",
+            "resolved experiment schema validation failed ({}): agent command event placeholders must use declared event sinks, and agent env values must not contain event path placeholders (missing trajectory sink: {}; unknown event ids: {}; malformed placeholders: {}; unsupported env placeholders: {})",
             context,
-            format_list(&removed_placeholders),
+            format_list(&missing_trajectory_sink),
             format_list(&unknown_events),
             format_list(&malformed),
             format_list(&unsupported_env)
@@ -1151,7 +1146,7 @@ fn validate_resolved_event_placeholders(value: &Value, context: &str) -> Result<
 
 #[derive(Debug, Clone, Default)]
 struct EventPlaceholders {
-    removed_trajectory_placeholder: bool,
+    trajectory_placeholder: bool,
     event_ids: BTreeSet<String>,
     malformed: bool,
 }
@@ -1181,7 +1176,7 @@ fn event_placeholders_in_array(value: Option<&Value>) -> BTreeMap<String, EventP
     for (idx, item) in items.iter().enumerate() {
         if let Some(raw) = item.as_str() {
             let placeholders = event_placeholders(raw);
-            if placeholders.removed_trajectory_placeholder
+            if placeholders.trajectory_placeholder
                 || placeholders.malformed
                 || !placeholders.event_ids.is_empty()
             {
@@ -1200,7 +1195,7 @@ fn event_placeholders_in_env(value: Option<&Value>) -> BTreeMap<String, EventPla
     for (key, item) in env {
         if let Some(raw) = item.as_str() {
             let placeholders = event_placeholders(raw);
-            if placeholders.removed_trajectory_placeholder
+            if placeholders.trajectory_placeholder
                 || placeholders.malformed
                 || !placeholders.event_ids.is_empty()
             {
@@ -1224,7 +1219,7 @@ fn merge_event_env_placeholders(
         refs.remove(&field);
         if let Some(raw) = item.as_str() {
             let placeholders = event_placeholders(raw);
-            if placeholders.removed_trajectory_placeholder
+            if placeholders.trajectory_placeholder
                 || placeholders.malformed
                 || !placeholders.event_ids.is_empty()
             {
@@ -1237,7 +1232,7 @@ fn merge_event_env_placeholders(
 
 fn event_placeholders(raw: &str) -> EventPlaceholders {
     let mut placeholders = EventPlaceholders {
-        removed_trajectory_placeholder: raw.contains("__BUCEPHALUS_TRAJECTORY_PATH__"),
+        trajectory_placeholder: raw.contains("__BUCEPHALUS_TRAJECTORY_PATH__"),
         event_ids: BTreeSet::new(),
         malformed: false,
     };

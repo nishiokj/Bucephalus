@@ -34,9 +34,18 @@ expand to Buc's trial input and result paths.
 adapter is the seam where Buc becomes the client for your agent: it reads Buc's
 trial input, invokes your CLI/API/SDK shape, and writes Buc's result JSON. If
 your command does not write the result file, the adapter falls back to a
-scaffold result that reports success — so a green smoke test does not by itself
-prove your agent ran. Confirm `bucephalus views <run_id> observability` shows
-valid result files before trusting a run. After that, the workflow is the same:
+scaffold result that reports success - so a green smoke test does not by itself
+prove your agent ran. On hosted Cloud, confirm `Trial` and `TrialArtifact`
+runtime resources are ready and content-backed before trusting a run:
+
+```bash
+bucephalus-cloud run resources <cloud_run_id> --kind Trial
+bucephalus-cloud run resources <cloud_run_id> --kind TrialArtifact --field-selector status.content_available=true
+bucephalus-cloud run audit <cloud_run_id> --limit 50
+```
+
+For a local-only smoke run, query the account database directly for the same
+evidence. After that, the workflow is the same:
 
 ```bash
 bucephalus dev my-eval
@@ -143,14 +152,25 @@ The JSON response includes a `run.run_id` and `run.run_dir`.
 Replace `<run_id>` with the run id from the previous command:
 
 ```bash
-bucephalus views <run_id>
 bucephalus query <run_id> "SELECT * FROM trials LIMIT 20"
+bucephalus query <run_id> "SELECT * FROM metrics_long LIMIT 20"
 ```
 
-You can also pass the run directory:
+For hosted Cloud runs, use the runtime resource API instead of local analysis
+views:
 
 ```bash
-bucephalus views <run_dir>
+bucephalus-cloud run resources <cloud_run_id> --kind Trial
+bucephalus-cloud run resources <cloud_run_id> --kind MetricObservation
+bucephalus-cloud run top <cloud_run_id> --category trial --limit 25
+bucephalus-cloud run audit <cloud_run_id> --limit 100
+bucephalus-cloud run inspect <cloud_run_id> --json --out runtime-inspect.json
+```
+
+You can also pass the local run directory to direct SQL queries:
+
+```bash
+bucephalus query <run_dir> "SELECT * FROM trials LIMIT 20"
 ```
 
 ## Advanced One Command Variant

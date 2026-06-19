@@ -232,9 +232,19 @@ fn validate_authoring_schema(json_value: &Value) -> Result<()> {
     let Some(errors) = schema.validate(json_value).err() else {
         return Ok(());
     };
-    let messages = errors
+    let mut messages = errors
         .map(|err| lab_schemas::format_validation_error(&err))
         .collect::<Vec<_>>();
+    if json_value
+        .pointer("/stages/agent")
+        .and_then(Value::as_object)
+        .is_some_and(|agent| !agent.contains_key("command") && !agent.contains_key("adapter"))
+    {
+        messages.push(
+            "/stages/agent must declare exactly one launch contract: command or adapter"
+                .to_string(),
+        );
+    }
     Err(anyhow!(
         "experiment authoring schema validation failed: {}",
         messages.join("; ")
@@ -252,7 +262,7 @@ pub(crate) fn reject_legacy_authoring_surface(json_value: &Value) -> Result<()> 
         ("/execution", "/stages/execution"),
         ("/grader", "/stages/grader"),
         ("/trial_runtime", "/stages"),
-        ("/sidecars", "/ephemerals"),
+        ("/sidecars", "/services"),
         ("/matrix/tasks", "/matrix/cases"),
         ("/runtime/externals", "/externals"),
         (
@@ -306,7 +316,7 @@ fn reject_nested_resolved_authoring_vocabulary(json_value: &Value) -> Result<()>
         let pointer = format!("/stages/{}/sidecars", stage);
         if json_value.pointer(&pointer).is_some() {
             return Err(anyhow!(
-                "{} is resolved package vocabulary and is not accepted in authoring YAML; use /stages/{}/ephemerals",
+                "{} is resolved package vocabulary and is not accepted in authoring YAML; use /stages/{}/services",
                 pointer,
                 stage
             ));
@@ -331,7 +341,7 @@ fn reject_nested_resolved_authoring_vocabulary(json_value: &Value) -> Result<()>
             let pointer = format!("/overrides/{}/sidecars", stage);
             if variant.pointer(&pointer).is_some() {
                 return Err(anyhow!(
-                    "/matrix/variants/{}/overrides/{}/sidecars is resolved package vocabulary and is not accepted in authoring YAML; use /matrix/variants/{}/overrides/{}/ephemerals",
+                    "/matrix/variants/{}/overrides/{}/sidecars is resolved package vocabulary and is not accepted in authoring YAML; use /matrix/variants/{}/overrides/{}/services",
                     idx,
                     stage,
                     idx,
@@ -644,7 +654,9 @@ fn reject_duplicate_credential_cache_env(json_value: &Value) -> Result<()> {
 }
 
 pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<()> {
+    lower_top_level_value(json_value, "services", &["sidecars"])?;
     lower_top_level_value(json_value, "ephemerals", &["sidecars"])?;
+    normalize_service_lifecycles(json_value, "/sidecars")?;
     lower_top_level_value(json_value, "externals", &["runtime", "externals"])?;
     if let Some(matrix) = json_value.get_mut("matrix") {
         lower_child_value(matrix, "cases", "tasks")?;
@@ -673,6 +685,7 @@ pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<(
         normalize_metric_authoring(json_value)?;
         normalize_trace_policy(json_value)?;
         normalize_agent_observability_contract(json_value)?;
+        normalize_agent_adapters(json_value)?;
         normalize_agent_integration_levels(json_value)?;
         drop_authoring_experiment_mode(json_value);
         return Ok(());
@@ -705,6 +718,7 @@ pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<(
     normalize_metric_authoring(json_value)?;
     normalize_trace_policy(json_value)?;
     normalize_agent_observability_contract(json_value)?;
+    normalize_agent_adapters(json_value)?;
     normalize_agent_integration_levels(json_value)?;
     drop_authoring_experiment_mode(json_value);
     Ok(())
@@ -1747,9 +1761,10 @@ fn normalize_protocol_trace_source(json_value: &mut Value, retain_raw: bool) -> 
         .get("command")
         .and_then(Value::as_array)
         .is_some_and(|parts| !parts.is_empty());
-    if !has_command {
+    let has_adapter = agent.get("adapter").is_some();
+    if !has_command && !has_adapter {
         return Err(anyhow!(
-            "/traces.source=protocol requires /stages.agent.command"
+            "/traces.source=protocol requires /stages.agent.command or /stages.agent.adapter"
         ));
     }
     if agent.get("events").is_some() {
@@ -1831,11 +1846,289 @@ fn normalize_agent_observability_contract_at(root: &mut Value, pointer: &str) ->
     Ok(())
 }
 
+fn normalize_agent_adapters(json_value: &mut Value) -> Result<()> {
+    normalize_agent_adapter_at(json_value, "/trial_runtime/agent", false)?;
+    let base_has_event_sink = agent_has_event_sink(json_value, "/trial_runtime/agent");
+    let Some(variants) = json_value
+        .pointer_mut("/matrix/variants")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for (idx, variant) in variants.iter_mut().enumerate() {
+        normalize_agent_adapter_at(variant, "/overrides/agent", base_has_event_sink)
+            .with_context(|| format!("/matrix.variants[{}].overrides.agent", idx))?;
+    }
+    Ok(())
+}
+
+fn agent_has_event_sink(root: &Value, pointer: &str) -> bool {
+    root.pointer(pointer)
+        .and_then(|agent| agent.get("events"))
+        .and_then(Value::as_array)
+        .is_some_and(|events| !events.is_empty())
+}
+
+fn normalize_agent_adapter_at(
+    root: &mut Value,
+    pointer: &str,
+    inherited_event_sink: bool,
+) -> Result<()> {
+    let Some(agent) = root.pointer_mut(pointer) else {
+        return Ok(());
+    };
+    let agent = agent
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must be an object", pointer))?;
+    let Some(adapter) = agent.get("adapter").cloned() else {
+        return Ok(());
+    };
+    if agent.contains_key("command") {
+        return Err(anyhow!(
+            "{} cannot declare both command and adapter; adapter owns the command contract",
+            pointer
+        ));
+    }
+    let context = format!("{}.adapter", pointer);
+    let has_local_event_sink = agent
+        .get("events")
+        .and_then(Value::as_array)
+        .is_some_and(|events| !events.is_empty());
+    let has_event_sink =
+        has_local_event_sink || (agent.get("events").is_none() && inherited_event_sink);
+    let adapter_events = adapter
+        .as_object()
+        .and_then(|adapter| adapter.get("events"))
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("{}.events must be a boolean", context))
+        })
+        .transpose()?;
+    let event_argv_enabled = adapter_events.unwrap_or(has_event_sink);
+    if event_argv_enabled && !has_event_sink {
+        return Err(anyhow!(
+            "{}.events=true requires /traces.source: protocol or an explicit /stages.agent.events sink",
+            context
+        ));
+    }
+    let command = nova_adapter_command(&adapter, &context, event_argv_enabled)?;
+    agent.insert("command".to_string(), json!(command));
+    Ok(())
+}
+
+fn adapter_string<'a>(
+    adapter: &'a Map<String, Value>,
+    key: &str,
+    default: Option<&'a str>,
+    context: &str,
+) -> Result<Option<String>> {
+    match adapter.get(key) {
+        Some(value) => value
+            .as_str()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(Some)
+            .ok_or_else(|| anyhow!("{}.{} must be a non-empty string", context, key)),
+        None => Ok(default.map(ToString::to_string)),
+    }
+}
+
+fn adapter_bool(
+    adapter: &Map<String, Value>,
+    key: &str,
+    default: bool,
+    context: &str,
+) -> Result<bool> {
+    match adapter.get(key) {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| anyhow!("{}.{} must be a boolean", context, key)),
+        None => Ok(default),
+    }
+}
+
+fn adapter_u64(adapter: &Map<String, Value>, key: &str, context: &str) -> Result<Option<u64>> {
+    match adapter.get(key) {
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .map(Some)
+            .ok_or_else(|| anyhow!("{}.{} must be a positive integer", context, key)),
+        None => Ok(None),
+    }
+}
+
+fn adapter_string_array(
+    adapter: &Map<String, Value>,
+    key: &str,
+    context: &str,
+) -> Result<Vec<String>> {
+    let Some(value) = adapter.get(key) else {
+        return Ok(Vec::new());
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| anyhow!("{}.{} must be an argv array", context, key))?;
+    array
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            item.as_str()
+                .map(ToString::to_string)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow!("{}.{}[{}] must be a non-empty string", context, key, idx))
+        })
+        .collect()
+}
+
+fn nova_adapter_command(
+    adapter: &Value,
+    context: &str,
+    event_argv_enabled: bool,
+) -> Result<Vec<String>> {
+    let adapter = adapter
+        .as_object()
+        .ok_or_else(|| anyhow!("{} must be an object", context))?;
+    for key in adapter.keys() {
+        if !matches!(
+            key.as_str(),
+            "kind"
+                | "executable"
+                | "config"
+                | "mcp_config"
+                | "working_dir"
+                | "timeout_ms"
+                | "dangerous"
+                | "events"
+                | "provider"
+                | "model"
+                | "provider_env"
+                | "result"
+                | "args"
+        ) {
+            return Err(anyhow!("{}.{} is not supported", context, key));
+        }
+    }
+    let kind = adapter_string(adapter, "kind", None, context)?
+        .ok_or_else(|| anyhow!("{}.kind is required", context))?;
+    if kind != "nova" {
+        return Err(anyhow!(
+            "{}.kind must be nova for the built-in adapter (got '{}')",
+            context,
+            kind
+        ));
+    }
+    let result = adapter_string(adapter, "result", Some("structured_json"), context)?
+        .ok_or_else(|| anyhow!("{}.result is required", context))?;
+    if result != "structured_json" {
+        return Err(anyhow!(
+            "{}.result must be structured_json (got '{}')",
+            context,
+            result
+        ));
+    }
+
+    let mut command = vec![
+        adapter_string(adapter, "executable", Some("/usr/local/bin/nova"), context)?.unwrap(),
+        "run".to_string(),
+        "--input-file".to_string(),
+        "__BUCEPHALUS_TRIAL_INPUT_PATH__".to_string(),
+        "--output".to_string(),
+        "__BUCEPHALUS_RESULT_PATH__".to_string(),
+    ];
+    if event_argv_enabled {
+        command.extend([
+            "--events".to_string(),
+            "__BUCEPHALUS_TRAJECTORY_PATH__".to_string(),
+        ]);
+    }
+    if let Some(config) = adapter_string(adapter, "config", None, context)? {
+        command.extend(["--config".to_string(), config]);
+    }
+    if let Some(mcp_config) = adapter_string(adapter, "mcp_config", None, context)? {
+        command.extend(["--mcp-config".to_string(), mcp_config]);
+    }
+    command.extend([
+        "--working-dir".to_string(),
+        adapter_string(
+            adapter,
+            "working_dir",
+            Some(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER),
+            context,
+        )?
+        .unwrap(),
+    ]);
+    if let Some(timeout_ms) = adapter_u64(adapter, "timeout_ms", context)? {
+        command.extend(["--timeout-ms".to_string(), timeout_ms.to_string()]);
+    }
+    if adapter_bool(adapter, "dangerous", false, context)? {
+        command.push("--dangerous".to_string());
+    }
+    if let Some(provider_env) = adapter.get("provider_env") {
+        let provider_env = provider_env
+            .as_object()
+            .ok_or_else(|| anyhow!("{}.provider_env must be an object", context))?;
+        let mut entries = provider_env.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(provider, _)| provider.as_str());
+        for (provider, env_name) in entries {
+            let env_name = env_name
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{}.provider_env.{} must be a non-empty environment variable name",
+                        context,
+                        provider
+                    )
+                })?;
+            command.extend([
+                "--provider-env".to_string(),
+                format!("{provider}={env_name}"),
+            ]);
+        }
+    }
+    command.extend([
+        "--provider".to_string(),
+        adapter_string(adapter, "provider", Some("$provider"), context)?.unwrap(),
+        "--model".to_string(),
+        adapter_string(adapter, "model", Some("$model"), context)?.unwrap(),
+    ]);
+    command.extend(adapter_string_array(adapter, "args", context)?);
+    Ok(command)
+}
+
 fn normalize_public_stage_ephemerals(stage_name: &str, value: &mut Value) -> Result<()> {
     if !matches!(stage_name, "agent" | "grader") {
         return Ok(());
     }
+    lower_child_value(value, "services", "sidecars")?;
     lower_child_value(value, "ephemerals", "sidecars")?;
+    Ok(())
+}
+
+fn normalize_service_lifecycles(root: &mut Value, pointer: &str) -> Result<()> {
+    let Some(services) = root.pointer_mut(pointer) else {
+        return Ok(());
+    };
+    let services = services
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must be an object", pointer))?;
+    for (id, service) in services {
+        let service = service
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("{}/{} must be an object", pointer, id))?;
+        let Some(lifecycle) = service.get_mut("lifecycle") else {
+            continue;
+        };
+        let Some(raw) = lifecycle.as_str() else {
+            continue;
+        };
+        if raw == "trial" {
+            *lifecycle = json!("per-trial");
+        }
+    }
     Ok(())
 }
 
@@ -2161,6 +2454,211 @@ mod tests {
             Some(&json!(["mcp"]))
         );
         assert!(value.pointer("/sidecars/mcp").is_some());
+    }
+
+    #[test]
+    fn normalizes_services_authoring_nouns_and_trial_lifecycle() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "path": "cases.jsonl" }
+            },
+            "stages": {
+                "case": {},
+                "agent": {
+                    "command": ["agent"],
+                    "services": ["pg-data-api"]
+                },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            },
+            "services": {
+                "pg-data-api": {
+                    "image": "python:3.11-slim",
+                    "lifecycle": "trial",
+                    "readiness": {
+                        "http": {
+                            "url": "http://127.0.0.1:9757",
+                            "method": "POST",
+                            "json": { "case_id": "pg_001", "command": "overview" }
+                        },
+                        "timeout_ms": 10000
+                    }
+                }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/sidecars"),
+            Some(&json!(["pg-data-api"]))
+        );
+        assert_eq!(
+            value.pointer("/sidecars/pg-data-api/lifecycle"),
+            Some(&json!("per-trial"))
+        );
+        assert_eq!(
+            value.pointer("/sidecars/pg-data-api/readiness/http/json/case_id"),
+            Some(&json!("pg_001"))
+        );
+        assert!(value.pointer("/services").is_none());
+        assert!(value.pointer("/trial_runtime/agent/services").is_none());
+    }
+
+    #[test]
+    fn normalizes_nova_agent_adapter_to_contract_command() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "path": "cases.jsonl" }
+            },
+            "stages": {
+                "case": {},
+                "agent": {
+                    "adapter": {
+                        "kind": "nova",
+                        "config": "/opt/agent/nova-config.json",
+                        "mcp_config": "/opt/agent/mcp.json",
+                        "timeout_ms": 540000,
+                        "dangerous": true,
+                        "provider_env": {
+                            "gemini": "GOOGLE_API_KEY"
+                        }
+                    }
+                },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            },
+            "traces": { "source": "protocol" }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        let command = value
+            .pointer("/trial_runtime/agent/command")
+            .and_then(Value::as_array)
+            .expect("adapter command");
+        let command_has = |flag: &str, expected: &str| {
+            command.windows(2).any(|pair| {
+                pair.first() == Some(&json!(flag)) && pair.get(1) == Some(&json!(expected))
+            })
+        };
+        assert_eq!(command.first(), Some(&json!("/usr/local/bin/nova")));
+        assert!(command.contains(&json!("__BUCEPHALUS_TRIAL_INPUT_PATH__")));
+        assert!(command.contains(&json!("__BUCEPHALUS_RESULT_PATH__")));
+        assert!(command.contains(&json!("__BUCEPHALUS_TRAJECTORY_PATH__")));
+        assert!(command_has("--mcp-config", "/opt/agent/mcp.json"));
+        assert!(command_has("--provider-env", "gemini=GOOGLE_API_KEY"));
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/adapter/kind"),
+            Some(&json!("nova"))
+        );
+        assert!(value.pointer("/traces").is_none());
+        assert!(value.pointer("/trial_runtime/agent/events/0/id").is_some());
+    }
+
+    #[test]
+    fn nova_agent_adapter_without_traces_omits_event_argv() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "path": "cases.jsonl" }
+            },
+            "stages": {
+                "case": {},
+                "agent": {
+                    "adapter": {
+                        "kind": "nova",
+                        "config": "/opt/agent/nova-config.json"
+                    }
+                },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        let command = value
+            .pointer("/trial_runtime/agent/command")
+            .and_then(Value::as_array)
+            .expect("adapter command");
+        assert!(!command.contains(&json!("--events")));
+        assert!(!command.contains(&json!("__BUCEPHALUS_TRAJECTORY_PATH__")));
+        assert!(value.pointer("/trial_runtime/agent/events").is_none());
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/integration_level"),
+            Some(&json!("cli_basic"))
+        );
+    }
+
+    #[test]
+    fn variant_nova_agent_adapter_inherits_base_trace_sink() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "path": "cases.jsonl" },
+                "variants": [
+                    { "id": "base", "baseline": true },
+                    {
+                        "id": "nova-treatment",
+                        "overrides": {
+                            "agent": {
+                                "adapter": {
+                                    "kind": "nova",
+                                    "config": "/opt/agent/treatment-nova.json"
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "stages": {
+                "case": {},
+                "agent": {
+                    "command": ["baseline-agent"]
+                },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            },
+            "traces": { "source": "protocol" }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        let command = value
+            .pointer("/matrix/variants/1/overrides/agent/command")
+            .and_then(Value::as_array)
+            .expect("variant adapter command");
+        assert!(command.contains(&json!("--events")));
+        assert!(command.contains(&json!("__BUCEPHALUS_TRAJECTORY_PATH__")));
+        assert!(value
+            .pointer("/matrix/variants/1/overrides/agent/events")
+            .is_none());
+    }
+
+    #[test]
+    fn nova_agent_adapter_events_true_requires_event_sink() {
+        let mut value = json!({
+            "matrix": {
+                "cases": { "path": "cases.jsonl" }
+            },
+            "stages": {
+                "case": {},
+                "agent": {
+                    "adapter": {
+                        "kind": "nova",
+                        "events": true
+                    }
+                },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("events=true requires /traces.source: protocol"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -3843,6 +4341,24 @@ mod tests {
     fn authoring_lowering_rejects_public_and_resolved_field_collisions() {
         for (label, mut value, expected) in [
             (
+                "services",
+                json!({
+                    "services": {
+                        "svc": {
+                            "image": "svc:latest",
+                            "lifecycle": "trial"
+                        }
+                    },
+                    "sidecars": {
+                        "svc": {
+                            "image": "svc:latest",
+                            "lifecycle": "per-trial"
+                        }
+                    }
+                }),
+                "target 'sidecars' already exists",
+            ),
+            (
                 "ephemerals",
                 json!({
                     "ephemerals": {
@@ -4196,7 +4712,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_source_protocol_requires_command_stage() {
+    fn trace_source_protocol_requires_agent_launch_contract() {
         let mut value = json!({
             "traces": { "source": "protocol" },
             "matrix": {
@@ -4215,8 +4731,9 @@ mod tests {
         let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
 
         assert!(
-            err.to_string()
-                .contains("/traces.source=protocol requires /stages.agent.command"),
+            err.to_string().contains(
+                "/traces.source=protocol requires /stages.agent.command or /stages.agent.adapter"
+            ),
             "unexpected error: {err}"
         );
     }

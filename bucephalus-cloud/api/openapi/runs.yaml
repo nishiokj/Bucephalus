@@ -2114,14 +2114,6 @@ components:
             - local-docker
             - local_docker
             - modal
-        executor:
-          type: string
-          enum:
-            - runner-docker
-            - runner_docker
-            - local-docker
-            - local_docker
-            - modal
         arch:
           type: string
           enum:
@@ -2130,8 +2122,6 @@ components:
             - arm64
             - aarch64
         cpu_count:
-          $ref: '#/components/schemas/PositiveIntegerLike'
-        cpu:
           $ref: '#/components/schemas/PositiveIntegerLike'
         memory_mb:
           $ref: '#/components/schemas/PositiveIntegerLike'

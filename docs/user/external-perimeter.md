@@ -68,4 +68,4 @@ mode. When `egress` is non-empty, at least one runtime plane must be able to use
 it: set `runtime.network.agent` or `runtime.network.task_sandbox` to a non-`none`
 mode.
 
-Ephemerals are not externals. In Local Docker runs, attaching ephemerals creates a per-trial network for the sandbox and ephemeral containers. When `runtime.network.task_sandbox: none`, that network is internal: attached containers can talk to each other by ephemeral id, but the network does not grant external egress.
+Services are not externals. In Local Docker runs, attaching services creates a per-trial network for the sandbox and service containers. When `runtime.network.task_sandbox: none`, that network is internal: attached containers can talk to each other by service id, but the network does not grant external egress.

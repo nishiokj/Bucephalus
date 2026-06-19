@@ -143,6 +143,7 @@ describe("runtime event row ingestion", () => {
 describe("runtime event stream exposure", () => {
   test("merges worker lifecycle events with trial rows, tagged by source", async () => {
     const trialRow: RuntimeEventRecord = {
+      source: "worker_live_ingest",
       core_run_id: CORE_RUN_ID,
       trial_id: "trial-001",
       schedule_idx: 0,
@@ -155,6 +156,7 @@ describe("runtime event stream exposure", () => {
       seq: 0,
       event_type: "agent.step",
       ts: "2026-06-11T00:00:05Z",
+      resource_refs: [],
       payload: { event_type: "agent.step" },
       row: {},
     };
@@ -209,6 +211,7 @@ describe("runtime event stream exposure", () => {
 describe("runtime event record merge", () => {
   function record(overrides: Partial<RuntimeEventRecord>): RuntimeEventRecord {
     return {
+      source: "worker_live_ingest",
       core_run_id: CORE_RUN_ID,
       trial_id: "trial-001",
       schedule_idx: 0,
@@ -221,6 +224,7 @@ describe("runtime event record merge", () => {
       seq: 0,
       event_type: "agent.step",
       ts: null,
+      resource_refs: [],
       payload: {},
       row: {},
       ...overrides,

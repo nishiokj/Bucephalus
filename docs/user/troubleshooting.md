@@ -43,7 +43,7 @@ Common causes:
 - a declared runtime output cannot be captured or materialized into a declared grader input.
 - `cases.jsonl` is malformed JSONL.
 - `stages.agent.mount.source` does not exist, or `stages.agent.mount.mount.path/read_only` is missing.
-- a `stages.*.ephemerals` entry references an unknown ephemeral id, or an ephemeral id is not a valid runtime alias.
+- a `stages.*.services` entry references an unknown service id, or a service id is not a valid runtime alias.
 - `stages.grader.command` references a file that does not match the selected grader strategy.
 - `strategy: host` is pointing at a local or absolute script path instead of a declared `stages.grader.host.capability`.
 - A command or env value references `$NAME`, but no variant `config` value or explicit launch-time `--env` / `--env-file` input provides it. For credentials, also declare the name in `runtime.secrets`.
@@ -84,13 +84,12 @@ Common causes:
 
 - Docker or OrbStack is not running.
 - Required image cannot be pulled.
-- Required ephemeral image cannot be pulled or does not stay running.
+- Required service image cannot be pulled or does not stay running.
 - Agent runtime image lacks the command executable.
 - Case image lacks the grader runtime, such as `python3` or `node`.
 - Required runtime env var is missing.
 - grader output capture fails.
 - Host grader capability is missing or unknown.
-- `runtime.compute.backend: modal` or `--executor modal` is selected for an experiment that declares ephemerals.
 - The planned trial footprint exceeds `BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS` or `BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES`.
 
 Fix preflight before running the full experiment.
@@ -149,7 +148,7 @@ cat <run_dir>/trials/<trial_id>/out/result.json
 ls <run_dir>/trials/<trial_id>/out
 ```
 
-If trials appear to wait before launch during a very concurrent run, check the active runtime caps. Local Docker defaults to `24` active Bucephalus-owned containers on the Docker daemon, counting case sandboxes, ephemerals, and separate grader sandboxes. Modal defaults to `64` active sandboxes per runner process.
+If trials appear to wait before launch during a very concurrent run, check the active runtime caps. Local Docker defaults to `24` active Bucephalus-owned containers on the Docker daemon, counting case sandboxes, service containers, and separate grader sandboxes. Modal defaults to `64` active sandboxes per runner process.
 
 ## Agent Contract Failures
 
@@ -203,9 +202,9 @@ Fixes:
 - set `runtime.network.task_sandbox: full` only when the case sandbox also needs network
 - leave `policy.sanitization_profile` unset or use a non-hermetic profile for networked experiments
 
-For ephemerals, use the ephemeral id as the hostname, for example `http://mcp-bash:8080`. If `runtime.network.task_sandbox: none`, Local Docker still allows sandbox-to-ephemeral traffic on the internal per-trial network, but not external egress.
+For services, use the service id as the hostname, for example `http://mcp-bash:8080`. If `runtime.network.task_sandbox: none`, Local Docker still allows sandbox-to-service traffic on the internal per-trial network, but not external egress.
 
-Host stages cannot attach container ephemerals. Move the stage into a container runtime, or call a host-owned capability directly instead of declaring an ephemeral.
+Host stages cannot attach container services. Move the stage into a container runtime, or call a host-owned capability directly instead of declaring a service.
 
 ## Storage Growth
 

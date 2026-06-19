@@ -21,6 +21,51 @@ import (
 
 const runtimeTransferArchivePath = "/tmp/bucephalus-runtime-transfer.tar.gz"
 
+const httpReadinessHelper = `#!/usr/bin/env python3
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+spec_path = sys.argv[1]
+timeout_seconds = int(sys.argv[2])
+with open(spec_path, "r", encoding="utf-8") as handle:
+    spec = json.load(handle)
+
+url = spec["url"]
+method = spec.get("method") or "GET"
+headers = dict(spec.get("headers") or {})
+expect_status = int(spec.get("expect_status") or 200)
+interval = max(float(spec.get("interval_ms") or 200) / 1000.0, 0.05)
+
+body = None
+if "json" in spec and spec["json"] is not None:
+    body = json.dumps(spec["json"]).encode("utf-8")
+    headers.setdefault("Content-Type", "application/json")
+elif "body" in spec and spec["body"] is not None:
+    body = str(spec["body"]).encode("utf-8")
+
+deadline = time.time() + timeout_seconds
+last_error = "probe did not run"
+while time.time() < deadline:
+    try:
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        with urllib.request.urlopen(request, timeout=min(2, max(1, timeout_seconds))) as response:
+            if response.status == expect_status:
+                raise SystemExit(0)
+            last_error = f"status {response.status}, expected {expect_status}"
+    except urllib.error.HTTPError as exc:
+        if exc.code == expect_status:
+            raise SystemExit(0)
+        last_error = f"status {exc.code}, expected {expect_status}"
+    except Exception as exc:
+        last_error = str(exc)
+    time.sleep(interval)
+
+raise SystemExit("HTTP readiness failed for " + url + ": " + last_error)
+`
+
 type execRecord struct {
 	Phase                 string  `json:"phase,omitempty"`
 	SandboxID             string  `json:"sandbox_id,omitempty"`
@@ -748,6 +793,45 @@ func runCommandChecked(ctx context.Context, sandbox *modal.Sandbox, label string
 	return nil
 }
 
+func writeSandboxText(ctx context.Context, fsys *modal.SandboxFilesystem, remotePath string, text string) error {
+	parent := path.Dir(remotePath)
+	if parent != "." && parent != "/" {
+		if err := makeDir(ctx, fsys, parent); err != nil {
+			return err
+		}
+	}
+	return fsys.WriteText(ctx, text, remotePath, nil)
+}
+
+func runHTTPReadinessChecked(ctx context.Context, sandbox *modal.Sandbox, id string, readiness map[string]any, env map[string]string, workdir string, timeoutSeconds int) error {
+	httpSpec := jsonObject(readiness["http"])
+	if len(httpSpec) == 0 {
+		return fmt.Errorf("readiness_ephemeral_%s missing http spec", id)
+	}
+	helperPath := "/bucephalus/state/ephemerals/http-readiness.py"
+	specPath := "/bucephalus/state/ephemerals/" + id + ".readiness.json"
+	fsys := sandbox.Filesystem()
+	if err := writeSandboxText(ctx, fsys, helperPath, httpReadinessHelper); err != nil {
+		return err
+	}
+	specBytes, err := json.MarshalIndent(httpSpec, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeSandboxText(ctx, fsys, specPath, string(specBytes)); err != nil {
+		return err
+	}
+	return runCommandChecked(
+		ctx,
+		sandbox,
+		"readiness_ephemeral_"+id,
+		[]string{"python3", helperPath, specPath, strconv.Itoa(timeoutSeconds)},
+		env,
+		workdir,
+		timeoutSeconds,
+	)
+}
+
 func startSameSandboxEphemeral(ctx context.Context, sandbox *modal.Sandbox, ephemeral map[string]any) error {
 	id := stringValue(ephemeral, "id")
 	command := stringList(ephemeral["command"])
@@ -773,6 +857,18 @@ func startSameSandboxEphemeral(ctx context.Context, sandbox *modal.Sandbox, ephe
 	if len(readiness) == 0 {
 		return nil
 	}
+	timeoutSeconds := intValue(readiness, "timeout_seconds", 30)
+	if len(jsonObject(readiness["http"])) > 0 {
+		return runHTTPReadinessChecked(
+			ctx,
+			sandbox,
+			id,
+			readiness,
+			stringMap(ephemeral["env"]),
+			stringValue(ephemeral, "workdir"),
+			timeoutSeconds,
+		)
+	}
 	return runCommandChecked(
 		ctx,
 		sandbox,
@@ -780,7 +876,7 @@ func startSameSandboxEphemeral(ctx context.Context, sandbox *modal.Sandbox, ephe
 		stringList(readiness["command"]),
 		stringMap(ephemeral["env"]),
 		stringValue(ephemeral, "workdir"),
-		intValue(readiness, "timeout_seconds", 30),
+		timeoutSeconds,
 	)
 }
 

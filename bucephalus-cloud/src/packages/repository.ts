@@ -527,6 +527,11 @@ export class RunRepository {
     eventType: string;
     payload: JsonObject;
   }): Promise<RunEventRecord> {
+    const payload = {
+      ...input.payload,
+      attempt_id: input.attemptId,
+      runner_instance_id: input.runnerInstanceId,
+    };
     const rows = await this.sql`
       insert into cloud.run_events (
         run_id,
@@ -540,7 +545,7 @@ export class RunRepository {
         active_attempt.attempt_id,
         coalesce((select max(seq) + 1 from cloud.run_events where run_id = active_attempt.run_id), 1),
         ${input.eventType},
-        ${this.sql.json(input.payload)}
+        ${this.sql.json(payload)}
       from (
         select run_id, attempt_id
         from cloud.run_attempts

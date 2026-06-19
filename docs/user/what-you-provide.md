@@ -1,6 +1,6 @@
 # What You Must Provide
 
-Bucephalus is not a magic wrapper around arbitrary apps. A successful experiment needs explicit cases, a stage chain, and declared ephemerals and externals.
+Bucephalus is not a magic wrapper around arbitrary apps. A successful experiment needs explicit cases, a stage chain, and declared services and externals.
 
 For the full field-level YAML surface, use [Experiment YAML Reference](experiment-yaml-reference.md).
 
@@ -12,10 +12,10 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | Project manifest | For hosted Cloud YAML builds | `bucephalus.project.yaml` with `schema_version: bucephalus_project_v1`, `project.id`, `package_sources`, and `targets.hosted_cloud` |
 | Cases | Yes | `cases.jsonl` with `case_v2` rows |
 | Stages | Yes | `stages.case`, `stages.agent`; add `stages.grader` for custom grading and `stages.execution` when the agent site is not inferred |
-| Agent command | Yes | `stages.agent.command` |
+| Agent launch | Yes | `stages.agent.command` or `stages.agent.adapter` |
 | Agent image | When the agent runs in its own container | `ghcr.io/my-org/my-agent-runtime:latest` |
 | Agent mount | Optional; declare only when the agent needs mounted files | `stages.agent.mount.source: ./agent`, `stages.agent.mount.mount.path: /opt/agent` |
-| Ephemerals | Optional; declare only when a stage needs a per-trial service | `ephemerals.mcp-bash`, `stages.agent.ephemerals: [mcp-bash]` |
+| Services | Optional; declare only when a stage needs a per-trial service | `services.mcp-bash`, `stages.agent.services: [mcp-bash]` |
 | Case workspace image | When workspace source is `container_image` | `case_v2.resources.workspace.image` |
 | Grader declaration | Only when benchmark scoring needs a grader | `stages.grader.strategy`; omit `stages.grader` for the no-grader default |
 | Metric declarations | If you want queryable custom metrics | `metrics[].id` plus `metrics[].from` |
@@ -155,7 +155,7 @@ Metric declarations are the canonical analytics contract. The runner does not pe
 
 Your agent app must:
 
-1. Start from `stages.agent.command`.
+1. Start from `stages.agent.command`, or from a built-in `stages.agent.adapter` that lowers to a command contract.
 2. Read trial input from `BUCEPHALUS_TRIAL_INPUT_PATH`.
 3. Work the case according to the resolved case interface.
 4. Write any valid JSON response to `BUCEPHALUS_RESULT_PATH`.
@@ -193,28 +193,28 @@ Optional but recommended:
 
 - set `traces.source: protocol` and write JSONL to the injected `BUCEPHALUS_TRAJECTORY_PATH` when command-agent traces should be ingested
 - write runtime evidence under declared `stages.agent.output_mounts`
-- attach `ephemerals` only for services the stage actually calls
+- attach `services` only for resources the stage actually calls
 - for artifact cases, write `artifact_envelope_v1` JSON
 - produce clear stdout/stderr for debugging
 
-## Ephemeral Responsibilities
+## Service Responsibilities
 
-Use `ephemerals` for per-trial service containers, not for case data, mounted artifacts, or long-lived external dependencies. Each ephemeral has a top-level declaration and each stage opts in explicitly:
+Use `services` for per-trial service containers, not for case data, mounted artifacts, or long-lived external dependencies. Each service has a top-level declaration and each stage opts in explicitly:
 
 ```yaml
-ephemerals:
+services:
   mcp-bash:
     image: ghcr.io/acme/mcp-bash-server:v0.4
-    lifecycle: per-trial
+    lifecycle: trial
     expose:
       MCP_URL: http://mcp-bash:8080
 
 stages:
   agent:
-    ephemerals: [mcp-bash]
+    services: [mcp-bash]
 ```
 
-Local Docker attaches ephemerals on a per-trial network and tracks them for cleanup. Host stages cannot attach container ephemerals. Modal rejects ephemerals until backend-native support exists. See [Ephemerals](ephemerals.md).
+Local Docker attaches services on a per-trial network and tracks them for cleanup. Modal supports same-sandbox services with `placement: same_sandbox`. Host stages cannot attach container services. See [Services](ephemerals.md).
 
 ## Grader Responsibilities
 

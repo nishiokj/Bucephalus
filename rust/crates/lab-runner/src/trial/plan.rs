@@ -89,6 +89,8 @@ pub(crate) struct RuntimeFieldSource {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TrialRuntimeAgentConfig {
     pub(crate) command: Vec<String>,
+    #[serde(default)]
+    pub(crate) adapter: Option<Value>,
     pub(crate) artifact_type: ArtifactType,
     #[serde(default)]
     pub(crate) image: Option<String>,
