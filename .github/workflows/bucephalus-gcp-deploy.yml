@@ -84,6 +84,9 @@ jobs:
     name: Plan and optionally apply ${{ inputs.deployment_stage || 'drift check' }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.github_environment || 'bucephalus' }}
+    concurrency:
+      group: bucephalus-gcp-state-${{ inputs.github_environment || 'bucephalus' }}
+      cancel-in-progress: false
     permissions:
       contents: read
       actions: read
@@ -483,6 +486,7 @@ jobs:
         run: |
           args=(
             -input=false
+            -lock-timeout=10m
             -var-file="${RUNNER_TEMP}/gcp-deploy.tfvars"
             -out="${RUNNER_TEMP}/bucephalus-gcp.tfplan"
           )
@@ -543,7 +547,7 @@ jobs:
       - name: Terraform apply
         if: ${{ inputs.apply }}
         working-directory: bucephalus-cloud/infra/gcp
-        run: terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp.tfplan"
+        run: terraform apply -input=false -lock-timeout=10m -auto-approve "${RUNNER_TEMP}/bucephalus-gcp.tfplan"
 
       - name: Run migration job
         if: ${{ inputs.apply && inputs.deployment_stage != 'substrate' }}

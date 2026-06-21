@@ -1707,8 +1707,11 @@ for (const requiredEnv of [
 if (!deployWorkflowText.includes("terraform init") || !deployWorkflowText.includes("terraform plan") || !deployWorkflowText.includes("terraform apply")) {
   fail(`${deployWorkflowPath} must run Terraform init, plan, and gated apply`);
 }
-if (!deployWorkflowText.includes('-out="${RUNNER_TEMP}/bucephalus-gcp.tfplan"') || !deployWorkflowText.includes('terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp.tfplan"')) {
+if (!deployWorkflowText.includes('-out="${RUNNER_TEMP}/bucephalus-gcp.tfplan"') || !deployWorkflowText.includes('terraform apply -input=false -lock-timeout=10m -auto-approve "${RUNNER_TEMP}/bucephalus-gcp.tfplan"')) {
   fail(`${deployWorkflowPath} must apply the exact Terraform plan generated in the same run`);
+}
+if (!deployWorkflowText.includes('group: bucephalus-gcp-state-${{ inputs.github_environment || \'bucephalus\' }}') || !deployWorkflowText.includes('-lock-timeout=10m')) {
+  fail(`${deployWorkflowPath} must serialize Terraform state access by environment and wait for active locks`);
 }
 if (deployWorkflowText.includes("Refuse implicit service cleanup") || deployWorkflowText.includes("Use the Bucephalus GCP Cleanup workflow")) {
   fail(`${deployWorkflowPath} must not force a separate cleanup workflow before substrate deploys`);
@@ -1830,8 +1833,11 @@ if (!cleanupWorkflowText.includes("scripts/deploy/write-gcp-deploy-tfvars.sh") |
 if (!cleanupWorkflowText.includes("control-plane-services") || !cleanupWorkflowText.includes("pool-controller")) {
   fail(`${cleanupWorkflowPath} must support explicit control-plane service and pool-controller cleanup targets`);
 }
-if (!cleanupWorkflowText.includes('-out="${RUNNER_TEMP}/bucephalus-gcp-cleanup.tfplan"') || !cleanupWorkflowText.includes('terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp-cleanup.tfplan"')) {
+if (!cleanupWorkflowText.includes('-out="${RUNNER_TEMP}/bucephalus-gcp-cleanup.tfplan"') || !cleanupWorkflowText.includes('terraform apply -input=false -lock-timeout=10m -auto-approve "${RUNNER_TEMP}/bucephalus-gcp-cleanup.tfplan"')) {
   fail(`${cleanupWorkflowPath} must apply the exact Terraform cleanup plan generated in the same run`);
+}
+if (!cleanupWorkflowText.includes('group: bucephalus-gcp-state-${{ inputs.github_environment }}') || !cleanupWorkflowText.includes('-lock-timeout=10m')) {
+  fail(`${cleanupWorkflowPath} must share Terraform state serialization with deploy and wait for active locks`);
 }
 if (cleanupWorkflowText.includes("terraform destroy")) {
   fail(`${cleanupWorkflowPath} must not expose full substrate destroy as a routine cleanup action`);
