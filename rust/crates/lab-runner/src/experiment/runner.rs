@@ -1560,10 +1560,10 @@ impl StdoutRunProgress {
         let remaining_value = remaining.to_string();
         let progress_value = format_progress_bar(completed, self.total_slots, 24);
         let active_detail = format_active_trials(active_trials, schedule);
-        let monitor = "bucephalus-cloud run watch <cloud-run-id> --resources-only".to_string();
-        let resources = "bucephalus-cloud run resources <cloud-run-id> --kind Trial".to_string();
-        let health = "bucephalus-cloud run health <cloud-run-id>".to_string();
-        let audit = "bucephalus-cloud run audit <cloud-run-id> --limit 100".to_string();
+        let monitor = "buc runs watch <cloud-run-id> --kind Trial".to_string();
+        let resources = "buc runs resources <cloud-run-id> --kind Trial".to_string();
+        let health = "buc runs health <cloud-run-id>".to_string();
+        let audit = "buc runs events <cloud-run-id> --limit 100".to_string();
         let local_trials = format!(
             "bucephalus query {} \"SELECT * FROM trials LIMIT 20\"",
             run_id

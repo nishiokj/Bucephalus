@@ -128,9 +128,19 @@ buc secrets list
 buc doctor <package-digest> --secret-ref NAME=bucephalus://NAME
 buc run <package-digest> --secret-ref NAME=bucephalus://NAME
 buc runs list
+buc runs get <run-id>
+buc runs get <run-id> Trial
+buc runs get <run-id> Trial --wide
+buc runs get <run-id> Trial/<trial-name>
+buc runs wait <run-id> Trial/<trial-name> --for condition=Ready
 buc runs events <run-id>
-buc runs results <run-id>
-buc runs value <run-id> <key>
+buc runs audit <run-id>
+buc runs top <run-id> --kind Trial
+buc runs can-i <run-id> port-forward RunnerInstance/<runner-name>
+buc runs logs <run-id> Trial/<trial-name> --stream stdout --metadata-out trial.log.metadata.json
+buc runs port-forward <run-id> Trial/<trial-name> --target-port 8080 --local-port 18080 --attach --resource-version <reviewed-version>
+buc runs exec <run-id> Trial/<trial-name> --resource-version <reviewed-version> -- python -V
+buc runs content <run-id> TrialArtifact/<artifact-name> --out result.json --metadata-out result.metadata.json
 buc logout
 ```
 
@@ -153,10 +163,25 @@ buc experiments doctor <package-digest> --secret-ref NAME=bucephalus://NAME
 buc runs list
 buc runs create <package-digest> --secret-ref NAME=bucephalus://NAME
 buc runs get <run-id>
-buc runs runtime <run-id>
+buc runs get <run-id> Trial
+buc runs get <run-id> Trial/<trial-name>
+buc runs api-resources <run-id>
+buc runs explain <run-id> TrialContainer
+buc runs tree <run-id> --kind Trial,TrialContainer
+buc runs get <run-id> Trial --field-selector status.phase=running
+buc runs describe <run-id> Trial/<trial-name>
+buc runs metrics <run-id> --kind Trial
+buc runs top <run-id> --kind Trial
 buc runs events <run-id>
-buc runs results <run-id>
-buc runs value <run-id> <key>
+buc runs audit <run-id>
+buc runs logs <run-id> Trial/<trial-name> --stream stdout --metadata-out trial.log.metadata.json
+buc runs port-forward <run-id> RunnerInstance/<runner-name> --target-port 8080 --local-port 18080 --attach --resource-version <reviewed-version>
+buc runs exec <run-id> RunnerInstance/<runner-name> --resource-version <reviewed-version> -- python -V
+buc runs cordon <run-id> RunnerInstance/<runner-name> --reason "maintenance" --resource-version <reviewed-version>
+buc runs drain <run-id> RunnerInstance/<runner-name> --reason "maintenance" --resource-version <reviewed-version>
+buc runs uncordon <run-id> RunnerInstance/<runner-name> --reason "maintenance complete" --resource-version <reviewed-version>
+buc runs complete <run-id> PortForward/<port-forward-name> --reason "done" --resource-version <reviewed-version>
+buc runs delete <run-id> PortForward/<port-forward-name> --reason "done" --resource-version <reviewed-version>
 ```
 
 ## End-To-End Hosted Run
@@ -238,14 +263,273 @@ buc runs value <run-id> <key>
      --secret-ref GEMINI_API_KEY=bucephalus://GEMINI_API_KEY
    ```
 
-7. Fetch status:
+7. Inspect the hosted runtime:
 
    ```bash
    buc runs get <run-id>
+   buc runs api-resources <run-id>
+   buc runs get <run-id> Trial
+   buc runs get <run-id> Trial/<trial-name>
+   buc runs wait <run-id> Trial/<trial-name> --for condition=Ready
+   buc runs get <run-id> TrialArtifact --field-selector status.content_available=true
+   buc runs top <run-id> --kind Trial
    buc runs events <run-id>
-   buc runs results <run-id>
-   buc runs value <run-id> <key>
+   buc runs audit <run-id>
+   buc runs can-i <run-id> exec Trial/<trial-name>
+   buc runs logs <run-id> Trial/<trial-name> --stream stdout --metadata-out trial.log.metadata.json
+   buc runs port-forward <run-id> Trial/<trial-name> --target-port 8080 --no-wait --resource-version <reviewed-version>
+   buc runs exec <run-id> Trial/<trial-name> --resource-version <reviewed-version> -- python -V
+   buc runs content <run-id> TrialArtifact/<artifact-name> --out result.json --metadata-out result.metadata.json
    ```
+
+## Runtime Resources and Low-Level Operations
+
+Hosted runs expose their execution state as runtime resources, not one-off
+compatibility routes. Start with discovery, then work against concrete
+`Kind/name` objects:
+
+```bash
+buc runs api-resources <run-id>
+buc runs explain <run-id> TrialContainer
+buc runs tree <run-id> --kind RunnerInstance,RunnerAttempt,Trial,TrialContainer
+buc runs get <run-id> RunnerInstance,RunnerAttempt,Trial,TrialContainer --wide
+buc runs get <run-id> Trial -o name
+buc runs get <run-id> --category runner --wide
+buc runs get <run-id> Event --field-selector status.involved=PortForward/<port-forward-name> --wide
+buc runs get <run-id> Event --field-selector spec.involved_object.kind=PortForward,spec.involved_object.name=<port-forward-name> --wide
+buc runs get <run-id> RunnerInstance/<runner-name>
+buc runs status <run-id> RunnerInstance/<runner-name>
+buc runs events <run-id> RunnerInstance/<runner-name>
+buc runs audit <run-id> RunnerInstance/<runner-name>
+buc runs top <run-id> --kind RunnerInstance
+```
+
+`buc runs api-resources` prints the generated catalog timestamp, represented
+Core run ids, and each kind with count, short names, categories, verbs,
+subresources, actions, access verbs, and selector support so operators can pick
+the right `--kind` or `--category` before listing resources.
+`buc runs get` mirrors the useful part of `kubectl get`: with only a run id it
+fetches the Cloud run record, with a kind or selectors it lists runtime
+resources, and with `Kind/name` or `KIND NAME` it fetches that raw resource.
+Use `--category <name>` to send the same server-owned selector exposed by
+`buc runs api-resources`, such as `runner`, `trial`, `access`, or
+`access-target`, without memorizing the current concrete kind list. API clients
+can use that selector directly with `category=runner` on runtime resource list,
+watch, health, metrics, and inspect endpoints.
+Add `--wide` on resource lists to render the server-advertised printer columns
+instead of the compact summary. Use `--output name` or `-o name` when scripts
+need one concrete `Kind/name` ref per line for later `describe`, `logs`,
+`can-i`, `delete`, or `wait` commands.
+For `Event` resources, `--wide` includes the primary involved runtime object
+from `status.involved` plus the event type and row sequence, so access and audit
+events can be listed by concrete `Kind/name` without opening raw payload JSON.
+The discovery document also advertises concrete Event selectors such as
+`spec.involved_object.kind`, `spec.involved_object.name`, `status.involved`,
+and `status.involved_uid`; use those advertised paths for tooling instead of
+parsing event payloads.
+Use `buc runs describe <run-id> Kind/name` or
+`buc runs get <run-id> Kind/name --view describe` when you also want related
+owner/dependent resources and lifecycle/audit events. Describe output includes
+the generated snapshot timestamp and represented Core run ids before related
+resources, available operations, and recent related event rows with
+`event_resource_version`/cursor metadata. Each advertised operation is printed
+with its support decision, verb/subresource/action metadata, whether it requires
+a running Cloud run, and command template so CLI users can see the concrete
+low-level operation contract before running `can-i` or a mutating command.
+Use `buc runs explain <run-id> <kind>` when you need the server-owned contract
+for one kind: aliases, selectors, printer columns, paths, actions, and example
+commands. The paths section includes low-level subresource endpoint templates
+such as `subresource/status`, `subresource/logs`, and `subresource/actions/*`.
+Runtime catalog reads are part of the audit stream as
+`runtime.api_resources.read`; missing-kind discovery attempts are recorded as
+`runtime.api_resources.read.failed` with the requester, selected kind, error
+code, HTTP status, and `Run/<run-id>` resource ref.
+Field selectors include Kubernetes-style metadata paths such as
+`metadata.creationTimestamp`, `metadata.deletionTimestamp`,
+`metadata.generation`, and `metadata.resourceVersion` alongside status,
+condition, and audit paths.
+Use `buc runs tree <run-id>` when you need to see parent/child runtime shape
+from `metadata.ownerReferences` before drilling into one object.
+`buc runs status <run-id> Kind/name` reads the status subresource and prints the
+generated status timestamp, resourceVersion, generation/observedGeneration
+freshness, conditions, available actions, deletion timestamp, and audit source
+when present; `buc runs wait`
+prints that same summary after the predicate is reached. If a wait times out
+or the resource reaches a terminal phase first, the error includes the latest
+observed phase, reason, waited condition status, resourceVersion, and
+generation freshness.
+
+Use `can-i` before a mutating, low-level access, or observability operation
+when scripting. It queries the same operation-review subresource the GUI uses
+and returns the generated review timestamp, represented Core run ids, and
+resource version that can be passed to a later mutation. Human output prints a
+reviewed command with the current `--resource-version` materialized when the
+operation accepts optimistic concurrency:
+
+```bash
+buc runs can-i <run-id> port-forward RunnerInstance/<runner-name>
+buc runs can-i <run-id> exec Trial/<trial-name>
+buc runs can-i <run-id> top TrialContainer/<container-name>
+buc runs can-i <run-id> audit RunnerInstance/<runner-name>
+buc runs can-i <run-id> logs/stdout TrialContainer/<container-name>
+buc runs can-i <run-id> logs/stderr TrialContainer/<container-name>
+buc runs can-i <run-id> content TrialArtifact/<artifact-name>
+buc runs can-i <run-id> cordon RunnerInstance/<runner-name>
+buc runs can-i <run-id> cancel Exec/<exec-name>
+buc runs can-i <run-id> complete PortForward/<port-forward-name>
+```
+
+`can-i` exits zero when the operation is currently supported and nonzero when
+the server denies it, so scripts can use it as a preflight gate. Reviewed
+mutating and low-level access commands include `--resource-version` so the later
+request fails safely if the resource changed after review. Operation reviews
+are also written to the runtime audit stream as
+`runtime.resource.operation.reviewed`; failed review attempts use
+`runtime.resource.operation.review.failed` with the selected resource and error
+details.
+
+Declared infra resources also carry worker-observed lifecycle evidence.
+`ImagePull` resources move past capability-level `Satisfied` to `Pulling`,
+`Pulled`, or `Failed` as the runner pre-pulls digest-pinned images before
+network policy is applied. These transitions are emitted as
+`worker.runtime.image_pull.*` events and keep the image ref tied to the
+selected `ImagePull/<name>` resource.
+`SecretBinding` resources move past capability-level `Satisfied` to
+`Materialized` when the worker reports `worker.runtime.secret_binding.materialized`;
+the event names the secret id and resource, never the secret ref or value.
+`SidecarRequirement/<sidecar>` moves past capability-level `Satisfied` to
+`Checking`, `Available`, or `Failed` from
+`worker.runtime.sidecar_requirement.*` events when the worker validates that the
+claimed runner actually advertises the required sidecar capability.
+`AcceleratorRequirement/<accelerator>` follows the same worker-observed lifecycle
+through `worker.runtime.accelerator_requirement.*` events when the worker
+validates runner accelerator capability.
+`NetworkPerimeter/declared` reports `Applying`, `Applied`, or `Failed` from
+`worker.runtime.network_perimeter.*` events after the provider enforcer runs.
+
+Runtime access is resource-scoped. The target can be a `RunnerInstance`,
+`RunnerAttempt`, active `Trial`, assigned `ScheduleSlot`, or `TrialContainer`
+when the resource advertises `status.access.port_forward` or
+`status.access.exec`:
+
+```bash
+buc runs port-forward <run-id> Trial/<trial-name> --target-port 8080 --local-port 18080 --attach --resource-version <reviewed-version>
+buc runs exec <run-id> Trial/<trial-name> --resource-version <reviewed-version> -- python -V
+buc runs logs <run-id> Trial/<trial-name> --stream stdout --tail-lines 200 --metadata-out trial.log.metadata.json
+```
+
+`port-forward` creates an audited `PortForward` runtime resource and waits for
+the worker to report an active tunnel unless `--no-wait` is set. Add `--attach`
+to start a local TCP forward when the active resource reports a supported
+provider handle, such as GCE IAP. When the CLI-owned local attach process exits,
+the CLI marks the `PortForward` resource `completed` with an audited closeout
+reason. If the worker reports a client-reachable endpoint instead, `--attach`
+prints the endpoint and leaves the worker-managed `PortForward` active for
+explicit cleanup or TTL expiry.
+If the tunnel resource ends `failed`, `expired`, or `cancelled`, `buc runs port-forward` exits nonzero after printing
+the `PortForward` resource summary. `exec` creates an audited `Exec` resource
+and waits for completion unless `--no-wait` is set; when the remote command
+exits nonzero, `buc runs exec` exits nonzero after printing the `Exec` resource
+summary. Human describe output and the GUI inspector surface closeout commands
+for live access resources using the current `metadata.resourceVersion`, so raw
+provider attach sessions still have an audited closeout path. Inspect, complete, or cancel
+those resources through the same resource API:
+
+```bash
+buc runs get <run-id> PortForward,Exec
+buc runs describe <run-id> PortForward/<port-forward-name>
+buc runs logs <run-id> Exec/<exec-name> --stream stdout --metadata-out exec.log.metadata.json
+buc runs complete <run-id> PortForward/<port-forward-name> --reason "local tunnel ended" --resource-version <reviewed-version>
+buc runs delete <run-id> Exec/<exec-name> --reason "cancelled by operator" --resource-version <reviewed-version>
+buc runs wait <run-id> Exec/<exec-name> --for delete --timeout-seconds 60
+```
+
+`describe` output for `PortForward` and `Exec` includes the resolved target
+resource and resourceVersion, requester/reason/expiration, runner/attempt/worker
+binding, connection mode, raw connection details, and command/output facts. When
+a `PortForward` is active with a supported GCE IAP handle, the summary also
+prints an `attach_command` line that can be run independently. Worker-managed
+active tunnels surface their `client_endpoint` in the same detail output.
+`Exec` output facts include stdout/stderr tail byte counts and truncation flags
+when the worker had to bound captured command output.
+For raw `logs` and `content` downloads, add `--metadata-out FILE` to save the
+Cloud response provenance separately from the bytes: Cloud run id, resource
+kind/name/resourceVersion, stream, Core run id, trial id, artifact role, object
+ref, digest, media type, and byte size. The server also records the read in
+runtime audit events as `runtime.resource.logs.read` or
+`runtime.resource.content.read` with the requester, resource ref, object ref,
+digest, media type, and byte size.
+Failed raw reads are also audited as `runtime.resource.logs.read.failed` or
+`runtime.resource.content.read.failed` with the selected resource, error code,
+HTTP status, and error message.
+Normal resource reads are audited too. Server-side `resources`, `watch`,
+`describe`, `get`, `status`, `events`, `top`/`metrics`, and metrics-list reads
+emit `runtime.resource.list.read`, `runtime.resource.watch.read`,
+`runtime.resource.describe.read`, `runtime.resource.get.read`,
+`runtime.resource.status.read`, `runtime.resource.events.read`,
+`runtime.resource.metrics.read`, or `runtime.resource.metrics.list.read` with
+the requester, selected resource or `Run/<run-id>` ref, selector and cursor provenance,
+resourceVersion, returned counts, and health/metrics/event summary
+metadata. Failure variants keep the same event name plus `.failed` and include
+the error code, HTTP status, and message.
+The server-discovered `--wide` columns for `PortForward` and `Exec` include the
+same target, reviewed target resourceVersion, runner/worker binding, requester,
+connection mode, provider tunnel, and expiration fields for scanning access
+resources before opening one object. `Exec --wide` columns also expose
+stdout/stderr byte totals, retained tail byte counts, and truncation flags so a
+resource list can reveal bounded output evidence without dumping the tail text.
+Runtime audit summaries for completed Exec resources include the same
+stdout/stderr byte totals, retained tail byte counts, and truncation flags
+alongside the exit code, so `buc runs audit` can prove what stream evidence was
+captured.
+
+`delete` is the Kubernetes-style resource verb; for audited access resources it
+is implemented as the same lifecycle transition as `actions/cancel`. The
+resource remains inspectable for audit and carries `metadata.deletionTimestamp`
+once the delete/cancel is acknowledged, which is also enough for
+`wait --for delete` to complete.
+
+Runner VM lifecycle operations use explicit resource verbs:
+
+```bash
+buc runs cordon <run-id> RunnerInstance/<runner-name> --reason "maintenance" --resource-version <reviewed-version>
+buc runs drain <run-id> RunnerInstance/<runner-name> --reason "maintenance" --resource-version <reviewed-version>
+buc runs uncordon <run-id> RunnerInstance/<runner-name> --reason "maintenance complete" --resource-version <reviewed-version>
+```
+
+For support handoff, `buc runs inspect <run-id>` fetches a bounded runtime
+bundle with API discovery, resource inventory cursors, health summary, metrics
+summary, recent event cursors, and log references. Use `--json` to save the full
+bundle. Each bundle read emits a `runtime.inspect.bundle.read` audit event with
+the requester, `Run/<run-id>` resource ref, applied filters, inventory and event
+resource versions, returned counts, and log-reference count. Failed bundle reads emit
+`runtime.inspect.bundle.read.failed` with the requester, filters, error code,
+HTTP status, and error message when the runtime audit store is reachable.
+
+Every low-level access request, runner lifecycle mutation, and worker-observed
+infra lifecycle transition is emitted into the runtime audit stream. Use
+`buc runs audit <run-id>` for run-wide operator history, or pass a `Kind/name`
+target such as `ImagePull/<image-name>`, `SecretBinding/<secret-id>`,
+`SidecarRequirement/<sidecar>`, or `NetworkPerimeter/declared` to scope the
+audit to one resource. For
+incident review and support handoff, `buc runs events` and `buc runs audit`
+also accept repeatable `--event-type` and `--source` filters plus
+`--resource-kind`, `--resource-name`, `--trial-id`, `--task-id`, and
+`--continue` cursors. Add `--follow` to `buc runs events`, `buc runs audit`,
+`buc runs watch`, or `buc runs logs` to keep polling; `--interval-seconds`
+controls the poll delay, and `--max-polls` captures a bounded stream for
+incident notes or support bundles. Followed logs print only appended bytes, so
+sliding `--tail-lines` windows do not duplicate output. Human event output
+includes the event `resource_version`, `continue`, and row-sequence cursor
+metadata when the API returns it; individual audit lines surface row, event
+type, source, actor, resource/access/target refs, runner/worker binding,
+reviewed `resource_version_precondition`, reason, and status transition when
+present. Human watch output includes the collection `resource_version`, copyable
+`known_resource: Kind/name=resourceVersion` cursor entries, and per-event
+`rv`/`previous` transitions. `buc runs watch --follow` carries
+forward the returned collection and per-resource versions for resource changes
+and deletions. Watch follow requests opt into server BOOKMARK events, so an
+unchanged collection is still visible as a cursor heartbeat.
 
 ## Secret Refs
 
@@ -341,6 +625,10 @@ buc doctor <package-digest> --secret-ref GEMINI_API_KEY=gcp-secret-manager://pro
    comma-separated values such as `sidecars=redis,postgres`, and `network`
    uses a JSON object such as
    `network={"default":"allowlist_enforced","egress":["api.openai.com"]}`.
+   Hosted Cloud does not accept runtime placement selectors such as `region`,
+   `runtime_region`, `placement`, or `zone`; runner placement is controlled by
+   runner pools and the Cloud scheduler. The API rejects unsupported placement
+   fields with pointers such as `/runtime_options/region`.
    Hosted Cloud does not accept the compatibility aliases `executor` or `cpu`;
    use canonical `backend` and `cpu_count`.
    Hosted `buc` does not accept `--smoke-test` until Cloud has a real hosted

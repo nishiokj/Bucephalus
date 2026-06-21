@@ -53,9 +53,6 @@ pub(crate) fn normalize_agent_result_adapter(
     let Some(adapter) = runtime_experiment.pointer("/trial_runtime/agent/adapter") else {
         return Ok(());
     };
-    if adapter.get("kind").and_then(Value::as_str) != Some("nova") {
-        return Ok(());
-    }
     let result_kind = adapter
         .get("result")
         .and_then(Value::as_str)
@@ -64,13 +61,13 @@ pub(crate) fn normalize_agent_result_adapter(
         return Ok(());
     }
     let raw: Value = serde_json::from_slice(&fs::read(result_path)?)
-        .with_context(|| format!("failed to parse Nova result at {}", result_path.display()))?;
+        .with_context(|| format!("failed to parse adapter result at {}", result_path.display()))?;
     if raw.get("schema_version").and_then(Value::as_str) == Some("artifact_envelope_v1") {
         return Ok(());
     }
-    let normalized = normalize_nova_structured_json_result(&raw).with_context(|| {
+    let normalized = normalize_structured_json_result(&raw).with_context(|| {
         format!(
-            "failed to normalize Nova result at {}",
+            "failed to normalize adapter result at {}",
             result_path.display()
         )
     })?;
@@ -78,12 +75,12 @@ pub(crate) fn normalize_agent_result_adapter(
     Ok(())
 }
 
-fn normalize_nova_structured_json_result(raw: &Value) -> Result<Value> {
+fn normalize_structured_json_result(raw: &Value) -> Result<Value> {
     let response = raw
         .get("response")
-        .ok_or_else(|| anyhow!("Nova result missing /response"))?;
-    let mut artifact = parse_nova_response_artifact(response)?;
-    let usage = normalized_nova_usage(raw);
+        .ok_or_else(|| anyhow!("adapter result missing /response"))?;
+    let mut artifact = parse_response_artifact(response)?;
+    let usage = normalized_usage(raw);
     artifact.insert("usage".to_string(), usage.clone());
     let mut metadata = Map::new();
     if let Some(raw_object) = raw.as_object() {
@@ -93,7 +90,7 @@ fn normalize_nova_structured_json_result(raw: &Value) -> Result<Value> {
             }
         }
     }
-    metadata.insert("metrics".to_string(), normalized_nova_metrics(raw, &usage));
+    metadata.insert("metrics".to_string(), normalized_metrics(raw, &usage));
     Ok(json!({
         "schema_version": "artifact_envelope_v1",
         "artifact_type": "structured_json",
@@ -102,12 +99,12 @@ fn normalize_nova_structured_json_result(raw: &Value) -> Result<Value> {
     }))
 }
 
-fn parse_nova_response_artifact(response: &Value) -> Result<Map<String, Value>> {
+fn parse_response_artifact(response: &Value) -> Result<Map<String, Value>> {
     if let Some(object) = response.as_object() {
         return Ok(object.clone());
     }
     let Some(text) = response.as_str() else {
-        return Err(anyhow!("Nova /response must be an object or JSON string"));
+        return Err(anyhow!("adapter /response must be an object or JSON string"));
     };
     let mut candidates = vec![text.trim().to_string(), strip_code_fence(text)];
     if let Some(embedded) = first_json_object(text) {
@@ -138,7 +135,7 @@ fn parse_nova_response_artifact(response: &Value) -> Result<Map<String, Value>> 
         .collect::<Vec<_>>()
         .join("; ");
     Err(anyhow!(
-        "Nova response did not contain a JSON object{}",
+        "adapter response did not contain a JSON object{}",
         if detail.is_empty() {
             "".to_string()
         } else {
@@ -190,7 +187,7 @@ fn first_json_object(text: &str) -> Option<String> {
     None
 }
 
-fn normalized_nova_usage(raw: &Value) -> Value {
+fn normalized_usage(raw: &Value) -> Value {
     let source = raw
         .get("usage")
         .and_then(Value::as_object)
@@ -204,7 +201,7 @@ fn normalized_nova_usage(raw: &Value) -> Value {
     })
 }
 
-fn normalized_nova_metrics(raw: &Value, usage: &Value) -> Value {
+fn normalized_metrics(raw: &Value, usage: &Value) -> Value {
     let mut metrics = raw
         .get("metrics")
         .and_then(Value::as_object)

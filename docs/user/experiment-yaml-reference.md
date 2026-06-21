@@ -58,9 +58,10 @@ outputs, metrics, and grading contracts.
 Optional `experiment.description`, `experiment.owner`, and `experiment.tags`
 must be non-empty when present; tags must be unique.
 
-`stages.agent.command` is the direct command-agent launch contract. For known
-agent CLIs, `stages.agent.adapter` can own the runner argv and result
-normalization instead. Declare exactly one of `command` or `adapter`.
+`stages.agent.command` is the direct command-agent launch contract. For an
+agent CLI that natively speaks the runner's trial contract, `stages.agent.adapter`
+can own the runner argv and result normalization instead. Declare exactly one of
+`command` or `adapter`.
 
 The runner launches the resolved argv, injects runner-owned input/output paths,
 and can ingest command-agent event streams. Do not declare
@@ -70,19 +71,20 @@ and can ingest command-agent event streams. Do not declare
 stages:
   agent:
     adapter:
-      kind: nova
-      config: /opt/agent/nova-config.json
+      executable: /usr/local/bin/myagent
+      config: /opt/agent/config.json
       timeout_ms: 540000
       provider_env:
         gemini: GOOGLE_API_KEY
 ```
 
-`adapter.kind: nova` lowers to a sealed command that reads the trial input,
-writes the canonical result, and normalizes Nova's native result into the
-structured JSON artifact contract after execution. When the agent has a
-declared event sink, the adapter also passes the trajectory path; set
-`adapter.events: false` to suppress that argv, or `adapter.events: true` to
-require a declared sink.
+The adapter lowers to a sealed command that invokes `executable` as
+`<executable> run --input-file … --output …`, reading the trial input,
+writing the canonical result, and normalizing the agent's native
+`structured_json` result into the artifact envelope contract after execution.
+When the agent has a declared event sink, the adapter also passes the trajectory
+path; set `adapter.events: false` to suppress that argv, or `adapter.events: true`
+to require a declared sink.
 
 The canonical agent `result` output is added by default. Use
 `stages.agent.outputs` only for additional captures such as patches, stdout

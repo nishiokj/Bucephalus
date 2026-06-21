@@ -17,9 +17,11 @@ import {
   runtimeResourceMetricsView,
   runtimeSnapshotFromWorkerEventPayload,
   runtimeTrialResultsFromSnapshots,
+  type RuntimeAccessRequestRecord,
   type RuntimeEventRecord,
   type RuntimeResourceRecord,
 } from "../src/runtime/repository";
+import { HttpError } from "../src/http";
 import type { JsonObject } from "../src/primitives";
 
 describe("runtime repository worker snapshots", () => {
@@ -597,7 +599,9 @@ describe("runtime repository worker snapshots", () => {
     }, "run-1", run);
 
     for (const resource of inventory.resources) {
+      expect(resource.metadata.uid).toMatch(/\S/);
       expect(resource.metadata.generation).toEqual(expect.any(Number));
+      expect(resource.metadata.resourceVersion).toMatch(/^sha256:[0-9a-f]{64}$/);
       expect(resource.status.observedGeneration).toBe(resource.metadata.generation);
       expect(runtimeConditionsByType(resource).Observed).toMatchObject({
         status: "True",
@@ -654,6 +658,10 @@ describe("runtime repository worker snapshots", () => {
       labelSelector: "bucephalus.dev/core-run-id=core-run-1,bucephalus.dev/runtime-status=running",
       fieldSelector: "status.experiment_id=experiment-1",
     })).toEqual([coreRun!]);
+    expect(filterRuntimeResources(inventory.resources, {
+      kinds: ["CoreRun"],
+      fieldSelector: "metadata.creationTimestamp=2027-02-06T23:59:50.000Z",
+    })).toEqual([coreRun!]);
     expect(coreRun).toMatchObject({
       kind: "CoreRun",
       metadata: {
@@ -667,6 +675,7 @@ describe("runtime repository worker snapshots", () => {
         ownerReferences: expect.arrayContaining([
           expect.objectContaining({ kind: "Run", name: "run-1", uid: "run-1" }),
         ]),
+        creationTimestamp: "2027-02-06T23:59:50.000Z",
         created_at: "2027-02-06T23:59:50.000Z",
         updated_at: "2027-02-07T00:00:00.000Z",
       },
@@ -880,6 +889,7 @@ describe("runtime repository worker snapshots", () => {
         access: {
           port_forward: false,
           exec: true,
+          runner_instance_status: "online",
         },
       },
       audit: {
@@ -971,6 +981,7 @@ describe("runtime repository worker snapshots", () => {
           port_forward: false,
           exec: true,
           runner_instance_id: "runner-instance-1",
+          runner_instance_status: "online",
           attempt_id: "attempt-1",
           worker_id: "worker-1",
         },
@@ -1035,6 +1046,7 @@ describe("runtime repository worker snapshots", () => {
           port_forward: false,
           exec: true,
           runner_instance_id: "runner-instance-1",
+          runner_instance_status: "online",
           attempt_id: "attempt-1",
           worker_id: "worker-1",
         },
@@ -1956,6 +1968,14 @@ describe("runtime repository worker snapshots", () => {
             status: "active",
             connection: { client_endpoint: "tcp://127.0.0.1:18080" },
           }),
+          accessRequestRecord({
+            access_request_id: "pf-iap",
+            status: "active",
+            connection: {
+              provider_tunnel_url: "gcp-iap-ssh://projects/p/zones/z/instances/i?target_host=10.0.0.2&target_port=8080",
+              tunnel: "gcp-iap-ssh i 10.0.0.2:8080",
+            },
+          }),
         ];
       },
       async listExecRequests() {
@@ -1971,6 +1991,7 @@ describe("runtime repository worker snapshots", () => {
 
     const localOnly = inventory.resources.find((resource) => resource.metadata.name === "pf-local");
     const clientReachable = inventory.resources.find((resource) => resource.metadata.name === "pf-client");
+    const providerTunnelOnly = inventory.resources.find((resource) => resource.metadata.name === "pf-iap");
 
     expect(runtimeConditionsByType(localOnly!).Active).toMatchObject({
       status: "True",
@@ -1984,6 +2005,63 @@ describe("runtime repository worker snapshots", () => {
     expect(runtimeConditionsByType(clientReachable!).ClientReachable).toMatchObject({
       status: "True",
       reason: "ClientEndpointReported",
+    });
+    expect(runtimeConditionsByType(providerTunnelOnly!).Active).toMatchObject({
+      status: "True",
+      reason: "TunnelActive",
+    });
+    expect(runtimeConditionsByType(providerTunnelOnly!).ClientReachable).toMatchObject({
+      status: "False",
+      reason: "ClientEndpointMissing",
+    });
+  });
+
+  test("stamps deletionTimestamp on cancelled runtime access resources", async () => {
+    const run = cloudRunRecord();
+    const cancelledAt = "2026-06-04T00:03:00Z";
+    const portForward = RuntimeRepository.prototype.runtimeAccessRequestResource.call(
+      {} as RuntimeRepository,
+      run,
+      accessRequestRecord({
+        status: "cancelled",
+        updated_at: cancelledAt,
+      }),
+    );
+
+    expect(portForward.metadata).toMatchObject({
+      deletionTimestamp: cancelledAt,
+      updated_at: cancelledAt,
+    });
+    expect(filterRuntimeResources([portForward], {
+      fieldSelector: `metadata.deletionTimestamp=${cancelledAt}`,
+    })).toEqual([portForward]);
+
+    const status = await RuntimeRepository.prototype.resourceStatus.call({
+      async resources() {
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceList",
+          cloud_run_id: "run-1",
+          core_run_ids: [],
+          resources: [portForward],
+        };
+      },
+    } as any, "run-1", run, {
+      kind: "PortForward",
+      name: "pf-1",
+    });
+
+    expect(status).toMatchObject({
+      kind: "RuntimeResourceStatus",
+      cloud_run_id: "run-1",
+      generated_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      core_run_ids: [],
+      deletionTimestamp: cancelledAt,
+      phase: "cancelled",
+      resource_ref: {
+        kind: "PortForward",
+        name: "pf-1",
+      },
     });
   });
 
@@ -2128,14 +2206,19 @@ describe("runtime repository worker snapshots", () => {
         kind: "Event",
         name: "event-runtime-access",
       }),
-    ]);
+    ], ["core-run-1"]);
 
     expect(discovery).toMatchObject({
       apiVersion: "bucephalus.dev/v1alpha1",
       kind: "RuntimeApiResourceList",
       cloud_run_id: "run-1",
+      generated_at: expect.any(String),
+      core_run_ids: ["core-run-1"],
     });
     expect(discovery.resources.find((resource) => resource.kind === "CoreRun")).toMatchObject({
+      cloud_run_id: "run-1",
+      generated_at: discovery.generated_at,
+      core_run_ids: ["core-run-1"],
       group: "bucephalus.dev",
       version: "v1alpha1",
       name: "coreruns",
@@ -2153,10 +2236,13 @@ describe("runtime repository worker snapshots", () => {
         watch: "/v1/runs/{run_id}/runtime/resources/watch?kind=CoreRun",
       }),
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind CoreRun" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} CoreRun/{name}" },
-        { purpose: "status", command: "bucephalus-cloud run status {run_id} CoreRun/{name}" },
-        { purpose: "wait", command: "bucephalus-cloud run wait {run_id} CoreRun/{name} --for condition=Ready" },
+        { purpose: "list", command: "buc runs get {run_id} CoreRun" },
+        { purpose: "list/name", command: "buc runs get {run_id} CoreRun --output name" },
+        { purpose: "top", command: "buc runs top {run_id} --kind CoreRun" },
+        { purpose: "get", command: "buc runs get {run_id} CoreRun/{name}" },
+        { purpose: "status", command: "buc runs status {run_id} CoreRun/{name}" },
+        { purpose: "wait", command: "buc runs wait {run_id} CoreRun/{name} --for condition=Ready" },
+        { purpose: "audit", command: "buc runs audit {run_id} CoreRun/{name}" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "CoreRun", type: "string", jsonPath: ".spec.core_run_id", description: expect.any(String), priority: 0 },
@@ -2213,16 +2299,17 @@ describe("runtime repository worker snapshots", () => {
         },
       },
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind RunnerInstance" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} RunnerInstance/{name}" },
-        { purpose: "describe", command: "bucephalus-cloud run describe {run_id} RunnerInstance/{name}" },
-        { purpose: "status", command: "bucephalus-cloud run status {run_id} RunnerInstance/{name}" },
-        { purpose: "wait", command: "bucephalus-cloud run wait {run_id} RunnerInstance/{name} --for condition=Ready" },
-        { purpose: "events", command: "bucephalus-cloud run events {run_id} RunnerInstance/{name} --follow" },
-        { purpose: "logs/stdout", command: "bucephalus-cloud run logs {run_id} RunnerInstance/{name} --stream stdout --follow" },
-        { purpose: "port-forward", command: "bucephalus-cloud run port-forward {run_id} RunnerInstance/{name} --target-port PORT" },
-        { purpose: "exec", command: "bucephalus-cloud run exec {run_id} RunnerInstance/{name} -- COMMAND [ARG...]" },
-        { purpose: "cordon", command: "bucephalus-cloud run cordon {run_id} RunnerInstance/{name}" },
+        { purpose: "list", command: "buc runs get {run_id} RunnerInstance" },
+        { purpose: "top", command: "buc runs top {run_id} --kind RunnerInstance" },
+        { purpose: "get", command: "buc runs get {run_id} RunnerInstance/{name}" },
+        { purpose: "describe", command: "buc runs describe {run_id} RunnerInstance/{name}" },
+        { purpose: "status", command: "buc runs status {run_id} RunnerInstance/{name}" },
+        { purpose: "wait", command: "buc runs wait {run_id} RunnerInstance/{name} --for condition=Ready" },
+        { purpose: "events", command: "buc runs events {run_id} RunnerInstance/{name}" },
+        { purpose: "audit", command: "buc runs audit {run_id} RunnerInstance/{name}" },
+        { purpose: "port-forward", command: "buc runs port-forward {run_id} RunnerInstance/{name} --target-port PORT --local-port PORT --attach --resource-version <metadata.resourceVersion>" },
+        { purpose: "exec", command: "buc runs exec {run_id} RunnerInstance/{name} --resource-version <metadata.resourceVersion> -- COMMAND [ARG...]" },
+        { purpose: "cordon", command: "buc runs cordon {run_id} RunnerInstance/{name} --resource-version <metadata.resourceVersion>" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "Name", type: "string", jsonPath: ".metadata.name", description: expect.any(String), priority: 0 },
@@ -2307,12 +2394,14 @@ describe("runtime repository worker snapshots", () => {
         },
       },
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind Trial" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} Trial/{name}" },
-        { purpose: "events", command: "bucephalus-cloud run events {run_id} Trial/{name} --follow" },
-        { purpose: "logs/stdout", command: "bucephalus-cloud run logs {run_id} Trial/{name} --stream stdout --follow" },
-        { purpose: "port-forward", command: "bucephalus-cloud run port-forward {run_id} Trial/{name} --target-port PORT" },
-        { purpose: "exec", command: "bucephalus-cloud run exec {run_id} Trial/{name} -- COMMAND [ARG...]" },
+        { purpose: "list", command: "buc runs get {run_id} Trial" },
+        { purpose: "top", command: "buc runs top {run_id} --kind Trial" },
+        { purpose: "get", command: "buc runs get {run_id} Trial/{name}" },
+        { purpose: "wait", command: "buc runs wait {run_id} Trial/{name} --for condition=Ready" },
+        { purpose: "events", command: "buc runs events {run_id} Trial/{name}" },
+        { purpose: "audit", command: "buc runs audit {run_id} Trial/{name}" },
+        { purpose: "port-forward", command: "buc runs port-forward {run_id} Trial/{name} --target-port PORT --local-port PORT --attach --resource-version <metadata.resourceVersion>" },
+        { purpose: "exec", command: "buc runs exec {run_id} Trial/{name} --resource-version <metadata.resourceVersion> -- COMMAND [ARG...]" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "Task", type: "string", jsonPath: ".spec.task_id", description: expect.any(String), priority: 0 },
@@ -2381,10 +2470,10 @@ describe("runtime repository worker snapshots", () => {
         },
       },
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind SlotCommit" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} SlotCommit/{name}" },
-        { purpose: "describe", command: "bucephalus-cloud run describe {run_id} SlotCommit/{name}" },
-        { purpose: "events", command: "bucephalus-cloud run events {run_id} SlotCommit/{name} --follow" },
+        { purpose: "list", command: "buc runs get {run_id} SlotCommit" },
+        { purpose: "get", command: "buc runs get {run_id} SlotCommit/{name}" },
+        { purpose: "describe", command: "buc runs describe {run_id} SlotCommit/{name}" },
+        { purpose: "events", command: "buc runs events {run_id} SlotCommit/{name}" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "Schedule", type: "integer", jsonPath: ".spec.schedule_idx", description: expect.any(String), priority: 0 },
@@ -2424,10 +2513,10 @@ describe("runtime repository worker snapshots", () => {
         },
       },
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind PendingTrialCompletion" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} PendingTrialCompletion/{name}" },
-        { purpose: "describe", command: "bucephalus-cloud run describe {run_id} PendingTrialCompletion/{name}" },
-        { purpose: "events", command: "bucephalus-cloud run events {run_id} PendingTrialCompletion/{name} --follow" },
+        { purpose: "list", command: "buc runs get {run_id} PendingTrialCompletion" },
+        { purpose: "get", command: "buc runs get {run_id} PendingTrialCompletion/{name}" },
+        { purpose: "describe", command: "buc runs describe {run_id} PendingTrialCompletion/{name}" },
+        { purpose: "events", command: "buc runs events {run_id} PendingTrialCompletion/{name}" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "Schedule", type: "integer", jsonPath: ".spec.schedule_idx", description: expect.any(String), priority: 0 },
@@ -2515,8 +2604,8 @@ describe("runtime repository worker snapshots", () => {
         watch: "/v1/runs/{run_id}/runtime/resources/watch?kind=VariantSnapshot",
       }),
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind VariantSnapshot" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} VariantSnapshot/{name}" },
+        { purpose: "list", command: "buc runs get {run_id} VariantSnapshot" },
+        { purpose: "get", command: "buc runs get {run_id} VariantSnapshot/{name}" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "Schedule", type: "integer", jsonPath: ".spec.schedule_idx", description: expect.any(String), priority: 0 },
@@ -2675,10 +2764,10 @@ describe("runtime repository worker snapshots", () => {
         },
       },
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind TrialStage" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} TrialStage/{name}" },
-        { purpose: "describe", command: "bucephalus-cloud run describe {run_id} TrialStage/{name}" },
-        { purpose: "events", command: "bucephalus-cloud run events {run_id} TrialStage/{name} --follow" },
+        { purpose: "list", command: "buc runs get {run_id} TrialStage" },
+        { purpose: "get", command: "buc runs get {run_id} TrialStage/{name}" },
+        { purpose: "describe", command: "buc runs describe {run_id} TrialStage/{name}" },
+        { purpose: "events", command: "buc runs events {run_id} TrialStage/{name}" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "Trial", type: "string", jsonPath: ".spec.trial_id", description: expect.any(String), priority: 0 },
@@ -2712,10 +2801,10 @@ describe("runtime repository worker snapshots", () => {
         },
       },
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind RuntimeValue" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} RuntimeValue/{name}" },
-        { purpose: "describe", command: "bucephalus-cloud run describe {run_id} RuntimeValue/{name}" },
-        { purpose: "events", command: "bucephalus-cloud run events {run_id} RuntimeValue/{name} --follow" },
+        { purpose: "list", command: "buc runs get {run_id} RuntimeValue" },
+        { purpose: "get", command: "buc runs get {run_id} RuntimeValue/{name}" },
+        { purpose: "describe", command: "buc runs describe {run_id} RuntimeValue/{name}" },
+        { purpose: "events", command: "buc runs events {run_id} RuntimeValue/{name}" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "Key", type: "string", jsonPath: ".spec.key", description: expect.any(String), priority: 0 },
@@ -2750,10 +2839,10 @@ describe("runtime repository worker snapshots", () => {
         },
       },
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind MetricObservation" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} MetricObservation/{name}" },
-        { purpose: "describe", command: "bucephalus-cloud run describe {run_id} MetricObservation/{name}" },
-        { purpose: "events", command: "bucephalus-cloud run events {run_id} MetricObservation/{name} --follow" },
+        { purpose: "list", command: "buc runs get {run_id} MetricObservation" },
+        { purpose: "get", command: "buc runs get {run_id} MetricObservation/{name}" },
+        { purpose: "describe", command: "buc runs describe {run_id} MetricObservation/{name}" },
+        { purpose: "events", command: "buc runs events {run_id} MetricObservation/{name}" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "Trial", type: "string", jsonPath: ".spec.trial_id", description: expect.any(String), priority: 0 },
@@ -2790,10 +2879,10 @@ describe("runtime repository worker snapshots", () => {
         },
       },
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind PerformanceSample" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} PerformanceSample/{name}" },
-        { purpose: "describe", command: "bucephalus-cloud run describe {run_id} PerformanceSample/{name}" },
-        { purpose: "events", command: "bucephalus-cloud run events {run_id} PerformanceSample/{name} --follow" },
+        { purpose: "list", command: "buc runs get {run_id} PerformanceSample" },
+        { purpose: "get", command: "buc runs get {run_id} PerformanceSample/{name}" },
+        { purpose: "describe", command: "buc runs describe {run_id} PerformanceSample/{name}" },
+        { purpose: "events", command: "buc runs events {run_id} PerformanceSample/{name}" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "Stage", type: "string", jsonPath: ".spec.stage", description: expect.any(String), priority: 0 },
@@ -2831,10 +2920,10 @@ describe("runtime repository worker snapshots", () => {
         },
       },
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind RuntimeOperation" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} RuntimeOperation/{name}" },
-        { purpose: "describe", command: "bucephalus-cloud run describe {run_id} RuntimeOperation/{name}" },
-        { purpose: "events", command: "bucephalus-cloud run events {run_id} RuntimeOperation/{name} --follow" },
+        { purpose: "list", command: "buc runs get {run_id} RuntimeOperation" },
+        { purpose: "get", command: "buc runs get {run_id} RuntimeOperation/{name}" },
+        { purpose: "describe", command: "buc runs describe {run_id} RuntimeOperation/{name}" },
+        { purpose: "events", command: "buc runs events {run_id} RuntimeOperation/{name}" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "Kind", type: "string", jsonPath: ".spec.op_kind", description: expect.any(String), priority: 0 },
@@ -2880,11 +2969,10 @@ describe("runtime repository worker snapshots", () => {
         },
       },
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind TrialArtifact" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} TrialArtifact/{name}" },
-        { purpose: "describe", command: "bucephalus-cloud run describe {run_id} TrialArtifact/{name}" },
-        { purpose: "events", command: "bucephalus-cloud run events {run_id} TrialArtifact/{name} --follow" },
-        { purpose: "content", command: "bucephalus-cloud run artifact {run_id} TrialArtifact/{name} --out FILE" },
+        { purpose: "list", command: "buc runs get {run_id} TrialArtifact" },
+        { purpose: "get", command: "buc runs get {run_id} TrialArtifact/{name}" },
+        { purpose: "describe", command: "buc runs describe {run_id} TrialArtifact/{name}" },
+        { purpose: "events", command: "buc runs events {run_id} TrialArtifact/{name}" },
       ]),
       printerColumns: expect.arrayContaining([
         { name: "Trial", type: "string", jsonPath: ".spec.trial_id", description: expect.any(String), priority: 0 },
@@ -2902,7 +2990,7 @@ describe("runtime repository worker snapshots", () => {
     });
     expect(discovery.resources.find((resource) => resource.kind === "PortForward")).toMatchObject({
       verbs: expect.arrayContaining(["create", "delete"]),
-      actions: ["cancel"],
+      actions: ["cancel", "complete"],
       supports: expect.objectContaining({ create: true, delete: true, actions: true }),
       pathTemplates: expect.objectContaining({
         collection: "/v1/runs/{run_id}/runtime/resources?kind=PortForward",
@@ -2911,26 +2999,41 @@ describe("runtime repository worker snapshots", () => {
         watch: "/v1/runs/{run_id}/runtime/resources/watch?kind=PortForward",
         create: "/v1/runs/{run_id}/runtime/resources/{target_kind}/{target_name}/port-forward",
         delete: "/v1/runs/{run_id}/runtime/resources/PortForward/{name}",
+        subresources: expect.objectContaining({
+          "actions/complete": "/v1/runs/{run_id}/runtime/resources/PortForward/{name}/actions/complete",
+        }),
       }),
       exampleCommands: expect.arrayContaining([
-        { purpose: "list", command: "bucephalus-cloud run resources {run_id} --kind PortForward" },
-        { purpose: "watch/not-ready", command: "bucephalus-cloud run watch {run_id} --kind PortForward --field-selector status.conditions.Ready!=True" },
-        { purpose: "watch/client-unreachable", command: "bucephalus-cloud run watch {run_id} --kind PortForward --field-selector status.conditions.ClientReachable!=True" },
-        { purpose: "get", command: "bucephalus-cloud run get {run_id} PortForward/{name}" },
-        { purpose: "events", command: "bucephalus-cloud run events {run_id} PortForward/{name} --follow" },
-        { purpose: "delete", command: "bucephalus-cloud run delete {run_id} PortForward/{name}" },
-        { purpose: "cancel", command: "bucephalus-cloud run cancel {run_id} PortForward/{name}" },
+        { purpose: "list", command: "buc runs get {run_id} PortForward" },
+        { purpose: "watch/not-ready", command: "buc runs watch {run_id} --kind PortForward --field-selector status.conditions.Ready!=True" },
+        { purpose: "watch/client-unreachable", command: "buc runs watch {run_id} --kind PortForward --field-selector status.conditions.ClientReachable!=True" },
+        { purpose: "get", command: "buc runs get {run_id} PortForward/{name}" },
+        { purpose: "events", command: "buc runs events {run_id} PortForward/{name}" },
+        { purpose: "delete", command: "buc runs delete {run_id} PortForward/{name} --resource-version <metadata.resourceVersion>" },
+        { purpose: "wait/delete", command: "buc runs wait {run_id} PortForward/{name} --for delete" },
+        { purpose: "cancel", command: "buc runs cancel {run_id} PortForward/{name} --resource-version <metadata.resourceVersion>" },
+        { purpose: "complete", command: "buc runs complete {run_id} PortForward/{name} --resource-version <metadata.resourceVersion>" },
       ]),
       printerColumns: expect.arrayContaining([
+        { name: "Target", type: "string", jsonPath: ".spec.target_ref.name", description: expect.any(String), priority: 0 },
+        { name: "TargetKind", type: "string", jsonPath: ".spec.target_ref.kind", description: expect.any(String), priority: 1 },
+        { name: "TargetRV", type: "string", jsonPath: ".spec.target_ref.resourceVersion", description: expect.any(String), priority: 1 },
         { name: "TargetPort", type: "integer", jsonPath: ".spec.target_port", description: expect.any(String), priority: 0 },
         { name: "LocalPort", type: "integer", jsonPath: ".spec.local_port", description: expect.any(String), priority: 0 },
         { name: "ClientReachable", type: "string", jsonPath: '.status.conditions[?(@.type=="ClientReachable")].status', description: expect.any(String), priority: 0 },
+        { name: "Runner", type: "string", jsonPath: ".status.runner_binding.runner_instance_id", description: expect.any(String), priority: 0 },
+        { name: "Worker", type: "string", jsonPath: ".status.runner_binding.worker_id", description: expect.any(String), priority: 1 },
+        { name: "Requester", type: "string", jsonPath: ".audit.requester", description: expect.any(String), priority: 1 },
+        { name: "Mode", type: "string", jsonPath: ".status.connection.mode", description: expect.any(String), priority: 1 },
+        { name: "ProviderTunnel", type: "string", jsonPath: ".status.connection.provider_tunnel_url", description: expect.any(String), priority: 1 },
+        { name: "Expires", type: "date", jsonPath: ".status.expires_at", description: expect.any(String), priority: 1 },
         { name: "Connection", type: "string", jsonPath: ".status.connection", description: expect.any(String), priority: 1 },
       ]),
       labelSelectors: expect.arrayContaining([
         "bucephalus.dev/run-id",
         "bucephalus.dev/runner-instance-id",
         "bucephalus.dev/attempt-id",
+        "bucephalus.dev/worker-id",
         "bucephalus.dev/resource-kind",
         "bucephalus.dev/resource-name",
       ]),
@@ -2949,32 +3052,86 @@ describe("runtime repository worker snapshots", () => {
         }),
       }),
       exampleCommands: expect.arrayContaining([
-        { purpose: "logs/stdout", command: "bucephalus-cloud run logs {run_id} Exec/{name} --stream stdout --follow" },
+        { purpose: "delete", command: "buc runs delete {run_id} Exec/{name} --resource-version <metadata.resourceVersion>" },
+        { purpose: "wait/delete", command: "buc runs wait {run_id} Exec/{name} --for delete" },
+      ]),
+      printerColumns: expect.arrayContaining([
+        { name: "Target", type: "string", jsonPath: ".spec.target_ref.name", description: expect.any(String), priority: 0 },
+        { name: "TargetKind", type: "string", jsonPath: ".spec.target_ref.kind", description: expect.any(String), priority: 1 },
+        { name: "TargetRV", type: "string", jsonPath: ".spec.target_ref.resourceVersion", description: expect.any(String), priority: 1 },
+        { name: "Command", type: "string", jsonPath: ".spec.command", description: expect.any(String), priority: 0 },
+        { name: "Exit", type: "integer", jsonPath: ".status.connection.exit_code", description: expect.any(String), priority: 0 },
+        { name: "StdoutBytes", type: "integer", jsonPath: ".status.connection.stdout_bytes", description: expect.any(String), priority: 1 },
+        { name: "StdoutTailBytes", type: "integer", jsonPath: ".status.connection.stdout_tail_bytes", description: expect.any(String), priority: 1 },
+        { name: "StdoutTruncated", type: "boolean", jsonPath: ".status.connection.stdout_tail_truncated", description: expect.any(String), priority: 1 },
+        { name: "StderrBytes", type: "integer", jsonPath: ".status.connection.stderr_bytes", description: expect.any(String), priority: 1 },
+        { name: "StderrTailBytes", type: "integer", jsonPath: ".status.connection.stderr_tail_bytes", description: expect.any(String), priority: 1 },
+        { name: "StderrTruncated", type: "boolean", jsonPath: ".status.connection.stderr_tail_truncated", description: expect.any(String), priority: 1 },
+        { name: "Runner", type: "string", jsonPath: ".status.runner_binding.runner_instance_id", description: expect.any(String), priority: 0 },
+        { name: "Worker", type: "string", jsonPath: ".status.runner_binding.worker_id", description: expect.any(String), priority: 1 },
+        { name: "Requester", type: "string", jsonPath: ".audit.requester", description: expect.any(String), priority: 1 },
+        { name: "Mode", type: "string", jsonPath: ".status.connection.mode", description: expect.any(String), priority: 1 },
+        { name: "Expires", type: "date", jsonPath: ".status.expires_at", description: expect.any(String), priority: 1 },
+      ]),
+      labelSelectors: expect.arrayContaining([
+        "bucephalus.dev/run-id",
+        "bucephalus.dev/runner-instance-id",
+        "bucephalus.dev/attempt-id",
+        "bucephalus.dev/worker-id",
+        "bucephalus.dev/resource-kind",
+        "bucephalus.dev/resource-name",
       ]),
       count: 0,
     });
-    expect(discovery.resources.find((resource) => resource.kind === "Event")).toMatchObject({
+    const eventDiscovery = discovery.resources.find((resource) => resource.kind === "Event");
+    expect(eventDiscovery).toBeDefined();
+    expect(eventDiscovery).toMatchObject({
       name: "events",
       singularName: "event",
       shortNames: ["ev"],
       categories: ["observability"],
-      verbs: expect.arrayContaining(["list", "get", "watch", "describe"]),
-      printerColumns: expect.arrayContaining([
-        { name: "Type", type: "string", jsonPath: ".spec.event_type", description: expect.any(String), priority: 0 },
-        { name: "Seq", type: "integer", jsonPath: ".spec.row_seq", description: expect.any(String), priority: 0 },
-        { name: "Message", type: "string", jsonPath: ".status.message", description: expect.any(String), priority: 1 },
-      ]),
-      labelSelectors: expect.arrayContaining([
-        "bucephalus.dev/run-id",
-        "bucephalus.dev/core-run-id",
-        "bucephalus.dev/trial-id",
-        "bucephalus.dev/event-type",
-        "bucephalus.dev/event-source",
-        "bucephalus.dev/resource-kind",
-        "bucephalus.dev/resource-name",
-      ]),
       count: 1,
     });
+    for (const verb of ["list", "get", "watch", "describe"]) {
+      expect(eventDiscovery?.verbs).toContain(verb);
+    }
+    const eventColumns = eventDiscovery?.printerColumns ?? [];
+    for (const expectedColumn of [
+      { name: "Involved", type: "string", jsonPath: ".status.involved", priority: 0 },
+      { name: "Type", type: "string", jsonPath: ".spec.event_type", priority: 0 },
+      { name: "Seq", type: "integer", jsonPath: ".spec.row_seq", priority: 0 },
+      { name: "InvolvedKind", type: "string", jsonPath: ".status.involved_kind", priority: 1 },
+      { name: "Message", type: "string", jsonPath: ".status.message", priority: 1 },
+    ]) {
+      expect(eventColumns.find((column) => column.name === expectedColumn.name)).toMatchObject({
+        ...expectedColumn,
+        description: expect.any(String),
+      });
+    }
+    for (const label of [
+      "bucephalus.dev/run-id",
+      "bucephalus.dev/core-run-id",
+      "bucephalus.dev/trial-id",
+      "bucephalus.dev/event-type",
+      "bucephalus.dev/event-source",
+      "bucephalus.dev/resource-kind",
+      "bucephalus.dev/resource-name",
+    ]) {
+      expect(eventDiscovery?.labelSelectors).toContain(label);
+    }
+    expect(eventDiscovery?.fieldSelectors).toEqual(expect.arrayContaining([
+      "spec.event_type",
+      "spec.source",
+      "spec.row_seq",
+      "spec.involved_object.kind",
+      "spec.involved_object.name",
+      "spec.involved_object.uid",
+      "status.involved",
+      "status.involved_kind",
+      "status.involved_name",
+      "status.involved_uid",
+      "status.involved_count",
+    ]));
   });
 
   test("explains one runtime API resource kind through server-side alias resolution", () => {
@@ -2984,7 +3141,10 @@ describe("runtime repository worker snapshots", () => {
       runtimeResourceFixture({ kind: "RunnerInstance", name: "runner-1" }),
     ];
 
-    expect(runtimeApiResourceForKind("run-1", resources, "container")).toMatchObject({
+    expect(runtimeApiResourceForKind("run-1", resources, "container", ["core-run-1"])).toMatchObject({
+      cloud_run_id: "run-1",
+      generated_at: expect.any(String),
+      core_run_ids: ["core-run-1"],
       kind: "TrialContainer",
       name: "trialcontainers",
       singularName: "trialcontainer",
@@ -2997,7 +3157,10 @@ describe("runtime repository worker snapshots", () => {
       fieldSelectors: expect.arrayContaining(["kind", "status.conditions.<type>"]),
       labelSelectors: expect.arrayContaining(["bucephalus.dev/trial-id"]),
     });
-    expect(runtimeApiResourceForKind("run-1", resources, "runner-instance")).toMatchObject({
+    expect(runtimeApiResourceForKind("run-1", resources, "runner-instance", ["core-run-1"])).toMatchObject({
+      cloud_run_id: "run-1",
+      generated_at: expect.any(String),
+      core_run_ids: ["core-run-1"],
       kind: "RunnerInstance",
       name: "runnerinstances",
       count: 1,
@@ -3203,7 +3366,7 @@ describe("runtime repository worker snapshots", () => {
     const observedInputs: Record<string, unknown>[] = [];
     const observedEventInputs: unknown[] = [];
 
-    const repository = {
+    const repository = Object.assign(Object.create(RuntimeRepository.prototype), {
       async resources(_cloudRunId: string, _run: unknown, input: Record<string, unknown>) {
         observedInputs.push(input);
         return {
@@ -3252,7 +3415,7 @@ describe("runtime repository worker snapshots", () => {
         ];
         return [];
       },
-    };
+    });
 
     const metrics = await RuntimeRepository.prototype.resourceMetricsList.call(repository, "run-1", cloudRunRecord(), {
       kinds: ["RunnerInstance", "Trial"],
@@ -3353,12 +3516,27 @@ describe("runtime repository worker snapshots", () => {
       event_type: "runtime.access.port_forward.requested",
       payload: {
         message: "Port forward requested",
-        resource_ref: {
+        access_request_id: "pf-1",
+        kind: "port_forward",
+        access_resource_ref: {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "PortForward",
+          name: "pf-1",
+          uid: "pf-1",
+        },
+        target_ref: {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RunnerInstance",
+          name: "runner-instance-1",
+        },
+        resolved_target: {
           apiVersion: "bucephalus.dev/v1alpha1",
           kind: "RunnerInstance",
           name: "runner-instance-1",
           uid: "runner-instance-1",
         },
+        resource_kind: "RunnerInstance",
+        resource_name: "runner-instance-1",
       },
     });
     const repository = {
@@ -3409,8 +3587,8 @@ describe("runtime repository worker snapshots", () => {
           "bucephalus.dev/run-id": "run-1",
           "bucephalus.dev/core-run-id": "core-run-1",
           "bucephalus.dev/event-type": "runtime.access.port_forward.requested",
-          "bucephalus.dev/resource-kind": "RunnerInstance",
-          "bucephalus.dev/resource-name": "runner-instance-1",
+          "bucephalus.dev/resource-kind": "PortForward",
+          "bucephalus.dev/resource-name": "pf-1",
         },
         annotations: {
           "bucephalus.dev/event-type": "runtime.access.port_forward.requested",
@@ -3418,6 +3596,7 @@ describe("runtime repository worker snapshots", () => {
         },
         ownerReferences: expect.arrayContaining([
           expect.objectContaining({ kind: "Run", name: "run-1", uid: "run-1" }),
+          expect.objectContaining({ kind: "PortForward", name: "pf-1", uid: "pf-1" }),
           expect.objectContaining({ kind: "RunnerInstance", name: "runner-instance-1", uid: "runner-instance-1" }),
         ]),
       },
@@ -3425,9 +3604,12 @@ describe("runtime repository worker snapshots", () => {
         event_type: "runtime.access.port_forward.requested",
         source: "cloud.run_events",
         row_seq: 7,
-        resource_refs: expect.arrayContaining([
-          expect.objectContaining({ kind: "RunnerInstance", name: "runner-instance-1", uid: "runner-instance-1" }),
-        ]),
+        involved_object: {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "PortForward",
+          name: "pf-1",
+          uid: "pf-1",
+        },
         payload: {
           message: "Port forward requested",
         },
@@ -3436,6 +3618,17 @@ describe("runtime repository worker snapshots", () => {
         phase: "recorded",
         reason: "RuntimeAccessPortForwardRequested",
         message: "Port forward requested",
+        involved: "PortForward/pf-1",
+        involved_object: {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "PortForward",
+          name: "pf-1",
+          uid: "pf-1",
+        },
+        involved_kind: "PortForward",
+        involved_name: "pf-1",
+        involved_uid: "pf-1",
+        involved_count: 2,
       },
       audit: {
         source: "cloud.run_events",
@@ -3451,6 +3644,31 @@ describe("runtime repository worker snapshots", () => {
       fieldSelector: "spec.event_type=runtime.access.port_forward.requested",
     });
     expect(filtered.resources.map((resource) => resource.metadata.name)).toEqual([eventName]);
+    expect(eventResource.spec.involved_resources).toEqual([
+      expect.objectContaining({ kind: "PortForward", name: "pf-1", uid: "pf-1" }),
+      expect.objectContaining({ kind: "RunnerInstance", name: "runner-instance-1", uid: "runner-instance-1" }),
+    ]);
+    expect(eventResource.spec.resource_refs).toEqual([
+      expect.objectContaining({ kind: "PortForward", name: "pf-1", uid: "pf-1" }),
+      expect.objectContaining({ kind: "RunnerInstance", name: "runner-instance-1", uid: "runner-instance-1" }),
+    ]);
+    for (const involvedSelector of [
+      "status.involved=PortForward/pf-1",
+      "status.involved_kind=PortForward,status.involved_name=pf-1",
+      "status.involved_uid=pf-1",
+      "spec.involved_object.kind=PortForward,spec.involved_object.name=pf-1",
+    ]) {
+      const filteredByInvolved = await RuntimeRepository.prototype.resources.call(repository, "run-1", run, {
+        kinds: ["Event"],
+        fieldSelector: involvedSelector,
+      });
+      expect(filteredByInvolved.resources.map((resource) => resource.metadata.name)).toEqual([eventName]);
+    }
+    const unrelatedInvolved = await RuntimeRepository.prototype.resources.call(repository, "run-1", run, {
+      kinds: ["Event"],
+      fieldSelector: "status.involved=RunnerInstance/runner-instance-1",
+    });
+    expect(unrelatedInvolved.resources).toEqual([]);
 
     const described = await RuntimeRepository.prototype.describeResource.call({
       async resources() {
@@ -3464,14 +3682,14 @@ describe("runtime repository worker snapshots", () => {
       kind: "Event",
       name: eventName,
     });
-    expect(described.event_list.events).toEqual([
-      expect.objectContaining({
-        row_seq: auditEvent.row_seq,
-        event_type: auditEvent.event_type,
-        resource_refs: expect.arrayContaining([
-          expect.objectContaining({ kind: "RunnerInstance", name: "runner-instance-1", uid: "runner-instance-1" }),
-        ]),
-      }),
+    expect(described.event_list.events).toHaveLength(1);
+    expect(described.event_list.events[0]).toMatchObject({
+      row_seq: auditEvent.row_seq,
+      event_type: auditEvent.event_type,
+    });
+    expect(described.event_list.events[0]?.resource_refs).toEqual([
+      expect.objectContaining({ kind: "PortForward", name: "pf-1", uid: "pf-1" }),
+      expect.objectContaining({ kind: "RunnerInstance", name: "runner-instance-1", uid: "runner-instance-1" }),
     ]);
     expect(described.event_list).toMatchObject({
       apiVersion: "bucephalus.dev/v1alpha1",
@@ -3503,6 +3721,106 @@ describe("runtime repository worker snapshots", () => {
       { relationship: "owner", kind: "Run", name: "run-1" },
       { relationship: "owner", kind: "RunnerInstance", name: "runner-instance-1" },
     ]));
+  });
+
+  test("projects inspect bundle audit events onto the run resource", async () => {
+    const run = cloudRunRecord();
+    const inspectEvent = runtimeEvent({
+      source: "cloud.run_events",
+      core_run_id: "",
+      trial_id: "",
+      task_id: "",
+      row_seq: 15,
+      seq: 15,
+      event_type: "runtime.inspect.bundle.read",
+      payload: {
+        operation: "inspect",
+        requester: "issuer:user-a",
+        resource_ref: {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "Run",
+          name: "run-1",
+          uid: "run-1",
+        },
+        resource_filter: {
+          kinds: ["RunnerInstance", "Trial"],
+          categories: ["access-target"],
+        },
+        event_limit: 250,
+        inventory_resource_version: "sha256:inspect-inventory",
+        event_resource_version: "event-row-seq:42",
+        log_refs: 6,
+      },
+    });
+    const repository = Object.assign(Object.create(RuntimeRepository.prototype), {
+      async coreRunIdsForCloudRun() {
+        return [];
+      },
+      async workerRuntimeSnapshots() {
+        return [];
+      },
+      async runAttempts() {
+        return [];
+      },
+      async provisionRequests() {
+        return [];
+      },
+      async listPortForwards() {
+        return [];
+      },
+      async listExecRequests() {
+        return [];
+      },
+      async runnerPools() {
+        return [];
+      },
+      async scheduleSlots() {
+        return [];
+      },
+      async trialContainers() {
+        return [];
+      },
+      async eventRows() {
+        return [inspectEvent];
+      },
+    }) as any;
+
+    const inventory = await RuntimeRepository.prototype.resources.call(repository, "run-1", run, {
+      kinds: ["Event"],
+    });
+    const eventResource = inventory.resources.find((resource) => resource.kind === "Event");
+    expect(eventResource).toMatchObject({
+      metadata: {
+        labels: {
+          "bucephalus.dev/event-type": "runtime.inspect.bundle.read",
+          "bucephalus.dev/resource-kind": "Run",
+          "bucephalus.dev/resource-name": "run-1",
+        },
+        ownerReferences: expect.arrayContaining([
+          expect.objectContaining({ kind: "Run", name: "run-1", uid: "run-1" }),
+        ]),
+      },
+      spec: {
+        event_type: "runtime.inspect.bundle.read",
+        resource_refs: expect.arrayContaining([
+          expect.objectContaining({ kind: "Run", name: "run-1", uid: "run-1" }),
+        ]),
+      },
+    });
+
+    const runEvents = await RuntimeRepository.prototype.resourceEvents.call(repository, "run-1", run, {
+      kind: "Run",
+      name: "run-1",
+      limit: 10,
+    });
+    expect(runEvents.events).toEqual([
+      expect.objectContaining({
+        event_type: "runtime.inspect.bundle.read",
+        resource_refs: expect.arrayContaining([
+          expect.objectContaining({ kind: "Run", name: "run-1", uid: "run-1" }),
+        ]),
+      }),
+    ]);
   });
 
   test("scopes ordinary resource describe event scans to the selected resource identity", async () => {
@@ -3569,10 +3887,28 @@ describe("runtime repository worker snapshots", () => {
 
   test("builds runtime inspect bundles with inventory, events, discovery, and log refs", async () => {
     const run = cloudRunRecord();
-    const observed: { filter?: unknown; eventInputs: Array<{ limit?: number | undefined; resourceKind?: string | undefined; resourceName?: string | undefined }> } = {
+    const observed: {
+      filter?: unknown;
+      eventInputs: Array<{ limit?: number | undefined; resourceKind?: string | undefined; resourceName?: string | undefined }>;
+      eventInsertValues?: unknown[];
+      jsonPayloads: JsonObject[];
+    } = {
       eventInputs: [],
+      jsonPayloads: [],
+    };
+    const sql = ((strings: TemplateStringsArray, ...values: unknown[]) => {
+      const query = strings.raw.join(" ");
+      if (query.includes("insert into cloud.run_events")) {
+        observed.eventInsertValues = values;
+      }
+      return [];
+    }) as any;
+    sql.json = (payload: JsonObject) => {
+      observed.jsonPayloads.push(payload);
+      return payload;
     };
     const bundle = await RuntimeRepository.prototype.inspectBundle.call({
+      sql,
       async resources(cloudRunId: string, _run: unknown, input: unknown) {
         observed.filter = input;
         return {
@@ -3687,8 +4023,10 @@ describe("runtime repository worker snapshots", () => {
     } as any, "run-1", run, {
       eventLimit: 25,
       kinds: ["RunnerInstance", "Trial"],
+      categories: ["access-target"],
       labelSelector: "bucephalus.dev/run-id=run-1",
       fieldSelector: "status.phase!=completed",
+      requester: "issuer:user-a",
     });
 
     expect(observed.eventInputs[0]).toEqual({ limit: 26 });
@@ -3701,6 +4039,7 @@ describe("runtime repository worker snapshots", () => {
     ]);
     expect(observed.filter).toEqual({
       kinds: ["RunnerInstance", "Trial"],
+      categories: ["access-target"],
       labelSelector: "bucephalus.dev/run-id=run-1",
       fieldSelector: "status.phase!=completed",
     });
@@ -3711,11 +4050,15 @@ describe("runtime repository worker snapshots", () => {
       generated_at: expect.any(String),
       resource_filter: {
         kinds: ["RunnerInstance", "Trial"],
+        categories: ["access-target"],
         label_selector: "bucephalus.dev/run-id=run-1",
         field_selector: "status.phase!=completed",
       },
       api_resources: {
         kind: "RuntimeApiResourceList",
+        cloud_run_id: "run-1",
+        generated_at: expect.any(String),
+        core_run_ids: ["core-run-1"],
         resources: expect.arrayContaining([
           expect.objectContaining({ kind: "RunnerInstance", count: 1 }),
           expect.objectContaining({ kind: "RunnerAttempt", count: 1 }),
@@ -3843,6 +4186,103 @@ describe("runtime repository worker snapshots", () => {
           },
         },
       ]),
+    });
+    expect(observed.eventInsertValues).toContain("runtime.inspect.bundle.read");
+    expect(observed.jsonPayloads[0]).toMatchObject({
+      operation: "inspect",
+      requester: "issuer:user-a",
+      resource_ref: {
+        apiVersion: "bucephalus.dev/v1alpha1",
+        kind: "Run",
+        name: "run-1",
+        uid: "run-1",
+      },
+      resource_filter: {
+        kinds: ["RunnerInstance", "Trial"],
+        categories: ["access-target"],
+        label_selector: "bucephalus.dev/run-id=run-1",
+        field_selector: "status.phase!=completed",
+      },
+      event_limit: 25,
+      inventory_resource_version: "sha256:inspect-inventory",
+      inventory_total: 1,
+      inventory_returned: 1,
+      event_resource_version: "event-row-seq:1",
+      event_returned: 1,
+      event_next_after_row_seq: 1,
+      api_resources_returned: expect.any(Number),
+      health_summary: {
+        total: 5,
+      },
+      metrics_summary: {
+        resources_total: 5,
+        resources_returned: 5,
+        events_total: 5,
+      },
+      log_refs: 4,
+    });
+  });
+
+  test("audits failed runtime inspect bundle reads with requester, filters, and error provenance", async () => {
+    const observed: {
+      eventInsertValues?: unknown[];
+      jsonPayloads: JsonObject[];
+    } = {
+      jsonPayloads: [],
+    };
+    const sql = ((strings: TemplateStringsArray, ...values: unknown[]) => {
+      const query = strings.raw.join(" ");
+      if (query.includes("insert into cloud.run_events")) {
+        observed.eventInsertValues = values;
+      }
+      return [];
+    }) as any;
+    sql.json = (payload: JsonObject) => {
+      observed.jsonPayloads.push(payload);
+      return payload;
+    };
+
+    await expect(RuntimeRepository.prototype.inspectBundle.call({
+      sql,
+      async resources() {
+        throw new HttpError(503, "runtime_inventory_unavailable", "Runtime inventory unavailable");
+      },
+      async eventRows() {
+        return [];
+      },
+    } as any, "run-1", cloudRunRecord(), {
+      eventLimit: 25,
+      kinds: ["RunnerInstance", "Trial"],
+      categories: ["access-target"],
+      labelSelector: "bucephalus.dev/run-id=run-1",
+      fieldSelector: "status.phase!=completed",
+      requester: "issuer:user-a",
+    })).rejects.toMatchObject({
+      status: 503,
+      code: "runtime_inventory_unavailable",
+    });
+
+    expect(observed.eventInsertValues).toContain("runtime.inspect.bundle.read.failed");
+    expect(observed.jsonPayloads[0]).toMatchObject({
+      operation: "inspect",
+      status: "failed",
+      requester: "issuer:user-a",
+      resource_ref: {
+        apiVersion: "bucephalus.dev/v1alpha1",
+        kind: "Run",
+        name: "run-1",
+        uid: "run-1",
+      },
+      resource_filter: {
+        kinds: ["RunnerInstance", "Trial"],
+        categories: ["access-target"],
+        label_selector: "bucephalus.dev/run-id=run-1",
+        field_selector: "status.phase!=completed",
+      },
+      event_limit: 25,
+      error_code: "runtime_inventory_unavailable",
+      error_status: 503,
+      error_message: "Runtime inventory unavailable",
     });
   });
 
@@ -4061,6 +4501,11 @@ describe("runtime repository worker snapshots", () => {
     );
 
     expect(initial.kind).toBe("RuntimeResourceWatchList");
+    expect(initial.cloud_run_id).toBe("run-1");
+    expect(initial.generated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(initial.core_run_ids).toEqual(["core-run-1"]);
+    expect(initial.resource_inventory.cloud_run_id).toBe("run-1");
+    expect(initial.resource_inventory.core_run_ids).toEqual(["core-run-1"]);
     expect(initial.resource_versions["runnerinstance/runner-1"]).toMatch(/^sha256:/);
     expect(initial.events.map((event) => event.type)).toEqual(["ADDED", "ADDED"]);
     expect(initial.events[0]?.resource_ref).toMatchObject({ kind: "RunnerInstance", name: "runner-1" });
@@ -4079,6 +4524,28 @@ describe("runtime repository worker snapshots", () => {
     expect(unchanged.resource_versions).toEqual(initial.resource_versions);
     expect(unchanged.events).toEqual([]);
     expect(unchanged.resource_inventory.metadata.resourceVersion).toBe("sha256:inventory");
+
+    const bookmarked = await RuntimeRepository.prototype.watchResources.call(
+      runtime,
+      "run-1",
+      cloudRunRecord(),
+      {
+        resourceVersion: "sha256:inventory",
+        allowBookmarks: true,
+      },
+    );
+
+    expect(bookmarked.resource_versions).toEqual(initial.resource_versions);
+    expect(bookmarked.events).toEqual([{
+      type: "BOOKMARK",
+      resource_ref: {
+        apiVersion: "bucephalus.dev/v1alpha1",
+        kind: "RuntimeResourceList",
+        name: "run-1",
+      },
+      resource_version: "sha256:inventory",
+    }]);
+    expect(bookmarked.resource_inventory.metadata.resourceVersion).toBe("sha256:inventory");
 
     const next = await RuntimeRepository.prototype.watchResources.call(
       runtime,
@@ -4103,6 +4570,311 @@ describe("runtime repository worker snapshots", () => {
       type: "DELETED",
       resource_ref: { kind: "Exec", name: "deleted" },
       previous_resource_version: "sha256:gone",
+    });
+  });
+
+  test("audits runtime API discovery reads with requester and catalog provenance", async () => {
+    const { sql, inserts } = captureRunEventsSql();
+    const runner = runtimeResourceFixture({
+      kind: "RunnerInstance",
+      name: "runner-1",
+      resourceVersion: "sha256:runner-rv",
+    });
+    const inventory = {
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "RuntimeResourceList",
+      metadata: runtimeResourceListMetadataFixture(),
+      cloud_run_id: "run-1",
+      core_run_ids: ["core-run-1"],
+      resources: [runner],
+    };
+    const host = {
+      sql,
+      async resources() {
+        return inventory;
+      },
+    } as any;
+
+    const list = await RuntimeRepository.prototype.apiResources.call(host, "run-1", cloudRunRecord(), {
+      requester: "issuer:user-a",
+    });
+    const resource = await RuntimeRepository.prototype.apiResource.call(host, "run-1", cloudRunRecord(), "runner", {
+      requester: "issuer:user-a",
+    });
+
+    expect(resource.kind).toBe("RunnerInstance");
+    expect(inserts).toHaveLength(2);
+    expect(inserts[0]).toMatchObject({
+      runId: "run-1",
+      attemptId: null,
+      eventType: "runtime.api_resources.read",
+      payload: {
+        operation: "api-resources",
+        requester: "issuer:user-a",
+        resource_kind: "Run",
+        resource_name: "run-1",
+        resource_uid: "run-1",
+        api_resources_returned: list.resources.length,
+        core_run_ids: ["core-run-1"],
+      },
+    });
+    expect(inserts[0]?.payload.resource_ref).toMatchObject({
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "Run",
+      name: "run-1",
+    });
+    expect(inserts[1]).toMatchObject({
+      runId: "run-1",
+      eventType: "runtime.api_resources.read",
+      payload: {
+        operation: "api-resource",
+        requester: "issuer:user-a",
+        selected_kind: "runner",
+        api_resource_kind: "RunnerInstance",
+        api_resource_name: "runnerinstances",
+        api_resource_categories: expect.arrayContaining(["runner", "access-target"]),
+        api_resource_verbs: expect.arrayContaining(["list", "get", "watch", "describe"]),
+        api_resource_subresources: expect.arrayContaining(["logs", "port-forward", "exec"]),
+        api_resource_actions: expect.arrayContaining(["cordon", "drain", "uncordon"]),
+        api_resource_access: expect.arrayContaining(["logs", "port-forward", "exec"]),
+        api_resource_count: 1,
+        core_run_ids: ["core-run-1"],
+      },
+    });
+  });
+
+  test("audits failed runtime API discovery reads with requested kind and error provenance", async () => {
+    const { sql, inserts } = captureRunEventsSql();
+    await expect(RuntimeRepository.prototype.apiResource.call({
+      sql,
+      async resources() {
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceList",
+          metadata: runtimeResourceListMetadataFixture(),
+          cloud_run_id: "run-1",
+          core_run_ids: [],
+          resources: [],
+        };
+      },
+    } as any, "run-1", cloudRunRecord(), "missing-kind", {
+      requester: "issuer:user-a",
+    })).rejects.toMatchObject({
+      status: 404,
+      code: "runtime_api_resource_not_found",
+    });
+
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]).toMatchObject({
+      runId: "run-1",
+      attemptId: null,
+      eventType: "runtime.api_resources.read.failed",
+      payload: {
+        operation: "api-resource",
+        status: "failed",
+        requester: "issuer:user-a",
+        resource_kind: "Run",
+        resource_name: "run-1",
+        selected_kind: "missing-kind",
+        error_code: "runtime_api_resource_not_found",
+        error_status: 404,
+        error_message: "Runtime API resource kind not found: missing-kind",
+      },
+    });
+  });
+
+  test("audits runtime resource list reads with requester and selector provenance", async () => {
+    const { sql, inserts } = captureRunEventsSql();
+    const list = await RuntimeRepository.prototype.resources.call({
+      sql,
+      async coreRunIdsForCloudRun() {
+        return [];
+      },
+      async workerRuntimeSnapshots() {
+        return [];
+      },
+      async runAttempts() {
+        return [];
+      },
+      async provisionRequests() {
+        return [];
+      },
+      async listPortForwards() {
+        return [];
+      },
+      async listExecRequests() {
+        return [];
+      },
+      async eventRows() {
+        return [];
+      },
+      async runnerPools() {
+        return [];
+      },
+      async scheduleSlots() {
+        return [];
+      },
+      async trialContainers() {
+        return [];
+      },
+    } as any, "run-1", cloudRunRecord(), {
+      kinds: ["RunnerInstance"],
+      categories: ["runner", "access-target"],
+      labelSelector: "bucephalus.dev/run-id=run-1",
+      fieldSelector: "status.access.exec=true",
+      limit: 10,
+      requester: "issuer:user-a",
+    });
+
+    expect(list.kind).toBe("RuntimeResourceList");
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]).toMatchObject({
+      runId: "run-1",
+      attemptId: null,
+      eventType: "runtime.resource.list.read",
+      payload: {
+        operation: "list",
+        requester: "issuer:user-a",
+        resource_kind: "Run",
+        resource_name: "run-1",
+        resource_uid: "run-1",
+        resource_filter: {
+          kinds: ["RunnerInstance"],
+          categories: ["runner", "access-target"],
+          label_selector: "bucephalus.dev/run-id=run-1",
+          field_selector: "status.access.exec=true",
+        },
+        limit: 10,
+        resource_version: list.metadata.resourceVersion,
+        total: list.metadata.total,
+        returned: list.metadata.returned,
+        remaining: list.metadata.remainingItemCount,
+      },
+    });
+    expect(inserts[0]?.payload.resource_ref).toMatchObject({
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "Run",
+      name: "run-1",
+    });
+  });
+
+  test("audits runtime resource watch reads with cursor provenance", async () => {
+    const { sql, inserts } = captureRunEventsSql();
+    const runner = runtimeResourceFixture({
+      kind: "RunnerInstance",
+      name: "runner-1",
+      resourceVersion: "sha256:runner-rv",
+    });
+    const watch = await RuntimeRepository.prototype.watchResources.call({
+      sql,
+      async resources() {
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceList",
+          metadata: {
+            resourceVersion: "sha256:inventory",
+            continue: null,
+            remainingItemCount: 0,
+            total: 1,
+            returned: 1,
+          },
+          cloud_run_id: "run-1",
+          core_run_ids: ["core-run-1"],
+          resources: [runner],
+        };
+      },
+    } as any, "run-1", cloudRunRecord(), {
+      filter: {
+        kinds: ["RunnerInstance"],
+        categories: ["runner"],
+        fieldSelector: "status.phase=online",
+      },
+      resourceVersion: "sha256:inventory",
+      knownResourceVersions: new Map([["runnerinstance/runner-1", "sha256:runner-rv"]]),
+      allowBookmarks: true,
+      requester: "issuer:user-a",
+    });
+
+    expect(watch.events).toEqual([{
+      type: "BOOKMARK",
+      resource_ref: {
+        apiVersion: "bucephalus.dev/v1alpha1",
+        kind: "RuntimeResourceList",
+        name: "run-1",
+      },
+      resource_version: "sha256:inventory",
+    }]);
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]).toMatchObject({
+      runId: "run-1",
+      eventType: "runtime.resource.watch.read",
+      payload: {
+        operation: "watch",
+        requester: "issuer:user-a",
+        resource_kind: "Run",
+        resource_name: "run-1",
+        resource_version: "sha256:inventory",
+        resource_filter: {
+          kinds: ["RunnerInstance"],
+          categories: ["runner"],
+          field_selector: "status.phase=online",
+        },
+        resource_version_cursor: "sha256:inventory",
+        known_resources: 1,
+        allow_bookmarks: true,
+        total: 1,
+        returned: 1,
+        watch_events_returned: 1,
+      },
+    });
+  });
+
+  test("audits failed runtime resource describe reads with requester and target identity", async () => {
+    const { sql, inserts } = captureRunEventsSql();
+    await expect(RuntimeRepository.prototype.describeResource.call({
+      sql,
+      async resources() {
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceList",
+          metadata: runtimeResourceListMetadataFixture(),
+          cloud_run_id: "run-1",
+          core_run_ids: [],
+          resources: [],
+        };
+      },
+      async eventRows() {
+        return [];
+      },
+    } as any, "run-1", cloudRunRecord(), {
+      kind: "Trial",
+      name: "missing-trial",
+      requester: "issuer:user-a",
+    })).rejects.toMatchObject({
+      status: 404,
+      code: "runtime_resource_not_found",
+    });
+
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]).toMatchObject({
+      runId: "run-1",
+      attemptId: null,
+      eventType: "runtime.resource.describe.read.failed",
+      payload: {
+        operation: "describe",
+        status: "failed",
+        requester: "issuer:user-a",
+        resource_kind: "Trial",
+        resource_name: "missing-trial",
+        error_code: "runtime_resource_not_found",
+        error_status: 404,
+        error_message: "Runtime resource not found",
+      },
+    });
+    expect(inserts[0]?.payload.resource_ref).toMatchObject({
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "Trial",
+      name: "missing-trial",
     });
   });
 
@@ -4409,17 +5181,18 @@ describe("runtime repository worker snapshots", () => {
         return [];
       }
       if (query.includes("update cloud.runtime_access_requests") && query.includes("kind = 'port_forward'")) {
+        const status = values.includes("completed") ? "completed" : "active";
         return [{
           ...accessRequestRecord({
             access_request_id: "pf-1",
             kind: "port_forward",
-            status: "active",
+            status,
             resource_kind: "TrialContainer",
             resource_name: "trial-1.agent.container-1",
             target_port: 8080,
             connection: { client_endpoint: "tcp://127.0.0.1:18080" },
           }),
-          previous_status: "accepted",
+          previous_status: status === "completed" ? "active" : "accepted",
         }];
       }
       if (query.includes("update cloud.runtime_access_requests") && query.includes("kind = 'exec'")) {
@@ -4456,6 +5229,12 @@ describe("runtime repository worker snapshots", () => {
       status: "active",
       connection: { client_endpoint: "tcp://127.0.0.1:18080" },
     });
+    await RuntimeRepository.prototype.updatePortForwardRequest.call(repo as any, {
+      attemptId: "attempt-1",
+      runnerInstanceId: "runner-instance-1",
+      accessRequestId: "pf-1",
+      status: "completed",
+    });
     await RuntimeRepository.prototype.updateExecRequest.call(repo as any, {
       attemptId: "attempt-1",
       runnerInstanceId: "runner-instance-1",
@@ -4466,6 +5245,7 @@ describe("runtime repository worker snapshots", () => {
 
     expect(observed.eventTypes).toEqual([
       "runtime.access.port_forward.active",
+      "runtime.access.port_forward.completed",
       "runtime.access.exec.completed",
     ]);
     expect(observed.payloads).toEqual([
@@ -4473,6 +5253,12 @@ describe("runtime repository worker snapshots", () => {
         access_request_id: "pf-1",
         previous_status: "accepted",
         status: "active",
+        connection: expect.objectContaining({ client_endpoint: "tcp://127.0.0.1:18080" }),
+      }),
+      expect.objectContaining({
+        access_request_id: "pf-1",
+        previous_status: "active",
+        status: "completed",
         connection: expect.objectContaining({ client_endpoint: "tcp://127.0.0.1:18080" }),
       }),
       expect.objectContaining({
@@ -4579,6 +5365,71 @@ describe("runtime repository worker snapshots", () => {
         requester: "issuer:user-a",
         reason: "stop command",
         resource_version_precondition: "sha256:exec-1",
+      }),
+    ]);
+  });
+
+  test("records previous lifecycle phase on port-forward complete audit events", async () => {
+    const observed: {
+      eventTypes: string[];
+      payloads: JsonObject[];
+    } = {
+      eventTypes: [],
+      payloads: [],
+    };
+    const updatedAt = "2026-06-04T00:05:00Z";
+    const tx = ((strings: TemplateStringsArray, ...values: unknown[]) => {
+      const query = strings.raw.join(" ");
+      if (query.includes("update cloud.runtime_access_requests") && query.includes("kind = 'port_forward'")) {
+        return [{
+          ...accessRequestRecord({
+            access_request_id: "pf-1",
+            kind: "port_forward",
+            status: "completed",
+            resource_kind: "TrialContainer",
+            resource_name: "trial-1.agent.container-1",
+            target_port: 8080,
+            requester: "issuer:user-a",
+            reason: "local attach ended",
+            connection: { client_endpoint: "tcp://127.0.0.1:18080" },
+            updated_at: updatedAt,
+          }),
+          previous_status: "active",
+        }];
+      }
+      if (query.includes("insert into cloud.run_events")) {
+        observed.eventTypes.push(String(values[3]));
+        observed.payloads.push(values[4] as JsonObject);
+        return [];
+      }
+      return [];
+    }) as any;
+    const repo = Object.create(RuntimeRepository.prototype) as RuntimeRepository;
+    (repo as any).sql = {
+      begin: async (callback: (tx: any) => Promise<unknown>) => await callback(tx),
+      json: (payload: JsonObject) => payload,
+    };
+
+    await RuntimeRepository.prototype.completePortForwardRequest.call(repo as any, {
+      cloudRunId: "run-1",
+      accessRequestId: "pf-1",
+      requester: "issuer:user-a",
+      reason: "local attach ended",
+      resourceVersion: "sha256:pf-1",
+    });
+
+    expect(observed.eventTypes).toEqual(["runtime.access.port_forward.completed"]);
+    expect(observed.payloads).toEqual([
+      expect.objectContaining({
+        access_request_id: "pf-1",
+        action: "complete",
+        previous_status: "active",
+        status: "completed",
+        completed_at: updatedAt,
+        requester: "issuer:user-a",
+        reason: "local attach ended",
+        resource_version_precondition: "sha256:pf-1",
+        connection: expect.objectContaining({ client_endpoint: "tcp://127.0.0.1:18080" }),
       }),
     ]);
   });
@@ -4707,6 +5558,7 @@ describe("runtime repository worker snapshots", () => {
         runtimeResourceFixture({
           kind: "TrialContainer",
           name: "trial-1.agent.container-1",
+          resourceVersion: "sha256:trial-container-no-port",
           spec: {
             core_run_id: "core-run-1",
             trial_id: "trial-1",
@@ -4743,6 +5595,7 @@ describe("runtime repository worker snapshots", () => {
       run: cloudRunRecord(),
       resourceKind: "TrialContainer",
       resourceName: "trial-1.agent.container-1",
+      resourceVersion: "sha256:trial-container-no-port",
       targetPort: 8080,
     })).rejects.toThrow("Port forwarding requires an active runner attempt whose runner advertises runtime_port_forward");
 
@@ -4848,6 +5701,7 @@ describe("runtime repository worker snapshots", () => {
         runtimeResourceFixture({
           kind: "TrialContainer",
           name: "trial-1.agent.container-1",
+          resourceVersion: "sha256:trial-container-no-exec",
           spec: {
             core_run_id: "core-run-1",
             trial_id: "trial-1",
@@ -4884,6 +5738,7 @@ describe("runtime repository worker snapshots", () => {
       run: cloudRunRecord(),
       resourceKind: "TrialContainer",
       resourceName: "trial-1.agent.container-1",
+      resourceVersion: "sha256:trial-container-no-exec",
       command: ["python", "-V"],
     })).rejects.toThrow("Runtime exec requires an active runner attempt whose runner advertises runtime_exec");
 
@@ -5486,6 +6341,184 @@ describe("runtime repository worker snapshots", () => {
         satisfied_attempt_ids: ["attempt-1"],
       },
     });
+    const lifecycleResources = declaredRuntimeResources({
+      ...cloudRunRecord(),
+      run_requirements: {
+        ...cloudRunRecord().run_requirements,
+        requires: ["registry_pull", "secret_resolver", "network_perimeter", "sidecar:redis", "accelerator:gpu-a10"],
+        image_refs: ["us-docker.pkg.dev/acme/runners/agent@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        secret_ids: ["OPENAI_API_KEY"],
+        network_perimeter: {
+          default: "none",
+          task_sandbox: "none",
+          agent: "none",
+          egress_hosts: ["api.openai.com"],
+        },
+        sidecars: ["redis"],
+        accelerators: ["gpu-a10"],
+      },
+    }, [attemptRecord({
+      runner_instance_capabilities: {
+        executors: ["runner-docker"],
+        resources: ["registry_pull", "secret_resolver", "network_perimeter", "sidecar:redis", "accelerator:gpu-a10"],
+        arch: "x86_64",
+        cpu_count: 4,
+        memory_mb: 8192,
+        disk_mb: 32768,
+        isolation: ["single_use_vm"],
+      },
+    })], [
+      runtimeEvent({
+        row_seq: 39,
+        seq: 39,
+        event_type: "worker.runtime.image_pull.pulled",
+        payload: {
+          resource_kind: "ImagePull",
+          resource_name: "us-docker.pkg.dev-acme-runners-agent-sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          image_ref: "us-docker.pkg.dev/acme/runners/agent@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          status: "pulled",
+          attempt_id: "attempt-1",
+          runner_instance_id: "runner-instance-1",
+          worker_id: "worker-1",
+        },
+      }),
+      runtimeEvent({
+        row_seq: 40,
+        seq: 40,
+        event_type: "worker.runtime.secret_binding.materialized",
+        payload: {
+          resource_kind: "SecretBinding",
+          resource_name: "openai_api_key",
+          secret_id: "OPENAI_API_KEY",
+          status: "materialized",
+          attempt_id: "attempt-1",
+          runner_instance_id: "runner-instance-1",
+          worker_id: "worker-1",
+        },
+      }),
+      runtimeEvent({
+        row_seq: 41,
+        seq: 41,
+        event_type: "worker.runtime.network_perimeter.applied",
+        payload: {
+          resource_kind: "NetworkPerimeter",
+          resource_name: "declared",
+          status: "applied",
+          attempt_id: "attempt-1",
+          runner_instance_id: "runner-instance-1",
+          worker_id: "worker-1",
+          egress_hosts: ["api.openai.com"],
+        },
+      }),
+      runtimeEvent({
+        row_seq: 42,
+        seq: 42,
+        event_type: "worker.runtime.sidecar_requirement.available",
+        payload: {
+          resource_kind: "SidecarRequirement",
+          resource_name: "redis",
+          sidecar: "redis",
+          required_capability: "sidecar:redis",
+          status: "available",
+          attempt_id: "attempt-1",
+          runner_instance_id: "runner-instance-1",
+          worker_id: "worker-1",
+        },
+      }),
+      runtimeEvent({
+        row_seq: 43,
+        seq: 43,
+        event_type: "worker.runtime.accelerator_requirement.available",
+        payload: {
+          resource_kind: "AcceleratorRequirement",
+          resource_name: "gpu-a10",
+          accelerator: "gpu-a10",
+          required_capability: "accelerator:gpu-a10",
+          status: "available",
+          attempt_id: "attempt-1",
+          runner_instance_id: "runner-instance-1",
+          worker_id: "worker-1",
+        },
+      }),
+    ]);
+    const pulledImage = lifecycleResources.find((resource) => resource.kind === "ImagePull");
+    expect(pulledImage).toMatchObject({
+      status: {
+        phase: "Pulled",
+        reason: "ImagePulled",
+        event_type: "worker.runtime.image_pull.pulled",
+        event_row_seq: 39,
+        attempt_id: "attempt-1",
+        runner_instance_id: "runner-instance-1",
+      },
+    });
+    expect(runtimeConditionsByType(pulledImage!).Ready).toMatchObject({
+      status: "True",
+      reason: "Pulled",
+    });
+    const materializedSecret = lifecycleResources.find((resource) => resource.kind === "SecretBinding" && resource.metadata.name === "openai_api_key");
+    expect(materializedSecret).toMatchObject({
+      status: {
+        phase: "Materialized",
+        reason: "SecretBindingMaterialized",
+        event_type: "worker.runtime.secret_binding.materialized",
+        event_row_seq: 40,
+        attempt_id: "attempt-1",
+        runner_instance_id: "runner-instance-1",
+      },
+    });
+    expect(runtimeConditionsByType(materializedSecret!).Ready).toMatchObject({
+      status: "True",
+      reason: "Materialized",
+    });
+    expect(JSON.stringify(materializedSecret)).not.toContain("secret-manager/projects/dev/openai");
+    const appliedNetwork = lifecycleResources.find((resource) => resource.kind === "NetworkPerimeter");
+    expect(appliedNetwork).toMatchObject({
+      status: {
+        phase: "Applied",
+        reason: "NetworkPerimeterApplied",
+        event_type: "worker.runtime.network_perimeter.applied",
+        event_row_seq: 41,
+        attempt_id: "attempt-1",
+        runner_instance_id: "runner-instance-1",
+      },
+    });
+    expect(runtimeConditionsByType(appliedNetwork!).Ready).toMatchObject({
+      status: "True",
+      reason: "Applied",
+    });
+    const availableSidecar = lifecycleResources.find((resource) => resource.kind === "SidecarRequirement" && resource.metadata.name === "redis");
+    expect(availableSidecar).toMatchObject({
+      status: {
+        phase: "Available",
+        reason: "SidecarRequirementAvailable",
+        event_type: "worker.runtime.sidecar_requirement.available",
+        event_row_seq: 42,
+        attempt_id: "attempt-1",
+        runner_instance_id: "runner-instance-1",
+        required_capability: "sidecar:redis",
+      },
+    });
+    expect(runtimeConditionsByType(availableSidecar!).Ready).toMatchObject({
+      status: "True",
+      reason: "Available",
+    });
+    const availableAccelerator = lifecycleResources.find((resource) => resource.kind === "AcceleratorRequirement" && resource.metadata.name === "gpu-a10");
+    expect(availableAccelerator).toMatchObject({
+      status: {
+        phase: "Available",
+        reason: "AcceleratorRequirementAvailable",
+        event_type: "worker.runtime.accelerator_requirement.available",
+        event_row_seq: 43,
+        attempt_id: "attempt-1",
+        runner_instance_id: "runner-instance-1",
+        required_capability: "accelerator:gpu-a10",
+      },
+    });
+    expect(runtimeConditionsByType(availableAccelerator!).Ready).toMatchObject({
+      status: "True",
+      reason: "Available",
+    });
     expect(activeResources.find((resource) => resource.kind === "SidecarRequirement" && resource.metadata.name === "redis")).toMatchObject({
       status: {
         phase: "Satisfied",
@@ -5663,6 +6696,26 @@ describe("runtime repository worker snapshots", () => {
       kinds: ["container", "portforwards"],
     }).map((resource) => `${resource.kind}/${resource.metadata.name}`)).toEqual([
       "PortForward/pf-1",
+      "TrialContainer/trial-1.agent.container-1",
+    ]);
+
+    expect(filterRuntimeResources(resources, {
+      categories: ["runner"],
+    }).map((resource) => `${resource.kind}/${resource.metadata.name}`)).toEqual([
+      "RunnerAttempt/attempt-1",
+    ]);
+
+    expect(filterRuntimeResources(resources, {
+      categories: ["trial", "access"],
+    }).map((resource) => `${resource.kind}/${resource.metadata.name}`)).toEqual([
+      "PortForward/pf-1",
+      "TrialContainer/trial-1.agent.container-1",
+    ]);
+
+    expect(filterRuntimeResources(resources, {
+      kinds: ["container"],
+      categories: ["access-target"],
+    }).map((resource) => `${resource.kind}/${resource.metadata.name}`)).toEqual([
       "TrialContainer/trial-1.agent.container-1",
     ]);
 
@@ -5936,6 +6989,18 @@ describe("runtime repository worker snapshots", () => {
   test("rejects visible runtime access targets that are not reachable", () => {
     const resources = [
       runtimeResourceFixture({
+        kind: "Run",
+        name: "run-active",
+        status: {
+          phase: "active",
+          access: {
+            runner_instance_id: "runner-instance-1",
+            attempt_id: "attempt-1",
+            worker_id: "worker-1",
+          },
+        },
+      }),
+      runtimeResourceFixture({
         kind: "RunnerInstance",
         name: "runner-offline",
         status: {
@@ -5993,6 +7058,10 @@ describe("runtime repository worker snapshots", () => {
       }),
     ];
 
+    expect(() => runtimeAccessTargetFromInventory(resources, {
+      resourceKind: "Run",
+      resourceName: "run-active",
+    })).toThrow("Run/run-active is not currently reachable for runtime access: phase is active");
     expect(() => runtimeAccessTargetFromInventory(resources, {
       resourceKind: "RunnerInstance",
       resourceName: "runner-offline",
@@ -6060,6 +7129,8 @@ describe("runtime repository worker snapshots", () => {
       metadata: {
         name: "pf-1",
         uid: "pf-1",
+        generation: 1,
+        resourceVersion: "sha256:pf-1",
         labels: {
           "bucephalus.dev/run-id": "run-1",
         },
@@ -6081,6 +7152,9 @@ describe("runtime repository worker snapshots", () => {
       kind: "TrialContainer",
       metadata: {
         name: "trial-1.agent.container-1",
+        uid: "trial-1.agent.container-1",
+        generation: 1,
+        resourceVersion: "sha256:trial-container-1",
         labels: {},
         annotations: {},
         ownerReferences: [],
@@ -6213,6 +7287,7 @@ describe("runtime repository worker snapshots", () => {
           apiVersion: "bucephalus.dev/v1alpha1",
           kind: "RuntimeResourceDescribe",
           cloud_run_id: "run-1",
+          generated_at: "2026-06-18T00:00:00Z",
           core_run_ids: ["core-run-1"],
           resource: runnerAttempt,
           related_resources: [],
@@ -6318,6 +7393,7 @@ describe("runtime repository worker snapshots", () => {
           apiVersion: "bucephalus.dev/v1alpha1",
           kind: "RuntimeResourceDescribe",
           cloud_run_id: "run-1",
+          generated_at: "2026-06-18T00:00:00Z",
           core_run_ids: ["core-run-1"],
           resource: runnerInstance,
           related_resources: [],
@@ -6437,6 +7513,7 @@ describe("runtime repository worker snapshots", () => {
           apiVersion: "bucephalus.dev/v1alpha1",
           kind: "RuntimeResourceDescribe",
           cloud_run_id: "run-1",
+          generated_at: "2026-06-18T00:00:00Z",
           core_run_ids: ["core-run-1"],
           resource: execResource,
           related_resources: [],
@@ -6481,6 +7558,73 @@ describe("runtime repository worker snapshots", () => {
     expect(stderr.object.object_ref).toBe("runtime://cloud-run/run-1/exec/exec-1/stderr");
   });
 
+  test("serves exec logs from worker stdout and stderr connection fields", async () => {
+    const run = cloudRunRecord();
+    const execResource = runtimeResourceFixture({
+      kind: "Exec",
+      name: "exec-stdout-fields",
+      spec: {
+        access_request_id: "exec-stdout-fields",
+        resource_kind: "TrialContainer",
+        resource_name: "trial-1.agent.container-1",
+        target_ref: {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "TrialContainer",
+          name: "trial-1.agent.container-1",
+        },
+        command: ["node", "-v"],
+      },
+      status: {
+        phase: "completed",
+        runner_instance_id: "runner-instance-1",
+        attempt_id: "attempt-1",
+        connection: {
+          exit_code: 0,
+          stdout: "v22.0.0\n",
+          stderr: "node warning\n",
+        },
+      },
+    });
+    const repo = {
+      async describeResource(_cloudRunId: string, _run: ReturnType<typeof cloudRunRecord>, input: { kind: string; name: string }) {
+        expect(input).toMatchObject({ kind: "Exec", name: "exec-stdout-fields" });
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceDescribe",
+          cloud_run_id: "run-1",
+          generated_at: "2026-06-18T00:00:00Z",
+          core_run_ids: ["core-run-1"],
+          resource: execResource,
+          related_resources: [],
+        };
+      },
+    };
+
+    const stdout = await RuntimeRepository.prototype.resourceLogs.call(repo as any, "run-1", run, {
+      kind: "Exec",
+      name: "exec-stdout-fields",
+      stream: "stdout",
+    });
+    const stderr = await RuntimeRepository.prototype.resourceLogs.call(repo as any, "run-1", run, {
+      kind: "Exec",
+      name: "exec-stdout-fields",
+      stream: "stderr",
+    });
+
+    expect(new TextDecoder().decode(stdout.bytes)).toBe("v22.0.0\n");
+    expect(new TextDecoder().decode(stderr.bytes)).toBe("node warning\n");
+    expect(stdout.object).toMatchObject({
+      role: "stdout",
+      object_ref: "runtime://cloud-run/run-1/exec/exec-stdout-fields/stdout",
+      metadata: expect.objectContaining({
+        source: "cloud.runtime_access_requests",
+        resource_kind: "Exec",
+        resource_name: "exec-stdout-fields",
+        exit_code: 0,
+      }),
+    });
+  });
+
   test("serves trial logs from the selected Trial resource subresource", async () => {
     const run = cloudRunRecord();
     const trial = runtimeResourceFixture({
@@ -6502,6 +7646,7 @@ describe("runtime repository worker snapshots", () => {
           apiVersion: "bucephalus.dev/v1alpha1",
           kind: "RuntimeResourceDescribe",
           cloud_run_id: "run-1",
+          generated_at: "2026-06-18T00:00:00Z",
           core_run_ids: ["core-run-1"],
           resource: trial,
           related_resources: [],
@@ -6544,6 +7689,167 @@ describe("runtime repository worker snapshots", () => {
     });
   });
 
+  test("audits runtime log reads with requester and object provenance", async () => {
+    const { sql, inserts } = captureRunEventsSql();
+    const run = cloudRunRecord();
+    const trial = runtimeResourceFixture({
+      kind: "Trial",
+      name: "trial-1",
+      resourceVersion: "sha256:trial-rv",
+      spec: {
+        core_run_id: "core-run-1",
+        trial_id: "trial-1",
+        attempt: 2,
+      },
+      status: {
+        phase: "running",
+      },
+    });
+    const logs = await RuntimeRepository.prototype.resourceLogs.call({
+      sql,
+      async describeResource(_cloudRunId: string, _run: ReturnType<typeof cloudRunRecord>, input: { kind: string; name: string }) {
+        expect(input).toMatchObject({ kind: "Trial", name: "trial-1" });
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceDescribe",
+          cloud_run_id: "run-1",
+          generated_at: "2026-06-18T00:00:00Z",
+          core_run_ids: ["core-run-1"],
+          resource: trial,
+          related_resources: [],
+        };
+      },
+      async artifactContent(_cloudRunId: string, input: { trialId: string; role: string; coreRunId?: string | null; attempt?: number | undefined }) {
+        expect(input).toEqual({
+          trialId: "trial-1",
+          role: "stdout",
+          coreRunId: "core-run-1",
+          attempt: 2,
+        });
+        return {
+          bytes: new TextEncoder().encode("line 1\nline 2\n"),
+          media_type: "text/plain; charset=utf-8",
+          object: {
+            core_run_id: "core-run-1",
+            trial_id: "trial-1",
+            schedule_idx: 3,
+            attempt: 2,
+            role: "stdout",
+            object_ref: "artifact://sha256/trial-1-stdout",
+            metadata: null,
+            recorded_at_ms: 1,
+            content_available: true,
+            media_type: "text/plain; charset=utf-8",
+            byte_size: 14,
+            sha256: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            relative_path: "trial-1/stdout.log",
+          },
+        };
+      },
+    } as any, "run-1", run, {
+      kind: "Trial",
+      name: "trial-1",
+      stream: "stdout",
+      requester: "issuer:user-a",
+    });
+
+    expect(new TextDecoder().decode(logs.bytes)).toBe("line 1\nline 2\n");
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]).toMatchObject({
+      runId: "run-1",
+      attemptId: null,
+      eventType: "runtime.resource.logs.read",
+      payload: {
+        operation: "logs",
+        requester: "issuer:user-a",
+        resource_kind: "Trial",
+        resource_name: "trial-1",
+        resource_uid: "trial-1",
+        resource_version: "sha256:trial-rv",
+        stream: "stdout",
+        core_run_id: "core-run-1",
+        trial_id: "trial-1",
+        trial_attempt: 2,
+        artifact_role: "stdout",
+        object_ref: "artifact://sha256/trial-1-stdout",
+        sha256: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        media_type: "text/plain; charset=utf-8",
+        byte_size: 14,
+      },
+    });
+    expect(inserts[0]?.payload.resource_ref).toMatchObject({
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "Trial",
+      name: "trial-1",
+      uid: "trial-1",
+    });
+  });
+
+  test("audits failed runtime log reads with requester and error provenance", async () => {
+    const { sql, inserts } = captureRunEventsSql();
+    const run = cloudRunRecord();
+    const metric = runtimeResourceFixture({
+      kind: "MetricObservation",
+      name: "trial-1.accuracy.7",
+      resourceVersion: "sha256:metric-rv",
+      spec: {
+        core_run_id: "core-run-1",
+        trial_id: "trial-1",
+        metric_name: "accuracy",
+      },
+      status: {
+        phase: "observed",
+      },
+    });
+
+    await expect(RuntimeRepository.prototype.resourceLogs.call({
+      sql,
+      async describeResource(_cloudRunId: string, _run: ReturnType<typeof cloudRunRecord>, input: { kind: string; name: string }) {
+        expect(input).toMatchObject({ kind: "MetricObservation", name: "trial-1.accuracy.7" });
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceDescribe",
+          cloud_run_id: "run-1",
+          generated_at: "2026-06-18T00:00:00Z",
+          core_run_ids: ["core-run-1"],
+          resource: metric,
+          related_resources: [],
+        };
+      },
+    } as any, "run-1", run, {
+      kind: "MetricObservation",
+      name: "trial-1.accuracy.7",
+      stream: "stderr",
+      requester: "issuer:user-a",
+    })).rejects.toThrow("Runtime logs are not available for MetricObservation resources");
+
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]).toMatchObject({
+      runId: "run-1",
+      attemptId: null,
+      eventType: "runtime.resource.logs.read.failed",
+      payload: {
+        operation: "logs",
+        status: "failed",
+        requester: "issuer:user-a",
+        resource_kind: "MetricObservation",
+        resource_name: "trial-1.accuracy.7",
+        resource_uid: "trial-1.accuracy.7",
+        resource_version: "sha256:metric-rv",
+        stream: "stderr",
+        error_code: "runtime_logs_unavailable",
+        error_status: 409,
+        error_message: "Runtime logs are not available for MetricObservation resources",
+      },
+    });
+    expect(inserts[0]?.payload.resource_ref).toMatchObject({
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "MetricObservation",
+      name: "trial-1.accuracy.7",
+      uid: "trial-1.accuracy.7",
+    });
+  });
+
   test("serves artifact content from the selected TrialArtifact resource subresource", async () => {
     const run = cloudRunRecord();
     const artifact = runtimeResourceFixture({
@@ -6569,6 +7875,7 @@ describe("runtime repository worker snapshots", () => {
           apiVersion: "bucephalus.dev/v1alpha1",
           kind: "RuntimeResourceDescribe",
           cloud_run_id: "run-1",
+          generated_at: "2026-06-18T00:00:00Z",
           core_run_ids: ["core-run-1"],
           resource: artifact,
           related_resources: [],
@@ -6610,6 +7917,168 @@ describe("runtime repository worker snapshots", () => {
     expect(content.resource.kind).toBe("TrialArtifact");
     expect(content.media_type).toBe("application/json; charset=utf-8");
     expect(new TextDecoder().decode(content.bytes)).toBe("{\"ok\":true}");
+  });
+
+  test("audits runtime artifact content reads with requester and object provenance", async () => {
+    const { sql, inserts } = captureRunEventsSql();
+    const run = cloudRunRecord();
+    const artifact = runtimeResourceFixture({
+      kind: "TrialArtifact",
+      name: "trial-1.agent-result.sha256-aaaaaaaa",
+      resourceVersion: "sha256:artifact-rv",
+      spec: {
+        core_run_id: "core-run-1",
+        trial_id: "trial-1",
+        schedule_idx: 3,
+        attempt: 2,
+        role: "agent_result",
+        object_ref: "artifact://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      },
+      status: {
+        phase: "recorded",
+        content_available: true,
+      },
+    });
+    const content = await RuntimeRepository.prototype.resourceArtifactContent.call({
+      sql,
+      async describeResource(_cloudRunId: string, _run: ReturnType<typeof cloudRunRecord>, input: { kind: string; name: string }) {
+        expect(input).toMatchObject({ kind: "TrialArtifact", name: "trial-1.agent-result.sha256-aaaaaaaa" });
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceDescribe",
+          cloud_run_id: "run-1",
+          generated_at: "2026-06-18T00:00:00Z",
+          core_run_ids: ["core-run-1"],
+          resource: artifact,
+          related_resources: [],
+        };
+      },
+      async artifactContent(_cloudRunId: string, input: { trialId: string; role: string; coreRunId?: string | null; attempt?: number | undefined; objectRef?: string | null }) {
+        expect(input).toEqual({
+          trialId: "trial-1",
+          role: "agent_result",
+          coreRunId: "core-run-1",
+          attempt: 2,
+          objectRef: "artifact://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        });
+        return {
+          bytes: new TextEncoder().encode("{\"ok\":true}"),
+          media_type: "application/json; charset=utf-8",
+          object: {
+            core_run_id: "core-run-1",
+            trial_id: "trial-1",
+            schedule_idx: 3,
+            attempt: 2,
+            role: "agent_result",
+            object_ref: "artifact://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            metadata: null,
+            recorded_at_ms: 1,
+            content_available: true,
+            media_type: "application/json; charset=utf-8",
+            byte_size: 11,
+            sha256: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            relative_path: "agent/result.json",
+          },
+        };
+      },
+    } as any, "run-1", run, {
+      kind: "TrialArtifact",
+      name: "trial-1.agent-result.sha256-aaaaaaaa",
+      requester: "issuer:user-a",
+    });
+
+    expect(new TextDecoder().decode(content.bytes)).toBe("{\"ok\":true}");
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]).toMatchObject({
+      runId: "run-1",
+      attemptId: null,
+      eventType: "runtime.resource.content.read",
+      payload: {
+        operation: "content",
+        requester: "issuer:user-a",
+        resource_kind: "TrialArtifact",
+        resource_name: "trial-1.agent-result.sha256-aaaaaaaa",
+        resource_uid: "trial-1.agent-result.sha256-aaaaaaaa",
+        resource_version: "sha256:artifact-rv",
+        core_run_id: "core-run-1",
+        trial_id: "trial-1",
+        trial_attempt: 2,
+        artifact_role: "agent_result",
+        object_ref: "artifact://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        sha256: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        media_type: "application/json; charset=utf-8",
+        byte_size: 11,
+      },
+    });
+    expect(inserts[0]?.payload.resource_ref).toMatchObject({
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "TrialArtifact",
+      name: "trial-1.agent-result.sha256-aaaaaaaa",
+      uid: "trial-1.agent-result.sha256-aaaaaaaa",
+    });
+  });
+
+  test("audits failed runtime artifact content reads with requester and error provenance", async () => {
+    const { sql, inserts } = captureRunEventsSql();
+    const run = cloudRunRecord();
+    const trial = runtimeResourceFixture({
+      kind: "Trial",
+      name: "trial-1",
+      resourceVersion: "sha256:trial-rv",
+      spec: {
+        core_run_id: "core-run-1",
+        trial_id: "trial-1",
+        attempt: 2,
+      },
+      status: {
+        phase: "running",
+      },
+    });
+
+    await expect(RuntimeRepository.prototype.resourceArtifactContent.call({
+      sql,
+      async describeResource(_cloudRunId: string, _run: ReturnType<typeof cloudRunRecord>, input: { kind: string; name: string }) {
+        expect(input).toMatchObject({ kind: "Trial", name: "trial-1" });
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceDescribe",
+          cloud_run_id: "run-1",
+          generated_at: "2026-06-18T00:00:00Z",
+          core_run_ids: ["core-run-1"],
+          resource: trial,
+          related_resources: [],
+        };
+      },
+    } as any, "run-1", run, {
+      kind: "Trial",
+      name: "trial-1",
+      requester: "issuer:user-a",
+    })).rejects.toThrow("Runtime resource content subresource is only available for TrialArtifact resources");
+
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]).toMatchObject({
+      runId: "run-1",
+      attemptId: null,
+      eventType: "runtime.resource.content.read.failed",
+      payload: {
+        operation: "content",
+        status: "failed",
+        requester: "issuer:user-a",
+        resource_kind: "Trial",
+        resource_name: "trial-1",
+        resource_uid: "trial-1",
+        resource_version: "sha256:trial-rv",
+        error_code: "runtime_resource_content_not_found",
+        error_status: 404,
+        error_message: "Runtime resource content subresource is only available for TrialArtifact resources",
+      },
+    });
+    expect(inserts[0]?.payload.resource_ref).toMatchObject({
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "Trial",
+      name: "trial-1",
+      uid: "trial-1",
+    });
   });
 
   test("describes direct owner and dependent runtime resources", async () => {
@@ -6660,6 +8129,13 @@ describe("runtime repository worker snapshots", () => {
       name: "trial-1.agent.container-1",
     });
 
+    expect(described).toMatchObject({
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "RuntimeResourceDescribe",
+      cloud_run_id: "run-1",
+      generated_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      core_run_ids: [],
+    });
     expect(described.related_resources.map((related) => ({
       relationship: related.relationship,
       kind: related.resource.kind,
@@ -6671,13 +8147,13 @@ describe("runtime repository worker snapshots", () => {
     expect(described.operations).toEqual(expect.arrayContaining([
       expect.objectContaining({
         purpose: "describe",
-        command: "bucephalus-cloud run describe run-1 TrialContainer/trial-1.agent.container-1",
+        command: "buc runs describe run-1 TrialContainer/trial-1.agent.container-1",
         supported: true,
         reason: null,
       }),
       expect.objectContaining({
         purpose: "port-forward",
-        command: "bucephalus-cloud run port-forward run-1 TrialContainer/trial-1.agent.container-1 --target-port PORT",
+        command: expect.stringContaining("buc runs port-forward run-1 TrialContainer/trial-1.agent.container-1 --target-port PORT --local-port PORT --attach --resource-version sha256:"),
         supported: false,
         reason: "runtime_access_target_unreachable",
       }),
@@ -6746,6 +8222,22 @@ describe("runtime repository worker snapshots", () => {
         },
       },
     });
+    const artifact = runtimeResourceFixture({
+      kind: "TrialArtifact",
+      name: "trial-1.agent-result.sha256-aaaaaaaa",
+      spec: {
+        core_run_id: "core-run-1",
+        trial_id: "trial-1",
+        schedule_idx: 0,
+        attempt: 0,
+        role: "agent_result",
+        object_ref: "artifact://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      },
+      status: {
+        phase: "recorded",
+        content_available: true,
+      },
+    });
     const repo = {
       async resources() {
         return {
@@ -6753,7 +8245,7 @@ describe("runtime repository worker snapshots", () => {
           kind: "RuntimeResourceList",
           cloud_run_id: "run-1",
           core_run_ids: ["core-run-1"],
-          resources: [runnerAttempt, scheduleSlot, container],
+          resources: [runnerAttempt, scheduleSlot, container, artifact],
         };
       },
     };
@@ -6768,6 +8260,8 @@ describe("runtime repository worker snapshots", () => {
       apiVersion: "bucephalus.dev/v1alpha1",
       kind: "RuntimeResourceOperationReview",
       cloud_run_id: "run-1",
+      generated_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      core_run_ids: ["core-run-1"],
       resource_ref: {
         kind: "TrialContainer",
         name: "trial-1.agent.container-1",
@@ -6780,30 +8274,9 @@ describe("runtime repository worker snapshots", () => {
       supported: false,
       reason: "runtime_port_forward_unavailable",
       message: "port-forward requires an active runner attempt whose runner advertises runtime_port_forward",
-      command: "bucephalus-cloud run port-forward run-1 TrialContainer/trial-1.agent.container-1 --target-port PORT",
+      command: expect.stringContaining("buc runs port-forward run-1 TrialContainer/trial-1.agent.container-1 --target-port PORT --local-port PORT --attach --resource-version sha256:"),
       subresource: "port-forward",
-      requires_active_run: true,
-    });
-
-    const waitReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
-      kind: "TrialContainer",
-      name: "trial-1.agent.container-1",
-      operation: "wait",
-    });
-
-    expect(waitReview).toMatchObject({
-      kind: "RuntimeResourceOperationReview",
-      operation: "wait",
-      resource_version: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
-      resource_generation: 8,
-      observed_generation: 7,
-      matched_operation: "wait",
-      supported: true,
-      command: "bucephalus-cloud run wait run-1 TrialContainer/trial-1.agent.container-1 --for condition=Ready",
-      verb: "get",
-      subresource: "status",
-      action: null,
-      requires_active_run: false,
+      requires_running_run: true,
     });
 
     const watchNotReadyReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
@@ -6820,11 +8293,115 @@ describe("runtime repository worker snapshots", () => {
       observed_generation: 7,
       matched_operation: "watch/not-ready",
       supported: true,
-      command: "bucephalus-cloud run watch run-1 --kind TrialContainer --field-selector status.conditions.Ready!=True",
+      command: "buc runs watch run-1 --kind TrialContainer --field-selector status.conditions.Ready!=True",
       verb: "watch",
       subresource: null,
       action: null,
-      requires_active_run: false,
+    });
+
+    const waitReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+      operation: "wait",
+    });
+
+    expect(waitReview).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      operation: "wait",
+      resource_version: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+      resource_generation: 8,
+      observed_generation: 7,
+      matched_operation: "wait",
+      supported: true,
+      command: "buc runs wait run-1 TrialContainer/trial-1.agent.container-1 --for condition=Ready",
+      verb: "get",
+      subresource: "status",
+      action: null,
+    });
+
+    const topReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+      operation: "top",
+    });
+
+    expect(topReview).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      operation: "top",
+      matched_operation: "top",
+      supported: true,
+      command: "buc runs top run-1 --kind TrialContainer",
+      verb: "get",
+      subresource: "metrics",
+      action: null,
+    });
+
+    const listNameReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+      operation: "list/name",
+    });
+
+    expect(listNameReview).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      operation: "list/name",
+      matched_operation: "list/name",
+      supported: true,
+      command: "buc runs get run-1 TrialContainer --output name",
+      verb: "list",
+      subresource: null,
+      action: null,
+    });
+
+    const auditReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+      operation: "audit",
+    });
+
+    expect(auditReview).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      operation: "audit",
+      matched_operation: "audit",
+      supported: true,
+      command: "buc runs audit run-1 TrialContainer/trial-1.agent.container-1",
+      verb: "watch",
+      subresource: "events",
+      action: null,
+    });
+
+    const logsReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+      operation: "logs",
+    });
+
+    expect(logsReview).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      operation: "logs",
+      matched_operation: "logs/stdout",
+      supported: true,
+      command: "buc runs logs run-1 TrialContainer/trial-1.agent.container-1 --stream stdout --metadata-out FILE.metadata.json",
+      verb: "get",
+      subresource: "logs",
+      action: null,
+    });
+
+    const contentReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "TrialArtifact",
+      name: "trial-1.agent-result.sha256-aaaaaaaa",
+      operation: "content",
+    });
+
+    expect(contentReview).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      operation: "content",
+      matched_operation: "content",
+      supported: true,
+      command: "buc runs content run-1 TrialArtifact/trial-1.agent-result.sha256-aaaaaaaa --out FILE --metadata-out FILE.metadata.json",
+      verb: "get",
+      subresource: "content",
+      action: null,
     });
 
     const unmatched = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
@@ -6834,6 +8411,9 @@ describe("runtime repository worker snapshots", () => {
     });
 
     expect(unmatched).toMatchObject({
+      cloud_run_id: "run-1",
+      generated_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      core_run_ids: ["core-run-1"],
       matched_operation: null,
       resource_version: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
       resource_generation: 8,
@@ -6843,8 +8423,230 @@ describe("runtime repository worker snapshots", () => {
       message: "TrialContainer/trial-1.agent.container-1 does not currently advertise runtime operation attach",
       command: null,
       subresource: null,
-      requires_active_run: null,
     });
+  });
+
+  test("audits runtime operation reviews with requester and decision provenance", async () => {
+    const { sql, inserts } = captureRunEventsSql();
+    const container = runtimeResourceFixture({
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+      resourceVersion: "sha256:container-rv",
+      generation: 8,
+      spec: {
+        core_run_id: "core-run-1",
+        trial_id: "trial-1",
+        attempt: 2,
+      },
+      status: {
+        phase: "running",
+        observedGeneration: 8,
+      },
+    });
+    const repo = {
+      sql,
+      async resources() {
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceList",
+          cloud_run_id: "run-1",
+          core_run_ids: ["core-run-1"],
+          resources: [container],
+        };
+      },
+    };
+
+    const auditReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+      operation: "audit",
+      requester: "issuer:user-a",
+    });
+    const unmatchedReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+      operation: "attach",
+      requester: "issuer:user-a",
+    });
+
+    expect(auditReview.supported).toBe(true);
+    expect(unmatchedReview.supported).toBe(false);
+    expect(inserts).toHaveLength(2);
+    expect(inserts[0]).toMatchObject({
+      runId: "run-1",
+      attemptId: null,
+      eventType: "runtime.resource.operation.reviewed",
+      payload: {
+        operation: "audit",
+        matched_operation: "audit",
+        supported: true,
+        status: "supported",
+        requester: "issuer:user-a",
+        resource_kind: "TrialContainer",
+        resource_name: "trial-1.agent.container-1",
+        resource_uid: "trial-1.agent.container-1",
+        resource_version: "sha256:container-rv",
+        resource_generation: 8,
+        observed_generation: 8,
+        command: "buc runs audit run-1 TrialContainer/trial-1.agent.container-1",
+        verb: "watch",
+        subresource: "events",
+        requires_running_run: false,
+      },
+    });
+    expect(inserts[0]?.payload.resource_ref).toMatchObject({
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+      uid: "trial-1.agent.container-1",
+    });
+    expect(inserts[1]).toMatchObject({
+      eventType: "runtime.resource.operation.reviewed",
+      payload: {
+        operation: "attach",
+        supported: false,
+        status: "unsupported",
+        requester: "issuer:user-a",
+        reason: "operation_unavailable",
+        message: "TrialContainer/trial-1.agent.container-1 does not currently advertise runtime operation attach",
+      },
+    });
+  });
+
+  test("audits failed runtime operation reviews with requester and error provenance", async () => {
+    const { sql, inserts } = captureRunEventsSql();
+    const repo = {
+      sql,
+      async resources() {
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceList",
+          cloud_run_id: "run-1",
+          core_run_ids: ["core-run-1"],
+          resources: [],
+        };
+      },
+    };
+
+    await expect(RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "TrialContainer",
+      name: "missing-container",
+      operation: "exec",
+      requester: "issuer:user-a",
+    })).rejects.toThrow("Runtime resource not found");
+
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]).toMatchObject({
+      runId: "run-1",
+      attemptId: null,
+      eventType: "runtime.resource.operation.review.failed",
+      payload: {
+        operation: "exec",
+        status: "failed",
+        requester: "issuer:user-a",
+        resource_kind: "TrialContainer",
+        resource_name: "missing-container",
+        error_code: "runtime_resource_not_found",
+        error_status: 404,
+        error_message: "Runtime resource not found",
+      },
+    });
+    expect(inserts[0]?.payload.resource_ref).toMatchObject({
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "TrialContainer",
+      name: "missing-container",
+    });
+  });
+
+  test("terminal runtime access resources do not advertise cancel operations", async () => {
+    const portForward = RuntimeRepository.prototype.runtimeAccessRequestResource.call(
+      {} as RuntimeRepository,
+      cloudRunRecord(),
+      accessRequestRecord({
+        kind: "port_forward",
+        access_request_id: "pf-failed",
+        status: "failed",
+        error_message: "worker could not establish a tunnel",
+      }),
+    );
+    const exec = RuntimeRepository.prototype.runtimeAccessRequestResource.call(
+      {} as RuntimeRepository,
+      cloudRunRecord(),
+      accessRequestRecord({
+        kind: "exec",
+        access_request_id: "exec-completed",
+        status: "completed",
+        target_port: null,
+        protocol: "exec",
+        command: ["python", "-V"],
+      }),
+    );
+    const repo = {
+      async resources() {
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceList",
+          cloud_run_id: "run-1",
+          core_run_ids: [],
+          resources: [portForward, exec],
+        };
+      },
+    };
+
+    expect(portForward.status.actions).toBeUndefined();
+    expect(exec.status.actions).toBeUndefined();
+
+    const portForwardReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "PortForward",
+      name: "pf-failed",
+      operation: "delete",
+    });
+    expect(portForwardReview).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      resource_ref: { kind: "PortForward", name: "pf-failed" },
+      operation: "delete",
+      matched_operation: "delete",
+      supported: false,
+      reason: "cancel_unavailable",
+      action: "cancel",
+      subresource: "actions/cancel",
+    });
+    expect(portForwardReview.command).toBe(`buc runs delete run-1 PortForward/pf-failed --resource-version ${portForwardReview.resource_version}`);
+
+    const portForwardWaitDeleteReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "PortForward",
+      name: "pf-failed",
+      operation: "wait/delete",
+    });
+    expect(portForwardWaitDeleteReview).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      resource_ref: { kind: "PortForward", name: "pf-failed" },
+      operation: "wait/delete",
+      matched_operation: "wait/delete",
+      supported: true,
+      reason: null,
+      action: null,
+      subresource: "status",
+      verb: "get",
+    });
+    expect(portForwardWaitDeleteReview.command).toBe("buc runs wait run-1 PortForward/pf-failed --for delete");
+
+    const execReview = await RuntimeRepository.prototype.reviewResourceOperation.call(repo as any, "run-1", cloudRunRecord(), {
+      kind: "Exec",
+      name: "exec-completed",
+      operation: "cancel",
+    });
+    expect(execReview).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      resource_ref: { kind: "Exec", name: "exec-completed" },
+      operation: "cancel",
+      matched_operation: "cancel",
+      supported: false,
+      reason: "cancel_unavailable",
+      action: "cancel",
+      subresource: "actions/cancel",
+    });
+    expect(execReview.command).toBe(`buc runs cancel run-1 Exec/exec-completed --resource-version ${execReview.resource_version}`);
   });
 
   test("reviews access operations through the same active binding precondition as creation", async () => {
@@ -6895,10 +8697,9 @@ describe("runtime repository worker snapshots", () => {
       supported: false,
       reason: "runtime_access_target_unreachable",
       message: "TrialContainer/trial-1.agent.container-1 is not currently reachable for runtime access: target is not bound to an active runner attempt",
-      command: "bucephalus-cloud run exec run-1 TrialContainer/trial-1.agent.container-1 -- COMMAND [ARG...]",
       subresource: "exec",
-      requires_active_run: true,
     });
+    expect(review.command).toBe(`buc runs exec run-1 TrialContainer/trial-1.agent.container-1 --resource-version ${review.resource_version} -- COMMAND [ARG...]`);
   });
 
   test("gets raw runtime resource manifests without describe wrapper", async () => {
@@ -6977,6 +8778,24 @@ describe("runtime repository worker snapshots", () => {
               },
             },
           }),
+          runtimeEvent({
+            row_seq: 8,
+            event_type: "runtime.access.port_forward.requested",
+            payload: {
+              resolved_target: {
+                apiVersion: "bucephalus.dev/v1alpha1",
+                kind: "TrialContainer",
+                name: "trial-1.agent.container-1",
+                uid: "trial-container-uid-1",
+                resourceVersion: "sha256:trial-container-rv",
+                runner_binding: {
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  worker_id: "worker-1",
+                },
+              },
+            },
+          }),
         ];
       },
     } as any, "run-1", cloudRunRecord(), {
@@ -7010,16 +8829,24 @@ describe("runtime repository worker snapshots", () => {
         task_id: null,
       },
       metadata: {
-        resourceVersion: "event-row-seq:6",
+        resourceVersion: "event-row-seq:8",
         continue: null,
         remainingItemCount: 0,
         limit: 2,
-        returned: 1,
+        returned: 2,
         after_row_seq: 5,
-        next_after_row_seq: 6,
+        next_after_row_seq: 8,
       },
     });
-    expect(result.events.map((event) => event.row_seq)).toEqual([6]);
+    expect(result.events.map((event) => event.row_seq)).toEqual([6, 8]);
+    expect(result.events[1]?.resource_refs).toEqual(expect.arrayContaining([
+      {
+        apiVersion: "bucephalus.dev/v1alpha1",
+        kind: "TrialContainer",
+        name: "trial-1.agent.container-1",
+        uid: "trial-container-uid-1",
+      },
+    ]));
     expect(observed.input).toMatchObject({
       limit: 250,
       afterRowSeq: 5,
@@ -7143,6 +8970,57 @@ describe("runtime repository worker snapshots", () => {
     });
   });
 
+  test("normalizes run-scoped runtime event continue tokens before scanning", async () => {
+    const observed: { input?: unknown } = {};
+    const result = await RuntimeRepository.prototype.events.call({
+      async eventRows(_cloudRunId: string, input: unknown) {
+        observed.input = input;
+        return [
+          runtimeEvent({
+            row_seq: 9,
+            seq: 90,
+            event_type: "runtime.access.exec.completed",
+          }),
+        ];
+      },
+    } as any, "run-1", {
+      limit: 25,
+      continueToken: "event-row-seq:6",
+      sources: ["cloud.run_events"],
+    });
+
+    expect(observed.input).toMatchObject({
+      limit: 26,
+      afterRowSeq: 6,
+      sources: ["cloud.run_events"],
+    });
+    expect(JSON.stringify(observed.input)).not.toContain("continueToken");
+    expect(result.metadata).toMatchObject({
+      resourceVersion: "event-row-seq:9",
+      continue: null,
+      remainingItemCount: 0,
+      limit: 25,
+      returned: 1,
+      after_row_seq: 6,
+      next_after_row_seq: 9,
+    });
+    expect(result.events.map((event) => event.row_seq)).toEqual([9]);
+  });
+
+  test("rejects conflicting runtime event row cursors", async () => {
+    await expect(RuntimeRepository.prototype.events.call({
+      async eventRows() {
+        throw new Error("eventRows should not be called");
+      },
+    } as any, "run-1", {
+      afterRowSeq: 6,
+      continueToken: "event-row-seq:6",
+    })).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_runtime_event_cursor",
+    });
+  });
+
   test("builds resource-scoped runtime event list cursors", async () => {
     const resource = runtimeResourceFixture({
       kind: "TrialContainer",
@@ -7201,6 +9079,68 @@ describe("runtime repository worker snapshots", () => {
       next_after_row_seq: 6,
     });
     expect(result.events.map((event) => event.row_seq)).toEqual([6]);
+  });
+
+  test("normalizes resource-scoped runtime event continue tokens before scanning", async () => {
+    const resource = runtimeResourceFixture({
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+    });
+    const observed: { input?: unknown } = {};
+    const result = await RuntimeRepository.prototype.resourceEvents.call({
+      async resources() {
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceList",
+          cloud_run_id: "run-1",
+          core_run_ids: ["core-run-1"],
+          resources: [resource],
+        };
+      },
+      async eventRows(_cloudRunId: string, input: unknown) {
+        observed.input = input;
+        return [
+          runtimeEvent({
+            row_seq: 8,
+            event_type: "runtime.access.exec.completed",
+            payload: {
+              target_ref: {
+                apiVersion: "bucephalus.dev/v1alpha1",
+                kind: "TrialContainer",
+                name: "trial-1.agent.container-1",
+              },
+            },
+          }),
+        ];
+      },
+    } as any, "run-1", cloudRunRecord(), {
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+      limit: 25,
+      continueToken: "event-row-seq:6",
+      filter: {
+        eventTypes: ["runtime.access.exec.completed"],
+      },
+    });
+
+    expect(observed.input).toMatchObject({
+      limit: 250,
+      afterRowSeq: 6,
+      eventTypes: ["runtime.access.exec.completed"],
+      resourceKind: "TrialContainer",
+      resourceName: "trial-1.agent.container-1",
+    });
+    expect(JSON.stringify(observed.input)).not.toContain("continueToken");
+    expect(result.metadata).toMatchObject({
+      resourceVersion: "event-row-seq:8",
+      continue: null,
+      remainingItemCount: 0,
+      limit: 25,
+      returned: 1,
+      after_row_seq: 6,
+      next_after_row_seq: 8,
+    });
+    expect(result.events.map((event) => event.row_seq)).toEqual([8]);
   });
 
   test("builds opaque runtime event list cursors when another page is known", async () => {
@@ -7285,6 +9225,7 @@ describe("runtime repository worker snapshots", () => {
       apiVersion: "bucephalus.dev/v1alpha1",
       kind: "RuntimeResourceStatus",
       cloud_run_id: "run-1",
+      generated_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
       core_run_ids: ["core-run-1"],
       resource_ref: {
         apiVersion: "bucephalus.dev/v1alpha1",
@@ -7314,6 +9255,47 @@ describe("runtime repository worker snapshots", () => {
         updated_at: "2026-06-18T00:00:00Z",
       },
     });
+  });
+
+  test("reviews runner lifecycle commands with resource version preconditions", async () => {
+    const resource = runtimeResourceFixture({
+      kind: "RunnerInstance",
+      name: "runner-instance-1",
+      status: {
+        phase: "online",
+        actions: ["cordon", "drain"],
+      },
+    });
+    resource.metadata.resourceVersion = "sha256:runner-online";
+
+    const review = await RuntimeRepository.prototype.reviewResourceOperation.call({
+      async resources() {
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceList",
+          cloud_run_id: "run-1",
+          core_run_ids: [],
+          resources: [resource],
+        };
+      },
+    } as any, "run-1", cloudRunRecord(), {
+      kind: "RunnerInstance",
+      name: "runner-instance-1",
+      operation: "cordon",
+    });
+
+    expect(review).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      resource_ref: { kind: "RunnerInstance", name: "runner-instance-1" },
+      resource_version: "sha256:runner-online",
+      operation: "cordon",
+      matched_operation: "cordon",
+      supported: true,
+      verb: null,
+      subresource: "actions/cordon",
+      action: "cordon",
+    });
+    expect(review.command).toBe("buc runs cordon run-1 RunnerInstance/runner-instance-1 --resource-version sha256:runner-online");
   });
 
   test("cordons runner instance resources with an audited runtime event", async () => {
@@ -7369,6 +9351,7 @@ describe("runtime repository worker snapshots", () => {
       apiVersion: "bucephalus.dev/v1alpha1" as const,
       kind: "RuntimeResourceDescribe" as const,
       cloud_run_id: "run-1",
+      generated_at: "2026-06-18T00:00:00Z",
       core_run_ids: [],
       resource: {
         ...resource,
@@ -7492,6 +9475,7 @@ describe("runtime repository worker snapshots", () => {
       apiVersion: "bucephalus.dev/v1alpha1" as const,
       kind: "RuntimeResourceDescribe" as const,
       cloud_run_id: "run-1",
+      generated_at: "2026-06-18T00:00:00Z",
       core_run_ids: [],
       resource: {
         ...resource,
@@ -7615,6 +9599,7 @@ describe("runtime repository worker snapshots", () => {
       apiVersion: "bucephalus.dev/v1alpha1" as const,
       kind: "RuntimeResourceDescribe" as const,
       cloud_run_id: "run-1",
+      generated_at: "2026-06-18T00:00:00Z",
       core_run_ids: [],
       resource: {
         ...resource,
@@ -7718,6 +9703,7 @@ describe("runtime repository worker snapshots", () => {
       apiVersion: "bucephalus.dev/v1alpha1" as const,
       kind: "RuntimeResourceDescribe" as const,
       cloud_run_id: "run-1",
+      generated_at: "2026-06-18T00:00:00Z",
       core_run_ids: [],
       resource: {
         ...resource,
@@ -7758,7 +9744,7 @@ describe("runtime repository worker snapshots", () => {
       },
     } as any, {
       run: cloudRunRecord(),
-      resourceKind: "PortForward",
+      resourceKind: "pf",
       resourceName: "pf-1",
       resourceVersion: "sha256:pf-1",
       requester: "issuer:user-a",
@@ -7777,6 +9763,149 @@ describe("runtime repository worker snapshots", () => {
       kind: "PortForward",
       name: "pf-1",
       eventLimit: 100,
+    });
+  });
+
+  test("requires reviewed resource versions before mutating runtime resources", async () => {
+    const run = cloudRunRecord();
+    const runner = runtimeResourceFixture({
+      kind: "RunnerInstance",
+      name: "runner-instance-1",
+      spec: {
+        runner_instance_id: "runner-instance-1",
+      },
+      status: {
+        phase: "online",
+        actions: ["cordon", "drain"],
+      },
+    });
+    runner.metadata.resourceVersion = "sha256:runner-online";
+    const target = runtimeResourceFixture({
+      kind: "RunnerAttempt",
+      name: "attempt-1",
+      labels: {
+        "bucephalus.dev/runner-instance-id": "runner-instance-1",
+        "bucephalus.dev/worker-id": "worker-1",
+      },
+      spec: {
+        runner_instance_id: "runner-instance-1",
+        worker_id: "worker-1",
+      },
+      status: {
+        phase: "running",
+        runner_instance_status: "online",
+      },
+    });
+    target.metadata.resourceVersion = "sha256:attempt-1";
+    const portForward = runtimeResourceFixture({
+      kind: "PortForward",
+      name: "pf-1",
+      spec: {
+        access_request_id: "pf-1",
+      },
+      status: {
+        phase: "active",
+        actions: ["cancel"],
+      },
+    });
+    portForward.metadata.resourceVersion = "sha256:pf-1";
+    const inventory = (resources: RuntimeResourceRecord[]) => ({
+      apiVersion: "bucephalus.dev/v1alpha1" as const,
+      kind: "RuntimeResourceList" as const,
+      metadata: runtimeResourceListMetadataFixture(),
+      cloud_run_id: "run-1",
+      core_run_ids: [],
+      resources,
+    });
+
+    await expect(RuntimeRepository.prototype.cordonRunnerInstanceResource.call({
+      sql: {
+        begin: async () => {
+          throw new Error("cordon should not mutate without a reviewed resource version");
+        },
+      },
+      async resources() {
+        return inventory([runner]);
+      },
+    } as any, {
+      run,
+      resourceKind: "RunnerInstance",
+      resourceName: "runner-instance-1",
+    })).rejects.toMatchObject({
+      status: 428,
+      code: "runtime_resource_version_required",
+      detail: {
+        resource_kind: "RunnerInstance",
+        resource_name: "runner-instance-1",
+        resource_version: "sha256:runner-online",
+        operation: "cordon",
+        required: ["resource_version"],
+      },
+    });
+
+    const accessRepo = Object.create(RuntimeRepository.prototype) as RuntimeRepository;
+    (accessRepo as any).sql = {
+      begin: async () => {
+        throw new Error("runtime access should not mutate without a reviewed resource version");
+      },
+    };
+    (accessRepo as any).resources = async () => inventory([target]);
+
+    await expect(RuntimeRepository.prototype.createPortForwardRequest.call(accessRepo as any, {
+      run,
+      resourceKind: "RunnerAttempt",
+      resourceName: "attempt-1",
+      targetPort: 8080,
+    })).rejects.toMatchObject({
+      status: 428,
+      code: "runtime_resource_version_required",
+      detail: {
+        resource_kind: "RunnerAttempt",
+        resource_name: "attempt-1",
+        resource_version: "sha256:attempt-1",
+        operation: "port-forward",
+        required: ["resource_version"],
+      },
+    });
+
+    await expect(RuntimeRepository.prototype.createExecRequest.call(accessRepo as any, {
+      run,
+      resourceKind: "RunnerAttempt",
+      resourceName: "attempt-1",
+      command: ["python", "-V"],
+    })).rejects.toMatchObject({
+      status: 428,
+      code: "runtime_resource_version_required",
+      detail: {
+        resource_kind: "RunnerAttempt",
+        resource_name: "attempt-1",
+        resource_version: "sha256:attempt-1",
+        operation: "exec",
+        required: ["resource_version"],
+      },
+    });
+
+    await expect(RuntimeRepository.prototype.cancelRuntimeAccessResource.call({
+      async resources() {
+        return inventory([portForward]);
+      },
+      async cancelPortForwardRequest() {
+        throw new Error("cancel should not mutate without a reviewed resource version");
+      },
+    } as any, {
+      run,
+      resourceKind: "PortForward",
+      resourceName: "pf-1",
+    })).rejects.toMatchObject({
+      status: 428,
+      code: "runtime_resource_version_required",
+      detail: {
+        resource_kind: "PortForward",
+        resource_name: "pf-1",
+        resource_version: "sha256:pf-1",
+        operation: "cancel",
+        required: ["resource_version"],
+      },
     });
   });
 
@@ -7802,6 +9931,7 @@ describe("runtime repository worker snapshots", () => {
         phase: "active",
       },
     });
+    portForward.metadata.resourceVersion = "sha256:pf-no-actions";
     const run = cloudRunRecord();
 
     await expect(RuntimeRepository.prototype.cordonRunnerInstanceResource.call({
@@ -7856,6 +9986,7 @@ describe("runtime repository worker snapshots", () => {
       run,
       resourceKind: "RunnerInstance",
       resourceName: "runner-instance-1",
+      resourceVersion: "sha256:current-runner",
       requester: "issuer:user-a",
       reason: "stale client",
     })).rejects.toMatchObject({
@@ -7886,6 +10017,7 @@ describe("runtime repository worker snapshots", () => {
       run,
       resourceKind: "PortForward",
       resourceName: "pf-1",
+      resourceVersion: "sha256:pf-no-actions",
       requester: "issuer:user-a",
       reason: "stale client",
     })).rejects.toMatchObject({
@@ -8043,6 +10175,9 @@ describe("runtime repository worker snapshots", () => {
       kind: "Trial",
       metadata: {
         name: "trial-1",
+        uid: "trial-1",
+        generation: 1,
+        resourceVersion: "sha256:trial-1",
         labels: {},
         annotations: {},
         ownerReferences: [],
@@ -8067,6 +10202,9 @@ describe("runtime repository worker snapshots", () => {
       kind: "TrialContainer",
       metadata: {
         name: "trial-1.agent.container-1",
+        uid: "trial-1.agent.container-1",
+        generation: 1,
+        resourceVersion: "sha256:trial-container-1",
         labels: {},
         annotations: {},
         ownerReferences: [],
@@ -8091,6 +10229,9 @@ describe("runtime repository worker snapshots", () => {
       kind: "ScheduleSlot",
       metadata: {
         name: "core-run-1.4",
+        uid: "core-run-1.4",
+        generation: 1,
+        resourceVersion: "sha256:schedule-slot-1",
         labels: {},
         annotations: {},
         ownerReferences: [],
@@ -8430,6 +10571,7 @@ function runtimeEvent(overrides: Partial<RuntimeEventRecord> = {}): RuntimeEvent
 function runtimeResourceFixture(overrides: {
   kind: string;
   name: string;
+  resourceVersion?: string;
   generation?: number;
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
@@ -8444,7 +10586,8 @@ function runtimeResourceFixture(overrides: {
     metadata: {
       name: overrides.name,
       uid: overrides.name,
-      ...(overrides.generation ? { generation: overrides.generation } : {}),
+      resourceVersion: overrides.resourceVersion ?? "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      generation: overrides.generation ?? 1,
       labels: overrides.labels ?? {},
       annotations: overrides.annotations ?? {},
       ownerReferences: overrides.ownerReferences ?? [],
@@ -8480,6 +10623,32 @@ function runtimeConditionsByType(resource: RuntimeResourceRecord): Record<string
 
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function captureRunEventsSql() {
+  const inserts: Array<{
+    runId: string;
+    attemptId: string | null;
+    eventType: string;
+    payload: JsonObject;
+  }> = [];
+  const sql = Object.assign(
+    (_strings: TemplateStringsArray, ...values: unknown[]) => {
+      inserts.push({
+        runId: String(values[0]),
+        attemptId: values[1] === null || values[1] === undefined ? null : String(values[1]),
+        eventType: String(values[3]),
+        payload: values[4] as JsonObject,
+      });
+      return [];
+    },
+    {
+      json(value: JsonObject) {
+        return value;
+      },
+    },
+  );
+  return { sql, inserts };
 }
 
 function cloudRunRecord() {
@@ -8521,7 +10690,7 @@ function cloudRunRecord() {
   };
 }
 
-function accessRequestRecord(overrides: Partial<Record<string, unknown>> = {}) {
+function accessRequestRecord(overrides: Partial<RuntimeAccessRequestRecord> = {}): RuntimeAccessRequestRecord {
   return {
     access_request_id: "pf-1",
     run_id: "run-1",

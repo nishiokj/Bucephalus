@@ -1309,7 +1309,7 @@ mod tests {
                         },
                         "credential_cache": {
                             "kind": "run_scoped",
-                            "target": "/root/.config/nova/codex-auth.json",
+                            "target": "/root/.config/codex/auth.json",
                             "env": "CODEX_AUTH_CACHE_FILE"
                         }
                     }
@@ -1407,7 +1407,7 @@ mod tests {
         );
 
         value["runtime"]["secrets"][0]["credential_cache"]["target_path"] =
-            json!("/root/.config/nova/codex-auth.json");
+            json!("/root/.config/codex/auth.json");
         assert!(
             schema.validate(&value).is_err(),
             "credential_cache should reject unknown target aliases"
@@ -4065,7 +4065,7 @@ mod tests {
                         },
                         "credential_cache": {
                             "kind": "run_scoped",
-                            "target": "/root/.config/nova/codex-auth.json",
+                            "target": "/root/.config/codex/auth.json",
                             "env": "CODEX_AUTH_CACHE_FILE"
                         }
                     }

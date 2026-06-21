@@ -1912,7 +1912,7 @@ fn normalize_agent_adapter_at(
             context
         ));
     }
-    let command = nova_adapter_command(&adapter, &context, event_argv_enabled)?;
+    let command = adapter_command(&adapter, &context, event_argv_enabled)?;
     agent.insert("command".to_string(), json!(command));
     Ok(())
 }
@@ -1982,7 +1982,7 @@ fn adapter_string_array(
         .collect()
 }
 
-fn nova_adapter_command(
+fn adapter_command(
     adapter: &Value,
     context: &str,
     event_argv_enabled: bool,
@@ -1993,8 +1993,7 @@ fn nova_adapter_command(
     for key in adapter.keys() {
         if !matches!(
             key.as_str(),
-            "kind"
-                | "executable"
+            "executable"
                 | "config"
                 | "mcp_config"
                 | "working_dir"
@@ -2010,15 +2009,6 @@ fn nova_adapter_command(
             return Err(anyhow!("{}.{} is not supported", context, key));
         }
     }
-    let kind = adapter_string(adapter, "kind", None, context)?
-        .ok_or_else(|| anyhow!("{}.kind is required", context))?;
-    if kind != "nova" {
-        return Err(anyhow!(
-            "{}.kind must be nova for the built-in adapter (got '{}')",
-            context,
-            kind
-        ));
-    }
     let result = adapter_string(adapter, "result", Some("structured_json"), context)?
         .ok_or_else(|| anyhow!("{}.result is required", context))?;
     if result != "structured_json" {
@@ -2030,7 +2020,8 @@ fn nova_adapter_command(
     }
 
     let mut command = vec![
-        adapter_string(adapter, "executable", Some("/usr/local/bin/nova"), context)?.unwrap(),
+        adapter_string(adapter, "executable", None, context)?
+            .ok_or_else(|| anyhow!("{}.executable is required", context))?,
         "run".to_string(),
         "--input-file".to_string(),
         "__BUCEPHALUS_TRIAL_INPUT_PATH__".to_string(),
@@ -2506,7 +2497,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_nova_agent_adapter_to_contract_command() {
+    fn normalizes_agent_adapter_to_contract_command() {
         let mut value = json!({
             "matrix": {
                 "cases": { "path": "cases.jsonl" }
@@ -2515,8 +2506,8 @@ mod tests {
                 "case": {},
                 "agent": {
                     "adapter": {
-                        "kind": "nova",
-                        "config": "/opt/agent/nova-config.json",
+                        "executable": "/usr/local/bin/myagent",
+                        "config": "/opt/agent/config.json",
                         "mcp_config": "/opt/agent/mcp.json",
                         "timeout_ms": 540000,
                         "dangerous": true,
@@ -2542,22 +2533,22 @@ mod tests {
                 pair.first() == Some(&json!(flag)) && pair.get(1) == Some(&json!(expected))
             })
         };
-        assert_eq!(command.first(), Some(&json!("/usr/local/bin/nova")));
+        assert_eq!(command.first(), Some(&json!("/usr/local/bin/myagent")));
         assert!(command.contains(&json!("__BUCEPHALUS_TRIAL_INPUT_PATH__")));
         assert!(command.contains(&json!("__BUCEPHALUS_RESULT_PATH__")));
         assert!(command.contains(&json!("__BUCEPHALUS_TRAJECTORY_PATH__")));
         assert!(command_has("--mcp-config", "/opt/agent/mcp.json"));
         assert!(command_has("--provider-env", "gemini=GOOGLE_API_KEY"));
         assert_eq!(
-            value.pointer("/trial_runtime/agent/adapter/kind"),
-            Some(&json!("nova"))
+            value.pointer("/trial_runtime/agent/adapter/executable"),
+            Some(&json!("/usr/local/bin/myagent"))
         );
         assert!(value.pointer("/traces").is_none());
         assert!(value.pointer("/trial_runtime/agent/events/0/id").is_some());
     }
 
     #[test]
-    fn nova_agent_adapter_without_traces_omits_event_argv() {
+    fn agent_adapter_without_traces_omits_event_argv() {
         let mut value = json!({
             "matrix": {
                 "cases": { "path": "cases.jsonl" }
@@ -2566,8 +2557,8 @@ mod tests {
                 "case": {},
                 "agent": {
                     "adapter": {
-                        "kind": "nova",
-                        "config": "/opt/agent/nova-config.json"
+                        "executable": "/usr/local/bin/myagent",
+                        "config": "/opt/agent/config.json"
                     }
                 },
                 "execution": { "agent_site": "host" },
@@ -2591,19 +2582,19 @@ mod tests {
     }
 
     #[test]
-    fn variant_nova_agent_adapter_inherits_base_trace_sink() {
+    fn variant_agent_adapter_inherits_base_trace_sink() {
         let mut value = json!({
             "matrix": {
                 "cases": { "path": "cases.jsonl" },
                 "variants": [
                     { "id": "base", "baseline": true },
                     {
-                        "id": "nova-treatment",
+                        "id": "treatment",
                         "overrides": {
                             "agent": {
                                 "adapter": {
-                                    "kind": "nova",
-                                    "config": "/opt/agent/treatment-nova.json"
+                                    "executable": "/usr/local/bin/myagent",
+                                    "config": "/opt/agent/treatment-config.json"
                                 }
                             }
                         }
@@ -2635,7 +2626,7 @@ mod tests {
     }
 
     #[test]
-    fn nova_agent_adapter_events_true_requires_event_sink() {
+    fn agent_adapter_events_true_requires_event_sink() {
         let mut value = json!({
             "matrix": {
                 "cases": { "path": "cases.jsonl" }
@@ -2644,7 +2635,7 @@ mod tests {
                 "case": {},
                 "agent": {
                     "adapter": {
-                        "kind": "nova",
+                        "executable": "/usr/local/bin/myagent",
                         "events": true
                     }
                 },

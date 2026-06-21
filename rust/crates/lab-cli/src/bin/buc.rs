@@ -7,12 +7,14 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Method;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[path = "../cloud_auth_ux.rs"]
 mod cloud_auth_ux;
@@ -26,6 +28,72 @@ const DEFAULT_MAX_AUTHORING_CONTEXT_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
 const PROJECT_MANIFEST_YAML: &str = "bucephalus.project.yaml";
 const PROJECT_MANIFEST_YML: &str = "bucephalus.project.yml";
 const PROJECT_MANIFEST_SCHEMA_VERSION: &str = "bucephalus_project_v1";
+const DEFAULT_RUNTIME_ACCESS_WAIT_SECONDS: u64 = 30;
+const RUNTIME_ACCESS_WAIT_POLL_MS: u64 = 1_000;
+const RUNTIME_AUDIT_EVENT_TYPES: &str = concat!(
+    "runtime.resource.runner_instance.cordoned,",
+    "runtime.resource.runner_instance.drained,",
+    "runtime.resource.runner_instance.offline,",
+    "runtime.resource.runner_instance.unhealthy,",
+    "runtime.resource.runner_instance.online,",
+    "runtime.resource.runner_instance.heartbeat_restored,",
+    "runtime.resource.runner_instance.uncordoned,",
+    "worker.runtime.image_pull.pulling,",
+    "worker.runtime.image_pull.pulled,",
+    "worker.runtime.image_pull.failed,",
+    "worker.runtime.secret_binding.materialized,",
+    "worker.runtime.sidecar_requirement.checking,",
+    "worker.runtime.sidecar_requirement.available,",
+    "worker.runtime.sidecar_requirement.failed,",
+    "worker.runtime.accelerator_requirement.checking,",
+    "worker.runtime.accelerator_requirement.available,",
+    "worker.runtime.accelerator_requirement.failed,",
+    "worker.runtime.network_perimeter.applying,",
+    "worker.runtime.network_perimeter.applied,",
+    "worker.runtime.network_perimeter.failed,",
+    "runtime.resource.operation.reviewed,",
+    "runtime.resource.operation.review.failed,",
+    "runtime.api_resources.read,",
+    "runtime.api_resources.read.failed,",
+    "runtime.resource.list.read,",
+    "runtime.resource.list.read.failed,",
+    "runtime.resource.watch.read,",
+    "runtime.resource.watch.read.failed,",
+    "runtime.resource.health.read,",
+    "runtime.resource.health.read.failed,",
+    "runtime.resource.describe.read,",
+    "runtime.resource.describe.read.failed,",
+    "runtime.resource.get.read,",
+    "runtime.resource.get.read.failed,",
+    "runtime.resource.events.read,",
+    "runtime.resource.events.read.failed,",
+    "runtime.resource.status.read,",
+    "runtime.resource.status.read.failed,",
+    "runtime.resource.metrics.read,",
+    "runtime.resource.metrics.read.failed,",
+    "runtime.resource.metrics.list.read,",
+    "runtime.resource.metrics.list.read.failed,",
+    "runtime.inspect.bundle.read,",
+    "runtime.inspect.bundle.read.failed,",
+    "runtime.access.port_forward.requested,",
+    "runtime.access.port_forward.accepted,",
+    "runtime.access.port_forward.active,",
+    "runtime.access.port_forward.completed,",
+    "runtime.access.port_forward.failed,",
+    "runtime.access.port_forward.expired,",
+    "runtime.access.port_forward.cancelled,",
+    "runtime.access.exec.requested,",
+    "runtime.access.exec.accepted,",
+    "runtime.access.exec.active,",
+    "runtime.access.exec.completed,",
+    "runtime.access.exec.failed,",
+    "runtime.access.exec.expired,",
+    "runtime.access.exec.cancelled,",
+    "runtime.resource.logs.read,",
+    "runtime.resource.logs.read.failed,",
+    "runtime.resource.content.read,",
+    "runtime.resource.content.read.failed"
+);
 
 #[derive(Clone, Debug)]
 struct CliContext {
@@ -33,6 +101,74 @@ struct CliContext {
     user_token: Option<String>,
     args: Vec<String>,
     client: Client,
+}
+
+#[derive(Debug)]
+struct RawCloudResponse {
+    bytes: Vec<u8>,
+    headers: HeaderMap,
+}
+
+#[derive(Debug)]
+struct JsonCloudResponse {
+    status: u16,
+    payload: Value,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimePrinterColumn {
+    name: String,
+    json_path: String,
+    priority: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RuntimeAccessWaitKind {
+    PortForward,
+    Exec,
+}
+
+#[derive(Clone, Debug)]
+enum RuntimeWaitPredicate {
+    Condition { kind: String, status: String },
+    Phase(String),
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunGetTarget {
+    RunRecord,
+    ResourceList,
+    ResourceItem,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeResourceListOutput {
+    Summary,
+    Name,
+    Wide,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimePortForwardAttachSpec {
+    project_id: String,
+    zone: String,
+    instance_name: String,
+    target_host: String,
+    target_port: u16,
+    local_port: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimePortForwardClientEndpointAttachSpec {
+    endpoint: String,
+    local_port: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RuntimePortForwardAttachPlan {
+    GceIap(RuntimePortForwardAttachSpec),
+    ClientEndpoint(RuntimePortForwardClientEndpointAttachSpec),
 }
 
 #[derive(Debug)]
@@ -174,10 +310,42 @@ fn run(argv: Vec<String>) -> Result<()> {
         (Some("runs"), Some("list")) => run_list(with_args(&context, rest)),
         (Some("runs"), Some("create")) => run_create(with_args(&context, rest)),
         (Some("runs"), Some("get")) => run_get(with_args(&context, rest)),
-        (Some("runs"), Some("runtime")) => run_runtime(with_args(&context, rest)),
+        (Some("runs"), Some("api-resources")) => run_api_resources(with_args(&context, rest)),
+        (Some("runs"), Some("explain")) => run_explain(with_args(&context, rest)),
+        (Some("runs"), Some("inspect")) => run_inspect(with_args(&context, rest)),
+        (Some("runs"), Some("resources")) => run_resources(with_args(&context, rest)),
+        (Some("runs"), Some("tree")) => run_tree(with_args(&context, rest)),
+        (Some("runs"), Some("describe")) => run_describe(with_args(&context, rest)),
+        (Some("runs"), Some("status")) => run_status(with_args(&context, rest)),
+        (Some("runs"), Some("wait")) => run_wait(with_args(&context, rest)),
+        (Some("runs"), Some("can-i")) => run_can_i(with_args(&context, rest)),
+        (Some("runs"), Some("health")) => run_health(with_args(&context, rest)),
+        (Some("runs"), Some("metrics")) => run_metrics(with_args(&context, rest)),
+        (Some("runs"), Some("top")) => run_top(with_args(&context, rest)),
+        (Some("runs"), Some("watch")) => run_watch(with_args(&context, rest)),
         (Some("runs"), Some("events")) => run_events(with_args(&context, rest)),
-        (Some("runs"), Some("results")) => run_results(with_args(&context, rest)),
-        (Some("runs"), Some("value" | "kv")) => run_value(with_args(&context, rest)),
+        (Some("runs"), Some("audit")) => run_audit(with_args(&context, rest)),
+        (Some("runs"), Some("logs")) => run_logs(with_args(&context, rest)),
+        (Some("runs"), Some("content")) => run_content(with_args(&context, rest)),
+        (Some("runs"), Some("port-forward")) => run_port_forward(with_args(&context, rest)),
+        (Some("runs"), Some("exec")) => run_exec(with_args(&context, rest)),
+        (Some("runs"), Some("action")) => run_resource_action(with_args(&context, rest), None),
+        (Some("runs"), Some("cordon")) => {
+            run_resource_action(with_args(&context, rest), Some("cordon"))
+        }
+        (Some("runs"), Some("drain")) => {
+            run_resource_action(with_args(&context, rest), Some("drain"))
+        }
+        (Some("runs"), Some("uncordon")) => {
+            run_resource_action(with_args(&context, rest), Some("uncordon"))
+        }
+        (Some("runs"), Some("cancel")) => {
+            run_resource_action(with_args(&context, rest), Some("cancel"))
+        }
+        (Some("runs"), Some("complete")) => {
+            run_resource_action(with_args(&context, rest), Some("complete"))
+        }
+        (Some("runs"), Some("delete")) => run_resource_delete(with_args(&context, rest)),
         _ => bail!(
             "unknown hosted command: {}\n\nRun `buc help` for the Cloud product commands.",
             entered_command_name(group, command)
@@ -213,7 +381,37 @@ fn known_hosted_command(group: Option<&str>, command: Option<&str>) -> bool {
             | (Some("experiments"), Some("build" | "doctor"))
             | (
                 Some("runs"),
-                Some("list" | "create" | "get" | "runtime" | "events" | "results" | "value" | "kv")
+                Some(
+                    "list"
+                        | "create"
+                        | "get"
+                        | "api-resources"
+                        | "explain"
+                        | "inspect"
+                        | "resources"
+                        | "tree"
+                        | "describe"
+                        | "status"
+                        | "wait"
+                        | "can-i"
+                        | "health"
+                        | "metrics"
+                        | "top"
+                        | "watch"
+                        | "events"
+                        | "audit"
+                        | "logs"
+                        | "content"
+                        | "port-forward"
+                        | "exec"
+                        | "action"
+                        | "cordon"
+                        | "drain"
+                        | "uncordon"
+                        | "cancel"
+                        | "complete"
+                        | "delete"
+                )
             )
     )
 }
@@ -664,6 +862,21 @@ fn run_list(context: CliContext) -> Result<()> {
 }
 
 fn run_get(context: CliContext) -> Result<()> {
+    match run_get_target(&context.args)? {
+        RunGetTarget::ResourceList => {
+            return run_resources(with_args(
+                &context,
+                canonical_run_get_resource_list_args(&context.args)?,
+            ))
+        }
+        RunGetTarget::ResourceItem => {
+            return run_describe(with_args(
+                &context,
+                canonical_run_get_resource_item_args(&context.args)?,
+            ))
+        }
+        RunGetTarget::RunRecord => {}
+    }
     reject_unknown_options(&context.args, &["--run-id"], &["--json"])?;
     let run_id = run_id_arg(&context.args)?;
     ensure_api_configured(&context)?;
@@ -682,96 +895,1264 @@ fn run_get(context: CliContext) -> Result<()> {
     }
 }
 
-fn run_runtime(context: CliContext) -> Result<()> {
-    reject_unknown_options(&context.args, &["--run-id"], &["--json"])?;
-    let run_id = run_id_arg(&context.args)?;
+fn run_get_target(args: &[String]) -> Result<RunGetTarget> {
+    reject_unknown_options(
+        args,
+        &[
+            "--run-id",
+            "--resource",
+            "--kind",
+            "--name",
+            "--category",
+            "--label-selector",
+            "--field-selector",
+            "--limit",
+            "--continue",
+            "--view",
+            "--event-limit",
+            "--output",
+            "-o",
+        ],
+        &["--wide", "--json"],
+    )?;
+    let run_id_option = option_value(args, "--run-id")?;
+    let resource_option = option_value(args, "--resource")?;
+    let kind_option = option_value(args, "--kind")?;
+    let name_option = option_value(args, "--name")?;
+    if resource_option.is_some() && (kind_option.is_some() || name_option.is_some()) {
+        bail!("use either --resource Kind/name or --kind KIND --name NAME");
+    }
+    if name_option.is_some() && kind_option.is_none() {
+        bail!("--kind and --name must be provided together");
+    }
+    let item_option = resource_option.is_some()
+        || name_option.is_some()
+        || option_value(args, "--view")?.is_some()
+        || option_value(args, "--event-limit")?.is_some();
+    let list_option = kind_option.is_some()
+        || !runtime_category_filters(args)?.is_empty()
+        || option_value(args, "--label-selector")?.is_some()
+        || option_value(args, "--field-selector")?.is_some()
+        || option_value(args, "--limit")?.is_some()
+        || option_value(args, "--continue")?.is_some()
+        || runtime_resource_output_option(args)?.is_some()
+        || flag_present(args, "--wide");
+    let positionals = positional_args(args);
+    match (run_id_option.is_some(), positionals.as_slice()) {
+        (true, []) => {
+            if item_option {
+                Ok(RunGetTarget::ResourceItem)
+            } else if list_option {
+                Ok(RunGetTarget::ResourceList)
+            } else {
+                Ok(RunGetTarget::RunRecord)
+            }
+        }
+        (true, [resource_or_kind]) => {
+            if item_option || resource_or_kind.contains('/') {
+                Ok(RunGetTarget::ResourceItem)
+            } else {
+                Ok(RunGetTarget::ResourceList)
+            }
+        }
+        (true, [_, _]) => Ok(RunGetTarget::ResourceItem),
+        (true, _) => Ok(RunGetTarget::ResourceItem),
+        (false, []) => {
+            if item_option {
+                Ok(RunGetTarget::ResourceItem)
+            } else if list_option {
+                Ok(RunGetTarget::ResourceList)
+            } else {
+                Ok(RunGetTarget::RunRecord)
+            }
+        }
+        (false, [_run_id]) => {
+            if item_option {
+                Ok(RunGetTarget::ResourceItem)
+            } else if list_option {
+                Ok(RunGetTarget::ResourceList)
+            } else {
+                Ok(RunGetTarget::RunRecord)
+            }
+        }
+        (false, [_run_id, resource_or_kind]) => {
+            if item_option || resource_or_kind.contains('/') {
+                Ok(RunGetTarget::ResourceItem)
+            } else {
+                Ok(RunGetTarget::ResourceList)
+            }
+        }
+        (false, [_, _, _]) => Ok(RunGetTarget::ResourceItem),
+        (false, _) => Ok(RunGetTarget::ResourceItem),
+    }
+}
+
+fn canonical_run_get_resource_list_args(args: &[String]) -> Result<Vec<String>> {
+    let run_id_option = option_value(args, "--run-id")?;
+    let kind_option = option_value(args, "--kind")?;
+    let positionals = positional_args(args);
+    let (run_id, positional_kind) = match (run_id_option, positionals.as_slice()) {
+        (Some(run_id), []) => (Some(run_id), None),
+        (Some(run_id), [kind]) => (Some(run_id), Some(kind.clone())),
+        (None, []) => (None, None),
+        (None, [run_id]) => (Some(run_id.clone()), None),
+        (None, [run_id, kind]) => (Some(run_id.clone()), Some(kind.clone())),
+        (Some(_), _) => bail!("buc runs get accepts --run-id <run-id> [kind] for resource lists"),
+        (None, _) => bail!("buc runs get accepts <run-id> [kind] for resource lists"),
+    };
+    if positional_kind.is_some() && kind_option.is_some() {
+        bail!(
+            "runtime resource kind must be provided either positionally or with --kind, not both"
+        );
+    }
+    if positional_kind.is_some() && !runtime_category_filters(args)?.is_empty() {
+        bail!("runtime resource filters must use either a kind or --category, not both");
+    }
+    let mut out = Vec::new();
+    if let Some(run_id) = run_id {
+        out.push(run_id);
+    }
+    if let Some(kind) = positional_kind.or(kind_option) {
+        out.push("--kind".to_string());
+        out.push(kind);
+    }
+    for option in [
+        "--label-selector",
+        "--field-selector",
+        "--limit",
+        "--continue",
+    ] {
+        if let Some(value) = option_value(args, option)? {
+            out.push(option.to_string());
+            out.push(value);
+        }
+    }
+    if let Some(value) = runtime_resource_output_option(args)? {
+        out.push("--output".to_string());
+        out.push(value);
+    }
+    for category in option_values(args, "--category")? {
+        out.push("--category".to_string());
+        out.push(category);
+    }
+    if flag_present(args, "--wide") {
+        out.push("--wide".to_string());
+    }
+    if json_requested(args) {
+        out.push("--json".to_string());
+    }
+    Ok(out)
+}
+
+fn canonical_run_get_resource_item_args(args: &[String]) -> Result<Vec<String>> {
+    if !runtime_category_filters(args)?.is_empty() {
+        bail!("--category only applies to runtime resource lists");
+    }
+    if flag_present(args, "--wide") {
+        bail!("--wide only applies to runtime resource lists");
+    }
+    if runtime_resource_output_option(args)?.is_some() {
+        bail!("--output only applies to runtime resource lists");
+    }
+    let mut out = args.to_vec();
+    if option_value(args, "--view")?.is_none() {
+        out.push("--view".to_string());
+        out.push("resource".to_string());
+    }
+    Ok(out)
+}
+
+fn run_api_resources(context: CliContext) -> Result<()> {
+    reject_unknown_options(&context.args, &["--run-id", "--kind"], &["--json"])?;
+    let (run_id, kind) = run_id_and_optional_kind_args(&context.args)?;
     ensure_api_configured(&context)?;
-    let runtime = cloud_fetch(
-        &context,
+    let path = if let Some(kind) = kind {
+        format!(
+            "/v1/runs/{}/runtime/api-resources/{}",
+            encode_path_segment(&run_id),
+            encode_path_segment(&kind)
+        )
+    } else {
+        format!(
+            "/v1/runs/{}/runtime/api-resources",
+            encode_path_segment(&run_id)
+        )
+    };
+    let response = cloud_fetch(&context, Method::GET, &path, None, None)?;
+    ensure_runtime_response_matches_if_present(&response, &run_id)?;
+    if json_requested(&context.args) {
+        print_json(&response)
+    } else {
+        print_runtime_api_resources_summary(&response)
+    }
+}
+
+fn fetch_runtime_api_resources(context: &CliContext, run_id: &str) -> Result<Value> {
+    let response = cloud_fetch(
+        context,
         Method::GET,
-        &format!("/v1/runs/{}/runtime", encode_path_segment(&run_id)),
+        &format!(
+            "/v1/runs/{}/runtime/api-resources",
+            encode_path_segment(run_id)
+        ),
         None,
         None,
     )?;
-    ensure_runtime_response_matches(&runtime, &run_id)?;
+    ensure_runtime_response_matches_if_present(&response, run_id)?;
+    Ok(response)
+}
+
+fn run_explain(context: CliContext) -> Result<()> {
+    reject_unknown_options(&context.args, &["--run-id", "--kind"], &["--json"])?;
+    let (run_id, kind) = run_id_and_optional_kind_args(&context.args)?;
+    let kind = kind.ok_or_else(|| anyhow!("runtime resource kind is required for explain"))?;
+    ensure_api_configured(&context)?;
+    let path = format!(
+        "/v1/runs/{}/runtime/api-resources/{}",
+        encode_path_segment(&run_id),
+        encode_path_segment(&kind)
+    );
+    let response = cloud_fetch(&context, Method::GET, &path, None, None)?;
+    ensure_runtime_response_matches_if_present(&response, &run_id)?;
     if json_requested(&context.args) {
-        print_json(&runtime)
+        print_json(&response)
     } else {
-        print_runtime_summary(&runtime)
+        print_runtime_api_resource_explain(&response)
+    }
+}
+
+fn run_inspect(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--kind",
+            "--category",
+            "--label-selector",
+            "--field-selector",
+            "--event-limit",
+        ],
+        &["--json"],
+    )?;
+    let run_id = run_id_arg(&context.args)?;
+    let event_limit = bounded_number_option_string(&context.args, "--event-limit", 1000)?;
+    let query_params =
+        runtime_selector_query_params(&context.args, vec![("event_limit", event_limit)])?;
+    ensure_api_configured(&context)?;
+    let response = cloud_fetch(
+        &context,
+        Method::GET,
+        &path_with_query(
+            &format!("/v1/runs/{}/runtime/inspect", encode_path_segment(&run_id)),
+            &query_params,
+        ),
+        None,
+        None,
+    )?;
+    ensure_runtime_response_matches(&response, &run_id)?;
+    if json_requested(&context.args) {
+        print_json(&response)
+    } else {
+        print_runtime_inspect_summary(&response)
+    }
+}
+
+fn runtime_resource_list_output_arg(args: &[String]) -> Result<RuntimeResourceListOutput> {
+    let output = runtime_resource_output_option(args)?;
+    let wide = flag_present(args, "--wide");
+    let json = json_requested(args);
+    if let Some(output) = output {
+        let output = output.trim().to_ascii_lowercase();
+        if output.is_empty() {
+            bail!("--output must be name for runtime resource lists");
+        }
+        if output != "name" {
+            bail!("--output supports only name for runtime resource lists; use --json or --wide for other formats");
+        }
+        if json {
+            bail!("--output name cannot be combined with --json");
+        }
+        if wide {
+            bail!("--output name cannot be combined with --wide");
+        }
+        return Ok(RuntimeResourceListOutput::Name);
+    }
+    if json && wide {
+        bail!("--wide cannot be combined with --json");
+    }
+    if wide {
+        Ok(RuntimeResourceListOutput::Wide)
+    } else {
+        Ok(RuntimeResourceListOutput::Summary)
+    }
+}
+
+fn run_resources(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--kind",
+            "--category",
+            "--label-selector",
+            "--field-selector",
+            "--limit",
+            "--continue",
+            "--output",
+            "-o",
+        ],
+        &["--wide", "--json"],
+    )?;
+    let output = runtime_resource_list_output_arg(&context.args)?;
+    let run_id = run_id_arg(&context.args)?;
+    let limit = bounded_number_option_string(&context.args, "--limit", 1000)?;
+    let continue_token = option_value(&context.args, "--continue")?;
+    let query_params = runtime_selector_query_params(
+        &context.args,
+        vec![("limit", limit), ("continue", continue_token)],
+    )?;
+    ensure_api_configured(&context)?;
+    let response = cloud_fetch(
+        &context,
+        Method::GET,
+        &path_with_query(
+            &format!(
+                "/v1/runs/{}/runtime/resources",
+                encode_path_segment(&run_id)
+            ),
+            &query_params,
+        ),
+        None,
+        None,
+    )?;
+    ensure_runtime_response_matches(&response, &run_id)?;
+    if json_requested(&context.args) {
+        print_json(&response)
+    } else {
+        match output {
+            RuntimeResourceListOutput::Summary => print_runtime_resources_summary(&response),
+            RuntimeResourceListOutput::Name => print_runtime_resources_name_summary(&response),
+            RuntimeResourceListOutput::Wide => {
+                let api_resources = fetch_runtime_api_resources(&context, &run_id)?;
+                print_runtime_resources_wide_summary(&response, &api_resources)
+            }
+        }
+    }
+}
+
+fn run_tree(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--kind",
+            "--category",
+            "--label-selector",
+            "--field-selector",
+            "--limit",
+            "--continue",
+        ],
+        &["--json"],
+    )?;
+    let run_id = run_id_arg(&context.args)?;
+    let limit = bounded_number_option_string(&context.args, "--limit", 1000)?
+        .or_else(|| Some("1000".to_string()));
+    let continue_token = option_value(&context.args, "--continue")?;
+    let query_params = runtime_selector_query_params(
+        &context.args,
+        vec![("limit", limit), ("continue", continue_token)],
+    )?;
+    ensure_api_configured(&context)?;
+    let response = cloud_fetch(
+        &context,
+        Method::GET,
+        &path_with_query(
+            &format!(
+                "/v1/runs/{}/runtime/resources",
+                encode_path_segment(&run_id)
+            ),
+            &query_params,
+        ),
+        None,
+        None,
+    )?;
+    ensure_runtime_response_matches(&response, &run_id)?;
+    if json_requested(&context.args) {
+        print_json(&response)
+    } else {
+        print_runtime_resource_tree_summary(&response)
+    }
+}
+
+fn run_describe(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--resource",
+            "--kind",
+            "--name",
+            "--view",
+            "--event-limit",
+        ],
+        &["--json"],
+    )?;
+    let (run_id, kind, name) = run_id_and_resource_args(&context.args, "runtime resource")?;
+    let view = option_value(&context.args, "--view")?;
+    let event_limit = bounded_number_option_string(&context.args, "--event-limit", 1000)?;
+    ensure_api_configured(&context)?;
+    let response = cloud_fetch(
+        &context,
+        Method::GET,
+        &path_with_query(
+            &format!(
+                "/v1/runs/{}/runtime/resources/{}/{}",
+                encode_path_segment(&run_id),
+                encode_path_segment(&kind),
+                encode_path_segment(&name)
+            ),
+            &[("view", view), ("event_limit", event_limit)],
+        ),
+        None,
+        None,
+    )?;
+    ensure_runtime_response_matches_if_present(&response, &run_id)?;
+    if json_requested(&context.args) {
+        print_json(&response)?;
+    } else {
+        print_runtime_resource_summary(&response)?;
+    }
+    Ok(())
+}
+
+fn run_status(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &["--run-id", "--resource", "--kind", "--name"],
+        &["--json"],
+    )?;
+    let (run_id, kind, name) = run_id_and_resource_args(&context.args, "runtime resource")?;
+    ensure_api_configured(&context)?;
+    let response = cloud_fetch(
+        &context,
+        Method::GET,
+        &format!(
+            "/v1/runs/{}/runtime/resources/{}/{}/status",
+            encode_path_segment(&run_id),
+            encode_path_segment(&kind),
+            encode_path_segment(&name)
+        ),
+        None,
+        None,
+    )?;
+    ensure_runtime_response_matches(&response, &run_id)?;
+    if json_requested(&context.args) {
+        print_json(&response)
+    } else {
+        print_runtime_resource_status_summary(&response)
+    }
+}
+
+fn run_wait(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--resource",
+            "--kind",
+            "--name",
+            "--for",
+            "--timeout-seconds",
+            "--interval-seconds",
+        ],
+        &["--json"],
+    )?;
+    let (run_id, kind, name) = run_id_and_resource_args(&context.args, "runtime resource")?;
+    let predicate = runtime_wait_predicate(&context.args)?;
+    let timeout_seconds =
+        bounded_number_option(&context.args, "--timeout-seconds", 86_400)?.unwrap_or(300);
+    let interval_seconds =
+        bounded_number_option(&context.args, "--interval-seconds", 3_600)?.unwrap_or(1);
+    ensure_api_configured(&context)?;
+    let path = format!(
+        "/v1/runs/{}/runtime/resources/{}/{}/status",
+        encode_path_segment(&run_id),
+        encode_path_segment(&kind),
+        encode_path_segment(&name)
+    );
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    loop {
+        let response = cloud_fetch_json_response(&context, Method::GET, &path, None, None)?;
+        if matches!(predicate, RuntimeWaitPredicate::Delete) && response.status == 404 {
+            if json_requested(&context.args) {
+                return print_json(&json!({
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RuntimeResourceWait",
+                    "cloud_run_id": &run_id,
+                    "resource_ref": {
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": &kind,
+                        "name": &name,
+                    },
+                    "predicate": "delete",
+                    "deleted": true,
+                }));
+            }
+            println!("wait: {kind}/{name} deleted");
+            return Ok(());
+        }
+        if response.status < 200 || response.status >= 300 {
+            bail!(
+                "{}",
+                cloud_fetch_error_message(&context, response.status, &response.payload)
+            );
+        }
+        let latest = response.payload;
+        ensure_runtime_response_matches(&latest, &run_id)?;
+        if runtime_wait_predicate_matches(&latest, &predicate) {
+            if json_requested(&context.args) {
+                return print_json(&latest);
+            }
+            println!(
+                "wait: {}/{} reached {}",
+                kind,
+                name,
+                runtime_wait_predicate_label(&predicate)
+            );
+            return print_runtime_resource_status_summary(&latest);
+        }
+        if runtime_wait_terminal_failure(&latest, &predicate) {
+            bail!(
+                "runtime resource {}/{} reached terminal phase={} before {}; latest {}",
+                kind,
+                name,
+                runtime_status_phase(&latest).unwrap_or_else(|| "unknown".to_string()),
+                runtime_wait_predicate_label(&predicate),
+                runtime_wait_latest_status_summary(&latest, &predicate)
+            );
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            bail!(
+                "timed out waiting for {}/{} after {}s; latest {}",
+                kind,
+                name,
+                timeout_seconds,
+                runtime_wait_latest_status_summary(&latest, &predicate)
+            );
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_secs(interval_seconds.max(1))));
+    }
+}
+
+fn run_can_i(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &["--run-id", "--resource", "--kind", "--name", "--operation"],
+        &["--json"],
+    )?;
+    let (run_id, operation, kind, name) = run_id_operation_and_resource_args(&context.args)?;
+    ensure_api_configured(&context)?;
+    let response = cloud_fetch(
+        &context,
+        Method::GET,
+        &format!(
+            "/v1/runs/{}/runtime/resources/{}/{}/operations/{}",
+            encode_path_segment(&run_id),
+            encode_path_segment(&kind),
+            encode_path_segment(&name),
+            encode_path_segment(&operation)
+        ),
+        None,
+        None,
+    )?;
+    ensure_runtime_response_matches(&response, &run_id)?;
+    if json_requested(&context.args) {
+        print_json(&response)?;
+    } else {
+        print_runtime_operation_review_summary(&response, &operation, &kind, &name)?;
+    }
+    ensure_runtime_operation_review_supported(&response, &operation, &kind, &name)
+}
+
+fn ensure_runtime_operation_review_supported(
+    value: &Value,
+    fallback_operation: &str,
+    fallback_kind: &str,
+    fallback_name: &str,
+) -> Result<()> {
+    if value
+        .get("supported")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let operation = value
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_operation);
+    let resource = value
+        .get("resource_ref")
+        .map(runtime_resource_ref_line)
+        .unwrap_or_else(|| format!("{fallback_kind}/{fallback_name}"));
+    let detail = value
+        .get("message")
+        .or_else(|| value.get("reason"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("runtime operation is not supported right now");
+    bail!("runtime operation {operation} is not supported for {resource}: {detail}");
+}
+
+fn run_health(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--kind",
+            "--category",
+            "--label-selector",
+            "--field-selector",
+        ],
+        &["--json"],
+    )?;
+    let run_id = run_id_arg(&context.args)?;
+    let query_params = runtime_selector_query_params(&context.args, vec![])?;
+    ensure_api_configured(&context)?;
+    let response = cloud_fetch(
+        &context,
+        Method::GET,
+        &path_with_query(
+            &format!(
+                "/v1/runs/{}/runtime/resources/health",
+                encode_path_segment(&run_id)
+            ),
+            &query_params,
+        ),
+        None,
+        None,
+    )?;
+    ensure_runtime_response_matches(&response, &run_id)?;
+    if json_requested(&context.args) {
+        print_json(&response)
+    } else {
+        print_runtime_health_summary(&response)
+    }
+}
+
+fn run_metrics(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--resource",
+            "--kind",
+            "--name",
+            "--category",
+            "--label-selector",
+            "--field-selector",
+            "--limit",
+            "--continue",
+        ],
+        &["--json"],
+    )?;
+    let run_id = run_id_arg_allowing_optional_resource(&context.args)?;
+    let limit = bounded_number_option_string(&context.args, "--limit", 1000)?;
+    let continue_token = option_value(&context.args, "--continue")?;
+    let resource_target = optional_resource_args(&context.args)?;
+    if resource_target.is_some() && !runtime_category_filters(&context.args)?.is_empty() {
+        bail!("--category only applies to runtime metrics collection lists");
+    }
+    let query_params = if resource_target.is_none() {
+        Some(runtime_selector_query_params(
+            &context.args,
+            vec![("limit", limit), ("continue", continue_token.clone())],
+        )?)
+    } else {
+        None
+    };
+    ensure_api_configured(&context)?;
+    let path = if let Some((kind, name)) = resource_target {
+        format!(
+            "/v1/runs/{}/runtime/resources/{}/{}/metrics",
+            encode_path_segment(&run_id),
+            encode_path_segment(&kind),
+            encode_path_segment(&name)
+        )
+    } else {
+        path_with_query(
+            &format!(
+                "/v1/runs/{}/runtime/resources/metrics",
+                encode_path_segment(&run_id)
+            ),
+            query_params
+                .as_ref()
+                .expect("runtime metrics collection query params should be built"),
+        )
+    };
+    let response = cloud_fetch(&context, Method::GET, &path, None, None)?;
+    ensure_runtime_response_matches(&response, &run_id)?;
+    if json_requested(&context.args) {
+        print_json(&response)
+    } else {
+        print_runtime_metrics_summary(&response)
+    }
+}
+
+fn run_top(context: CliContext) -> Result<()> {
+    run_metrics(context)
+}
+
+fn run_watch(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--kind",
+            "--category",
+            "--label-selector",
+            "--field-selector",
+            "--resource-version",
+            "--known-resource",
+            "--interval-seconds",
+            "--max-polls",
+        ],
+        &["--json", "--follow"],
+    )?;
+    let run_id = run_id_arg(&context.args)?;
+    let follow = flag_present(&context.args, "--follow");
+    if !follow
+        && (option_value(&context.args, "--interval-seconds")?.is_some()
+            || option_value(&context.args, "--max-polls")?.is_some())
+    {
+        bail!("--interval-seconds and --max-polls require --follow");
+    }
+    if follow && json_requested(&context.args) {
+        bail!("--follow cannot be combined with --json; use --resource-version and --known-resource for machine polling");
+    }
+    let interval_seconds =
+        bounded_non_negative_number_option(&context.args, "--interval-seconds", 3_600)?
+            .unwrap_or(2);
+    let max_polls = bounded_number_option(&context.args, "--max-polls", 1_000_000)?;
+    let mut resource_version = option_value(&context.args, "--resource-version")?;
+    let mut known_resources = option_values(&context.args, "--known-resource")?;
+    let _ = runtime_selector_query_params(&context.args, vec![])?;
+    ensure_api_configured(&context)?;
+    let mut polls = 0_u64;
+    loop {
+        polls += 1;
+        let mut query_params =
+            runtime_watch_query_params(&context.args, resource_version.clone(), &known_resources)?;
+        if follow {
+            query_params.push(("allow_bookmarks", Some("true".to_string())));
+        }
+        let response = cloud_fetch(
+            &context,
+            Method::GET,
+            &path_with_query(
+                &format!(
+                    "/v1/runs/{}/runtime/resources/watch",
+                    encode_path_segment(&run_id)
+                ),
+                &query_params,
+            ),
+            None,
+            None,
+        )?;
+        ensure_runtime_response_matches(&response, &run_id)?;
+        if json_requested(&context.args) {
+            return print_json(&response);
+        }
+        print_runtime_watch_summary(&response)?;
+        if !follow || max_polls.is_some_and(|max| polls >= max) {
+            return Ok(());
+        }
+        let (next_resource_version, next_known_resources) = runtime_watch_follow_cursors(&response);
+        if next_resource_version.is_none() && next_known_resources.is_empty() {
+            bail!("runtime resource watch response did not include resource_inventory.metadata.resourceVersion or resource_versions for --follow");
+        }
+        resource_version = next_resource_version;
+        known_resources = next_known_resources;
+        if interval_seconds > 0 {
+            std::thread::sleep(Duration::from_secs(interval_seconds));
+        }
     }
 }
 
 fn run_events(context: CliContext) -> Result<()> {
     reject_unknown_options(
         &context.args,
-        &["--run-id", "--limit", "--after-row-seq"],
-        &["--json"],
+        &[
+            "--run-id",
+            "--resource",
+            "--kind",
+            "--name",
+            "--limit",
+            "--after-row-seq",
+            "--continue",
+            "--event-type",
+            "--source",
+            "--resource-kind",
+            "--resource-name",
+            "--trial-id",
+            "--task-id",
+            "--interval-seconds",
+            "--max-polls",
+        ],
+        &["--json", "--follow"],
     )?;
-    let run_id = run_id_arg(&context.args)?;
-    let limit = bounded_number_option_string(&context.args, "--limit", 1000)?;
-    let after_row_seq = non_negative_number_option_string(&context.args, "--after-row-seq")?;
+    let run_id = run_id_arg_allowing_optional_resource(&context.args)?;
+    let follow = context.args.iter().any(|arg| arg == "--follow");
+    if !follow
+        && (option_value(&context.args, "--interval-seconds")?.is_some()
+            || option_value(&context.args, "--max-polls")?.is_some())
+    {
+        bail!("--interval-seconds and --max-polls require --follow");
+    }
+    if follow && json_requested(&context.args) {
+        bail!("--follow cannot be combined with --json; use --continue for machine pagination");
+    }
+    let interval_seconds =
+        bounded_non_negative_number_option(&context.args, "--interval-seconds", 3_600)?
+            .unwrap_or(2);
+    let max_polls = bounded_number_option(&context.args, "--max-polls", 1_000_000)?;
     ensure_api_configured(&context)?;
-    let events = cloud_fetch(
-        &context,
-        Method::GET,
-        &path_with_query(
-            &format!("/v1/runs/{}/runtime/events", encode_path_segment(&run_id)),
-            &[("limit", limit), ("after_row_seq", after_row_seq)],
-        ),
-        None,
-        None,
-    )?;
-    ensure_runtime_response_matches(&events, &run_id)?;
-    if json_requested(&context.args) {
-        print_json(&events)
+    let path = if let Some((kind, name)) = optional_resource_args(&context.args)? {
+        format!(
+            "/v1/runs/{}/runtime/resources/{}/{}/events",
+            encode_path_segment(&run_id),
+            encode_path_segment(&kind),
+            encode_path_segment(&name)
+        )
     } else {
-        print_runtime_events_summary(&events)
+        format!("/v1/runs/{}/runtime/events", encode_path_segment(&run_id))
+    };
+    if !follow {
+        let params = runtime_event_query_params(&context.args, None)?;
+        let events = cloud_fetch(
+            &context,
+            Method::GET,
+            &path_with_query(&path, &params),
+            None,
+            None,
+        )?;
+        ensure_runtime_response_matches(&events, &run_id)?;
+        return if json_requested(&context.args) {
+            print_json(&events)
+        } else {
+            print_runtime_events_summary(&events)
+        };
+    }
+
+    let mut cursor: Option<String> = None;
+    let mut polls = 0_u64;
+    loop {
+        polls += 1;
+        let params = runtime_event_query_params(&context.args, cursor.as_deref())?;
+        let events = cloud_fetch(
+            &context,
+            Method::GET,
+            &path_with_query(&path, &params),
+            None,
+            None,
+        )?;
+        ensure_runtime_response_matches(&events, &run_id)?;
+        print_runtime_events_summary(&events)?;
+        if max_polls.is_some_and(|max| polls >= max) {
+            return Ok(());
+        }
+        cursor = runtime_events_follow_cursor(&events);
+        if cursor.is_none() {
+            bail!("runtime event response did not include metadata.continue or metadata.resourceVersion for --follow");
+        }
+        if interval_seconds > 0 {
+            std::thread::sleep(Duration::from_secs(interval_seconds));
+        }
     }
 }
 
-fn run_results(context: CliContext) -> Result<()> {
-    reject_unknown_options(&context.args, &["--run-id", "--limit"], &["--json"])?;
-    let run_id = run_id_arg(&context.args)?;
-    let limit = bounded_number_option_string(&context.args, "--limit", 1000)?;
-    ensure_api_configured(&context)?;
-    let results = cloud_fetch(
-        &context,
-        Method::GET,
-        &path_with_query(
-            &format!("/v1/runs/{}/runtime/results", encode_path_segment(&run_id)),
-            &[("limit", limit)],
-        ),
-        None,
-        None,
-    )?;
-    ensure_runtime_response_matches(&results, &run_id)?;
-    if json_requested(&context.args) {
-        print_json(&results)
+fn run_audit(mut context: CliContext) -> Result<()> {
+    if option_values(&context.args, "--event-type")?.is_empty() {
+        context.args.push("--event-type".to_string());
+        context.args.push(RUNTIME_AUDIT_EVENT_TYPES.to_string());
+    }
+    run_events(context)
+}
+
+fn runtime_event_query_params(
+    args: &[String],
+    follow_cursor: Option<&str>,
+) -> Result<Vec<(&'static str, Option<String>)>> {
+    let limit = bounded_number_option_string(args, "--limit", 1000)?;
+    let after_row_seq = if follow_cursor.is_some() {
+        None
     } else {
-        print_runtime_results_summary(&results)
+        non_negative_number_option_string(args, "--after-row-seq")?
+    };
+    let continue_token = match follow_cursor {
+        Some(cursor) => Some(cursor.to_string()),
+        None => option_value(args, "--continue")?,
+    };
+    let mut params = vec![
+        ("limit", limit),
+        ("after_row_seq", after_row_seq),
+        ("continue", continue_token),
+    ];
+    for event_type in option_values(args, "--event-type")? {
+        params.push(("event_type", Some(event_type)));
+    }
+    for source in option_values(args, "--source")? {
+        params.push(("source", Some(source)));
+    }
+    params.push(("resource_kind", option_value(args, "--resource-kind")?));
+    params.push(("resource_name", option_value(args, "--resource-name")?));
+    params.push(("trial_id", option_value(args, "--trial-id")?));
+    params.push(("task_id", option_value(args, "--task-id")?));
+    Ok(params)
+}
+
+fn run_logs(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--resource",
+            "--kind",
+            "--name",
+            "--stream",
+            "--tail-lines",
+            "--out",
+            "--metadata-out",
+            "--interval-seconds",
+            "--max-polls",
+        ],
+        &["--follow"],
+    )?;
+    let (run_id, kind, name) = run_id_and_resource_args(&context.args, "runtime resource")?;
+    let stream = runtime_log_stream_arg(&context.args)?;
+    let tail_lines = bounded_number_option_string(&context.args, "--tail-lines", 1_000_000)?;
+    let out = option_value(&context.args, "--out")?;
+    let metadata_out = option_value(&context.args, "--metadata-out")?;
+    let follow = flag_present(&context.args, "--follow");
+    if !follow
+        && (option_value(&context.args, "--interval-seconds")?.is_some()
+            || option_value(&context.args, "--max-polls")?.is_some())
+    {
+        bail!("--interval-seconds and --max-polls require --follow");
+    }
+    let interval_seconds =
+        bounded_non_negative_number_option(&context.args, "--interval-seconds", 3_600)?
+            .unwrap_or(2);
+    let max_polls = bounded_number_option(&context.args, "--max-polls", 1_000_000)?;
+    ensure_api_configured(&context)?;
+    let path = path_with_query(
+        &format!(
+            "/v1/runs/{}/runtime/resources/{}/{}/logs",
+            encode_path_segment(&run_id),
+            encode_path_segment(&kind),
+            encode_path_segment(&name)
+        ),
+        &[("stream", stream), ("tail_lines", tail_lines)],
+    );
+    if !follow {
+        let response = cloud_fetch_raw(&context, Method::GET, &path, None, None)?;
+        return write_raw_output(&response, out.as_deref(), metadata_out.as_deref());
+    }
+
+    let mut polls = 0_u64;
+    let mut previous = Vec::new();
+    loop {
+        polls += 1;
+        let response = cloud_fetch_raw(&context, Method::GET, &path, None, None)?;
+        let bytes = appended_raw_log_bytes(&previous, &response.bytes);
+        write_raw_bytes(bytes, out.as_deref(), polls > 1)?;
+        write_runtime_raw_metadata(&response, metadata_out.as_deref())?;
+        previous = response.bytes;
+        if max_polls.is_some_and(|max| polls >= max) {
+            return Ok(());
+        }
+        if interval_seconds > 0 {
+            std::thread::sleep(Duration::from_secs(interval_seconds));
+        }
     }
 }
 
-fn run_value(context: CliContext) -> Result<()> {
-    reject_unknown_options(&context.args, &["--run-id", "--key"], &["--json"])?;
-    let (run_id, key) = run_value_args(&context.args)?;
+fn run_content(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--resource",
+            "--kind",
+            "--name",
+            "--out",
+            "--metadata-out",
+        ],
+        &[],
+    )?;
+    let (run_id, kind, name) = run_id_and_resource_args(&context.args, "runtime resource")?;
+    let out = option_value(&context.args, "--out")?;
+    let metadata_out = option_value(&context.args, "--metadata-out")?;
     ensure_api_configured(&context)?;
-    let value = cloud_fetch(
+    let response = cloud_fetch_raw(
         &context,
         Method::GET,
         &format!(
-            "/v1/runs/{}/runtime/kv/{}",
+            "/v1/runs/{}/runtime/resources/{}/{}/content",
             encode_path_segment(&run_id),
-            encode_path_segment(&key)
+            encode_path_segment(&kind),
+            encode_path_segment(&name)
         ),
         None,
         None,
     )?;
-    ensure_runtime_value_response_matches(&value, &run_id, &key)?;
+    write_raw_output(&response, out.as_deref(), metadata_out.as_deref())
+}
+
+fn run_port_forward(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--resource",
+            "--kind",
+            "--name",
+            "--target-port",
+            "--local-port",
+            "--protocol",
+            "--ttl-seconds",
+            "--wait-seconds",
+            "--reason",
+            "--resource-version",
+        ],
+        &["--json", "--no-wait", "--attach"],
+    )?;
+    let (run_id, kind, name) = run_id_and_resource_args(&context.args, "runtime resource")?;
+    let target_port = bounded_number_option(&context.args, "--target-port", 65535)?
+        .ok_or_else(|| anyhow!("--target-port is required"))?;
+    let local_port = bounded_number_option(&context.args, "--local-port", 65535)?;
+    let ttl_seconds = bounded_number_option(&context.args, "--ttl-seconds", i32::MAX as u64)?;
+    let wait_seconds = runtime_access_wait_seconds(&context.args)?;
+    let attach = flag_present(&context.args, "--attach");
+    if attach && wait_seconds.is_none() {
+        bail!("--attach requires waiting for the PortForward to become active; remove --no-wait");
+    }
+    if attach && json_requested(&context.args) {
+        bail!("--attach cannot be combined with --json; use --json without --attach to inspect the resource");
+    }
+    let protocol = option_value(&context.args, "--protocol")?;
+    let reason = option_value(&context.args, "--reason")?;
+    let resource_version = required_runtime_resource_version(&context.args, "port-forward")?;
+    let mut body = Map::new();
+    body.insert("target_port".to_string(), json!(target_port));
+    insert_option_u64(&mut body, "local_port", local_port);
+    insert_option_u64(&mut body, "ttl_seconds", ttl_seconds);
+    insert_option_string(&mut body, "protocol", protocol);
+    insert_option_string(&mut body, "reason", reason);
+    body.insert("resource_version".to_string(), json!(resource_version));
+    ensure_api_configured(&context)?;
+    let mut response = cloud_fetch(
+        &context,
+        Method::POST,
+        &format!(
+            "/v1/runs/{}/runtime/resources/{}/{}/port-forward",
+            encode_path_segment(&run_id),
+            encode_path_segment(&kind),
+            encode_path_segment(&name)
+        ),
+        Some(Value::Object(body)),
+        None,
+    )?;
+    ensure_runtime_response_matches_if_present(&response, &run_id)?;
+    ensure_resource_envelope(&response)?;
+    if let Some(wait_seconds) = wait_seconds {
+        response = wait_for_runtime_access_resource(
+            &context,
+            &run_id,
+            &response,
+            RuntimeAccessWaitKind::PortForward,
+            wait_seconds,
+        )?;
+        ensure_runtime_response_matches_if_present(&response, &run_id)?;
+    }
     if json_requested(&context.args) {
-        print_json(&value)
+        print_json(&response)?;
+        ensure_runtime_port_forward_success(&response)
     } else {
-        print_runtime_value_summary(&value)
+        print_runtime_resource_summary(&response)?;
+        ensure_runtime_port_forward_success(&response)?;
+        if attach {
+            let attach_plan = runtime_port_forward_attach_plan(&response, local_port, target_port)?;
+            let cleanup_on_exit = runtime_port_forward_attach_plan_requires_cleanup(&attach_plan);
+            let attach_result = run_runtime_port_forward_attach(&attach_plan);
+            let cleanup_result = if attach_result.is_ok() && cleanup_on_exit {
+                complete_attached_runtime_port_forward(&context, &run_id, &response)
+            } else if attach_result.is_err() && cleanup_on_exit {
+                cleanup_attached_runtime_port_forward(&context, &run_id, &response)
+            } else {
+                Ok(())
+            };
+            match (attach_result, cleanup_result) {
+                (Ok(()), Ok(())) => {}
+                (Ok(()), Err(error)) => {
+                    return Err(error.context("port-forward attach ended but cleanup failed"));
+                }
+                (Err(error), Ok(())) => return Err(error),
+                (Err(error), Err(cleanup_error)) => {
+                    eprintln!("port-forward: cleanup after attach error failed: {cleanup_error}");
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn run_exec(context: CliContext) -> Result<()> {
+    let (prefix_args, command) = split_command_after_double_dash(&context.args, "buc runs exec")?;
+    reject_unknown_options(
+        &prefix_args,
+        &[
+            "--run-id",
+            "--resource",
+            "--kind",
+            "--name",
+            "--ttl-seconds",
+            "--wait-seconds",
+            "--reason",
+            "--resource-version",
+        ],
+        &["--json", "--no-wait"],
+    )?;
+    let (run_id, kind, name) = run_id_and_resource_args(&prefix_args, "runtime resource")?;
+    let ttl_seconds = bounded_number_option(&prefix_args, "--ttl-seconds", i32::MAX as u64)?;
+    let wait_seconds = runtime_access_wait_seconds(&prefix_args)?;
+    let reason = option_value(&prefix_args, "--reason")?;
+    let resource_version = required_runtime_resource_version(&prefix_args, "exec")?;
+    let mut body = Map::new();
+    body.insert("command".to_string(), json!(command));
+    insert_option_u64(&mut body, "ttl_seconds", ttl_seconds);
+    insert_option_string(&mut body, "reason", reason);
+    body.insert("resource_version".to_string(), json!(resource_version));
+    ensure_api_configured(&context)?;
+    let mut response = cloud_fetch(
+        &context,
+        Method::POST,
+        &format!(
+            "/v1/runs/{}/runtime/resources/{}/{}/exec",
+            encode_path_segment(&run_id),
+            encode_path_segment(&kind),
+            encode_path_segment(&name)
+        ),
+        Some(Value::Object(body)),
+        None,
+    )?;
+    ensure_runtime_response_matches_if_present(&response, &run_id)?;
+    ensure_resource_envelope(&response)?;
+    if let Some(wait_seconds) = wait_seconds {
+        response = wait_for_runtime_access_resource(
+            &context,
+            &run_id,
+            &response,
+            RuntimeAccessWaitKind::Exec,
+            wait_seconds,
+        )?;
+        ensure_runtime_response_matches_if_present(&response, &run_id)?;
+    }
+    if json_requested(&context.args) {
+        print_json(&response)?;
+    } else {
+        print_runtime_resource_summary(&response)?;
+    }
+    ensure_runtime_exec_success(&response)
+}
+
+fn run_resource_action(context: CliContext, fixed_action: Option<&str>) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--resource",
+            "--kind",
+            "--name",
+            "--reason",
+            "--resource-version",
+        ],
+        &["--json"],
+    )?;
+    let (run_id, kind, name, action) =
+        run_id_resource_and_action_args(&context.args, fixed_action)?;
+    let resource_version = required_runtime_resource_version(&context.args, &action)?;
+    let mut body = Map::new();
+    insert_option_string(
+        &mut body,
+        "reason",
+        option_value(&context.args, "--reason")?,
+    );
+    body.insert("resource_version".to_string(), json!(resource_version));
+    ensure_api_configured(&context)?;
+    let response = cloud_fetch(
+        &context,
+        Method::POST,
+        &format!(
+            "/v1/runs/{}/runtime/resources/{}/{}/actions/{}",
+            encode_path_segment(&run_id),
+            encode_path_segment(&kind),
+            encode_path_segment(&name),
+            encode_path_segment(&action)
+        ),
+        Some(Value::Object(body)),
+        None,
+    )?;
+    ensure_runtime_response_matches_if_present(&response, &run_id)?;
+    if json_requested(&context.args) {
+        print_json(&response)
+    } else {
+        print_runtime_resource_summary(&response)
+    }
+}
+
+fn run_resource_delete(context: CliContext) -> Result<()> {
+    reject_unknown_options(
+        &context.args,
+        &[
+            "--run-id",
+            "--resource",
+            "--kind",
+            "--name",
+            "--reason",
+            "--resource-version",
+        ],
+        &["--json"],
+    )?;
+    let (run_id, kind, name) = run_id_and_resource_args(&context.args, "runtime resource")?;
+    let resource_version = required_runtime_resource_version(&context.args, "delete")?;
+    let mut body = Map::new();
+    insert_option_string(
+        &mut body,
+        "reason",
+        option_value(&context.args, "--reason")?,
+    );
+    body.insert("resource_version".to_string(), json!(resource_version));
+    ensure_api_configured(&context)?;
+    let response = cloud_fetch(
+        &context,
+        Method::DELETE,
+        &format!(
+            "/v1/runs/{}/runtime/resources/{}/{}",
+            encode_path_segment(&run_id),
+            encode_path_segment(&kind),
+            encode_path_segment(&name)
+        ),
+        Some(Value::Object(body)),
+        None,
+    )?;
+    ensure_runtime_response_matches_if_present(&response, &run_id)?;
+    if json_requested(&context.args) {
+        print_json(&response)
+    } else {
+        print_runtime_resource_summary(&response)
     }
 }
 
@@ -1004,6 +2385,462 @@ fn package_path_arg(args: &[String]) -> Result<String> {
 
 fn run_id_arg(args: &[String]) -> Result<String> {
     single_positional_or_option(args, "--run-id", "run id")
+}
+
+fn run_id_and_optional_kind_args(args: &[String]) -> Result<(String, Option<String>)> {
+    let positionals = positional_args(args);
+    let run_id = option_value(args, "--run-id")?;
+    let kind = option_value(args, "--kind")?;
+    match (positionals.as_slice(), run_id, kind) {
+        ([run_id], None, kind) => Ok((run_id.clone(), kind)),
+        ([run_id, kind], None, None) => Ok((run_id.clone(), Some(kind.clone()))),
+        ([], Some(run_id), kind) => Ok((run_id, kind)),
+        ([kind], Some(run_id), None) => Ok((run_id, Some(kind.clone()))),
+        ([], None, _) => Err(anyhow!("run id is required")),
+        (_, Some(_), Some(_)) => bail!(
+            "runtime API resource kind must be provided either positionally or with --kind, not both"
+        ),
+        _ => bail!("runtime API resources accepts <run-id> [kind] or --run-id <run-id> [--kind kind]"),
+    }
+}
+
+fn run_id_arg_allowing_optional_resource(args: &[String]) -> Result<String> {
+    let positionals = positional_args(args);
+    let run_id = option_value(args, "--run-id")?;
+    match (positionals.as_slice(), run_id) {
+        ([run_id], None) | ([run_id, _], None) | ([run_id, _, _], None) => Ok(run_id.clone()),
+        ([], Some(run_id)) | ([_], Some(run_id)) | ([_, _], Some(run_id)) => Ok(run_id),
+        ([], None) => Err(anyhow!("run id is required")),
+        (_, Some(_)) => {
+            bail!("run id must be provided either positionally or with --run-id, not both")
+        }
+        _ => bail!("runtime command accepts <run-id> and at most one resource identity"),
+    }
+}
+
+fn runtime_selector_query_params(
+    args: &[String],
+    mut extra: Vec<(&'static str, Option<String>)>,
+) -> Result<Vec<(&'static str, Option<String>)>> {
+    let kind = option_value(args, "--kind")?;
+    let categories = runtime_category_filters(args)?;
+    if kind.is_some() && !categories.is_empty() {
+        bail!("runtime resource filters must use either --kind or --category, not both");
+    }
+    extra.push(("kind", kind));
+    for category in categories {
+        extra.push(("category", Some(category)));
+    }
+    extra.push(("label_selector", option_value(args, "--label-selector")?));
+    extra.push(("field_selector", option_value(args, "--field-selector")?));
+    Ok(extra)
+}
+
+fn runtime_category_filters(args: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for value in option_values(args, "--category")? {
+        for category in value.split(',') {
+            let category = category.trim();
+            if category.is_empty() {
+                continue;
+            }
+            if !out.iter().any(|existing| existing == category) {
+                out.push(category.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn runtime_watch_query_params(
+    args: &[String],
+    resource_version: Option<String>,
+    known_resources: &[String],
+) -> Result<Vec<(&'static str, Option<String>)>> {
+    let mut query_params =
+        runtime_selector_query_params(args, vec![("resource_version", resource_version)])?;
+    for known_resource in known_resources {
+        query_params.push(("known_resource", Some(known_resource.clone())));
+    }
+    Ok(query_params)
+}
+
+fn runtime_watch_follow_cursors(value: &Value) -> (Option<String>, Vec<String>) {
+    let resource_version = value
+        .pointer("/resource_inventory/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string);
+    let mut known_resources = value
+        .get("resource_versions")
+        .and_then(Value::as_object)
+        .map(|versions| {
+            versions
+                .iter()
+                .filter_map(|(key, value)| {
+                    let version = value.as_str()?.trim();
+                    (!key.trim().is_empty() && !version.is_empty())
+                        .then(|| format!("{}={version}", key.trim()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    known_resources.sort();
+    (resource_version, known_resources)
+}
+
+fn run_id_and_resource_args(args: &[String], noun: &str) -> Result<(String, String, String)> {
+    let run_id = run_id_arg_allowing_optional_resource(args)?;
+    let (kind, name) = optional_resource_args(args)?
+        .ok_or_else(|| anyhow!("{noun} is required; pass Kind/name or --kind KIND --name NAME"))?;
+    Ok((run_id, kind, name))
+}
+
+fn run_id_resource_and_action_args(
+    args: &[String],
+    fixed_action: Option<&str>,
+) -> Result<(String, String, String, String)> {
+    if let Some(action) = fixed_action {
+        let (run_id, kind, name) = run_id_and_resource_args(args, "runtime resource")?;
+        return Ok((run_id, kind, name, action.to_string()));
+    }
+
+    let positionals = positional_args(args);
+    let (resource_args, action) = match option_value(args, "--run-id")?.is_some() {
+        false => match positionals.as_slice() {
+            [run_id, resource, action] => (vec![run_id.clone(), resource.clone()], action.clone()),
+            [run_id, kind, name, action] => (
+                vec![run_id.clone(), kind.clone(), name.clone()],
+                action.clone(),
+            ),
+            _ => bail!("buc runs action requires <run-id> <Kind/name> <action>"),
+        },
+        true => match positionals.as_slice() {
+            [resource, action] => (vec![resource.clone()], action.clone()),
+            [kind, name, action] => (vec![kind.clone(), name.clone()], action.clone()),
+            _ => bail!("buc runs action requires --run-id <run-id> <Kind/name> <action>"),
+        },
+    };
+    let mut scoped_args = Vec::new();
+    if let Some(run_id) = option_value(args, "--run-id")? {
+        scoped_args.push("--run-id".to_string());
+        scoped_args.push(run_id);
+    }
+    if let Some(resource) = option_value(args, "--resource")? {
+        scoped_args.push("--resource".to_string());
+        scoped_args.push(resource);
+    }
+    if let Some(kind) = option_value(args, "--kind")? {
+        scoped_args.push("--kind".to_string());
+        scoped_args.push(kind);
+    }
+    if let Some(name) = option_value(args, "--name")? {
+        scoped_args.push("--name".to_string());
+        scoped_args.push(name);
+    }
+    scoped_args.extend(resource_args);
+    let (run_id, kind, name) = run_id_and_resource_args(&scoped_args, "runtime resource")?;
+    match action.as_str() {
+        "cordon" | "drain" | "uncordon" | "cancel" | "complete" => Ok((run_id, kind, name, action)),
+        _ => bail!(
+            "runtime resource action must be one of cordon, drain, uncordon, cancel, complete"
+        ),
+    }
+}
+
+fn run_id_operation_and_resource_args(args: &[String]) -> Result<(String, String, String, String)> {
+    let operation_option = option_value(args, "--operation")?;
+    let positionals = positional_args(args);
+    let (resource_args, operation) = match option_value(args, "--run-id")?.is_some() {
+        false => match (positionals.as_slice(), operation_option) {
+            ([run_id, operation, resource], None) => {
+                (vec![run_id.clone(), resource.clone()], operation.clone())
+            }
+            ([run_id, operation, kind, name], None) => (
+                vec![run_id.clone(), kind.clone(), name.clone()],
+                operation.clone(),
+            ),
+            ([run_id, resource], Some(operation)) => {
+                (vec![run_id.clone(), resource.clone()], operation)
+            }
+            ([run_id, kind, name], Some(operation)) => {
+                (vec![run_id.clone(), kind.clone(), name.clone()], operation)
+            }
+            _ => bail!("buc runs can-i requires <run-id> <operation> <Kind/name>"),
+        },
+        true => match (positionals.as_slice(), operation_option) {
+            ([operation, resource], None) => (vec![resource.clone()], operation.clone()),
+            ([operation, kind, name], None) => {
+                (vec![kind.clone(), name.clone()], operation.clone())
+            }
+            ([resource], Some(operation)) => (vec![resource.clone()], operation),
+            ([kind, name], Some(operation)) => (vec![kind.clone(), name.clone()], operation),
+            _ => bail!("buc runs can-i requires --run-id <run-id> <operation> <Kind/name>"),
+        },
+    };
+    let mut scoped_args = Vec::new();
+    if let Some(run_id) = option_value(args, "--run-id")? {
+        scoped_args.push("--run-id".to_string());
+        scoped_args.push(run_id);
+    }
+    if let Some(resource) = option_value(args, "--resource")? {
+        scoped_args.push("--resource".to_string());
+        scoped_args.push(resource);
+    }
+    if let Some(kind) = option_value(args, "--kind")? {
+        scoped_args.push("--kind".to_string());
+        scoped_args.push(kind);
+    }
+    if let Some(name) = option_value(args, "--name")? {
+        scoped_args.push("--name".to_string());
+        scoped_args.push(name);
+    }
+    scoped_args.extend(resource_args);
+    let (run_id, kind, name) = run_id_and_resource_args(&scoped_args, "runtime resource")?;
+    Ok((run_id, operation, kind, name))
+}
+
+fn runtime_wait_predicate(args: &[String]) -> Result<RuntimeWaitPredicate> {
+    let raw = option_value(args, "--for")?.unwrap_or_else(|| "condition=Ready".to_string());
+    if raw.trim().eq_ignore_ascii_case("delete") {
+        return Ok(RuntimeWaitPredicate::Delete);
+    }
+    let Some((kind, value)) = raw.split_once('=') else {
+        bail!("--for must be condition=<type>[=<status>], phase=<phase>, or delete");
+    };
+    match kind {
+        "condition" => {
+            let (condition, status) = if let Some((condition, status)) = value.split_once('=') {
+                (condition.trim(), status.trim())
+            } else {
+                (value.trim(), "True")
+            };
+            if condition.is_empty() {
+                bail!("--for condition requires a condition type");
+            }
+            if status.is_empty() {
+                bail!("--for condition requires a condition status");
+            }
+            Ok(RuntimeWaitPredicate::Condition {
+                kind: condition.to_string(),
+                status: status.to_string(),
+            })
+        }
+        "phase" => {
+            let phase = value.trim();
+            if phase.is_empty() {
+                bail!("--for phase requires a phase value");
+            }
+            Ok(RuntimeWaitPredicate::Phase(phase.to_ascii_lowercase()))
+        }
+        _ => bail!("--for must be condition=<type>[=<status>], phase=<phase>, or delete"),
+    }
+}
+
+fn runtime_wait_predicate_matches(value: &Value, predicate: &RuntimeWaitPredicate) -> bool {
+    match predicate {
+        RuntimeWaitPredicate::Phase(expected) => runtime_status_phase(value)
+            .map(|phase| phase == expected.to_ascii_lowercase())
+            .unwrap_or(false),
+        RuntimeWaitPredicate::Condition { kind, status } => runtime_status_condition(value, kind)
+            .map(|observed| observed.eq_ignore_ascii_case(status))
+            .unwrap_or(false),
+        RuntimeWaitPredicate::Delete => runtime_deletion_timestamp(value).is_some(),
+    }
+}
+
+fn runtime_wait_terminal_failure(value: &Value, predicate: &RuntimeWaitPredicate) -> bool {
+    if matches!(
+        predicate,
+        RuntimeWaitPredicate::Phase(_) | RuntimeWaitPredicate::Delete
+    ) {
+        return false;
+    }
+    matches!(
+        runtime_status_phase(value).as_deref(),
+        Some("failed" | "expired" | "cancelled")
+    )
+}
+
+fn runtime_wait_predicate_label(predicate: &RuntimeWaitPredicate) -> String {
+    match predicate {
+        RuntimeWaitPredicate::Phase(phase) => format!("phase={phase}"),
+        RuntimeWaitPredicate::Condition { kind, status } => format!("condition={kind}={status}"),
+        RuntimeWaitPredicate::Delete => "delete".to_string(),
+    }
+}
+
+fn runtime_wait_latest_status_summary(value: &Value, predicate: &RuntimeWaitPredicate) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "phase={}",
+        runtime_status_phase(value).unwrap_or_else(|| "unknown".to_string())
+    ));
+    if let Some(reason) = runtime_status_reason(value) {
+        parts.push(format!("reason={reason}"));
+    }
+    if let RuntimeWaitPredicate::Condition { kind, .. } = predicate {
+        let observed =
+            runtime_status_condition(value, kind).unwrap_or_else(|| "unknown".to_string());
+        parts.push(format!("condition={kind}={observed}"));
+    }
+    if let Some(resource_version) = runtime_status_resource_version(value) {
+        parts.push(format!("resource_version={resource_version}"));
+    }
+    if let Some(generation) = runtime_status_generation_summary(value) {
+        parts.push(generation);
+    }
+    if let Some(deletion_timestamp) = runtime_deletion_timestamp(value) {
+        parts.push(format!("deletion_timestamp={deletion_timestamp}"));
+    }
+    parts.join(" ")
+}
+
+fn runtime_status_phase(value: &Value) -> Option<String> {
+    value
+        .get("phase")
+        .or_else(|| value.pointer("/status/phase"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|phase| !phase.is_empty())
+        .map(|phase| phase.to_ascii_lowercase())
+}
+
+fn runtime_status_reason(value: &Value) -> Option<String> {
+    value
+        .get("reason")
+        .or_else(|| value.pointer("/status/reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(ToString::to_string)
+}
+
+fn runtime_status_resource_version(value: &Value) -> Option<String> {
+    value
+        .get("resourceVersion")
+        .or_else(|| value.pointer("/metadata/resourceVersion"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|resource_version| !resource_version.is_empty())
+        .map(ToString::to_string)
+}
+
+fn runtime_status_generation_summary(value: &Value) -> Option<String> {
+    let generation = value
+        .get("generation")
+        .or_else(|| value.pointer("/metadata/generation"))
+        .and_then(Value::as_i64)?;
+    let observed = value
+        .get("observedGeneration")
+        .or_else(|| value.pointer("/status/observedGeneration"))
+        .and_then(Value::as_i64);
+    match observed {
+        Some(observed) if observed == generation => Some(format!(
+            "generation={generation}/{observed} freshness=current"
+        )),
+        Some(observed) => Some(format!(
+            "generation={generation}/{observed} freshness=stale"
+        )),
+        None => Some(format!("generation={generation}")),
+    }
+}
+
+fn runtime_deletion_timestamp(value: &Value) -> Option<String> {
+    value
+        .get("deletionTimestamp")
+        .or_else(|| value.pointer("/metadata/deletionTimestamp"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|timestamp| !timestamp.is_empty())
+        .map(ToString::to_string)
+}
+
+fn runtime_status_condition(value: &Value, kind: &str) -> Option<String> {
+    value
+        .get("conditions")
+        .or_else(|| value.pointer("/status/conditions"))
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|condition| {
+            condition
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|observed| observed.eq_ignore_ascii_case(kind))
+                .unwrap_or(false)
+        })
+        .and_then(|condition| condition.get("status").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(ToString::to_string)
+}
+
+fn optional_resource_args(args: &[String]) -> Result<Option<(String, String)>> {
+    let resource = option_value(args, "--resource")?;
+    let kind = option_value(args, "--kind")?;
+    let name = option_value(args, "--name")?;
+    match (resource, kind, name) {
+        (Some(resource), None, None) => return Ok(Some(parse_resource_ref(&resource)?)),
+        (None, Some(kind), Some(name)) => return Ok(Some((kind, name))),
+        (None, None, None) => {}
+        (Some(_), _, _) => bail!("use either --resource Kind/name or --kind KIND --name NAME"),
+        (None, Some(_), None) => {}
+        (None, None, Some(_)) => bail!("--kind and --name must be provided together"),
+    }
+
+    let positionals = positional_args(args);
+    let uses_run_id_option = option_value(args, "--run-id")?.is_some();
+    let resource_positionals = if uses_run_id_option {
+        positionals.as_slice()
+    } else {
+        match positionals.as_slice() {
+            [] | [_] => &[][..],
+            [_, rest @ ..] => rest,
+        }
+    };
+    match resource_positionals {
+        [] => Ok(None),
+        [resource] => Ok(Some(parse_resource_ref(resource)?)),
+        [kind, name] => Ok(Some((kind.clone(), name.clone()))),
+        _ => bail!("runtime resource must be Kind/name or KIND NAME"),
+    }
+}
+
+fn parse_resource_ref(value: &str) -> Result<(String, String)> {
+    let Some((kind, name)) = value.split_once('/') else {
+        bail!("runtime resource must be written as Kind/name");
+    };
+    let kind = kind.trim();
+    let name = name.trim();
+    if kind.is_empty() || name.is_empty() {
+        bail!("runtime resource must include both kind and name");
+    }
+    Ok((kind.to_string(), name.to_string()))
+}
+
+fn runtime_log_stream_arg(args: &[String]) -> Result<Option<String>> {
+    let Some(stream) = option_value(args, "--stream")? else {
+        return Ok(None);
+    };
+    match stream.as_str() {
+        "stdout" | "stderr" => Ok(Some(stream)),
+        _ => bail!("--stream must be stdout or stderr"),
+    }
+}
+
+fn split_command_after_double_dash(
+    args: &[String],
+    command_name: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let Some(separator) = args.iter().position(|arg| arg == "--") else {
+        bail!("{command_name} requires `-- COMMAND [ARG...]` after the runtime resource");
+    };
+    let command = args.iter().skip(separator + 1).cloned().collect::<Vec<_>>();
+    if command.is_empty() {
+        bail!("{command_name} requires a non-empty command after `--`");
+    }
+    Ok((args[..separator].to_vec(), command))
 }
 
 fn draft_from_args(args: &[String]) -> Result<Value> {
@@ -2642,20 +4479,439 @@ fn ensure_runtime_response_matches(value: &Value, expected_run_id: &str) -> Resu
     Ok(())
 }
 
-fn ensure_runtime_value_response_matches(
-    value: &Value,
-    expected_run_id: &str,
-    expected_key: &str,
-) -> Result<()> {
-    ensure_runtime_response_matches(value, expected_run_id)?;
-    let key = value
-        .get("key")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("runtime value response is missing key"))?;
-    if key != expected_key {
-        bail!("runtime value response key mismatch: requested {expected_key}, API returned {key}");
+fn ensure_runtime_response_matches_if_present(value: &Value, expected_run_id: &str) -> Result<()> {
+    if value.get("cloud_run_id").is_some() {
+        ensure_runtime_response_matches(value, expected_run_id)?;
     }
     Ok(())
+}
+
+fn ensure_resource_envelope(value: &Value) -> Result<()> {
+    value
+        .get("resource")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("runtime access response is missing resource object"))?;
+    Ok(())
+}
+
+fn wait_for_runtime_access_resource(
+    context: &CliContext,
+    run_id: &str,
+    initial: &Value,
+    wait_kind: RuntimeAccessWaitKind,
+    wait_seconds: u64,
+) -> Result<Value> {
+    let (kind, name) = runtime_resource_kind_name(initial)?;
+    let expected_kind = match wait_kind {
+        RuntimeAccessWaitKind::PortForward => "PortForward",
+        RuntimeAccessWaitKind::Exec => "Exec",
+    };
+    if kind != expected_kind {
+        bail!("runtime access wait expected {expected_kind}, API returned {kind}/{name}");
+    }
+
+    let mut latest = initial.clone();
+    let deadline = Instant::now() + Duration::from_secs(wait_seconds);
+    loop {
+        let phase = runtime_resource_phase(&latest);
+        if runtime_access_wait_finished(wait_kind, phase.as_deref()) {
+            return Ok(latest);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for {} after {}s; latest phase={}",
+                runtime_resource_ref(&kind, &name),
+                wait_seconds,
+                phase.unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(Duration::from_millis(RUNTIME_ACCESS_WAIT_POLL_MS)));
+        latest = cloud_fetch(
+            context,
+            Method::GET,
+            &format!(
+                "/v1/runs/{}/runtime/resources/{}/{}",
+                encode_path_segment(run_id),
+                encode_path_segment(&kind),
+                encode_path_segment(&name)
+            ),
+            None,
+            None,
+        )?;
+        ensure_resource_envelope(&latest)?;
+    }
+}
+
+fn runtime_port_forward_attach_plan(
+    value: &Value,
+    requested_local_port: Option<u64>,
+    fallback_target_port: u64,
+) -> Result<RuntimePortForwardAttachPlan> {
+    let resource = runtime_resource_object(value);
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if kind != "PortForward" {
+        bail!("--attach expected a PortForward resource, API returned {kind}");
+    }
+    let phase = resource
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if !phase.eq_ignore_ascii_case("active") {
+        bail!("--attach requires an active PortForward resource; latest phase={phase}");
+    }
+    let mode = runtime_connection_string(resource, "mode").unwrap_or("");
+    if mode == "gcp_iap_ssh" {
+        return runtime_gce_iap_port_forward_attach_spec(
+            resource,
+            requested_local_port,
+            fallback_target_port,
+        )
+        .map(RuntimePortForwardAttachPlan::GceIap);
+    }
+    if let Some(endpoint) =
+        runtime_port_forward_client_endpoint_attach_spec(resource, requested_local_port)?
+    {
+        return Ok(RuntimePortForwardAttachPlan::ClientEndpoint(endpoint));
+    }
+    bail!(
+        "--attach requires a GCE IAP provider tunnel or a client-reachable PortForward endpoint; connection.mode={mode}"
+    );
+}
+
+fn runtime_gce_iap_port_forward_attach_spec(
+    resource: &Value,
+    requested_local_port: Option<u64>,
+    fallback_target_port: u64,
+) -> Result<RuntimePortForwardAttachSpec> {
+    let target_port =
+        match runtime_port_forward_connection_port(resource, "/status/connection/target_port")? {
+            Some(port) => port,
+            None => runtime_port_forward_connection_port(resource, "/spec/target_port")?
+                .ok_or_else(|| {
+                    anyhow!("--attach requires connection.target_port or spec.target_port")
+                })?,
+        };
+    let local_port = requested_local_port
+        .map(runtime_port_from_u64)
+        .transpose()?
+        .or(runtime_port_forward_connection_port(
+            resource,
+            "/status/connection/local_port",
+        )?)
+        .or(runtime_port_forward_connection_port(
+            resource,
+            "/spec/local_port",
+        )?)
+        .unwrap_or(runtime_port_from_u64(fallback_target_port)?);
+    Ok(RuntimePortForwardAttachSpec {
+        project_id: runtime_required_connection_string(resource, "project_id")?,
+        zone: runtime_required_connection_string(resource, "zone")?,
+        instance_name: runtime_required_connection_string(resource, "instance_name")?,
+        target_host: runtime_required_connection_string(resource, "target_host")?,
+        target_port,
+        local_port,
+    })
+}
+
+fn runtime_port_forward_client_endpoint_attach_spec(
+    resource: &Value,
+    requested_local_port: Option<u64>,
+) -> Result<Option<RuntimePortForwardClientEndpointAttachSpec>> {
+    let local_port = requested_local_port
+        .map(runtime_port_from_u64)
+        .transpose()?
+        .or(runtime_port_forward_connection_port(
+            resource,
+            "/status/connection/local_port",
+        )?)
+        .or(runtime_port_forward_connection_port(
+            resource,
+            "/spec/local_port",
+        )?);
+    let endpoint = runtime_connection_string(resource, "client_endpoint")
+        .or_else(|| runtime_connection_string(resource, "client_listen"))
+        .map(ToString::to_string)
+        .or_else(|| {
+            let client_reachable = resource
+                .pointer("/status/connection/client_reachable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if client_reachable {
+                local_port.map(|port| format!("tcp://127.0.0.1:{port}"))
+            } else {
+                None
+            }
+        });
+    Ok(
+        endpoint.map(|endpoint| RuntimePortForwardClientEndpointAttachSpec {
+            endpoint,
+            local_port,
+        }),
+    )
+}
+
+fn runtime_resource_object(value: &Value) -> &Value {
+    value.get("resource").unwrap_or(value)
+}
+
+fn ensure_runtime_port_forward_success(value: &Value) -> Result<()> {
+    let (kind, name) = runtime_resource_kind_name(value)?;
+    if kind != "PortForward" {
+        bail!("runtime port-forward expected PortForward resource, API returned {kind}/{name}");
+    }
+    let phase = runtime_resource_phase(value);
+    if let Some("failed" | "expired" | "cancelled") = phase.as_deref() {
+        let reason = runtime_resource_object(value)
+            .pointer("/status/reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+            .map(|reason| format!(" reason={reason}"))
+            .unwrap_or_default();
+        bail!(
+            "runtime port-forward {kind}/{name} ended with phase={}{}",
+            phase.unwrap(),
+            reason
+        );
+    }
+    Ok(())
+}
+
+fn ensure_runtime_exec_success(value: &Value) -> Result<()> {
+    let (kind, name) = runtime_resource_kind_name(value)?;
+    if kind != "Exec" {
+        bail!("runtime exec expected Exec resource, API returned {kind}/{name}");
+    }
+    let phase = runtime_resource_phase(value);
+    match phase.as_deref() {
+        Some("completed") => {
+            let exit_code = runtime_resource_object(value)
+                .pointer("/status/connection/exit_code")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("runtime exec {kind}/{name} completed without exit_code"))?;
+            if exit_code != 0 {
+                bail!("runtime exec {kind}/{name} exited with code {exit_code}");
+            }
+        }
+        Some("failed" | "expired" | "cancelled") => {
+            let reason = runtime_resource_object(value)
+                .pointer("/status/reason")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.trim().is_empty())
+                .map(|reason| format!(" reason={reason}"))
+                .unwrap_or_default();
+            bail!(
+                "runtime exec {kind}/{name} ended with phase={}{}",
+                phase.unwrap(),
+                reason
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn runtime_required_connection_string(resource: &Value, key: &str) -> Result<String> {
+    runtime_connection_string(resource, key)
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("--attach requires connection.{key}"))
+}
+
+fn runtime_port_forward_connection_port(resource: &Value, pointer: &str) -> Result<Option<u16>> {
+    resource
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .map(runtime_port_from_u64)
+        .transpose()
+}
+
+fn runtime_port_from_u64(value: u64) -> Result<u16> {
+    if value == 0 || value > 65535 {
+        bail!("port must be between 1 and 65535, got {value}");
+    }
+    Ok(value as u16)
+}
+
+fn runtime_port_forward_attach_plan_requires_cleanup(plan: &RuntimePortForwardAttachPlan) -> bool {
+    matches!(plan, RuntimePortForwardAttachPlan::GceIap(_))
+}
+
+fn run_runtime_port_forward_attach(plan: &RuntimePortForwardAttachPlan) -> Result<()> {
+    match plan {
+        RuntimePortForwardAttachPlan::GceIap(spec) => run_gce_iap_port_forward_attach(spec),
+        RuntimePortForwardAttachPlan::ClientEndpoint(spec) => {
+            run_client_endpoint_port_forward_attach(spec)
+        }
+    }
+}
+
+fn run_gce_iap_port_forward_attach(spec: &RuntimePortForwardAttachSpec) -> Result<()> {
+    let args = gcloud_iap_port_forward_args(spec);
+    eprintln!(
+        "port-forward: forwarding 127.0.0.1:{} -> {}:{} through GCE IAP instance {} (Ctrl-C to stop)",
+        spec.local_port, spec.target_host, spec.target_port, spec.instance_name
+    );
+    let status = Command::new("gcloud")
+        .args(&args)
+        .status()
+        .with_context(|| "failed to start gcloud for GCE IAP port-forward attach")?;
+    if !status.success() {
+        bail!("gcloud port-forward attach exited with status {status}");
+    }
+    Ok(())
+}
+
+fn run_client_endpoint_port_forward_attach(
+    spec: &RuntimePortForwardClientEndpointAttachSpec,
+) -> Result<()> {
+    let local_port = spec
+        .local_port
+        .map(|port| format!(" local_port={port}"))
+        .unwrap_or_default();
+    eprintln!(
+        "port-forward: worker reports client-reachable endpoint {}{}",
+        spec.endpoint, local_port
+    );
+    eprintln!(
+        "port-forward: this worker-managed tunnel is already active; leaving the PortForward resource active for explicit cleanup or TTL expiry",
+    );
+    Ok(())
+}
+
+fn cleanup_attached_runtime_port_forward(
+    context: &CliContext,
+    run_id: &str,
+    value: &Value,
+) -> Result<()> {
+    let (kind, name) = runtime_resource_kind_name(value)?;
+    if kind != "PortForward" {
+        bail!("port-forward cleanup expected PortForward resource, API returned {kind}/{name}");
+    }
+    let resource_version = runtime_resource_metadata_resource_version(value)?;
+    let mut body = Map::new();
+    body.insert(
+        "reason".to_string(),
+        json!("local port-forward attach ended"),
+    );
+    body.insert("resource_version".to_string(), json!(resource_version));
+    let response = cloud_fetch(
+        context,
+        Method::DELETE,
+        &format!(
+            "/v1/runs/{}/runtime/resources/{}/{}",
+            encode_path_segment(run_id),
+            encode_path_segment(&kind),
+            encode_path_segment(&name),
+        ),
+        Some(Value::Object(body)),
+        None,
+    )?;
+    ensure_resource_envelope(&response)
+}
+
+fn complete_attached_runtime_port_forward(
+    context: &CliContext,
+    run_id: &str,
+    value: &Value,
+) -> Result<()> {
+    let (kind, name) = runtime_resource_kind_name(value)?;
+    if kind != "PortForward" {
+        bail!("port-forward complete expected PortForward resource, API returned {kind}/{name}");
+    }
+    let resource_version = runtime_resource_metadata_resource_version(value)?;
+    let mut body = Map::new();
+    body.insert(
+        "reason".to_string(),
+        json!("local port-forward attach ended"),
+    );
+    body.insert("resource_version".to_string(), json!(resource_version));
+    let response = cloud_fetch(
+        context,
+        Method::POST,
+        &format!(
+            "/v1/runs/{}/runtime/resources/{}/{}/actions/complete",
+            encode_path_segment(run_id),
+            encode_path_segment(&kind),
+            encode_path_segment(&name),
+        ),
+        Some(Value::Object(body)),
+        None,
+    )?;
+    ensure_resource_envelope(&response)
+}
+
+fn gcloud_iap_port_forward_args(spec: &RuntimePortForwardAttachSpec) -> Vec<String> {
+    vec![
+        "compute".to_string(),
+        "ssh".to_string(),
+        spec.instance_name.clone(),
+        "--project".to_string(),
+        spec.project_id.clone(),
+        "--zone".to_string(),
+        spec.zone.clone(),
+        "--tunnel-through-iap".to_string(),
+        "--".to_string(),
+        "-N".to_string(),
+        "-L".to_string(),
+        format!(
+            "127.0.0.1:{}:{}:{}",
+            spec.local_port, spec.target_host, spec.target_port
+        ),
+    ]
+}
+
+fn runtime_resource_kind_name(value: &Value) -> Result<(String, String)> {
+    let resource = value.get("resource").unwrap_or(value);
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())
+        .ok_or_else(|| anyhow!("runtime resource response is missing kind"))?;
+    let name = resource
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| anyhow!("runtime resource response is missing metadata.name"))?;
+    Ok((kind.to_string(), name.to_string()))
+}
+
+fn runtime_resource_metadata_resource_version(value: &Value) -> Result<String> {
+    let resource = value.get("resource").unwrap_or(value);
+    resource
+        .pointer("/metadata/resourceVersion")
+        .or_else(|| resource.pointer("/metadata/resource_version"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|resource_version| !resource_version.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("runtime resource response is missing metadata.resourceVersion"))
+}
+
+fn runtime_resource_phase(value: &Value) -> Option<String> {
+    value
+        .get("resource")
+        .unwrap_or(value)
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|phase| !phase.is_empty())
+        .map(|phase| phase.to_ascii_lowercase())
+}
+
+fn runtime_access_wait_finished(wait_kind: RuntimeAccessWaitKind, phase: Option<&str>) -> bool {
+    match (wait_kind, phase) {
+        (RuntimeAccessWaitKind::PortForward, Some("active")) => true,
+        (RuntimeAccessWaitKind::Exec, Some("completed")) => true,
+        (_, Some("failed" | "expired" | "cancelled")) => true,
+        _ => false,
+    }
+}
+
+fn runtime_resource_ref(kind: &str, name: &str) -> String {
+    format!("{kind}/{name}")
 }
 
 fn ensure_secret_list_response(value: &Value) -> Result<()> {
@@ -2761,6 +5017,23 @@ fn cloud_fetch(
     body: Option<Value>,
     raw_body: Option<(Vec<u8>, &str)>,
 ) -> Result<Value> {
+    let response = cloud_fetch_json_response(context, method, path, body, raw_body)?;
+    if response.status < 200 || response.status >= 300 {
+        bail!(
+            "{}",
+            cloud_fetch_error_message(context, response.status, &response.payload)
+        );
+    }
+    Ok(response.payload)
+}
+
+fn cloud_fetch_json_response(
+    context: &CliContext,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+    raw_body: Option<(Vec<u8>, &str)>,
+) -> Result<JsonCloudResponse> {
     let mut headers = HeaderMap::new();
     if let Some(token) = context.user_token.as_ref() {
         headers.insert(
@@ -2787,14 +5060,56 @@ fn cloud_fetch(
     } else {
         serde_json::from_str(&text).unwrap_or_else(|_| json!({ "message": text }))
     };
+    Ok(JsonCloudResponse {
+        status: status.as_u16(),
+        payload,
+    })
+}
+
+fn cloud_fetch_raw(
+    context: &CliContext,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+    raw_body: Option<(Vec<u8>, &str)>,
+) -> Result<RawCloudResponse> {
+    let mut headers = HeaderMap::new();
+    if let Some(token) = context.user_token.as_ref() {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("invalid bearer token header")?,
+        );
+    }
+
+    let url = format!("{}{}", context.api_url, path);
+    let mut request = context.client.request(method, url).headers(headers);
+    if let Some((bytes, content_type)) = raw_body {
+        request = request.header(CONTENT_TYPE, content_type).body(bytes);
+    } else if let Some(body) = body {
+        request = request
+            .header(CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&body)?);
+    }
+    let response = request.send()?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response.bytes()?.to_vec();
     if !status.is_success() {
+        let payload = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or_else(
+                |_| json!({ "message": String::from_utf8_lossy(&bytes).to_string() }),
+            )
+        };
         let mut message = cloud_error_message(status.as_u16(), &payload);
         if status.as_u16() == 401 {
             message = append_user_auth_hint(context, message);
         }
         bail!("{message}");
     }
-    Ok(payload)
+    Ok(RawCloudResponse { bytes, headers })
 }
 
 fn cloud_error_message(status: u16, payload: &Value) -> String {
@@ -2833,6 +5148,15 @@ fn cloud_error_message(status: u16, payload: &Value) -> String {
     lines.join("\n")
 }
 
+fn cloud_fetch_error_message(context: &CliContext, status: u16, payload: &Value) -> String {
+    let message = cloud_error_message(status, payload);
+    if status == 401 {
+        append_user_auth_hint(context, message)
+    } else {
+        message
+    }
+}
+
 fn append_user_auth_hint(context: &CliContext, message: String) -> String {
     let token_path = lab_core::bucephalus_home()
         .ok()
@@ -2846,10 +5170,8 @@ fn append_user_auth_hint(context: &CliContext, message: String) -> String {
 
 const CLOUD_RUNTIME_OPTION_KEYS: &[&str] = &[
     "backend",
-    "executor",
     "arch",
     "cpu_count",
-    "cpu",
     "memory_mb",
     "disk_mb",
     "isolation",
@@ -2907,7 +5229,7 @@ fn runtime_options_from_args(args: &[String]) -> Result<Map<String, Value>> {
 
 fn parse_cloud_runtime_option(key: &str, value: &str) -> Result<Value> {
     match key {
-        "backend" | "executor" | "arch" | "isolation" => {
+        "backend" | "arch" | "isolation" => {
             if value.trim().is_empty() {
                 bail!("runtime option `{key}` requires a non-empty string");
             }
@@ -2915,7 +5237,7 @@ fn parse_cloud_runtime_option(key: &str, value: &str) -> Result<Value> {
             validate_cloud_runtime_string_option(key, value)?;
             Ok(json!(value))
         }
-        "cpu_count" | "cpu" | "memory_mb" | "disk_mb" | "timeout_ms" | "max_parallel_trials" => {
+        "cpu_count" | "memory_mb" | "disk_mb" | "timeout_ms" | "max_parallel_trials" => {
             let parsed = value.trim().parse::<u64>().with_context(|| {
                 format!("--runtime-option {key}=VALUE requires a positive integer")
             })?;
@@ -2960,23 +5282,13 @@ fn insert_runtime_option(
     if runtime_options.contains_key(key) {
         bail!("runtime option `{key}` was provided more than once");
     }
-    if (key == "backend" && runtime_options.contains_key("executor"))
-        || (key == "executor" && runtime_options.contains_key("backend"))
-    {
-        bail!("runtime options `backend` and `executor` cannot both be provided; use `backend`");
-    }
-    if (key == "cpu_count" && runtime_options.contains_key("cpu"))
-        || (key == "cpu" && runtime_options.contains_key("cpu_count"))
-    {
-        bail!("runtime options `cpu_count` and `cpu` cannot both be provided; use `cpu_count`");
-    }
     runtime_options.insert(key.to_string(), value);
     Ok(())
 }
 
 fn validate_cloud_runtime_string_option(key: &str, value: &str) -> Result<()> {
     match key {
-        "backend" | "executor" => {
+        "backend" => {
             if ![
                 "runner-docker",
                 "runner_docker",
@@ -2986,7 +5298,7 @@ fn validate_cloud_runtime_string_option(key: &str, value: &str) -> Result<()> {
             ]
             .contains(&value)
             {
-                bail!("runtime option `{key}` must be one of runner-docker, runner_docker, local-docker, local_docker, modal");
+                bail!("runtime option `backend` must be one of runner-docker, runner_docker, local-docker, local_docker, modal");
             }
         }
         "arch" => {
@@ -3349,22 +5661,6 @@ fn reject_no_positionals(args: &[String], command: &str) -> Result<()> {
     }
 }
 
-fn run_value_args(args: &[String]) -> Result<(String, String)> {
-    let positionals = positional_args(args);
-    let run_id = option_value(args, "--run-id")?;
-    let key = option_value(args, "--key")?;
-    match (positionals.as_slice(), run_id, key) {
-        ([run_id, key], None, None) => Ok((run_id.clone(), key.clone())),
-        ([], Some(run_id), Some(key)) => Ok((run_id, key)),
-        ([], None, _) => Err(anyhow!("run id is required")),
-        ([], _, None) => Err(anyhow!("runtime key is required")),
-        (_, Some(_), _) | (_, _, Some(_)) => bail!(
-            "runtime value lookup must be provided either as positional arguments `<run-id> <key>` or with --run-id and --key, not both"
-        ),
-        _ => bail!("runtime value lookup requires exactly two positional arguments: <run-id> <key>"),
-    }
-}
-
 fn build_value_options() -> [&'static str; 11] {
     [
         "--file",
@@ -3430,6 +5726,20 @@ fn reject_unknown_options(
     while index < args.len() {
         let arg = &args[index];
         if !arg.starts_with("--") {
+            if value_options.contains(&arg.as_str()) {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("{arg} requires a value"))?;
+                if value.starts_with("--") {
+                    bail!("{arg} requires a value, got option {value}");
+                }
+                index += 2;
+                continue;
+            }
+            if boolean_options.contains(&arg.as_str()) {
+                index += 1;
+                continue;
+            }
             index += 1;
             continue;
         }
@@ -3478,6 +5788,54 @@ fn option_value(args: &[String], name: &str) -> Result<Option<String>> {
     } else {
         Ok(None)
     }
+}
+
+fn option_value_alias(
+    args: &[String],
+    canonical_name: &str,
+    alias: &str,
+) -> Result<Option<String>> {
+    let matches = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| {
+            (arg == canonical_name || arg == alias).then_some((index, arg.as_str()))
+        })
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        bail!("{canonical_name} can only be provided once");
+    }
+    if let Some((index, name)) = matches.first().copied() {
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow!("{name} requires a value"))?;
+        if value.starts_with("--") {
+            bail!("{name} requires a value, got option {value}");
+        }
+        Ok(Some(value.clone()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn runtime_resource_output_option(args: &[String]) -> Result<Option<String>> {
+    option_value_alias(args, "--output", "-o")
+}
+
+fn option_values(args: &[String], name: &str) -> Result<Vec<String>> {
+    args.iter()
+        .enumerate()
+        .filter_map(|(index, arg)| (arg == name).then_some(index))
+        .map(|index| {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| anyhow!("{name} requires a value"))?;
+            if value.starts_with("--") {
+                bail!("{name} requires a value, got option {value}");
+            }
+            Ok(value.clone())
+        })
+        .collect()
 }
 
 fn validation_level_option(args: &[String]) -> Result<Option<String>> {
@@ -3554,6 +5912,51 @@ fn bounded_number_option(args: &[String], name: &str, max: u64) -> Result<Option
     Ok(Some(value))
 }
 
+fn bounded_non_negative_number_option(
+    args: &[String],
+    name: &str,
+    max: u64,
+) -> Result<Option<u64>> {
+    let Some(value) = option_value(args, name)? else {
+        return Ok(None);
+    };
+    let parsed = value
+        .parse::<u64>()
+        .with_context(|| format!("{name} requires a non-negative integer"))?;
+    if parsed > max {
+        bail!("{name} must be <= {max}");
+    }
+    Ok(Some(parsed))
+}
+
+fn runtime_access_wait_seconds(args: &[String]) -> Result<Option<u64>> {
+    let no_wait = args.iter().any(|arg| arg == "--no-wait");
+    let wait_seconds = bounded_number_option(args, "--wait-seconds", 86_400)?;
+    if no_wait && wait_seconds.is_some() {
+        bail!("--no-wait and --wait-seconds are mutually exclusive");
+    }
+    if no_wait {
+        Ok(None)
+    } else {
+        Ok(Some(
+            wait_seconds.unwrap_or(DEFAULT_RUNTIME_ACCESS_WAIT_SECONDS),
+        ))
+    }
+}
+
+fn required_runtime_resource_version(args: &[String], operation: &str) -> Result<String> {
+    let Some(resource_version) = option_value(args, "--resource-version")? else {
+        bail!(
+            "runtime {operation} requires --resource-version from `buc runs can-i` or `buc runs describe`; refresh the resource before mutating it"
+        );
+    };
+    let resource_version = resource_version.trim();
+    if resource_version.is_empty() {
+        bail!("--resource-version must not be empty");
+    }
+    Ok(resource_version.to_string())
+}
+
 fn non_negative_number_option_string(args: &[String], name: &str) -> Result<Option<String>> {
     let Some(value) = option_value(args, name)? else {
         return Ok(None);
@@ -3596,6 +5999,39 @@ fn positional_args(args: &[String]) -> Vec<String> {
         "--q",
         "--limit",
         "--after-row-seq",
+        "--continue",
+        "--event-type",
+        "--source",
+        "--resource-kind",
+        "--resource-name",
+        "--trial-id",
+        "--task-id",
+        "--kind",
+        "--category",
+        "--name",
+        "--resource",
+        "--label-selector",
+        "--field-selector",
+        "--event-limit",
+        "--view",
+        "--resource-version",
+        "--known-resource",
+        "--operation",
+        "--for",
+        "--timeout-seconds",
+        "--interval-seconds",
+        "--max-polls",
+        "--target-port",
+        "--local-port",
+        "--protocol",
+        "--stream",
+        "--tail-lines",
+        "--out",
+        "--metadata-out",
+        "--output",
+        "-o",
+        "--ttl-seconds",
+        "--reason",
         "--format",
         "--key",
         "--value-file",
@@ -3606,12 +6042,12 @@ fn positional_args(args: &[String]) -> Vec<String> {
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
+        if options_with_values.contains(&arg.as_str()) {
+            index += 2;
+            continue;
+        }
         if arg.starts_with("--") {
-            if options_with_values.contains(&arg.as_str()) {
-                index += 2;
-            } else {
-                index += 1;
-            }
+            index += 1;
             continue;
         }
         out.push(arg.clone());
@@ -3626,6 +6062,12 @@ fn insert_option_string(object: &mut Map<String, Value>, key: &str, value: Optio
     }
 }
 
+fn insert_option_u64(object: &mut Map<String, Value>, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), json!(value));
+    }
+}
+
 fn json_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--json")
 }
@@ -3633,6 +6075,171 @@ fn json_requested(args: &[String]) -> bool {
 fn print_json(value: &Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn write_raw_output(
+    response: &RawCloudResponse,
+    out: Option<&str>,
+    metadata_out: Option<&str>,
+) -> Result<()> {
+    write_raw_bytes(&response.bytes, out, false)?;
+    write_runtime_raw_metadata(response, metadata_out)
+}
+
+fn write_raw_bytes(bytes: &[u8], out: Option<&str>, append: bool) -> Result<()> {
+    match out {
+        Some("-") | None => {
+            std::io::stdout().write_all(bytes)?;
+            Ok(())
+        }
+        Some(path) => {
+            if append {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| file.write_all(bytes))
+                    .with_context(|| format!("failed to append runtime content to {path}"))?;
+            } else {
+                fs::write(path, bytes)
+                    .with_context(|| format!("failed to write runtime content to {path}"))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn appended_raw_log_bytes<'a>(previous: &[u8], current: &'a [u8]) -> &'a [u8] {
+    if previous.is_empty() {
+        return current;
+    }
+    if previous == current {
+        return &current[current.len()..];
+    }
+    let max_overlap = previous.len().min(current.len());
+    for overlap in (1..=max_overlap).rev() {
+        if previous[previous.len() - overlap..] == current[..overlap] {
+            return &current[overlap..];
+        }
+    }
+    current
+}
+
+fn write_runtime_raw_metadata(
+    response: &RawCloudResponse,
+    metadata_out: Option<&str>,
+) -> Result<()> {
+    let Some(path) = metadata_out else {
+        return Ok(());
+    };
+    if path == "-" {
+        bail!("--metadata-out must be a file path; stdout is reserved for raw runtime bytes");
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&runtime_raw_response_metadata(response))?,
+    )
+    .with_context(|| format!("failed to write runtime response metadata to {path}"))?;
+    Ok(())
+}
+
+fn runtime_raw_response_metadata(response: &RawCloudResponse) -> Value {
+    let mut metadata = Map::new();
+    insert_header_metadata(
+        &mut metadata,
+        "run_id",
+        &response.headers,
+        "x-bucephalus-run-id",
+    );
+    insert_header_metadata(
+        &mut metadata,
+        "log_stream",
+        &response.headers,
+        "x-bucephalus-log-stream",
+    );
+    insert_header_metadata(
+        &mut metadata,
+        "core_run_id",
+        &response.headers,
+        "x-bucephalus-core-run-id",
+    );
+    insert_header_metadata(
+        &mut metadata,
+        "trial_id",
+        &response.headers,
+        "x-bucephalus-trial-id",
+    );
+    insert_header_metadata(
+        &mut metadata,
+        "artifact_role",
+        &response.headers,
+        "x-bucephalus-artifact-role",
+    );
+    insert_header_metadata(
+        &mut metadata,
+        "object_ref",
+        &response.headers,
+        "x-bucephalus-object-ref",
+    );
+    if let Some(sha256) = raw_header_string(&response.headers, "x-bucephalus-artifact-sha256")
+        .or_else(|| raw_header_string(&response.headers, "x-bucephalus-sha256"))
+    {
+        metadata.insert("sha256".to_string(), json!(sha256));
+    }
+    insert_header_metadata(
+        &mut metadata,
+        "media_type",
+        &response.headers,
+        "content-type",
+    );
+    let byte_size = raw_header_string(&response.headers, "content-length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(response.bytes.len() as u64);
+    metadata.insert("byte_size".to_string(), json!(byte_size));
+
+    let mut resource = Map::new();
+    insert_header_metadata(
+        &mut resource,
+        "kind",
+        &response.headers,
+        "x-bucephalus-resource-kind",
+    );
+    insert_header_metadata(
+        &mut resource,
+        "name",
+        &response.headers,
+        "x-bucephalus-resource-name",
+    );
+    insert_header_metadata(
+        &mut resource,
+        "resource_version",
+        &response.headers,
+        "x-bucephalus-resource-version",
+    );
+    if !resource.is_empty() {
+        metadata.insert("resource".to_string(), Value::Object(resource));
+    }
+    Value::Object(metadata)
+}
+
+fn insert_header_metadata(
+    metadata: &mut Map<String, Value>,
+    key: &str,
+    headers: &HeaderMap,
+    header: &str,
+) {
+    if let Some(value) = raw_header_string(headers, header) {
+        metadata.insert(key.to_string(), json!(value));
+    }
+}
+
+fn raw_header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn print_import_summary(value: &Value, source: Option<&str>) -> Result<()> {
@@ -4316,16 +6923,1975 @@ fn print_secret_delete_summary(value: &Value, fallback_name: &str) -> Result<()>
     Ok(())
 }
 
-fn print_runtime_summary(value: &Value) -> Result<()> {
-    if let Some(summary) = value.get("summary") {
-        println!("summary: {}", compact_json(summary)?);
+fn print_runtime_api_resources_summary(value: &Value) -> Result<()> {
+    if let Some(lines) = runtime_api_resources_summary_lines(value) {
+        println!("{}", lines.join("\n"));
     } else {
-        println!("runtime: {}", compact_json(value)?);
+        println!("api_resource: {}", compact_json(value)?);
     }
     Ok(())
 }
 
+fn runtime_api_resources_summary_lines(value: &Value) -> Option<Vec<String>> {
+    let resources = value.get("resources").and_then(Value::as_array)?;
+    let mut lines = vec![format!("api_resources: {}", resources.len())];
+    if let Some(generated_at) = value.get("generated_at").and_then(Value::as_str) {
+        lines.push(format!("generated_at: {generated_at}"));
+    }
+    let core_run_ids = runtime_explain_string_array(value, "core_run_ids");
+    if !core_run_ids.is_empty() {
+        lines.push(format!("core_run_ids: {}", core_run_ids.join(",")));
+    }
+    for resource in resources {
+        let kind = resource
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let name = resource.get("name").and_then(Value::as_str).unwrap_or("");
+        let mut parts = vec![format!("{kind} {name}")];
+        if let Some(count) = resource.get("count").and_then(Value::as_u64) {
+            parts.push(format!("count={count}"));
+        }
+        for (label, key) in [
+            ("short", "shortNames"),
+            ("categories", "categories"),
+            ("verbs", "verbs"),
+            ("subresources", "subresources"),
+            ("actions", "actions"),
+            ("access", "access"),
+        ] {
+            let values = runtime_explain_string_array(resource, key);
+            if !values.is_empty() {
+                parts.push(format!("{label}={}", values.join(",")));
+            }
+        }
+        if let Some(supports) = resource.get("supports").and_then(Value::as_object) {
+            let mut selectors = Vec::new();
+            if supports
+                .get("labelSelector")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                selectors.push("label");
+            }
+            if supports
+                .get("fieldSelector")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                selectors.push("field");
+            }
+            if !selectors.is_empty() {
+                parts.push(format!("selectors={}", selectors.join(",")));
+            }
+        }
+        lines.push(format!("  - {}", parts.join(" ")));
+    }
+    Some(lines)
+}
+
+fn print_runtime_api_resource_explain(value: &Value) -> Result<()> {
+    println!("{}", runtime_api_resource_explain_lines(value).join("\n"));
+    Ok(())
+}
+
+fn runtime_api_resource_explain_lines(value: &Value) -> Vec<String> {
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let name = value.get("name").and_then(Value::as_str).unwrap_or("");
+    let singular = value
+        .get("singularName")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .unwrap_or("");
+    let scope = value.get("scope").and_then(Value::as_str).unwrap_or("run");
+    let count = value.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let mut lines = vec![format!("explain: {kind}")];
+    if !description.is_empty() {
+        lines.push(format!("description: {description}"));
+    }
+    if let Some(generated_at) = value.get("generated_at").and_then(Value::as_str) {
+        lines.push(format!("generated_at: {generated_at}"));
+    }
+    let core_run_ids = runtime_explain_string_array(value, "core_run_ids");
+    if !core_run_ids.is_empty() {
+        lines.push(format!("core_run_ids: {}", core_run_ids.join(",")));
+    }
+    lines.push(format!(
+        "resource: {name} singular={singular} scope={scope} count={count}"
+    ));
+    for (label, key) in [
+        ("short_names", "shortNames"),
+        ("categories", "categories"),
+        ("verbs", "verbs"),
+        ("subresources", "subresources"),
+        ("actions", "actions"),
+        ("access", "access"),
+        ("field_selectors", "fieldSelectors"),
+        ("label_selectors", "labelSelectors"),
+    ] {
+        let values = runtime_explain_string_array(value, key);
+        if !values.is_empty() {
+            lines.push(format!("{label}: {}", values.join(",")));
+        }
+    }
+    if let Some(supports) = value.get("supports").and_then(Value::as_object) {
+        let mut supported = supports
+            .iter()
+            .filter_map(|(key, value)| value.as_bool().filter(|flag| *flag).map(|_| key.clone()))
+            .collect::<Vec<_>>();
+        supported.sort();
+        if !supported.is_empty() {
+            lines.push(format!("supports: {}", supported.join(",")));
+        }
+    }
+    if let Some(columns) = value.get("printerColumns").and_then(Value::as_array) {
+        if !columns.is_empty() {
+            lines.push("columns:".to_string());
+            for column in columns {
+                let name = column
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let json_path = column.get("jsonPath").and_then(Value::as_str).unwrap_or("");
+                let value_type = column
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("string");
+                let priority = column.get("priority").and_then(Value::as_i64).unwrap_or(0);
+                let description = column
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                lines.push(format!(
+                    "  - {name} {json_path} type={value_type} priority={priority}{}",
+                    if description.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" description={description}")
+                    }
+                ));
+            }
+        }
+    }
+    if let Some(paths) = value.get("pathTemplates").and_then(Value::as_object) {
+        let mut rows = paths
+            .iter()
+            .filter_map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|path| (key.to_string(), path.to_string()))
+            })
+            .collect::<Vec<_>>();
+        if let Some(subresources) = paths.get("subresources").and_then(Value::as_object) {
+            rows.extend(subresources.iter().filter_map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|path| (format!("subresource/{key}"), path.to_string()))
+            }));
+        }
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        if !rows.is_empty() {
+            lines.push("paths:".to_string());
+            for (key, path) in rows {
+                lines.push(format!("  - {key}: {path}"));
+            }
+        }
+    }
+    if let Some(commands) = value.get("exampleCommands").and_then(Value::as_array) {
+        if !commands.is_empty() {
+            lines.push("commands:".to_string());
+            for command in commands {
+                let purpose = command
+                    .get("purpose")
+                    .and_then(Value::as_str)
+                    .unwrap_or("example");
+                let text = command.get("command").and_then(Value::as_str).unwrap_or("");
+                if !text.is_empty() {
+                    lines.push(format!("  - {purpose}: {text}"));
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn runtime_explain_string_array(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn print_runtime_inspect_summary(value: &Value) -> Result<()> {
+    println!("{}", runtime_inspect_summary_lines(value).join("\n"));
+    Ok(())
+}
+
+fn runtime_inspect_summary_lines(value: &Value) -> Vec<String> {
+    let resources = value
+        .pointer("/resource_inventory/resources")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let events = value
+        .pointer("/event_list/events")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let api_resources = value
+        .pointer("/api_resources/resources")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let log_refs = value
+        .get("log_refs")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let metrics_resources = value
+        .pointer("/resource_metrics/resources")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let mut lines = vec![format!(
+        "inspect: resources={resources} api_resources={api_resources} events={events} metrics_resources={metrics_resources} log_refs={log_refs}"
+    )];
+    if let Some(filter) = runtime_inspect_filter_line(value) {
+        lines.push(format!("filter: {filter}"));
+    }
+    if let Some(inventory) = value.get("resource_inventory") {
+        for line in runtime_list_metadata_summary_lines(inventory) {
+            lines.push(format!("inventory_{line}"));
+        }
+    }
+    if let Some(health) = value
+        .get("resource_health")
+        .and_then(|health| health.get("summary"))
+    {
+        lines.push(format!(
+            "health: {}",
+            runtime_inspect_health_summary_line(health)
+        ));
+    }
+    if let Some(metrics) = value
+        .get("resource_metrics")
+        .and_then(|metrics| metrics.get("summary"))
+    {
+        lines.push(format!(
+            "metrics: {}",
+            runtime_inspect_metrics_summary_line(metrics)
+        ));
+    }
+    if let Some(event_list) = value.get("event_list") {
+        for line in runtime_events_summary_lines(event_list)
+            .into_iter()
+            .filter(|line| !line.starts_with("  - "))
+        {
+            lines.push(format!("event_{line}"));
+        }
+    }
+    if let Some(refs) = value.get("log_refs").and_then(Value::as_array) {
+        for log_ref in refs.iter().take(10) {
+            let resource = log_ref
+                .get("resource")
+                .map(runtime_resource_ref_line)
+                .unwrap_or_else(|| "unknown".to_string());
+            let streams = log_ref
+                .get("streams")
+                .and_then(Value::as_array)
+                .map(|streams| {
+                    streams
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|stream| !stream.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            lines.push(format!("log_ref: {resource} streams={}", streams.join(",")));
+        }
+        if refs.len() > 10 {
+            lines.push(format!("log_ref: ... {} more", refs.len() - 10));
+        }
+    }
+    lines
+}
+
+fn runtime_inspect_filter_line(value: &Value) -> Option<String> {
+    let filter = value.get("resource_filter")?;
+    let mut parts = Vec::new();
+    for (label, key) in [("kinds", "kinds"), ("categories", "categories")] {
+        let values = runtime_explain_string_array(filter, key);
+        if !values.is_empty() {
+            parts.push(format!("{label}={}", values.join(",")));
+        }
+    }
+    for (label, pointer) in [
+        ("label_selector", "/label_selector"),
+        ("field_selector", "/field_selector"),
+    ] {
+        if let Some(value) = filter
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(format!("{label}={value}"));
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn runtime_inspect_health_summary_line(summary: &Value) -> String {
+    runtime_inspect_summary_numbers(
+        summary,
+        &[
+            ("total", "/total"),
+            ("ready", "/ready"),
+            ("degraded", "/degraded"),
+            ("problem", "/problem"),
+            ("unknown", "/unknown"),
+            ("access_targets", "/access_targets"),
+            ("reachable", "/reachable_access_targets"),
+            ("actions", "/actions_available"),
+            ("observed_stale", "/observed_stale"),
+        ],
+    )
+}
+
+fn runtime_inspect_metrics_summary_line(summary: &Value) -> String {
+    runtime_inspect_summary_numbers(
+        summary,
+        &[
+            ("resources_total", "/resources_total"),
+            ("resources_returned", "/resources_returned"),
+            ("metrics_total", "/metrics_total"),
+            ("events_total", "/events_total"),
+        ],
+    )
+}
+
+fn runtime_inspect_summary_numbers(summary: &Value, fields: &[(&str, &str)]) -> String {
+    let parts = fields
+        .iter()
+        .filter_map(|(label, pointer)| {
+            summary
+                .pointer(pointer)
+                .and_then(Value::as_i64)
+                .map(|value| format!("{label}={value}"))
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        compact_json_lossy(summary)
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn print_runtime_resources_summary(value: &Value) -> Result<()> {
+    let resources = value
+        .get("resources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut lines = vec![format!("resources: {}", resources.len())];
+    lines.extend(runtime_list_metadata_summary_lines(value));
+    for resource in resources.iter().take(50) {
+        lines.push(format!("  - {}", runtime_resource_line(resource)));
+    }
+    if resources.len() > 50 {
+        lines.push(format!(
+            "  ... {} more; rerun with --json for full output",
+            resources.len() - 50
+        ));
+    }
+    println!("{}", lines.join("\n"));
+    Ok(())
+}
+
+fn print_runtime_resources_name_summary(value: &Value) -> Result<()> {
+    println!("{}", runtime_resources_name_lines(value)?.join("\n"));
+    Ok(())
+}
+
+fn runtime_resources_name_lines(value: &Value) -> Result<Vec<String>> {
+    value
+        .get("resources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|resource| {
+            let (kind, name) = runtime_resource_kind_name(resource)?;
+            Ok(format!("{kind}/{name}"))
+        })
+        .collect()
+}
+
+fn print_runtime_resources_wide_summary(value: &Value, api_resources: &Value) -> Result<()> {
+    println!(
+        "{}",
+        runtime_resources_wide_lines(value, api_resources).join("\n")
+    );
+    Ok(())
+}
+
+fn runtime_resources_wide_lines(value: &Value, api_resources: &Value) -> Vec<String> {
+    let resources = value
+        .get("resources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut lines = vec![format!("resources: {}", resources.len())];
+    lines.extend(runtime_list_metadata_summary_lines(value));
+    let columns_by_kind = runtime_printer_columns_by_kind(api_resources);
+    let mut resources_by_kind: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    for resource in resources {
+        let kind = resource
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        resources_by_kind.entry(kind).or_default().push(resource);
+    }
+    for (kind, kind_resources) in resources_by_kind {
+        lines.push(String::new());
+        lines.push(format!("{kind}: {}", kind_resources.len()));
+        let columns = columns_by_kind
+            .get(&kind)
+            .cloned()
+            .unwrap_or_else(runtime_default_printer_columns);
+        let columns = runtime_visible_printer_columns(columns);
+        let headers = columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let rows = kind_resources
+            .iter()
+            .map(|resource| {
+                columns
+                    .iter()
+                    .map(|column| runtime_printer_column_value(resource, &column.json_path))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        lines.extend(runtime_table_lines(&headers, &rows));
+    }
+    lines
+}
+
+fn runtime_printer_columns_by_kind(
+    api_resources: &Value,
+) -> BTreeMap<String, Vec<RuntimePrinterColumn>> {
+    let mut out = BTreeMap::new();
+    for resource in api_resources
+        .get("resources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(kind) = resource.get("kind").and_then(Value::as_str) else {
+            continue;
+        };
+        let columns = resource
+            .get("printerColumns")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(runtime_printer_column_from_value)
+            .collect::<Vec<_>>();
+        if !columns.is_empty() {
+            out.insert(kind.to_string(), columns);
+        }
+    }
+    out
+}
+
+fn runtime_printer_column_from_value(value: &Value) -> Option<RuntimePrinterColumn> {
+    let name = value.get("name")?.as_str()?.trim();
+    let json_path = value.get("jsonPath")?.as_str()?.trim();
+    if name.is_empty() || json_path.is_empty() {
+        return None;
+    }
+    Some(RuntimePrinterColumn {
+        name: name.to_string(),
+        json_path: json_path.to_string(),
+        priority: value.get("priority").and_then(Value::as_i64).unwrap_or(0),
+    })
+}
+
+fn runtime_default_printer_columns() -> Vec<RuntimePrinterColumn> {
+    [
+        ("Name", ".metadata.name", 0),
+        ("Phase", ".status.phase", 0),
+        (
+            "Ready",
+            r#".status.conditions[?(@.type=="Ready")].status"#,
+            0,
+        ),
+        (
+            "Observed",
+            r#".status.conditions[?(@.type=="Observed")].status"#,
+            0,
+        ),
+        ("Reason", ".status.reason", 1),
+        ("Source", ".audit.source", 1),
+    ]
+    .into_iter()
+    .map(|(name, json_path, priority)| RuntimePrinterColumn {
+        name: name.to_string(),
+        json_path: json_path.to_string(),
+        priority,
+    })
+    .collect()
+}
+
+fn runtime_visible_printer_columns(
+    columns: Vec<RuntimePrinterColumn>,
+) -> Vec<RuntimePrinterColumn> {
+    let mut seen = BTreeSet::new();
+    let mut visible = columns
+        .into_iter()
+        .filter(|column| column.priority <= 1)
+        .filter(|column| seen.insert(column.name.clone()))
+        .collect::<Vec<_>>();
+    if visible.is_empty() {
+        visible = runtime_default_printer_columns();
+    }
+    visible
+}
+
+fn runtime_printer_column_value(resource: &Value, json_path: &str) -> String {
+    if let Some(value) = runtime_condition_json_path_value(resource, json_path) {
+        return runtime_cell_value(value);
+    }
+    let Some(value) = runtime_simple_json_path_value(resource, json_path) else {
+        return "-".to_string();
+    };
+    if json_path == ".spec.command" {
+        return runtime_command_cell_value(value);
+    }
+    runtime_cell_value(value)
+}
+
+fn runtime_command_cell_value(value: &Value) -> String {
+    if let Some(command_parts) = value.as_array() {
+        let parts = command_parts
+            .iter()
+            .filter_map(|part| part.as_str().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        if !parts.is_empty() && parts.len() == command_parts.len() {
+            return runtime_shell_command_parts_display(&parts);
+        }
+    }
+    runtime_cell_value(value)
+}
+
+fn runtime_condition_json_path_value<'a>(
+    resource: &'a Value,
+    json_path: &str,
+) -> Option<&'a Value> {
+    let rest = json_path.strip_prefix(r#".status.conditions[?(@.type==""#)?;
+    let (condition_type, suffix) = rest.split_once(r#"")]"#)?;
+    let field = suffix.strip_prefix('.')?;
+    resource
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|condition| {
+            condition
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|value| value == condition_type)
+                .unwrap_or(false)
+        })
+        .and_then(|condition| condition.get(field))
+}
+
+fn runtime_simple_json_path_value<'a>(resource: &'a Value, json_path: &str) -> Option<&'a Value> {
+    let mut current = resource;
+    let path = json_path.strip_prefix('.')?;
+    if path.contains('[') {
+        return None;
+    }
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+fn runtime_cell_value(value: &Value) -> String {
+    match value {
+        Value::Null => "-".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => runtime_normalize_cell(value),
+        Value::Array(values) => {
+            let items = values
+                .iter()
+                .map(runtime_cell_value)
+                .filter(|value| value != "-")
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                "-".to_string()
+            } else {
+                runtime_normalize_cell(&items.join(","))
+            }
+        }
+        Value::Object(_) => runtime_normalize_cell(&compact_json_lossy(value)),
+    }
+}
+
+fn runtime_normalize_cell(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.trim().is_empty() {
+        "-".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn runtime_table_lines(headers: &[String], rows: &[Vec<String>]) -> Vec<String> {
+    if headers.is_empty() {
+        return Vec::new();
+    }
+    let header_cells = headers
+        .iter()
+        .map(|header| runtime_table_cell(&runtime_table_header_label(header)))
+        .collect::<Vec<_>>();
+    let row_cells = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| runtime_table_cell(cell))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut widths = header_cells
+        .iter()
+        .map(|cell| cell.len())
+        .collect::<Vec<_>>();
+    for row in &row_cells {
+        for (index, cell) in row.iter().enumerate() {
+            if let Some(width) = widths.get_mut(index) {
+                *width = (*width).max(cell.len());
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    lines.push(runtime_table_row_line(&header_cells, &widths));
+    for row in row_cells {
+        lines.push(runtime_table_row_line(&row, &widths));
+    }
+    lines
+}
+
+fn runtime_table_header_label(value: &str) -> String {
+    let mut out = String::new();
+    let chars = value.chars().collect::<Vec<_>>();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if index > 0 {
+            let previous = chars[index - 1];
+            let next = chars.get(index + 1).copied();
+            let starts_word = ch.is_ascii_uppercase()
+                && (previous.is_ascii_lowercase()
+                    || previous.is_ascii_digit()
+                    || next.map(|next| next.is_ascii_lowercase()).unwrap_or(false)
+                        && previous.is_ascii_uppercase());
+            if starts_word || ch == '_' || ch == '-' {
+                out.push(' ');
+            }
+        }
+        if ch != '_' && ch != '-' {
+            out.push(ch.to_ascii_uppercase());
+        }
+    }
+    runtime_normalize_cell(&out)
+}
+
+fn runtime_table_cell(value: &str) -> String {
+    const MAX_CELL_CHARS: usize = 56;
+    let value = runtime_normalize_cell(value);
+    if value.chars().count() <= MAX_CELL_CHARS {
+        return value;
+    }
+    let mut out = value
+        .chars()
+        .take(MAX_CELL_CHARS.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn runtime_table_row_line(cells: &[String], widths: &[usize]) -> String {
+    cells
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| {
+            let width = widths.get(index).copied().unwrap_or(cell.len());
+            format!("{cell:<width$}")
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+        .trim_end()
+        .to_string()
+}
+
+fn print_runtime_resource_tree_summary(value: &Value) -> Result<()> {
+    let resources = value
+        .get("resources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut lines = vec![format!("resource_tree: {}", resources.len())];
+    lines.extend(runtime_list_metadata_summary_lines(value));
+    for (resource_index, depth) in runtime_resource_tree_rows(&resources) {
+        let Some(resource) = resources.get(resource_index) else {
+            continue;
+        };
+        let mut line = format!(
+            "{}- {}",
+            "  ".repeat(depth),
+            runtime_resource_line(resource)
+        );
+        if depth == 0 {
+            let owners = runtime_resource_owner_ref_lines(resource);
+            if !owners.is_empty() {
+                line.push_str(&format!(" owners={}", owners.join(",")));
+            }
+        }
+        lines.push(line);
+    }
+    println!("{}", lines.join("\n"));
+    Ok(())
+}
+
+fn runtime_resource_tree_rows(resources: &[&Value]) -> Vec<(usize, usize)> {
+    let mut sorted = (0..resources.len()).collect::<Vec<_>>();
+    sorted.sort_by(|left, right| {
+        runtime_resource_identity(resources[*left])
+            .cmp(&runtime_resource_identity(resources[*right]))
+    });
+    let mut roots = Vec::new();
+    let mut children: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for resource_index in sorted.iter().copied() {
+        if let Some(parent_index) = runtime_resource_tree_parent_index(resources, resource_index) {
+            children
+                .entry(parent_index)
+                .or_default()
+                .push(resource_index);
+        } else {
+            roots.push(resource_index);
+        }
+    }
+    let mut rows = Vec::new();
+    let mut visited = vec![false; resources.len()];
+    for root in roots {
+        runtime_resource_tree_push_rows(root, 0, &children, &mut visited, &mut rows);
+    }
+    for resource_index in sorted {
+        runtime_resource_tree_push_rows(resource_index, 0, &children, &mut visited, &mut rows);
+    }
+    rows
+}
+
+fn runtime_resource_tree_push_rows(
+    resource_index: usize,
+    depth: usize,
+    children: &BTreeMap<usize, Vec<usize>>,
+    visited: &mut [bool],
+    rows: &mut Vec<(usize, usize)>,
+) {
+    if visited.get(resource_index).copied().unwrap_or(true) {
+        return;
+    }
+    visited[resource_index] = true;
+    rows.push((resource_index, depth));
+    if let Some(child_indices) = children.get(&resource_index) {
+        for child_index in child_indices {
+            runtime_resource_tree_push_rows(*child_index, depth + 1, children, visited, rows);
+        }
+    }
+}
+
+fn runtime_resource_tree_parent_index(resources: &[&Value], child_index: usize) -> Option<usize> {
+    let child = resources.get(child_index)?;
+    for owner in child
+        .pointer("/metadata/ownerReferences")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(parent_index) =
+            resources
+                .iter()
+                .enumerate()
+                .find_map(|(resource_index, resource)| {
+                    (resource_index != child_index
+                        && runtime_resource_matches_owner_ref(resource, owner))
+                    .then_some(resource_index)
+                })
+        {
+            return Some(parent_index);
+        }
+    }
+    None
+}
+
+fn runtime_resource_matches_owner_ref(resource: &Value, owner: &Value) -> bool {
+    let resource_kind = resource.get("kind").and_then(Value::as_str).unwrap_or("");
+    let owner_kind = owner.get("kind").and_then(Value::as_str).unwrap_or("");
+    if resource_kind != owner_kind {
+        return false;
+    }
+    let resource_uid = resource
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let owner_uid = owner.get("uid").and_then(Value::as_str).unwrap_or("");
+    if !resource_uid.is_empty() && !owner_uid.is_empty() {
+        return resource_uid == owner_uid;
+    }
+    resource
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        == owner.get("name").and_then(Value::as_str).unwrap_or("")
+}
+
+fn runtime_resource_identity(resource: &Value) -> String {
+    format!(
+        "{}/{}",
+        resource
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        resource
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    )
+}
+
+fn runtime_resource_owner_ref_lines(resource: &Value) -> Vec<String> {
+    resource
+        .pointer("/metadata/ownerReferences")
+        .and_then(Value::as_array)
+        .map(|owners| {
+            owners
+                .iter()
+                .filter_map(|owner| {
+                    let kind = owner.get("kind").and_then(Value::as_str)?.trim();
+                    let name = owner.get("name").and_then(Value::as_str)?.trim();
+                    (!kind.is_empty() && !name.is_empty()).then(|| format!("{kind}/{name}"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn print_runtime_resource_summary(value: &Value) -> Result<()> {
+    println!("{}", runtime_resource_summary_lines(value).join("\n"));
+    Ok(())
+}
+
+fn runtime_resource_summary_lines(value: &Value) -> Vec<String> {
+    let resource = value.get("resource").unwrap_or(value);
+    let mut lines = vec![format!("resource: {}", runtime_resource_line(resource))];
+    if let Some(generated_at) = value
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|generated_at| !generated_at.is_empty())
+    {
+        lines.push(format!("generated_at: {generated_at}"));
+    }
+    let core_run_ids = runtime_explain_string_array(value, "core_run_ids");
+    if !core_run_ids.is_empty() {
+        lines.push(format!("core_run_ids: {}", core_run_ids.join(",")));
+    }
+    lines.extend(runtime_resource_metadata_summary_lines(resource));
+    lines.extend(runtime_resource_condition_summary_lines(resource));
+    lines.extend(runtime_access_detail_lines(
+        resource,
+        runtime_resource_summary_run_id(value),
+    ));
+    lines.extend(runtime_related_resource_summary_lines(value));
+    if let Some(operations) = value.get("operations").and_then(Value::as_array) {
+        let supported = operations
+            .iter()
+            .filter(|operation| operation.get("supported").and_then(Value::as_bool) == Some(true))
+            .filter_map(|operation| operation.get("purpose").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        if !supported.is_empty() {
+            lines.push(format!("operations: {}", supported.join(",")));
+        }
+        lines.extend(runtime_resource_operation_summary_lines(operations));
+    }
+    if let Some(event_list) = value.get("event_list") {
+        lines.extend(runtime_resource_event_summary_lines(event_list));
+    }
+    lines
+}
+
+fn runtime_resource_event_summary_lines(event_list: &Value) -> Vec<String> {
+    let events = event_list
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut lines = vec![format!("events: {}", events.len())];
+    for line in runtime_events_summary_lines(event_list)
+        .into_iter()
+        .skip(1)
+        .filter(|line| !line.starts_with("  - "))
+    {
+        lines.push(format!("event_{line}"));
+    }
+    let visible_events = events
+        .iter()
+        .filter(|event| runtime_event_has_type(event))
+        .take(10)
+        .map(|event| {
+            format!(
+                "event: {}",
+                runtime_event_summary_line(event).trim_start_matches("  - ")
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.extend(visible_events);
+    let typed_event_count = events
+        .iter()
+        .filter(|event| runtime_event_has_type(event))
+        .count();
+    if typed_event_count > 10 {
+        lines.push(format!(
+            "event: ... {} more; run buc runs events for full output",
+            typed_event_count - 10
+        ));
+    }
+    lines
+}
+
+fn runtime_event_has_type(event: &Value) -> bool {
+    event
+        .get("event_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(|event_type| !event_type.is_empty())
+        .unwrap_or(false)
+}
+
+fn runtime_resource_operation_summary_lines(operations: &[Value]) -> Vec<String> {
+    operations
+        .iter()
+        .filter_map(runtime_resource_operation_summary_line)
+        .collect()
+}
+
+fn runtime_resource_operation_summary_line(operation: &Value) -> Option<String> {
+    let purpose = operation
+        .get("purpose")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|purpose| !purpose.is_empty())?;
+    let supported = operation
+        .get("supported")
+        .and_then(Value::as_bool)
+        .map(|value| if value { "yes" } else { "no" })
+        .unwrap_or("unknown");
+    let mut parts = vec![format!("operation: {purpose} supported={supported}")];
+    for key in ["verb", "subresource", "action", "reason", "message"] {
+        if let Some(value) = operation
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(format!("{key}={}", runtime_shell_quote(value)));
+        }
+    }
+    if let Some(requires_running_run) = operation
+        .get("requires_running_run")
+        .and_then(Value::as_bool)
+    {
+        parts.push(format!("requires_running_run={requires_running_run}"));
+    }
+    if let Some(command) = operation
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    {
+        parts.push(format!("command={}", runtime_shell_quote(command)));
+    }
+    Some(parts.join(" "))
+}
+
+fn runtime_related_resource_summary_lines(value: &Value) -> Vec<String> {
+    value
+        .get("related_resources")
+        .and_then(Value::as_array)
+        .map(|related_resources| {
+            related_resources
+                .iter()
+                .filter_map(|related| {
+                    let relationship = related
+                        .get("relationship")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|relationship| !relationship.is_empty())
+                        .unwrap_or("related");
+                    let resource = related.get("resource")?;
+                    let mut line = format!(
+                        "related: {relationship} {}",
+                        runtime_resource_line(resource)
+                    );
+                    if let Some(resource_version) = resource
+                        .pointer("/metadata/resourceVersion")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|resource_version| !resource_version.is_empty())
+                    {
+                        line.push_str(&format!(" resource_version={resource_version}"));
+                    }
+                    Some(line)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn runtime_resource_summary_run_id(value: &Value) -> Option<&str> {
+    value
+        .get("cloud_run_id")
+        .or_else(|| value.get("run_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|run_id| !run_id.is_empty())
+}
+
+fn runtime_resource_metadata_summary_lines(resource: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(uid) = resource
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|uid| !uid.is_empty())
+    {
+        lines.push(format!("uid: {uid}"));
+    }
+    if let Some(resource_version) = resource
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|resource_version| !resource_version.is_empty())
+    {
+        lines.push(format!("resource_version: {resource_version}"));
+    }
+    let generation = resource
+        .pointer("/metadata/generation")
+        .and_then(Value::as_i64);
+    let observed_generation = resource
+        .pointer("/status/observedGeneration")
+        .and_then(Value::as_i64);
+    match (generation, observed_generation) {
+        (Some(generation), Some(observed_generation)) => {
+            let freshness = if generation == observed_generation {
+                "current"
+            } else {
+                "stale"
+            };
+            lines.push(format!(
+                "generation: {generation} observed={observed_generation} freshness={freshness}"
+            ));
+        }
+        (Some(generation), None) => lines.push(format!("generation: {generation}")),
+        (None, Some(observed_generation)) => {
+            lines.push(format!("observed_generation: {observed_generation}"));
+        }
+        (None, None) => {}
+    }
+    let owners = runtime_resource_owner_ref_lines(resource);
+    if !owners.is_empty() {
+        lines.push(format!("owners: {}", owners.join(",")));
+    }
+    lines
+}
+
+fn runtime_resource_condition_summary_lines(resource: &Value) -> Vec<String> {
+    runtime_condition_summary_lines(
+        resource
+            .pointer("/status/conditions")
+            .and_then(Value::as_array),
+    )
+}
+
+fn runtime_condition_summary_lines(conditions: Option<&Vec<Value>>) -> Vec<String> {
+    conditions
+        .map(|conditions| {
+            conditions
+                .iter()
+                .filter_map(|condition| {
+                    let condition_type = condition.get("type").and_then(Value::as_str)?.trim();
+                    let status = condition
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Unknown")
+                        .trim();
+                    if condition_type.is_empty() {
+                        return None;
+                    }
+                    let mut line = format!("condition: {condition_type}={status}");
+                    if let Some(reason) = condition
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|reason| !reason.is_empty())
+                    {
+                        line.push_str(&format!(" reason={reason}"));
+                    }
+                    if let Some(message) = condition
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|message| !message.is_empty())
+                    {
+                        line.push_str(&format!(" message={message}"));
+                    }
+                    Some(line)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn runtime_access_detail_lines(resource: &Value, run_id: Option<&str>) -> Vec<String> {
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if kind != "PortForward" && kind != "Exec" {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    if let Some(target) = runtime_access_target_line(resource) {
+        lines.push(format!("target: {target}"));
+    }
+    if let Some(request) = runtime_access_request_line(resource) {
+        lines.push(format!("request: {request}"));
+    }
+    if let Some(binding) = runtime_access_runner_binding_line(resource) {
+        lines.push(format!("runner_binding: {binding}"));
+    }
+    if let Some(connection_mode) = runtime_connection_string(resource, "mode")
+        .or_else(|| runtime_connection_string(resource, "kind"))
+    {
+        lines.push(format!("connection_mode: {connection_mode}"));
+    }
+    if let Some(connection) = resource.pointer("/status/connection") {
+        if !connection.is_null() {
+            lines.push(format!("connection: {}", compact_json_lossy(connection)));
+        }
+    }
+    if kind == "PortForward" {
+        if let Some(target_port) = resource
+            .pointer("/spec/target_port")
+            .and_then(Value::as_u64)
+        {
+            lines.push(format!("target_port: {target_port}"));
+        }
+        if let Some(local_port) = resource
+            .pointer("/status/connection/local_port")
+            .and_then(Value::as_u64)
+            .or_else(|| resource.pointer("/spec/local_port").and_then(Value::as_u64))
+        {
+            lines.push(format!("local_port: {local_port}"));
+        }
+        if let Some(endpoint) = runtime_connection_string(resource, "client_endpoint")
+            .or_else(|| runtime_connection_string(resource, "client_listen"))
+        {
+            lines.push(format!("client_endpoint: {endpoint}"));
+        }
+        if let Some(tunnel) = runtime_connection_string(resource, "tunnel") {
+            lines.push(format!("tunnel: {tunnel}"));
+        }
+        if let Some(provider_tunnel_url) =
+            runtime_connection_string(resource, "provider_tunnel_url")
+                .or_else(|| runtime_connection_string(resource, "client_url"))
+        {
+            lines.push(format!("provider_tunnel_url: {provider_tunnel_url}"));
+        }
+        if let Some(attach_command) = runtime_port_forward_attach_command_line(resource) {
+            lines.push(format!("attach_command: {attach_command}"));
+        }
+    }
+    if kind == "Exec" {
+        if let Some(command) = runtime_exec_command_line(resource) {
+            lines.push(format!("command: {command}"));
+        }
+        if let Some(exit_code) = resource
+            .pointer("/status/connection/exit_code")
+            .and_then(Value::as_i64)
+        {
+            lines.push(format!("exit_code: {exit_code}"));
+        }
+        if let Some(stdout) = runtime_connection_string(resource, "stdout_tail") {
+            lines.push(format!("stdout_tail:\n{stdout}"));
+        } else if let Some(stdout) = runtime_connection_string(resource, "stdout") {
+            lines.push(format!("stdout:\n{stdout}"));
+        }
+        if let Some(stdout_evidence) = runtime_exec_stream_evidence_line(resource, "stdout") {
+            lines.push(format!("stdout_evidence: {stdout_evidence}"));
+        }
+        if let Some(stderr) = runtime_connection_string(resource, "stderr_tail") {
+            lines.push(format!("stderr_tail:\n{stderr}"));
+        } else if let Some(stderr) = runtime_connection_string(resource, "stderr") {
+            lines.push(format!("stderr:\n{stderr}"));
+        }
+        if let Some(stderr_evidence) = runtime_exec_stream_evidence_line(resource, "stderr") {
+            lines.push(format!("stderr_evidence: {stderr_evidence}"));
+        }
+    }
+    if let Some(cleanup_command) = runtime_access_cleanup_command_line(resource, run_id) {
+        lines.push(format!("cleanup_command: {cleanup_command}"));
+    }
+    lines
+}
+
+fn runtime_exec_stream_evidence_line(resource: &Value, stream: &str) -> Option<String> {
+    let bytes = resource
+        .pointer(&format!("/status/connection/{stream}_bytes"))
+        .and_then(Value::as_u64);
+    let tail_bytes = resource
+        .pointer(&format!("/status/connection/{stream}_tail_bytes"))
+        .and_then(Value::as_u64);
+    let truncated = resource
+        .pointer(&format!("/status/connection/{stream}_tail_truncated"))
+        .and_then(Value::as_bool);
+    if bytes.is_none() && tail_bytes.is_none() && truncated.is_none() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(bytes) = bytes {
+        parts.push(format!("bytes={bytes}"));
+    }
+    if let Some(tail_bytes) = tail_bytes {
+        parts.push(format!("tail_bytes={tail_bytes}"));
+    }
+    if let Some(truncated) = truncated {
+        parts.push(format!("truncated={truncated}"));
+    }
+    Some(parts.join(" "))
+}
+
+fn runtime_access_cleanup_command_line(resource: &Value, run_id: Option<&str>) -> Option<String> {
+    let phase = runtime_resource_phase(resource);
+    if matches!(
+        phase.as_deref(),
+        Some("completed" | "failed" | "expired" | "cancelled")
+    ) {
+        return None;
+    }
+    let (kind, name) = runtime_resource_kind_name(resource).ok()?;
+    if kind != "PortForward" && kind != "Exec" {
+        return None;
+    }
+    let run_id = run_id.map(str::trim).filter(|run_id| !run_id.is_empty())?;
+    let resource_version = runtime_resource_metadata_resource_version(resource).ok()?;
+    let command = if kind == "PortForward" && phase.as_deref() == Some("active") {
+        "complete"
+    } else {
+        "delete"
+    };
+    Some(runtime_shell_command_parts_display(&[
+        "buc".to_string(),
+        "runs".to_string(),
+        command.to_string(),
+        run_id.to_string(),
+        format!("{kind}/{name}"),
+        "--reason".to_string(),
+        "cleanup".to_string(),
+        "--resource-version".to_string(),
+        resource_version,
+    ]))
+}
+
+fn runtime_access_target_line(resource: &Value) -> Option<String> {
+    let target_ref = resource
+        .pointer("/spec/target_ref")
+        .or_else(|| resource.pointer("/audit/target_ref"))?;
+    let kind = target_ref.get("kind").and_then(Value::as_str)?.trim();
+    let name = target_ref.get("name").and_then(Value::as_str)?.trim();
+    if kind.is_empty() || name.is_empty() {
+        return None;
+    }
+    let mut parts = vec![format!("{kind}/{name}")];
+    if let Some(uid) = target_ref
+        .get("uid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("uid={uid}"));
+    }
+    if let Some(resource_version) = target_ref
+        .get("resourceVersion")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            resource
+                .pointer("/audit/target_resource_version")
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("resource_version={resource_version}"));
+    }
+    Some(parts.join(" "))
+}
+
+fn runtime_access_request_line(resource: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(requester) = runtime_resource_string(resource, "/audit/requester") {
+        parts.push(format!("requester={requester}"));
+    }
+    if let Some(reason) = runtime_resource_string(resource, "/spec/reason") {
+        parts.push(format!("reason={reason}"));
+    }
+    if let Some(expires_at) = runtime_resource_string(resource, "/status/expires_at") {
+        parts.push(format!("expires_at={expires_at}"));
+    }
+    if let Some(source) = runtime_resource_string(resource, "/audit/source") {
+        parts.push(format!("source={source}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn runtime_access_runner_binding_line(resource: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(runner) = runtime_access_runner_binding_string(resource, "runner_instance_id") {
+        parts.push(format!("runner={runner}"));
+    }
+    if let Some(attempt) = runtime_access_runner_binding_string(resource, "attempt_id") {
+        parts.push(format!("attempt={attempt}"));
+    }
+    if let Some(worker) = runtime_access_runner_binding_string(resource, "worker_id") {
+        parts.push(format!("worker={worker}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn runtime_access_runner_binding_string<'a>(resource: &'a Value, key: &str) -> Option<&'a str> {
+    resource
+        .pointer(&format!("/status/runner_binding/{key}"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            resource
+                .pointer(&format!("/audit/runner_binding/{key}"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            resource
+                .pointer(&format!("/status/{key}"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn runtime_port_forward_attach_command_line(resource: &Value) -> Option<String> {
+    let fallback_target_port = resource
+        .pointer("/status/connection/target_port")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            resource
+                .pointer("/spec/target_port")
+                .and_then(Value::as_u64)
+        })?;
+    let plan = runtime_port_forward_attach_plan(resource, None, fallback_target_port).ok()?;
+    match plan {
+        RuntimePortForwardAttachPlan::GceIap(spec) => {
+            let args = gcloud_iap_port_forward_args(&spec);
+            Some(runtime_shell_command_display("gcloud", &args))
+        }
+        RuntimePortForwardAttachPlan::ClientEndpoint(_) => None,
+    }
+}
+
+fn runtime_exec_command_line(resource: &Value) -> Option<String> {
+    let command = resource.pointer("/spec/command")?;
+    if let Some(command_parts) = command.as_array() {
+        let parts = command_parts
+            .iter()
+            .filter_map(|part| part.as_str().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        if !parts.is_empty() && parts.len() == command_parts.len() {
+            return Some(runtime_shell_command_parts_display(&parts));
+        }
+    }
+    command
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| Some(compact_json_lossy(command)).filter(|value| value != "null"))
+}
+
+fn runtime_shell_command_display(program: &str, args: &[String]) -> String {
+    let mut parts = vec![program.to_string()];
+    parts.extend(args.iter().cloned());
+    runtime_shell_command_parts_display(&parts)
+}
+
+fn runtime_shell_command_parts_display(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| runtime_shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn runtime_shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "-_./:=,@%".contains(ch))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn runtime_resource_string<'a>(resource: &'a Value, pointer: &str) -> Option<&'a str> {
+    resource
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn runtime_connection_string<'a>(resource: &'a Value, key: &str) -> Option<&'a str> {
+    resource
+        .pointer(&format!("/status/connection/{key}"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn print_runtime_resource_status_summary(value: &Value) -> Result<()> {
+    println!(
+        "{}",
+        runtime_resource_status_summary_lines(value).join("\n")
+    );
+    Ok(())
+}
+
+fn runtime_resource_status_summary_lines(value: &Value) -> Vec<String> {
+    let resource = value
+        .get("resource_ref")
+        .map(runtime_resource_ref_line)
+        .unwrap_or_else(|| "unknown".to_string());
+    let phase = value
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let reason = value.get("reason").and_then(Value::as_str).unwrap_or("");
+    let mut lines = vec![format!("status: {resource} phase={phase} reason={reason}")];
+    if let Some(message) = value
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        lines.push(format!("message: {message}"));
+    }
+    if let Some(resource_version) = value
+        .get("resourceVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|resource_version| !resource_version.is_empty())
+    {
+        lines.push(format!("resource_version: {resource_version}"));
+    }
+    if let Some(generated_at) = value
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|generated_at| !generated_at.is_empty())
+    {
+        lines.push(format!("generated_at: {generated_at}"));
+    }
+    let generation = value.get("generation").and_then(Value::as_i64);
+    let observed_generation = value.get("observedGeneration").and_then(Value::as_i64);
+    match (generation, observed_generation) {
+        (Some(generation), Some(observed_generation)) => {
+            let freshness = if generation == observed_generation {
+                "current"
+            } else {
+                "stale"
+            };
+            lines.push(format!(
+                "generation: {generation} observed={observed_generation} freshness={freshness}"
+            ));
+        }
+        (Some(generation), None) => lines.push(format!("generation: {generation}")),
+        (None, Some(observed_generation)) => {
+            lines.push(format!("observed_generation: {observed_generation}"));
+        }
+        (None, None) => {}
+    }
+    if let Some(deletion_timestamp) = value
+        .get("deletionTimestamp")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|timestamp| !timestamp.is_empty())
+    {
+        lines.push(format!("deletion_timestamp: {deletion_timestamp}"));
+    }
+    lines.extend(runtime_condition_summary_lines(
+        value.get("conditions").and_then(Value::as_array),
+    ));
+    if let Some(actions) = value.get("actions").and_then(Value::as_array) {
+        let actions = actions
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|action| !action.is_empty())
+            .collect::<Vec<_>>();
+        lines.push(format!(
+            "actions: {}",
+            if actions.is_empty() {
+                "none".to_string()
+            } else {
+                actions.join(",")
+            }
+        ));
+    }
+    if let Some(audit_source) = value
+        .pointer("/audit/source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+    {
+        lines.push(format!("audit_source: {audit_source}"));
+    }
+    lines
+}
+
+fn print_runtime_operation_review_summary(
+    value: &Value,
+    fallback_operation: &str,
+    fallback_kind: &str,
+    fallback_name: &str,
+) -> Result<()> {
+    println!(
+        "{}",
+        runtime_operation_review_summary(value, fallback_operation, fallback_kind, fallback_name)
+            .join("\n")
+    );
+    Ok(())
+}
+
+fn runtime_operation_review_summary(
+    value: &Value,
+    fallback_operation: &str,
+    fallback_kind: &str,
+    fallback_name: &str,
+) -> Vec<String> {
+    let operation = value
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_operation);
+    let resource = value
+        .get("resource_ref")
+        .map(runtime_resource_ref_line)
+        .unwrap_or_else(|| format!("{fallback_kind}/{fallback_name}"));
+    let supported = value
+        .get("supported")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let reason = value.get("reason").and_then(Value::as_str).unwrap_or("");
+    let mut lines = vec![format!(
+        "can-i: {} {} {}{}",
+        if supported { "yes" } else { "no" },
+        operation,
+        resource,
+        if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" reason={reason}")
+        }
+    )];
+    if let Some(command) = value
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    {
+        lines.push(format!(
+            "command: {}",
+            runtime_review_command_with_resource_version(value, operation, command)
+        ));
+    }
+    let mut review_parts = Vec::new();
+    if let Some(matched_operation) = value
+        .get("matched_operation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|matched_operation| {
+            !matched_operation.is_empty() && *matched_operation != operation
+        })
+    {
+        review_parts.push(format!("matched={matched_operation}"));
+    }
+    if let Some(verb) = value
+        .get("verb")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|verb| !verb.is_empty())
+    {
+        review_parts.push(format!("verb={verb}"));
+    }
+    if let Some(subresource) = value
+        .get("subresource")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|subresource| !subresource.is_empty())
+    {
+        review_parts.push(format!("subresource={subresource}"));
+    }
+    if let Some(action) = value
+        .get("action")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|action| !action.is_empty())
+    {
+        review_parts.push(format!("action={action}"));
+    }
+    if let Some(requires_running_run) = value.get("requires_running_run").and_then(Value::as_bool) {
+        review_parts.push(format!("requires_running_run={requires_running_run}"));
+    }
+    let generation = value.get("resource_generation").and_then(Value::as_i64);
+    let observed_generation = value.get("observed_generation").and_then(Value::as_i64);
+    match (generation, observed_generation) {
+        (Some(generation), Some(observed_generation)) => {
+            review_parts.push(format!("generation={generation}/{observed_generation}"));
+        }
+        (Some(generation), None) => review_parts.push(format!("generation={generation}")),
+        (None, Some(observed_generation)) => {
+            review_parts.push(format!("observed_generation={observed_generation}"));
+        }
+        (None, None) => {}
+    }
+    if !review_parts.is_empty() {
+        lines.push(format!("review: {}", review_parts.join(" ")));
+    }
+    if let Some(generated_at) = value
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|generated_at| !generated_at.is_empty())
+    {
+        lines.push(format!("generated_at: {generated_at}"));
+    }
+    let core_run_ids = runtime_explain_string_array(value, "core_run_ids");
+    if !core_run_ids.is_empty() {
+        lines.push(format!("core_run_ids: {}", core_run_ids.join(",")));
+    }
+    if let Some(resource_version) = value
+        .get("resource_version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|resource_version| !resource_version.is_empty())
+    {
+        lines.push(format!("resource_version: {resource_version}"));
+    }
+    lines
+}
+
+fn runtime_review_command_with_resource_version(
+    value: &Value,
+    operation: &str,
+    command: &str,
+) -> String {
+    let Some(resource_version) = value
+        .get("resource_version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|resource_version| !resource_version.is_empty())
+    else {
+        return command.to_string();
+    };
+    if !runtime_operation_accepts_resource_version(operation) {
+        return command.to_string();
+    }
+    let trimmed = command.trim();
+    let version_placeholder = "--resource-version <metadata.resourceVersion>";
+    if trimmed.contains(version_placeholder) {
+        return trimmed.replace(
+            version_placeholder,
+            &format!(
+                "--resource-version {}",
+                runtime_shell_quote(resource_version)
+            ),
+        );
+    }
+    if trimmed
+        .split_whitespace()
+        .any(|part| part == "--resource-version")
+    {
+        return command.to_string();
+    }
+    let resource_version_arg = format!(
+        "--resource-version {}",
+        runtime_shell_quote(resource_version)
+    );
+    if let Some(command_separator) = trimmed.find(" -- ") {
+        return format!(
+            "{} {}{}",
+            &trimmed[..command_separator],
+            resource_version_arg,
+            &trimmed[command_separator..]
+        );
+    }
+    format!("{trimmed} {resource_version_arg}")
+}
+
+fn runtime_operation_accepts_resource_version(operation: &str) -> bool {
+    matches!(
+        operation.trim().to_ascii_lowercase().as_str(),
+        "port-forward"
+            | "exec"
+            | "delete"
+            | "cancel"
+            | "complete"
+            | "cordon"
+            | "drain"
+            | "uncordon"
+    )
+}
+
+fn print_runtime_health_summary(value: &Value) -> Result<()> {
+    let summary = value.get("summary").cloned().unwrap_or(Value::Null);
+    println!("health: {}", compact_json_lossy(&summary));
+    if let Some(resources) = value.get("resources").and_then(Value::as_array) {
+        for resource in resources.iter().take(20) {
+            let name = resource
+                .get("resource")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let health = resource
+                .get("health")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let phase = resource.get("phase").and_then(Value::as_str).unwrap_or("");
+            let message = resource
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            println!("  - {name} health={health} phase={phase} {message}");
+        }
+    }
+    Ok(())
+}
+
+fn print_runtime_metrics_summary(value: &Value) -> Result<()> {
+    println!("{}", runtime_metrics_summary_lines(value).join("\n"));
+    Ok(())
+}
+
+fn runtime_metrics_summary_lines(value: &Value) -> Vec<String> {
+    if let Some(resources) = value.get("resources").and_then(Value::as_array) {
+        let summary = value.get("summary").cloned().unwrap_or(Value::Null);
+        let mut lines = vec![format!(
+            "metrics: resources={} summary={}",
+            resources.len(),
+            compact_json_lossy(&summary)
+        )];
+        lines.extend(runtime_list_metadata_summary_lines(value));
+        for resource in resources.iter().take(20) {
+            let name = resource
+                .get("resource_ref")
+                .map(runtime_resource_ref_line)
+                .unwrap_or_else(|| "unknown".to_string());
+            let metrics = resource
+                .get("metrics")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            lines.push(format!("  - {name} metrics={metrics}"));
+        }
+        lines
+    } else {
+        let name = value
+            .get("resource_ref")
+            .map(runtime_resource_ref_line)
+            .unwrap_or_else(|| "unknown".to_string());
+        let metrics = value
+            .get("metrics")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        vec![format!("metrics: {name} metrics={metrics}")]
+    }
+}
+
+fn runtime_list_metadata_summary_lines(value: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(resource_version) = value
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("resource_version: {resource_version}"));
+    }
+    if let Some(continue_token) = value
+        .pointer("/metadata/continue")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("continue: {continue_token}"));
+    }
+    for (label, pointer) in [
+        ("remaining", "/metadata/remainingItemCount"),
+        ("total", "/metadata/total"),
+        ("returned", "/metadata/returned"),
+        ("limit", "/metadata/limit"),
+    ] {
+        if let Some(value) = value.pointer(pointer).and_then(Value::as_i64) {
+            lines.push(format!("{label}: {value}"));
+        }
+    }
+    lines
+}
+
+fn print_runtime_watch_summary(value: &Value) -> Result<()> {
+    println!("{}", runtime_watch_summary_lines(value).join("\n"));
+    Ok(())
+}
+
+fn runtime_watch_summary_lines(value: &Value) -> Vec<String> {
+    let events = value
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut lines = vec![format!("watch_events: {}", events.len())];
+    if let Some(inventory) = value.get("resource_inventory") {
+        lines.extend(runtime_list_metadata_summary_lines(inventory));
+        let inventory_resources = inventory
+            .get("resources")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        lines.push(format!("inventory_resources: {inventory_resources}"));
+    }
+    let known_resources = runtime_watch_known_resource_lines(value);
+    for known_resource in known_resources.iter().take(50) {
+        lines.push(format!("known_resource: {known_resource}"));
+    }
+    if known_resources.len() > 50 {
+        lines.push(format!(
+            "known_resource: ... {} more; rerun with --json for full output",
+            known_resources.len() - 50
+        ));
+    }
+    for event in events.iter().take(50) {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN");
+        let resource = event
+            .get("resource_ref")
+            .map(runtime_resource_ref_line)
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut line = format!("  - {event_type} {resource}");
+        if let Some(resource_version) = event
+            .get("resource_version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            line.push_str(&format!(" rv={resource_version}"));
+        }
+        if let Some(previous_resource_version) = event
+            .get("previous_resource_version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            line.push_str(&format!(" previous={previous_resource_version}"));
+        }
+        lines.push(line);
+    }
+    if events.len() > 50 {
+        lines.push(format!(
+            "  ... {} more; rerun with --json for full output",
+            events.len() - 50
+        ));
+    }
+    lines
+}
+
+fn runtime_watch_known_resource_lines(value: &Value) -> Vec<String> {
+    let mut lines = value
+        .get("resource_versions")
+        .and_then(Value::as_object)
+        .map(|versions| {
+            versions
+                .iter()
+                .filter_map(|(key, value)| {
+                    let key = key.trim();
+                    let version = value.as_str()?.trim();
+                    (!key.is_empty() && !version.is_empty()).then(|| format!("{key}={version}"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    lines.sort();
+    lines
+}
+
 fn print_runtime_events_summary(value: &Value) -> Result<()> {
+    println!("{}", runtime_events_summary_lines(value).join("\n"));
+    Ok(())
+}
+
+fn runtime_events_summary_lines(value: &Value) -> Vec<String> {
     let events = value
         .get("events")
         .and_then(Value::as_array)
@@ -4333,8 +8899,33 @@ fn print_runtime_events_summary(value: &Value) -> Result<()> {
         .flatten()
         .collect::<Vec<_>>();
     let mut lines = vec![format!("events: {}", events.len())];
+    if let Some(resource_version) = value
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("resource_version: {resource_version}"));
+    }
+    if let Some(continue_token) = value
+        .pointer("/metadata/continue")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("continue: {continue_token}"));
+    }
+    for (label, pointer) in [
+        ("after_row_seq", "/metadata/after_row_seq"),
+        ("next_after_row_seq", "/metadata/next_after_row_seq"),
+        ("remaining", "/metadata/remainingItemCount"),
+        ("limit", "/metadata/limit"),
+        ("returned", "/metadata/returned"),
+    ] {
+        if let Some(value) = value.pointer(pointer).and_then(Value::as_i64) {
+            lines.push(format!("{label}: {value}"));
+        }
+    }
     for event in events.iter().take(20) {
-        lines.push(format!("  - {}", compact_json_lossy(event)));
+        lines.push(runtime_event_summary_line(event));
     }
     if events.len() > 20 {
         lines.push(format!(
@@ -4342,42 +8933,568 @@ fn print_runtime_events_summary(value: &Value) -> Result<()> {
             events.len() - 20
         ));
     }
-    println!("{}", lines.join("\n"));
-    Ok(())
+    lines
 }
 
-fn print_runtime_results_summary(value: &Value) -> Result<()> {
-    let rows = value
-        .get("results")
-        .or_else(|| value.get("trial_results"))
+fn runtime_event_summary_line(event: &Value) -> String {
+    let event_type = event
+        .get("event_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let payload = event.get("payload").unwrap_or(&Value::Null);
+    let mut parts = Vec::new();
+    if let Some(row_seq) = event.get("row_seq").and_then(Value::as_i64) {
+        parts.push(format!("row={row_seq}"));
+    }
+    parts.push(event_type.to_string());
+    if let Some(source) = event
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("source={source}"));
+    }
+    if let Some(actor) = runtime_event_payload_string(payload, "requester")
+        .or_else(|| runtime_event_payload_string(payload, "requested_by"))
+    {
+        parts.push(format!("actor={actor}"));
+    }
+    let mut emitted_resource_refs = Vec::new();
+    if let Some(resource) = runtime_event_top_level_resource_ref_identity(event)
+        .or_else(|| runtime_event_ref_identity(payload, "resource_ref"))
+        .or_else(|| runtime_event_payload_resource_identity(payload))
+    {
+        parts.push(format!("resource={resource}"));
+        emitted_resource_refs.push(resource);
+    }
+    if let Some(access) = runtime_event_ref_identity(payload, "access_resource_ref") {
+        if !runtime_event_ref_identity_seen(&emitted_resource_refs, &access) {
+            parts.push(format!("access={access}"));
+            emitted_resource_refs.push(access);
+        }
+    }
+    if let Some(target) = runtime_event_ref_identity(payload, "resolved_target")
+        .or_else(|| runtime_event_ref_identity(payload, "target_ref"))
+    {
+        if !runtime_event_ref_identity_seen(&emitted_resource_refs, &target) {
+            parts.push(format!("target={target}"));
+            emitted_resource_refs.push(target);
+        }
+    }
+    if let Some(involved) =
+        runtime_event_top_level_unemitted_refs_summary(event, &emitted_resource_refs)
+    {
+        parts.push(format!("involved={involved}"));
+    }
+    if let Some(runner) =
+        runtime_event_payload_string(payload, "resolved_target.runner_binding.runner_instance_id")
+            .or_else(|| runtime_event_payload_string(payload, "resolved_target.runner_instance_id"))
+            .or_else(|| runtime_event_payload_string(payload, "runner_binding.runner_instance_id"))
+    {
+        parts.push(format!("runner={runner}"));
+    }
+    if let Some(worker) =
+        runtime_event_payload_string(payload, "resolved_target.runner_binding.worker_id")
+            .or_else(|| runtime_event_payload_string(payload, "resolved_target.worker_id"))
+            .or_else(|| runtime_event_payload_string(payload, "runner_binding.worker_id"))
+    {
+        parts.push(format!("worker={worker}"));
+    }
+    if let Some(reviewed_version) =
+        runtime_event_payload_string(payload, "resource_version_precondition")
+    {
+        parts.push(format!("reviewed-rv={reviewed_version}"));
+    }
+    if event_type.starts_with("runtime.resource.operation.review") {
+        if let Some(operation) = runtime_event_payload_string(payload, "operation") {
+            parts.push(format!("operation={operation}"));
+        }
+        if let Some(matched_operation) = runtime_event_payload_string(payload, "matched_operation")
+        {
+            parts.push(format!("matched={matched_operation}"));
+        }
+    }
+    if runtime_event_is_api_resources_read(event_type) {
+        if let Some(operation) = runtime_event_payload_string(payload, "operation") {
+            parts.push(format!("operation={operation}"));
+        }
+        if let Some(selected_kind) = runtime_event_payload_string(payload, "selected_kind") {
+            parts.push(format!("selected={selected_kind}"));
+        }
+        if let Some(api_resources_returned) =
+            runtime_event_payload_i64(payload, "api_resources_returned")
+        {
+            parts.push(format!("api_resources={api_resources_returned}"));
+        }
+        if let Some(api_resource_kind) = runtime_event_payload_string(payload, "api_resource_kind")
+        {
+            parts.push(format!("api_kind={api_resource_kind}"));
+        }
+        if let Some(api_resource_name) = runtime_event_payload_string(payload, "api_resource_name")
+        {
+            parts.push(format!("api_name={api_resource_name}"));
+        }
+        if let Some(api_resource_count) = runtime_event_payload_i64(payload, "api_resource_count") {
+            parts.push(format!("count={api_resource_count}"));
+        }
+        if let Some(categories) =
+            runtime_event_payload_string_array(payload, "api_resource_categories")
+        {
+            parts.push(format!("categories={categories}"));
+        }
+        if let Some(verbs) = runtime_event_payload_string_array(payload, "api_resource_verbs") {
+            parts.push(format!("verbs={verbs}"));
+        }
+        if let Some(subresources) =
+            runtime_event_payload_string_array(payload, "api_resource_subresources")
+        {
+            parts.push(format!("subresources={subresources}"));
+        }
+        if let Some(actions) = runtime_event_payload_string_array(payload, "api_resource_actions") {
+            parts.push(format!("actions={actions}"));
+        }
+        if let Some(access) = runtime_event_payload_string_array(payload, "api_resource_access") {
+            parts.push(format!("access={access}"));
+        }
+        if let Some(core_run_ids) = runtime_event_payload_string_array(payload, "core_run_ids") {
+            parts.push(format!("core_runs={core_run_ids}"));
+        }
+    }
+    if runtime_event_is_resource_query_read(event_type) {
+        if let Some(operation) = runtime_event_payload_string(payload, "operation") {
+            parts.push(format!("operation={operation}"));
+        }
+        if let Some(kinds) = runtime_event_payload_string_array(payload, "resource_filter.kinds") {
+            parts.push(format!("kinds={kinds}"));
+        }
+        if let Some(categories) =
+            runtime_event_payload_string_array(payload, "resource_filter.categories")
+        {
+            parts.push(format!("categories={categories}"));
+        }
+        if let Some(label_selector) =
+            runtime_event_payload_string(payload, "resource_filter.label_selector")
+        {
+            parts.push(format!("label_selector={label_selector}"));
+        }
+        if let Some(field_selector) =
+            runtime_event_payload_string(payload, "resource_filter.field_selector")
+        {
+            parts.push(format!("field_selector={field_selector}"));
+        }
+        if let Some(limit) = runtime_event_payload_i64(payload, "limit") {
+            parts.push(format!("limit={limit}"));
+        }
+        if let Some(event_limit) = runtime_event_payload_i64(payload, "event_limit") {
+            parts.push(format!("event_limit={event_limit}"));
+        }
+        if let Some(resource_version) = runtime_event_payload_string(payload, "resource_version") {
+            parts.push(format!("rv={resource_version}"));
+        }
+        if let Some(resource_version_cursor) =
+            runtime_event_payload_string(payload, "resource_version_cursor")
+        {
+            parts.push(format!("cursor-rv={resource_version_cursor}"));
+        }
+        if let Some(continue_token) = runtime_event_payload_string(payload, "continue") {
+            parts.push(format!("continue={continue_token}"));
+        }
+        if let Some(known_resources) = runtime_event_payload_i64(payload, "known_resources") {
+            parts.push(format!("known={known_resources}"));
+        }
+        if let Some(allow_bookmarks) = payload.get("allow_bookmarks").and_then(Value::as_bool) {
+            parts.push(format!("bookmarks={allow_bookmarks}"));
+        }
+        match (
+            runtime_event_payload_i64(payload, "returned"),
+            runtime_event_payload_i64(payload, "total"),
+        ) {
+            (Some(returned), Some(total)) => parts.push(format!("returned={returned}/{total}")),
+            (Some(returned), None) => parts.push(format!("returned={returned}")),
+            (None, Some(total)) => parts.push(format!("total={total}")),
+            (None, None) => {}
+        }
+        if let Some(remaining) = runtime_event_payload_i64(payload, "remaining") {
+            parts.push(format!("remaining={remaining}"));
+        }
+        if let Some(watch_events) = runtime_event_payload_i64(payload, "watch_events_returned") {
+            parts.push(format!("watch_events={watch_events}"));
+        }
+        if let Some(event_resource_version) =
+            runtime_event_payload_string(payload, "event_resource_version")
+        {
+            parts.push(format!("event-rv={event_resource_version}"));
+        }
+        if let Some(event_returned) = runtime_event_payload_i64(payload, "event_returned") {
+            parts.push(format!("events={event_returned}"));
+        }
+        if let Some(metrics_total) = runtime_event_payload_i64(payload, "metrics_total") {
+            parts.push(format!("metrics={metrics_total}"));
+        }
+        if let Some(metrics_resources) =
+            runtime_event_payload_i64(payload, "metrics_resources_returned")
+        {
+            parts.push(format!("metrics_resources={metrics_resources}"));
+        }
+        match (
+            runtime_event_payload_i64(payload, "health_ready"),
+            runtime_event_payload_i64(payload, "health_degraded"),
+            runtime_event_payload_i64(payload, "health_problem"),
+            runtime_event_payload_i64(payload, "health_unknown"),
+        ) {
+            (Some(ready), Some(degraded), Some(problem), Some(unknown)) => {
+                parts.push(format!("health={ready}/{degraded}/{problem}/{unknown}"))
+            }
+            _ => {}
+        }
+    }
+    if event_type.starts_with("runtime.inspect.bundle.read") {
+        if let Some(operation) = runtime_event_payload_string(payload, "operation") {
+            parts.push(format!("operation={operation}"));
+        }
+        if let Some(kinds) = runtime_event_payload_string_array(payload, "resource_filter.kinds") {
+            parts.push(format!("kinds={kinds}"));
+        }
+        if let Some(categories) =
+            runtime_event_payload_string_array(payload, "resource_filter.categories")
+        {
+            parts.push(format!("categories={categories}"));
+        }
+        if let Some(label_selector) =
+            runtime_event_payload_string(payload, "resource_filter.label_selector")
+        {
+            parts.push(format!("label_selector={label_selector}"));
+        }
+        if let Some(field_selector) =
+            runtime_event_payload_string(payload, "resource_filter.field_selector")
+        {
+            parts.push(format!("field_selector={field_selector}"));
+        }
+        if let Some(event_limit) = runtime_event_payload_i64(payload, "event_limit") {
+            parts.push(format!("event_limit={event_limit}"));
+        }
+        if let Some(inventory_resource_version) =
+            runtime_event_payload_string(payload, "inventory_resource_version")
+        {
+            parts.push(format!("inventory-rv={inventory_resource_version}"));
+        }
+        match (
+            runtime_event_payload_i64(payload, "inventory_returned"),
+            runtime_event_payload_i64(payload, "inventory_total"),
+        ) {
+            (Some(returned), Some(total)) => parts.push(format!("inventory={returned}/{total}")),
+            (Some(returned), None) => parts.push(format!("inventory_returned={returned}")),
+            (None, Some(total)) => parts.push(format!("inventory_total={total}")),
+            (None, None) => {}
+        }
+        if let Some(event_resource_version) =
+            runtime_event_payload_string(payload, "event_resource_version")
+        {
+            parts.push(format!("event-rv={event_resource_version}"));
+        }
+        if let Some(events_returned) = runtime_event_payload_i64(payload, "event_returned") {
+            parts.push(format!("events={events_returned}"));
+        }
+        if let Some(api_resources_returned) =
+            runtime_event_payload_i64(payload, "api_resources_returned")
+        {
+            parts.push(format!("api_resources={api_resources_returned}"));
+        }
+        if let Some(health_total) = runtime_event_payload_i64(payload, "health_summary.total") {
+            parts.push(format!("health_total={health_total}"));
+        }
+        match (
+            runtime_event_payload_i64(payload, "metrics_summary.resources_returned"),
+            runtime_event_payload_i64(payload, "metrics_summary.resources_total"),
+        ) {
+            (Some(returned), Some(total)) => {
+                parts.push(format!("metrics_resources={returned}/{total}"))
+            }
+            (Some(returned), None) => parts.push(format!("metrics_resources_returned={returned}")),
+            (None, Some(total)) => parts.push(format!("metrics_resources_total={total}")),
+            (None, None) => {}
+        }
+        if let Some(metrics_events_total) =
+            runtime_event_payload_i64(payload, "metrics_summary.events_total")
+        {
+            parts.push(format!("metric_events={metrics_events_total}"));
+        }
+        if let Some(log_refs) = runtime_event_payload_i64(payload, "log_refs") {
+            parts.push(format!("log_refs={log_refs}"));
+        }
+    }
+    if let Some(stream) = runtime_event_payload_string(payload, "stream") {
+        parts.push(format!("stream={stream}"));
+    }
+    if let Some(object_ref) = runtime_event_payload_string(payload, "object_ref") {
+        parts.push(format!("object={object_ref}"));
+    }
+    if let Some(sha256) = runtime_event_payload_string(payload, "sha256") {
+        parts.push(format!("sha256={sha256}"));
+    }
+    if let Some(byte_size) = payload.get("byte_size").and_then(Value::as_i64) {
+        parts.push(format!("bytes={byte_size}"));
+    }
+    if let Some(media_type) = runtime_event_payload_string(payload, "media_type") {
+        parts.push(format!("media={media_type}"));
+    }
+    if let Some(exit_code) = runtime_event_payload_i64(payload, "connection.exit_code") {
+        parts.push(format!("exit={exit_code}"));
+    }
+    if let Some(stdout) = runtime_event_exec_stream_summary(payload, "stdout") {
+        parts.push(stdout);
+    }
+    if let Some(stderr) = runtime_event_exec_stream_summary(payload, "stderr") {
+        parts.push(stderr);
+    }
+    if let Some(action) = runtime_event_payload_string(payload, "action") {
+        parts.push(format!("action={action}"));
+    }
+    if let Some(reason) = runtime_event_payload_string(payload, "reason") {
+        parts.push(format!("reason={reason}"));
+    }
+    if let Some(error_code) = runtime_event_payload_string(payload, "error_code") {
+        parts.push(format!("error={error_code}"));
+    }
+    if let Some(error_status) = payload.get("error_status").and_then(Value::as_i64) {
+        parts.push(format!("http={error_status}"));
+    }
+    if let Some(transition) = runtime_event_lifecycle_transition(payload) {
+        parts.push(transition);
+    } else if let Some(status) = runtime_event_payload_string(payload, "status") {
+        parts.push(format!("status={status}"));
+    }
+    if let Some(message) = runtime_event_payload_string(payload, "message")
+        .or_else(|| runtime_event_payload_string(payload, "error_message"))
+        .or_else(|| runtime_event_payload_string(payload, "error"))
+    {
+        parts.push(format!("message={message}"));
+    }
+    format!("  - {}", parts.join(" "))
+}
+
+fn runtime_event_exec_stream_summary(payload: &Value, stream: &str) -> Option<String> {
+    let bytes = runtime_event_payload_i64(payload, &format!("connection.{stream}_bytes"));
+    let tail_bytes = runtime_event_payload_i64(payload, &format!("connection.{stream}_tail_bytes"));
+    let truncated =
+        runtime_event_payload_bool(payload, &format!("connection.{stream}_tail_truncated"));
+    if bytes.is_none() && tail_bytes.is_none() && truncated.is_none() {
+        return None;
+    }
+    let mut facts = Vec::new();
+    if let Some(bytes) = bytes {
+        facts.push(format!("bytes={bytes}"));
+    }
+    if let Some(tail_bytes) = tail_bytes {
+        facts.push(format!("tail={tail_bytes}"));
+    }
+    if let Some(truncated) = truncated {
+        facts.push(format!("truncated={truncated}"));
+    }
+    Some(format!("{stream}={}", facts.join(",")))
+}
+
+fn runtime_event_is_api_resources_read(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "runtime.api_resources.read" | "runtime.api_resources.read.failed"
+    )
+}
+
+fn runtime_event_is_resource_query_read(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "runtime.resource.list.read"
+            | "runtime.resource.list.read.failed"
+            | "runtime.resource.watch.read"
+            | "runtime.resource.watch.read.failed"
+            | "runtime.resource.health.read"
+            | "runtime.resource.health.read.failed"
+            | "runtime.resource.describe.read"
+            | "runtime.resource.describe.read.failed"
+            | "runtime.resource.get.read"
+            | "runtime.resource.get.read.failed"
+            | "runtime.resource.events.read"
+            | "runtime.resource.events.read.failed"
+            | "runtime.resource.status.read"
+            | "runtime.resource.status.read.failed"
+            | "runtime.resource.metrics.read"
+            | "runtime.resource.metrics.read.failed"
+            | "runtime.resource.metrics.list.read"
+            | "runtime.resource.metrics.list.read.failed"
+    )
+}
+
+fn runtime_event_payload_string(payload: &Value, path: &str) -> Option<String> {
+    let mut current = payload;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn runtime_event_payload_i64(payload: &Value, path: &str) -> Option<i64> {
+    let mut current = payload;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    current.as_i64()
+}
+
+fn runtime_event_payload_bool(payload: &Value, path: &str) -> Option<bool> {
+    let mut current = payload;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    current.as_bool()
+}
+
+fn runtime_event_payload_string_array(payload: &Value, path: &str) -> Option<String> {
+    let mut current = payload;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    let values = current
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.join(","))
+}
+
+fn runtime_event_ref_identity(payload: &Value, path: &str) -> Option<String> {
+    let kind = runtime_event_payload_string(payload, &format!("{path}.kind"))?;
+    let name = runtime_event_payload_string(payload, &format!("{path}.name"))?;
+    Some(format!("{kind}/{name}"))
+}
+
+fn runtime_event_top_level_resource_ref_identity(event: &Value) -> Option<String> {
+    runtime_event_top_level_resource_ref_identities(event)
+        .into_iter()
+        .next()
+}
+
+fn runtime_event_top_level_unemitted_refs_summary(
+    event: &Value,
+    emitted: &[String],
+) -> Option<String> {
+    let refs = runtime_event_top_level_resource_ref_identities(event)
+        .into_iter()
+        .filter(|identity| !runtime_event_ref_identity_seen(emitted, identity))
+        .collect::<Vec<_>>();
+    (!refs.is_empty()).then(|| refs.join(","))
+}
+
+fn runtime_event_top_level_resource_ref_identities(event: &Value) -> Vec<String> {
+    event
+        .get("resource_refs")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .collect::<Vec<_>>();
-    let mut lines = vec![format!("results: {}", rows.len())];
-    for row in rows.iter().take(20) {
-        lines.push(format!("  - {}", compact_json_lossy(row)));
-    }
-    if rows.len() > 20 {
-        lines.push(format!(
-            "  ... {} more; rerun with --json for full output",
-            rows.len() - 20
-        ));
-    }
-    println!("{}", lines.join("\n"));
-    Ok(())
+        .filter_map(|resource| {
+            let kind = resource.get("kind").and_then(Value::as_str)?.trim();
+            let name = resource.get("name").and_then(Value::as_str)?.trim();
+            (!kind.is_empty() && !name.is_empty()).then(|| format!("{kind}/{name}"))
+        })
+        .collect()
 }
 
-fn print_runtime_value_summary(value: &Value) -> Result<()> {
-    if let Some(key) = value.get("key").and_then(Value::as_str) {
-        println!("key: {key}");
+fn runtime_event_payload_resource_identity(payload: &Value) -> Option<String> {
+    let kind = runtime_event_payload_string(payload, "resource_kind")?;
+    let name = runtime_event_payload_string(payload, "resource_name")?;
+    Some(format!("{kind}/{name}"))
+}
+
+fn runtime_event_ref_identity_seen(emitted: &[String], identity: &str) -> bool {
+    emitted.iter().any(|existing| existing == identity)
+}
+
+fn runtime_event_lifecycle_transition(payload: &Value) -> Option<String> {
+    let previous = runtime_event_payload_string(payload, "previous_status");
+    let current = runtime_event_payload_string(payload, "status");
+    match (previous, current) {
+        (Some(previous), Some(current)) if previous != current => {
+            Some(format!("transition={previous}->{current}"))
+        }
+        (Some(previous), Some(current)) => Some(format!("status={current} previous={previous}")),
+        (None, Some(current)) => Some(format!("status={current}")),
+        _ => None,
     }
-    if let Some(values) = value.get("values") {
-        println!("values: {}", compact_json(values)?);
-    } else {
-        println!("{}", compact_json(value)?);
+}
+
+fn runtime_events_follow_cursor(value: &Value) -> Option<String> {
+    value
+        .pointer("/metadata/continue")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            value
+                .pointer("/metadata/resourceVersion")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .map(ToString::to_string)
+}
+
+fn runtime_resource_line(resource: &Value) -> String {
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let name = resource
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let phase = resource
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let reason = resource
+        .pointer("/status/reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let ready = resource
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .and_then(|conditions| {
+            conditions
+                .iter()
+                .find(|condition| condition.get("type").and_then(Value::as_str) == Some("Ready"))
+        })
+        .and_then(|condition| condition.get("status").and_then(Value::as_str))
+        .unwrap_or("Unknown");
+    let mut parts = vec![format!("{kind}/{name}")];
+    if !phase.is_empty() {
+        parts.push(format!("phase={phase}"));
     }
-    Ok(())
+    parts.push(format!("ready={ready}"));
+    if !reason.is_empty() {
+        parts.push(format!("reason={reason}"));
+    }
+    parts.join(" ")
+}
+
+fn runtime_resource_ref_line(resource: &Value) -> String {
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let name = resource
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    format!("{kind}/{name}")
 }
 
 fn print_draft_canonicalize_summary(value: &Value) -> Result<()> {
@@ -4629,10 +9746,33 @@ Long-form nouns:
   buc runs list [--limit N] [--json]
   buc runs create <package-digest> [--secret-ref NAME=REF ...] [--label TEXT] [--json]
   buc runs get <run-id> [--json]
-  buc runs runtime <run-id> [--json]
-  buc runs events <run-id> [--limit N] [--after-row-seq N] [--json]
-  buc runs results <run-id> [--limit N] [--json]
-  buc runs value <run-id> <key> [--json]
+  buc runs get <run-id> [kind|--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--wide|--output name|-o name] [--json]
+  buc runs get <run-id> <Kind/name|KIND NAME> [--view resource|describe] [--json]
+  buc runs api-resources <run-id> [kind] [--json]
+  buc runs explain <run-id> <kind> [--json]
+  buc runs inspect <run-id> [--kind KIND|--category CATEGORY] [--json]
+  buc runs resources <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--wide|--output name|-o name] [--json]
+  buc runs tree <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]
+  buc runs describe <run-id> <Kind/name> [--json]
+  buc runs status <run-id> <Kind/name> [--json]
+  buc runs wait <run-id> <Kind/name> [--for condition=Ready|phase=completed|delete] [--json]
+  buc runs can-i <run-id> <operation> <Kind/name> [--json]
+  buc runs health <run-id> [--kind KIND|--category CATEGORY] [--json]
+  buc runs metrics <run-id> [Kind/name] [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]
+  buc runs top <run-id> [Kind/name] [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]
+  buc runs watch <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--resource-version VERSION] [--known-resource Kind/name=VERSION] [--follow] [--interval-seconds N] [--max-polls N] [--json]
+  buc runs events <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]
+  buc runs audit <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]
+  buc runs logs <run-id> <Kind/name> [--stream stdout|stderr] [--tail-lines N] [--out FILE] [--metadata-out FILE] [--follow] [--interval-seconds N] [--max-polls N]
+  buc runs content <run-id> <TrialArtifact/name> [--out FILE] [--metadata-out FILE]
+  buc runs port-forward <run-id> <Kind/name> --target-port PORT [--local-port PORT] [--attach] [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json]
+  buc runs exec <run-id> <Kind/name> [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json] -- COMMAND [ARG...]
+  buc runs cordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs drain <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs uncordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs cancel <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs complete <run-id> <PortForward/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs delete <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]
 
 Cloud package boundary:
   build accepts authoring YAML or a sealed package directory/archive. YAML is
@@ -4719,10 +9859,30 @@ fn command_help_text(group: Option<&str>, command: Option<&str>) -> Option<&'sta
         (Some("runs"), Some("list")) => Some(RUNS_LIST_HELP),
         (Some("runs"), Some("create")) => Some(RUNS_CREATE_HELP),
         (Some("runs"), Some("get")) => Some(RUNS_GET_HELP),
-        (Some("runs"), Some("runtime")) => Some(RUNS_RUNTIME_HELP),
+        (Some("runs"), Some("api-resources")) => Some(RUNS_API_RESOURCES_HELP),
+        (Some("runs"), Some("explain")) => Some(RUNS_EXPLAIN_HELP),
+        (Some("runs"), Some("inspect")) => Some(RUNS_INSPECT_HELP),
+        (Some("runs"), Some("resources")) => Some(RUNS_RESOURCES_HELP),
+        (Some("runs"), Some("tree")) => Some(RUNS_TREE_HELP),
+        (Some("runs"), Some("describe")) => Some(RUNS_DESCRIBE_HELP),
+        (Some("runs"), Some("status")) => Some(RUNS_STATUS_HELP),
+        (Some("runs"), Some("wait")) => Some(RUNS_WAIT_HELP),
+        (Some("runs"), Some("can-i")) => Some(RUNS_CAN_I_HELP),
+        (Some("runs"), Some("health")) => Some(RUNS_HEALTH_HELP),
+        (Some("runs"), Some("metrics")) => Some(RUNS_METRICS_HELP),
+        (Some("runs"), Some("top")) => Some(RUNS_TOP_HELP),
+        (Some("runs"), Some("watch")) => Some(RUNS_WATCH_HELP),
         (Some("runs"), Some("events")) => Some(RUNS_EVENTS_HELP),
-        (Some("runs"), Some("results")) => Some(RUNS_RESULTS_HELP),
-        (Some("runs"), Some("value" | "kv")) => Some(RUNS_VALUE_HELP),
+        (Some("runs"), Some("audit")) => Some(RUNS_AUDIT_HELP),
+        (Some("runs"), Some("logs")) => Some(RUNS_LOGS_HELP),
+        (Some("runs"), Some("content")) => Some(RUNS_CONTENT_HELP),
+        (Some("runs"), Some("port-forward")) => Some(RUNS_PORT_FORWARD_HELP),
+        (Some("runs"), Some("exec")) => Some(RUNS_EXEC_HELP),
+        (
+            Some("runs"),
+            Some("action" | "cordon" | "drain" | "uncordon" | "cancel" | "complete"),
+        ) => Some(RUNS_ACTION_HELP),
+        (Some("runs"), Some("delete")) => Some(RUNS_DELETE_HELP),
         _ => None,
     }
 }
@@ -5032,10 +10192,33 @@ Usage:
   buc runs list [--limit N] [--json]
   buc runs create <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--label TEXT] [--json]
   buc runs get <run-id> [--json]
-  buc runs runtime <run-id> [--json]
-  buc runs events <run-id> [--limit N] [--after-row-seq N] [--json]
-  buc runs results <run-id> [--limit N] [--json]
-  buc runs value <run-id> <key> [--json]
+  buc runs get <run-id> [kind|--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--wide|--output name|-o name] [--json]
+  buc runs get <run-id> <Kind/name|KIND NAME> [--view resource|describe] [--json]
+  buc runs api-resources <run-id> [kind] [--json]
+  buc runs explain <run-id> <kind> [--json]
+  buc runs inspect <run-id> [--kind KIND|--category CATEGORY] [--json]
+  buc runs resources <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--wide|--output name|-o name] [--json]
+  buc runs tree <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]
+  buc runs describe <run-id> <Kind/name> [--json]
+  buc runs status <run-id> <Kind/name> [--json]
+  buc runs wait <run-id> <Kind/name> [--for condition=Ready|phase=completed|delete] [--timeout-seconds N] [--json]
+  buc runs can-i <run-id> <operation> <Kind/name> [--json]
+  buc runs health <run-id> [--kind KIND|--category CATEGORY] [--json]
+  buc runs metrics <run-id> [Kind/name] [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]
+  buc runs top <run-id> [Kind/name] [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]
+  buc runs watch <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--resource-version VERSION] [--known-resource Kind/name=VERSION] [--follow] [--interval-seconds N] [--max-polls N] [--json]
+  buc runs events <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]
+  buc runs audit <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]
+  buc runs logs <run-id> <Kind/name> [--stream stdout|stderr] [--tail-lines N] [--out FILE] [--metadata-out FILE] [--follow] [--interval-seconds N] [--max-polls N]
+  buc runs content <run-id> <TrialArtifact/name> [--out FILE] [--metadata-out FILE]
+  buc runs port-forward <run-id> <Kind/name> --target-port PORT [--local-port PORT] [--attach] [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json]
+  buc runs exec <run-id> <Kind/name> [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json] -- COMMAND [ARG...]
+  buc runs cordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs drain <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs uncordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs cancel <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs complete <run-id> <PortForward/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs delete <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]
 
 Secrets:
   Prefer hosted secrets. Upload once with `buc secrets put NAME --from-env NAME`,
@@ -5067,43 +10250,245 @@ Secrets:
 
 const RUNS_GET_HELP: &str = r#"buc runs get
 
-Fetch hosted run status.
+Fetch hosted run status or Kubernetes-shaped runtime resources.
 
 Usage:
   buc runs get <run-id> [--json]
+  buc runs get <run-id> [kind|--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--wide|--output name|-o name] [--json]
+  buc runs get <run-id> <Kind/name|KIND NAME> [--view resource|describe] [--event-limit N] [--json]
+
+Resource forms:
+  With only <run-id>, get returns the Cloud run record.
+  With kind or selectors, get lists runtime resources from /runtime/resources.
+  --category sends server-advertised API resource categories as selectors.
+  Add --wide to render API-discovered printer columns for resource lists, or
+  --output name or -o name to print only Kind/name refs for scripts and shell
+  pipelines.
+  With Kind/name or KIND NAME, get fetches the raw runtime resource by default.
 "#;
 
-const RUNS_RUNTIME_HELP: &str = r#"buc runs runtime
+const RUNS_API_RESOURCES_HELP: &str = r#"buc runs api-resources
 
-Fetch the latest live runtime summary for a hosted run.
+Discover runtime resource kinds, verbs, subresources, actions, selectors, and
+low-level access operations for a hosted run.
 
 Usage:
-  buc runs runtime <run-id> [--json]
+  buc runs api-resources <run-id> [kind] [--json]
+"#;
+
+const RUNS_EXPLAIN_HELP: &str = r#"buc runs explain
+
+Explain one runtime resource kind from the server-owned API resource contract:
+aliases, categories, verbs, subresources, actions, access, printer columns,
+paths, and example commands.
+
+Usage:
+  buc runs explain <run-id> <kind> [--json]
+"#;
+
+const RUNS_INSPECT_HELP: &str = r#"buc runs inspect
+
+Fetch a bounded runtime inspect bundle: API discovery, inventory, health,
+metrics, recent audit events, and log refs.
+
+Usage:
+  buc runs inspect <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--event-limit N] [--json]
+"#;
+
+const RUNS_RESOURCES_HELP: &str = r#"buc runs resources
+
+List Kubernetes-shaped runtime resources for a hosted run.
+
+Usage:
+  buc runs resources <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--wide|--output name|-o name] [--json]
+
+Options:
+  --category CATEGORY
+            Select server-advertised runtime API resource categories.
+  --wide    Render API-discovered printer columns, grouped by runtime kind.
+  --output name, -o name
+            Print one Kind/name runtime resource ref per line for pipelines.
+"#;
+
+const RUNS_TREE_HELP: &str = r#"buc runs tree
+
+Print a Kubernetes-style owner-reference tree for runtime resources. The tree is
+built from the current /runtime/resources inventory; filtered-out parents are
+shown as owner references on root rows.
+
+Usage:
+  buc runs tree <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]
+"#;
+
+const RUNS_DESCRIBE_HELP: &str = r#"buc runs describe
+
+Describe one runtime resource and its related lifecycle/audit events.
+
+Usage:
+  buc runs describe <run-id> <Kind/name> [--view describe|resource] [--event-limit N] [--json]
+"#;
+
+const RUNS_STATUS_HELP: &str = r#"buc runs status
+
+Fetch the status subresource for one runtime resource.
+Human output includes resourceVersion, generation freshness, conditions,
+available actions, deletion timestamp, and audit source when present.
+
+Usage:
+  buc runs status <run-id> <Kind/name> [--json]
+"#;
+
+const RUNS_WAIT_HELP: &str = r#"buc runs wait
+
+Wait for one runtime resource status predicate through the status subresource.
+On success, human output prints the same status summary as `buc runs status`
+so follow-up commands can reuse the returned resourceVersion.
+
+Usage:
+  buc runs wait <run-id> <Kind/name> [--for condition=Ready[=True]|phase=completed|delete] [--timeout-seconds N] [--interval-seconds N] [--json]
+"#;
+
+const RUNS_CAN_I_HELP: &str = r#"buc runs can-i
+
+Ask the server whether one runtime resource operation is supported right now.
+Exits zero when supported and non-zero when the server denies the operation.
+Human output includes the reviewed command and resource version when available.
+Use it for mutating, low-level access, and observability operations.
+
+Usage:
+  buc runs can-i <run-id> <operation> <Kind/name> [--json]
+
+Examples:
+  buc runs can-i <run-id> port-forward RunnerInstance/<runner-name>
+  buc runs can-i <run-id> exec TrialContainer/<container-name>
+  buc runs can-i <run-id> top TrialContainer/<container-name>
+  buc runs can-i <run-id> audit RunnerInstance/<runner-name>
+  buc runs can-i <run-id> logs/stdout TrialContainer/<container-name>
+  buc runs can-i <run-id> logs/stderr TrialContainer/<container-name>
+  buc runs can-i <run-id> content TrialArtifact/<artifact-name>
+  buc runs can-i <run-id> cordon RunnerInstance/<runner-name>
+  buc runs can-i <run-id> cancel Exec/<exec-name>
+  buc runs can-i <run-id> complete PortForward/<port-forward-name>
+"#;
+
+const RUNS_HEALTH_HELP: &str = r#"buc runs health
+
+Summarize runtime resource health for a hosted run.
+
+Usage:
+  buc runs health <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--json]
+"#;
+
+const RUNS_METRICS_HELP: &str = r#"buc runs metrics
+
+Fetch collection metrics or one runtime resource metrics subresource.
+
+Usage:
+  buc runs metrics <run-id> [Kind/name] [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]
+"#;
+
+const RUNS_TOP_HELP: &str = r#"buc runs top
+
+Show top-style collection metrics for runtime resources in a hosted run.
+
+Usage:
+  buc runs top <run-id> [Kind/name] [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]
+"#;
+
+const RUNS_WATCH_HELP: &str = r#"buc runs watch
+
+Fetch a Kubernetes-style watch snapshot for runtime resource changes.
+
+Usage:
+  buc runs watch <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--resource-version VERSION] [--known-resource Kind/name=VERSION] [--follow] [--interval-seconds N] [--max-polls N] [--json]
 "#;
 
 const RUNS_EVENTS_HELP: &str = r#"buc runs events
 
-List live runtime event rows for a hosted run.
+List run-wide or resource-scoped runtime audit/events.
 
 Usage:
-  buc runs events <run-id> [--limit N] [--after-row-seq N] [--json]
+  buc runs events <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]
 "#;
 
-const RUNS_RESULTS_HELP: &str = r#"buc runs results
+const RUNS_AUDIT_HELP: &str = r#"buc runs audit
 
-Fetch runtime result rows for a hosted run.
+List runtime access, resource lifecycle, catalog read, resource read, inspect-bundle read, and raw-byte read audit events for a hosted run.
 
 Usage:
-  buc runs results <run-id> [--limit N] [--json]
+  buc runs audit <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]
 "#;
 
-const RUNS_VALUE_HELP: &str = r#"buc runs value
+const RUNS_LOGS_HELP: &str = r#"buc runs logs
 
-Fetch live runtime values by key for a hosted run. `buc runs kv` is an alias.
+Fetch raw logs from a runtime resource logs subresource.
 
 Usage:
-  buc runs value <run-id> <key> [--json]
-  buc runs kv <run-id> <key> [--json]
+  buc runs logs <run-id> <Kind/name> [--stream stdout|stderr] [--tail-lines N] [--out FILE] [--metadata-out FILE] [--follow] [--interval-seconds N] [--max-polls N]
+
+Notes:
+  Omit --out or pass --out - to write to stdout.
+  Use --metadata-out FILE to write the response provenance from Cloud headers
+  without mixing it into raw stdout.
+  --follow repeats the logs request and prints only appended bytes, using
+  overlap detection so sliding --tail-lines windows do not duplicate output.
+"#;
+
+const RUNS_CONTENT_HELP: &str = r#"buc runs content
+
+Fetch raw artifact content from a TrialArtifact resource content subresource.
+
+Usage:
+  buc runs content <run-id> <TrialArtifact/name> [--out FILE] [--metadata-out FILE]
+
+Notes:
+  Omit --out or pass --out - to write to stdout.
+  Use --metadata-out FILE to write the response provenance from Cloud headers
+  without mixing it into raw stdout.
+"#;
+
+const RUNS_PORT_FORWARD_HELP: &str = r#"buc runs port-forward
+
+Create an audited PortForward resource for a concrete runtime target and wait
+for the runner to report an active tunnel by default.
+Pass --attach to start a GCE IAP local TCP forward when a provider tunnel is
+available, or to surface a worker-reported client endpoint when the worker owns
+the tunnel.
+
+Usage:
+  buc runs port-forward <run-id> <Kind/name> --target-port PORT [--local-port PORT] [--attach] [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json]
+"#;
+
+const RUNS_EXEC_HELP: &str = r#"buc runs exec
+
+Create an audited Exec resource for a concrete runtime target and wait for the
+runner to report the command result by default.
+
+Usage:
+  buc runs exec <run-id> <Kind/name> [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json] -- COMMAND [ARG...]
+"#;
+
+const RUNS_ACTION_HELP: &str = r#"buc runs resource verbs
+
+Perform runtime resource lifecycle verbs with reviewed resource versions.
+
+Usage:
+  buc runs cordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs drain <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs uncordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs cancel <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]
+  buc runs complete <run-id> <PortForward/name> [--reason TEXT] --resource-version VERSION [--json]
+
+Compatibility:
+  buc runs action <run-id> <Kind/name> <cordon|drain|uncordon|cancel|complete> [--reason TEXT] --resource-version VERSION [--json]
+"#;
+
+const RUNS_DELETE_HELP: &str = r#"buc runs delete
+
+Delete a cancelable runtime access resource.
+
+Usage:
+  buc runs delete <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]
 "#;
 
 fn sha256_digest(bytes: &[u8]) -> String {
@@ -7234,7 +12619,7 @@ mod tests {
 
         let too_large_limit_err = run(vec![
             "runs".to_string(),
-            "results".to_string(),
+            "resources".to_string(),
             "run-1".to_string(),
             "--limit".to_string(),
             "1001".to_string(),
@@ -7243,6 +12628,149 @@ mod tests {
         .to_string();
         assert!(too_large_limit_err.contains("--limit must be <= 1000"));
         assert!(!too_large_limit_err.contains("hosted API URL"));
+
+        let wide_json_err = run(vec![
+            "runs".to_string(),
+            "resources".to_string(),
+            "run-1".to_string(),
+            "--wide".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(wide_json_err.contains("--wide cannot be combined with --json"));
+        assert!(!wide_json_err.contains("hosted API URL"));
+
+        let output_json_err = run(vec![
+            "runs".to_string(),
+            "resources".to_string(),
+            "run-1".to_string(),
+            "--output".to_string(),
+            "name".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(output_json_err.contains("--output name cannot be combined with --json"));
+        assert!(!output_json_err.contains("hosted API URL"));
+
+        let short_output_json_err = run(vec![
+            "runs".to_string(),
+            "resources".to_string(),
+            "run-1".to_string(),
+            "-o".to_string(),
+            "name".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(short_output_json_err.contains("--output name cannot be combined with --json"));
+        assert!(!short_output_json_err.contains("hosted API URL"));
+
+        let unsupported_output_err = run(vec![
+            "runs".to_string(),
+            "resources".to_string(),
+            "run-1".to_string(),
+            "--output".to_string(),
+            "yaml".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(unsupported_output_err.contains("--output supports only name"));
+        assert!(!unsupported_output_err.contains("hosted API URL"));
+
+        let wide_item_err = run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "Trial/trial-1".to_string(),
+            "--wide".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(wide_item_err.contains("--wide only applies to runtime resource lists"));
+        assert!(!wide_item_err.contains("hosted API URL"));
+
+        let output_item_err = run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "Trial/trial-1".to_string(),
+            "--output".to_string(),
+            "name".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(output_item_err.contains("--output only applies to runtime resource lists"));
+        assert!(!output_item_err.contains("hosted API URL"));
+
+        let short_output_item_err = run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "Trial/trial-1".to_string(),
+            "-o".to_string(),
+            "name".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(short_output_item_err.contains("--output only applies to runtime resource lists"));
+        assert!(!short_output_item_err.contains("hosted API URL"));
+
+        let duplicate_output_err = run(vec![
+            "runs".to_string(),
+            "resources".to_string(),
+            "run-1".to_string(),
+            "--output".to_string(),
+            "name".to_string(),
+            "-o".to_string(),
+            "name".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(duplicate_output_err.contains("--output can only be provided once"));
+        assert!(!duplicate_output_err.contains("hosted API URL"));
+
+        let category_kind_err = run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "Trial".to_string(),
+            "--category".to_string(),
+            "runner".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(category_kind_err
+            .contains("runtime resource filters must use either a kind or --category"));
+        assert!(!category_kind_err.contains("hosted API URL"));
+
+        let category_item_err = run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "Trial/trial-1".to_string(),
+            "--category".to_string(),
+            "runner".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(category_item_err.contains("--category only applies to runtime resource lists"));
+        assert!(!category_item_err.contains("hosted API URL"));
+
+        let metrics_category_item_err = run(vec![
+            "runs".to_string(),
+            "metrics".to_string(),
+            "run-1".to_string(),
+            "Trial/trial-1".to_string(),
+            "--category".to_string(),
+            "trial".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(metrics_category_item_err
+            .contains("--category only applies to runtime metrics collection lists"));
+        assert!(!metrics_category_item_err.contains("hosted API URL"));
 
         let events_err = run(vec![
             "runs".to_string(),
@@ -7255,12 +12783,700 @@ mod tests {
         .to_string();
         assert!(events_err.contains("--after-row-seq requires a non-negative integer"));
         assert!(!events_err.contains("hosted API URL"));
+
+        let follow_json_err = run(vec![
+            "runs".to_string(),
+            "events".to_string(),
+            "run-1".to_string(),
+            "--follow".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(follow_json_err.contains("--follow cannot be combined with --json"));
+        assert!(!follow_json_err.contains("hosted API URL"));
+
+        let max_polls_without_follow_err = run(vec![
+            "runs".to_string(),
+            "events".to_string(),
+            "run-1".to_string(),
+            "--max-polls".to_string(),
+            "2".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(max_polls_without_follow_err
+            .contains("--interval-seconds and --max-polls require --follow"));
+        assert!(!max_polls_without_follow_err.contains("hosted API URL"));
+
+        let log_max_polls_without_follow_err = run(vec![
+            "runs".to_string(),
+            "logs".to_string(),
+            "run-1".to_string(),
+            "Trial/trial-1".to_string(),
+            "--max-polls".to_string(),
+            "2".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(log_max_polls_without_follow_err
+            .contains("--interval-seconds and --max-polls require --follow"));
+        assert!(!log_max_polls_without_follow_err.contains("hosted API URL"));
+
+        let bad_wait_predicate_err = run(vec![
+            "runs".to_string(),
+            "wait".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--for".to_string(),
+            "deleted".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(bad_wait_predicate_err
+            .contains("--for must be condition=<type>[=<status>], phase=<phase>, or delete"));
+        assert!(!bad_wait_predicate_err.contains("hosted API URL"));
     }
 
     #[test]
-    fn runs_runtime_events_results_and_values_get_hosted_runtime_paths() {
+    fn runs_raw_resource_commands_fetch_logs_and_content() {
         let _lock = lock_env();
-        let server = MockCloudServer::start(4);
+        let server = MockCloudServer::start_with_raw_header_handler(2, |request, _index| {
+            match (request.method.as_str(), request.path.as_str()) {
+                (
+                    "GET",
+                    "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/logs?stream=stderr&tail%5Flines=2",
+                ) => (
+                    200,
+                    "text/plain; charset=utf-8",
+                    vec![
+                        ("x-bucephalus-run-id", "run-1"),
+                        ("x-bucephalus-resource-kind", "RunnerInstance"),
+                        ("x-bucephalus-resource-name", "runner-1"),
+                        ("x-bucephalus-resource-version", "sha256:runner-rv"),
+                        ("x-bucephalus-log-stream", "stderr"),
+                        ("x-bucephalus-core-run-id", "core-run-1"),
+                        ("x-bucephalus-trial-id", ""),
+                        ("x-bucephalus-artifact-role", "stderr"),
+                        (
+                            "x-bucephalus-object-ref",
+                            "runtime://cloud-run/run-1/runner-instance/runner-1/stderr",
+                        ),
+                        (
+                            "x-bucephalus-artifact-sha256",
+                            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        ),
+                    ],
+                    b"line 2\nline 3\n".to_vec(),
+                ),
+                (
+                    "GET",
+                    "/v1/runs/run%2D1/runtime/resources/TrialArtifact/artifact%2D1/content",
+                ) => (
+                    200,
+                    "application/json",
+                    vec![
+                        ("x-bucephalus-run-id", "run-1"),
+                        ("x-bucephalus-resource-kind", "TrialArtifact"),
+                        ("x-bucephalus-resource-name", "artifact-1"),
+                        ("x-bucephalus-resource-version", "sha256:artifact-rv"),
+                        ("x-bucephalus-core-run-id", "core-run-1"),
+                        ("x-bucephalus-trial-id", "trial-1"),
+                        ("x-bucephalus-artifact-role", "agent_result"),
+                        (
+                            "x-bucephalus-object-ref",
+                            "artifact://sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        ),
+                        (
+                            "x-bucephalus-artifact-sha256",
+                            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        ),
+                    ],
+                    br#"{"ok":true}"#.to_vec(),
+                ),
+                _ => panic!(
+                    "unexpected mock Cloud API raw request: {} {}",
+                    request.method, request.path
+                ),
+            }
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_raw_runtime_home");
+        let log_path = home.join("runner.log");
+        let log_metadata_path = home.join("runner.log.metadata.json");
+        let content_path = home.join("artifact.json");
+        let content_metadata_path = home.join("artifact.json.metadata.json");
+        fs::create_dir_all(&home).unwrap();
+        let home_s = home.display().to_string();
+        let log_path_s = log_path.display().to_string();
+        let log_metadata_path_s = log_metadata_path.display().to_string();
+        let content_path_s = content_path.display().to_string();
+        let content_metadata_path_s = content_metadata_path.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "logs".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--stream".to_string(),
+            "stderr".to_string(),
+            "--tail-lines".to_string(),
+            "2".to_string(),
+            "--out".to_string(),
+            log_path_s,
+            "--metadata-out".to_string(),
+            log_metadata_path_s,
+        ])
+        .expect("hosted run logs should fetch raw resource logs");
+        run(vec![
+            "runs".to_string(),
+            "content".to_string(),
+            "run-1".to_string(),
+            "TrialArtifact/artifact-1".to_string(),
+            "--out".to_string(),
+            content_path_s,
+            "--metadata-out".to_string(),
+            content_metadata_path_s,
+        ])
+        .expect("hosted run content should fetch raw artifact content");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "line 2\nline 3\n");
+        assert_eq!(fs::read_to_string(&content_path).unwrap(), r#"{"ok":true}"#);
+        let log_metadata: Value =
+            serde_json::from_str(&fs::read_to_string(&log_metadata_path).unwrap()).unwrap();
+        assert_eq!(
+            log_metadata,
+            json!({
+                "run_id": "run-1",
+                "log_stream": "stderr",
+                "core_run_id": "core-run-1",
+                "artifact_role": "stderr",
+                "object_ref": "runtime://cloud-run/run-1/runner-instance/runner-1/stderr",
+                "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "media_type": "text/plain; charset=utf-8",
+                "byte_size": 14,
+                "resource": {
+                    "kind": "RunnerInstance",
+                    "name": "runner-1",
+                    "resource_version": "sha256:runner-rv"
+                }
+            })
+        );
+        let content_metadata: Value =
+            serde_json::from_str(&fs::read_to_string(&content_metadata_path).unwrap()).unwrap();
+        assert_eq!(
+            content_metadata,
+            json!({
+                "run_id": "run-1",
+                "core_run_id": "core-run-1",
+                "trial_id": "trial-1",
+                "artifact_role": "agent_result",
+                "object_ref": "artifact://sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "media_type": "application/json",
+                "byte_size": 11,
+                "resource": {
+                    "kind": "TrialArtifact",
+                    "name": "artifact-1",
+                    "resource_version": "sha256:artifact-rv"
+                }
+            })
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_logs_follow_prints_only_appended_tail_bytes() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_raw_handler(3, |request, index| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                "/v1/runs/run%2D1/runtime/resources/Trial/trial%2D1/logs?stream=stdout&tail%5Flines=2"
+            );
+            let body = match index {
+                0 => b"line 1\nline 2\n".to_vec(),
+                1 => b"line 1\nline 2\nline 3\n".to_vec(),
+                2 => b"line 2\nline 3\nline 4\n".to_vec(),
+                _ => unreachable!("unexpected mock request"),
+            };
+            (200, "text/plain; charset=utf-8", body)
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_logs_follow_home");
+        let log_path = home.join("trial.log");
+        fs::create_dir_all(&home).unwrap();
+        let home_s = home.display().to_string();
+        let log_path_s = log_path.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "logs".to_string(),
+            "run-1".to_string(),
+            "Trial/trial-1".to_string(),
+            "--stream".to_string(),
+            "stdout".to_string(),
+            "--tail-lines".to_string(),
+            "2".to_string(),
+            "--follow".to_string(),
+            "--max-polls".to_string(),
+            "3".to_string(),
+            "--interval-seconds".to_string(),
+            "0".to_string(),
+            "--out".to_string(),
+            log_path_s,
+        ])
+        .expect("hosted run logs should follow raw resource logs");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            fs::read_to_string(&log_path).unwrap(),
+            "line 1\nline 2\nline 3\nline 4\n"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn appended_raw_log_bytes_uses_suffix_prefix_overlap() {
+        assert_eq!(appended_raw_log_bytes(b"", b"line 1\n"), b"line 1\n");
+        assert_eq!(appended_raw_log_bytes(b"line 1\n", b"line 1\n"), b"");
+        assert_eq!(
+            appended_raw_log_bytes(b"line 1\nline 2\n", b"line 2\nline 3\n"),
+            b"line 3\n"
+        );
+        assert_eq!(appended_raw_log_bytes(b"old\n", b"new\n"), b"new\n");
+    }
+
+    #[test]
+    fn runs_wait_for_delete_treats_404_as_success() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_raw_handler(1, |request, _index| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                "/v1/runs/run%2D1/runtime/resources/Exec/exec%2D1/status"
+            );
+            (
+                404,
+                "application/json",
+                br#"{"message":"runtime resource not found","code":"not_found"}"#.to_vec(),
+            )
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_wait_delete_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "wait".to_string(),
+            "run-1".to_string(),
+            "Exec/exec-1".to_string(),
+            "--for".to_string(),
+            "delete".to_string(),
+            "--timeout-seconds".to_string(),
+            "1".to_string(),
+        ])
+        .expect("hosted run wait --for delete should succeed after status returns 404");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_wait_for_delete_treats_deletion_timestamp_as_success() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(1, |request, _index| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                "/v1/runs/run%2D1/runtime/resources/PortForward/pf%2D1/status"
+            );
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceStatus",
+                "cloud_run_id": "run-1",
+                "core_run_ids": [],
+                "resource_ref": {
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "PortForward",
+                    "name": "pf-1",
+                    "uid": "pf-1"
+                },
+                "generation": 2,
+                "observedGeneration": 2,
+                "resourceVersion": "sha256:pf-cancelled",
+                "deletionTimestamp": "2026-06-19T12:00:00Z",
+                "phase": "cancelled",
+                "reason": "Cancelled",
+                "message": "Access request was cancelled",
+                "conditions": [],
+                "actions": [],
+                "status": { "phase": "cancelled" },
+                "audit": { "source": "cloud.runtime_access_requests" }
+            })
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_wait_delete_timestamp_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "wait".to_string(),
+            "run-1".to_string(),
+            "PortForward/pf-1".to_string(),
+            "--for".to_string(),
+            "delete".to_string(),
+            "--timeout-seconds".to_string(),
+            "1".to_string(),
+        ])
+        .expect(
+            "hosted run wait --for delete should succeed after status returns deletionTimestamp",
+        );
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_wait_terminal_failure_surfaces_latest_status_evidence() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(1, |request, _index| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/status"
+            );
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceStatus",
+                "cloud_run_id": "run-1",
+                "core_run_ids": ["core-run-1"],
+                "resource_ref": {
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RunnerInstance",
+                    "name": "runner-1",
+                    "uid": "runner-uid-1"
+                },
+                "generation": 9,
+                "observedGeneration": 7,
+                "resourceVersion": "sha256:runner-waiting",
+                "phase": "failed",
+                "reason": "WorkerLost",
+                "message": "runner VM stopped while waiting",
+                "conditions": [
+                    {
+                        "type": "Ready",
+                        "status": "False",
+                        "reason": "Reconciling",
+                        "message": "runner not ready"
+                    }
+                ],
+                "actions": ["cordon"],
+                "status": { "phase": "running" },
+                "audit": { "source": "cloud.runtime_resources" }
+            })
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_wait_terminal_failure_evidence_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        let err = run(vec![
+            "runs".to_string(),
+            "wait".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--for".to_string(),
+            "condition=Ready".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains(
+            "runtime resource RunnerInstance/runner-1 reached terminal phase=failed before condition=Ready=True"
+        ));
+        assert!(err.contains("latest phase=failed"));
+        assert!(err.contains("reason=WorkerLost"));
+        assert!(err.contains("condition=Ready=False"));
+        assert!(err.contains("resource_version=sha256:runner-waiting"));
+        assert!(err.contains("generation=9/7 freshness=stale"));
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_explain_fetches_runtime_api_resource_contract() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(1, |request, _index| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                "/v1/runs/run%2D1/runtime/api-resources/container"
+            );
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "cloud_run_id": "run-1",
+                "generated_at": "2026-06-18T00:00:00Z",
+                "core_run_ids": ["core-run-1"],
+                "group": "bucephalus.dev",
+                "version": "v1alpha1",
+                "name": "trialcontainers",
+                "singularName": "trialcontainer",
+                "namespaced": false,
+                "scope": "run",
+                "kind": "TrialContainer",
+                "shortNames": ["container"],
+                "categories": ["trial", "access-target"],
+                "verbs": ["list", "get", "watch", "describe"],
+                "subresources": ["logs", "port-forward", "exec"],
+                "actions": [],
+                "access": ["logs", "port-forward", "exec"],
+                "supports": { "list": true, "get": true, "watch": true, "describe": true, "create": false, "delete": false, "actions": false, "access": true },
+                "pathTemplates": {
+                    "list": "/v1/runs/{run_id}/runtime/resources?kind=TrialContainer",
+                    "get": "/v1/runs/{run_id}/runtime/resources/TrialContainer/{name}",
+                    "logs": "/v1/runs/{run_id}/runtime/resources/TrialContainer/{name}/logs"
+                },
+                "exampleCommands": [
+                    { "purpose": "list", "command": "buc runs get {run_id} TrialContainer" },
+                    { "purpose": "wait", "command": "buc runs wait {run_id} TrialContainer/{name} --for condition=Ready" }
+                ],
+                "printerColumns": [
+                    { "name": "Phase", "type": "string", "jsonPath": ".status.phase", "description": "Lifecycle phase.", "priority": 0 },
+                    { "name": "Exec", "type": "boolean", "jsonPath": ".status.access.exec", "description": "Whether exec is supported.", "priority": 0 }
+                ],
+                "fieldSelectors": ["status.phase", "status.access.exec"],
+                "labelSelectors": ["bucephalus.dev/run-id"],
+                "labelSelector": true,
+                "count": 3,
+                "description": "Trial container identity with stdout/stderr log access."
+            })
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_explain_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "explain".to_string(),
+            "run-1".to_string(),
+            "container".to_string(),
+        ])
+        .expect("hosted run explain should fetch one runtime API resource contract");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runtime_api_resource_explain_surfaces_subresource_path_templates() {
+        let lines = runtime_api_resource_explain_lines(&json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "cloud_run_id": "run-1",
+            "generated_at": "2026-06-18T00:00:00Z",
+            "core_run_ids": ["core-run-1"],
+            "kind": "RunnerInstance",
+            "name": "runnerinstances",
+            "singularName": "runnerinstance",
+            "scope": "run",
+            "count": 1,
+            "verbs": ["list", "get", "watch", "describe"],
+            "subresources": ["status", "logs", "actions/cordon"],
+            "pathTemplates": {
+                "collection": "/v1/runs/{run_id}/runtime/resources?kind=RunnerInstance",
+                "resource": "/v1/runs/{run_id}/runtime/resources/RunnerInstance/{name}?view=resource",
+                "describe": "/v1/runs/{run_id}/runtime/resources/RunnerInstance/{name}",
+                "operationReview": "/v1/runs/{run_id}/runtime/resources/RunnerInstance/{name}/operations/{operation}",
+                "watch": "/v1/runs/{run_id}/runtime/resources/watch?kind=RunnerInstance",
+                "subresources": {
+                    "status": "/v1/runs/{run_id}/runtime/resources/RunnerInstance/{name}/status",
+                    "logs": "/v1/runs/{run_id}/runtime/resources/RunnerInstance/{name}/logs",
+                    "actions/cordon": "/v1/runs/{run_id}/runtime/resources/RunnerInstance/{name}/actions/cordon"
+                }
+            }
+        }));
+
+        assert!(lines.contains(&"paths:".to_string()), "{lines:?}");
+        assert!(
+            lines.contains(&"generated_at: 2026-06-18T00:00:00Z".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"core_run_ids: core-run-1".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"  - subresource/actions/cordon: /v1/runs/{run_id}/runtime/resources/RunnerInstance/{name}/actions/cordon".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"  - subresource/logs: /v1/runs/{run_id}/runtime/resources/RunnerInstance/{name}/logs".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"  - subresource/status: /v1/runs/{run_id}/runtime/resources/RunnerInstance/{name}/status".to_string()),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_api_resources_summary_surfaces_operator_catalog_fields() {
+        let lines = runtime_api_resources_summary_lines(&json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "kind": "RuntimeApiResourceList",
+            "cloud_run_id": "run-1",
+            "generated_at": "2026-06-18T00:00:00Z",
+            "core_run_ids": ["core-run-1"],
+            "resources": [
+                {
+                    "kind": "RunnerInstance",
+                    "name": "runnerinstances",
+                    "shortNames": ["runner"],
+                    "categories": ["runner", "access-target"],
+                    "verbs": ["list", "get", "watch", "describe"],
+                    "subresources": ["status", "events", "metrics", "logs", "actions/cordon"],
+                    "actions": ["cordon", "drain", "uncordon"],
+                    "access": ["logs", "port-forward", "exec"],
+                    "supports": { "labelSelector": true, "fieldSelector": true },
+                    "count": 2
+                },
+                {
+                    "kind": "PortForward",
+                    "name": "portforwards",
+                    "shortNames": ["pf"],
+                    "categories": ["access"],
+                    "verbs": ["list", "get", "watch", "describe", "create", "delete"],
+                    "subresources": ["status", "events", "metrics", "actions/cancel", "actions/complete"],
+                    "actions": ["cancel", "complete"],
+                    "access": [],
+                    "supports": { "labelSelector": true, "fieldSelector": true },
+                    "count": 1
+                }
+            ]
+        }))
+        .expect("api resource list lines");
+
+        assert_eq!(
+            lines,
+            vec![
+                "api_resources: 2".to_string(),
+                "generated_at: 2026-06-18T00:00:00Z".to_string(),
+                "core_run_ids: core-run-1".to_string(),
+                "  - RunnerInstance runnerinstances count=2 short=runner categories=runner,access-target verbs=list,get,watch,describe subresources=status,events,metrics,logs,actions/cordon actions=cordon,drain,uncordon access=logs,port-forward,exec selectors=label,field".to_string(),
+                "  - PortForward portforwards count=1 short=pf categories=access verbs=list,get,watch,describe,create,delete subresources=status,events,metrics,actions/cancel,actions/complete actions=cancel,complete selectors=label,field".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runs_tree_fetches_bounded_owner_reference_inventory() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(1, |request, _index| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                path_with_query(
+                    "/v1/runs/run%2D1/runtime/resources",
+                    &[
+                        ("limit", Some("1000".to_string())),
+                        ("continue", None),
+                        ("kind", Some("Trial,TrialContainer".to_string())),
+                        ("label_selector", None),
+                        (
+                            "field_selector",
+                            Some("metadata.ownerReferences.kind=Trial".to_string())
+                        ),
+                    ],
+                )
+            );
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceList",
+                "cloud_run_id": "run-1",
+                "core_run_ids": ["core-run-1"],
+                "metadata": { "resourceVersion": "rv-tree", "continue": null, "remainingItemCount": 0, "total": 2, "returned": 2 },
+                "resources": [{
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "Trial",
+                    "metadata": { "name": "trial-1", "uid": "trial-1", "ownerReferences": [] },
+                    "status": { "phase": "running", "conditions": [{ "type": "Ready", "status": "True" }] }
+                }, {
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "TrialContainer",
+                    "metadata": {
+                        "name": "trial-1.agent.container-1",
+                        "uid": "container-1",
+                        "ownerReferences": [{ "apiVersion": "bucephalus.dev/v1alpha1", "kind": "Trial", "name": "trial-1", "uid": "trial-1" }]
+                    },
+                    "status": { "phase": "running", "conditions": [{ "type": "Ready", "status": "True" }] }
+                }]
+            })
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_tree_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "tree".to_string(),
+            "run-1".to_string(),
+            "--kind".to_string(),
+            "Trial,TrialContainer".to_string(),
+            "--field-selector".to_string(),
+            "metadata.ownerReferences.kind=Trial".to_string(),
+        ])
+        .expect("hosted run tree should fetch runtime resources and render owner refs");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_resource_commands_get_hosted_runtime_paths() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start(17);
         let api_url = server.api_url();
         let home = temp_dir("runs_runtime_home");
         let home_s = home.display().to_string();
@@ -7272,53 +13488,3001 @@ mod tests {
 
         run(vec![
             "runs".to_string(),
-            "runtime".to_string(),
+            "api-resources".to_string(),
             "run-1".to_string(),
         ])
-        .expect("hosted run runtime should complete against mock Cloud API");
+        .expect("hosted run API resource discovery should complete against mock Cloud API");
+        run(vec![
+            "runs".to_string(),
+            "resources".to_string(),
+            "run-1".to_string(),
+            "--kind".to_string(),
+            "RunnerInstance".to_string(),
+            "--limit".to_string(),
+            "9".to_string(),
+        ])
+        .expect("hosted run resources should complete against mock Cloud API");
+        run(vec![
+            "runs".to_string(),
+            "describe".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+        ])
+        .expect("hosted run resource describe should complete against mock Cloud API");
+        run(vec![
+            "runs".to_string(),
+            "status".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+        ])
+        .expect("hosted run resource status should complete against mock Cloud API");
+        run(vec![
+            "runs".to_string(),
+            "wait".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--for".to_string(),
+            "phase=running".to_string(),
+            "--timeout-seconds".to_string(),
+            "1".to_string(),
+        ])
+        .expect("hosted run resource wait should use the status subresource");
+        run(vec![
+            "runs".to_string(),
+            "can-i".to_string(),
+            "run-1".to_string(),
+            "port-forward".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+        ])
+        .expect("hosted run operation review should complete against mock Cloud API");
+        run(vec![
+            "runs".to_string(),
+            "health".to_string(),
+            "run-1".to_string(),
+            "--kind".to_string(),
+            "RunnerInstance".to_string(),
+        ])
+        .expect("hosted run resource health should complete against mock Cloud API");
+        run(vec![
+            "runs".to_string(),
+            "top".to_string(),
+            "run-1".to_string(),
+            "--kind".to_string(),
+            "RunnerInstance".to_string(),
+            "--limit".to_string(),
+            "3".to_string(),
+        ])
+        .expect("hosted run top should use collection runtime metrics");
         run(vec![
             "runs".to_string(),
             "events".to_string(),
             "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
             "--limit".to_string(),
             "5".to_string(),
             "--after-row-seq".to_string(),
             "12".to_string(),
         ])
-        .expect("hosted run events should complete against mock Cloud API");
+        .expect("hosted run resource events should complete against mock Cloud API");
         run(vec![
             "runs".to_string(),
-            "results".to_string(),
+            "audit".to_string(),
             "run-1".to_string(),
             "--limit".to_string(),
-            "9".to_string(),
+            "7".to_string(),
         ])
-        .expect("hosted run results should complete against mock Cloud API");
+        .expect("hosted run audit should filter runtime lifecycle/access events");
         run(vec![
             "runs".to_string(),
-            "value".to_string(),
+            "port-forward".to_string(),
             "run-1".to_string(),
-            "trial/status".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--target-port".to_string(),
+            "8080".to_string(),
+            "--resource-version".to_string(),
+            "sha256:runner-pf".to_string(),
         ])
-        .expect("hosted run value should complete against mock Cloud API");
+        .expect("hosted run port-forward should complete against mock Cloud API");
+        run(vec![
+            "runs".to_string(),
+            "exec".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--resource-version".to_string(),
+            "sha256:runner-exec".to_string(),
+            "--".to_string(),
+            "python".to_string(),
+            "-V".to_string(),
+        ])
+        .expect("hosted run exec should complete against mock Cloud API");
+        run(vec![
+            "runs".to_string(),
+            "action".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "cordon".to_string(),
+            "--resource-version".to_string(),
+            "sha256:runner-cordon".to_string(),
+        ])
+        .expect("hosted run resource action should complete against mock Cloud API");
+        run(vec![
+            "runs".to_string(),
+            "delete".to_string(),
+            "run-1".to_string(),
+            "PortForward/pf-1".to_string(),
+            "--resource-version".to_string(),
+            "sha256:pf-delete".to_string(),
+        ])
+        .expect("hosted run resource delete should complete against mock Cloud API");
+        run(vec![
+            "runs".to_string(),
+            "inspect".to_string(),
+            "run-1".to_string(),
+            "--event-limit".to_string(),
+            "25".to_string(),
+        ])
+        .expect("hosted run inspect should complete against mock Cloud API");
 
         let requests = server.join();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 17);
         assert_eq!(requests[0].method, "GET");
-        assert_eq!(requests[0].path, "/v1/runs/run%2D1/runtime");
+        assert_eq!(requests[0].path, "/v1/runs/run%2D1/runtime/api-resources");
         assert_eq!(requests[1].method, "GET");
         assert_eq!(
             requests[1].path,
-            "/v1/runs/run%2D1/runtime/events?limit=5&after%5Frow%5Fseq=12"
+            "/v1/runs/run%2D1/runtime/resources?limit=9&kind=RunnerInstance"
         );
-        assert_eq!(requests[2].method, "GET");
-        assert_eq!(requests[2].path, "/v1/runs/run%2D1/runtime/results?limit=9");
-        assert_eq!(requests[3].method, "GET");
+        assert_eq!(
+            requests[2].path,
+            "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1"
+        );
         assert_eq!(
             requests[3].path,
-            "/v1/runs/run%2D1/runtime/kv/trial%2Fstatus"
+            "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/status"
+        );
+        assert_eq!(
+            requests[4].path,
+            "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/status"
+        );
+        assert_eq!(
+            requests[5].path,
+            "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/operations/port%2Dforward"
+        );
+        assert_eq!(
+            requests[6].path,
+            "/v1/runs/run%2D1/runtime/resources/health?kind=RunnerInstance"
+        );
+        assert_eq!(
+            requests[7].path,
+            "/v1/runs/run%2D1/runtime/resources/metrics?limit=3&kind=RunnerInstance"
+        );
+        assert_eq!(
+            requests[8].path,
+            "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/events?limit=5&after%5Frow%5Fseq=12"
+        );
+        assert_eq!(
+            requests[9].path,
+            path_with_query(
+                "/v1/runs/run%2D1/runtime/events",
+                &[
+                    ("limit", Some("7".to_string())),
+                    ("event_type", Some(RUNTIME_AUDIT_EVENT_TYPES.to_string())),
+                ],
+            )
+        );
+        assert_eq!(requests[10].method, "POST");
+        assert_eq!(
+            requests[10].path,
+            "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/port-forward"
+        );
+        let port_forward_body: Value = serde_json::from_slice(&requests[10].body).unwrap();
+        assert_eq!(port_forward_body["target_port"], json!(8080));
+        assert_eq!(
+            port_forward_body["resource_version"],
+            json!("sha256:runner-pf")
+        );
+        assert_eq!(requests[11].method, "GET");
+        assert_eq!(
+            requests[11].path,
+            "/v1/runs/run%2D1/runtime/resources/PortForward/pf%2D1"
+        );
+        assert_eq!(requests[12].method, "POST");
+        assert_eq!(
+            requests[12].path,
+            "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/exec"
+        );
+        let exec_body: Value = serde_json::from_slice(&requests[12].body).unwrap();
+        assert_eq!(exec_body["command"], json!(["python", "-V"]));
+        assert_eq!(exec_body["resource_version"], json!("sha256:runner-exec"));
+        assert_eq!(requests[13].method, "GET");
+        assert_eq!(
+            requests[13].path,
+            "/v1/runs/run%2D1/runtime/resources/Exec/exec%2D1"
+        );
+        assert_eq!(requests[14].method, "POST");
+        assert_eq!(
+            requests[14].path,
+            "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/actions/cordon"
+        );
+        let action_body: Value = serde_json::from_slice(&requests[14].body).unwrap();
+        assert_eq!(
+            action_body["resource_version"],
+            json!("sha256:runner-cordon")
+        );
+        assert_eq!(requests[15].method, "DELETE");
+        assert_eq!(
+            requests[15].path,
+            "/v1/runs/run%2D1/runtime/resources/PortForward/pf%2D1"
+        );
+        let delete_body: Value = serde_json::from_slice(&requests[15].body).unwrap();
+        assert_eq!(delete_body["resource_version"], json!("sha256:pf-delete"));
+        assert_eq!(requests[16].method, "GET");
+        assert_eq!(
+            requests[16].path,
+            "/v1/runs/run%2D1/runtime/inspect?event%5Flimit=25"
         );
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_events_forwards_repeated_filter_options() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(1, |request, _index| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                path_with_query(
+                    "/v1/runs/run%2D1/runtime/events",
+                    &[
+                        ("limit", Some("11".to_string())),
+                        ("continue", Some("cursor-1".to_string())),
+                        (
+                            "event_type",
+                            Some("runtime.access.exec.requested".to_string()),
+                        ),
+                        (
+                            "event_type",
+                            Some("runtime.access.exec.completed".to_string()),
+                        ),
+                        ("source", Some("cloud.run_events".to_string())),
+                        ("source", Some("runtime.event_rows".to_string())),
+                        ("resource_kind", Some("PortForward".to_string())),
+                        ("resource_name", Some("pf-1".to_string())),
+                        ("trial_id", Some("trial-1".to_string())),
+                        ("task_id", Some("task-1".to_string())),
+                    ],
+                )
+            );
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeEventList",
+                "cloud_run_id": "run-1",
+                "events": []
+            })
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_events_filter_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "events".to_string(),
+            "run-1".to_string(),
+            "--limit".to_string(),
+            "11".to_string(),
+            "--continue".to_string(),
+            "cursor-1".to_string(),
+            "--event-type".to_string(),
+            "runtime.access.exec.requested".to_string(),
+            "--event-type".to_string(),
+            "runtime.access.exec.completed".to_string(),
+            "--source".to_string(),
+            "cloud.run_events".to_string(),
+            "--source".to_string(),
+            "runtime.event_rows".to_string(),
+            "--resource-kind".to_string(),
+            "PortForward".to_string(),
+            "--resource-name".to_string(),
+            "pf-1".to_string(),
+            "--trial-id".to_string(),
+            "trial-1".to_string(),
+            "--task-id".to_string(),
+            "task-1".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("hosted run events should forward repeated event/source filters");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_events_follow_uses_event_cursors() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(2, |request, index| {
+            assert_eq!(request.method, "GET");
+            match index {
+                0 => {
+                    assert_eq!(
+                        request.path,
+                        path_with_query(
+                            "/v1/runs/run%2D1/runtime/events",
+                            &[("limit", Some("1".to_string()))],
+                        )
+                    );
+                    json!({
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "RuntimeEventList",
+                        "cloud_run_id": "run-1",
+                        "metadata": {
+                            "resourceVersion": "event-row-seq:10",
+                            "continue": null,
+                            "after_row_seq": null,
+                            "next_after_row_seq": 10,
+                            "remainingItemCount": 0,
+                            "limit": 1,
+                            "returned": 1
+                        },
+                        "events": [{ "row_seq": 10, "event_type": "runtime.access.exec.requested" }]
+                    })
+                }
+                1 => {
+                    assert_eq!(
+                        request.path,
+                        path_with_query(
+                            "/v1/runs/run%2D1/runtime/events",
+                            &[
+                                ("limit", Some("1".to_string())),
+                                ("continue", Some("event-row-seq:10".to_string())),
+                            ],
+                        )
+                    );
+                    json!({
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "RuntimeEventList",
+                        "cloud_run_id": "run-1",
+                        "metadata": {
+                            "resourceVersion": "event-row-seq:11",
+                            "continue": null,
+                            "after_row_seq": 10,
+                            "next_after_row_seq": 11,
+                            "remainingItemCount": 0,
+                            "limit": 1,
+                            "returned": 1
+                        },
+                        "events": [{ "row_seq": 11, "event_type": "runtime.access.exec.completed" }]
+                    })
+                }
+                _ => unreachable!("unexpected mock request"),
+            }
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_events_follow_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "events".to_string(),
+            "run-1".to_string(),
+            "--limit".to_string(),
+            "1".to_string(),
+            "--follow".to_string(),
+            "--max-polls".to_string(),
+            "2".to_string(),
+            "--interval-seconds".to_string(),
+            "0".to_string(),
+        ])
+        .expect("hosted run events should follow event cursors");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_watch_forwards_selectors_and_repeated_known_resources() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(1, |request, _index| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                path_with_query(
+                    "/v1/runs/run%2D1/runtime/resources/watch",
+                    &[
+                        ("resource_version", Some("rv-list".to_string())),
+                        ("kind", Some("PortForward".to_string())),
+                        (
+                            "label_selector",
+                            Some("bucephalus.dev/run-id=run-1".to_string()),
+                        ),
+                        (
+                            "field_selector",
+                            Some("status.conditions.ClientReachable!=True".to_string()),
+                        ),
+                        ("known_resource", Some("PortForward/pf-1=rv-pf".to_string()),),
+                        ("known_resource", Some("Exec/exec-1=rv-exec".to_string()),),
+                    ],
+                )
+            );
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceWatchList",
+                "cloud_run_id": "run-1",
+                "resource_versions": {},
+                "events": [],
+                "resource_inventory": {
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RuntimeResourceList",
+                    "metadata": { "resourceVersion": "rv-list", "continue": null, "remainingItemCount": 0, "total": 0, "returned": 0 },
+                    "cloud_run_id": "run-1",
+                    "core_run_ids": [],
+                    "resources": []
+                }
+            })
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_watch_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "watch".to_string(),
+            "run-1".to_string(),
+            "--kind".to_string(),
+            "PortForward".to_string(),
+            "--label-selector".to_string(),
+            "bucephalus.dev/run-id=run-1".to_string(),
+            "--field-selector".to_string(),
+            "status.conditions.ClientReachable!=True".to_string(),
+            "--resource-version".to_string(),
+            "rv-list".to_string(),
+            "--known-resource".to_string(),
+            "PortForward/pf-1=rv-pf".to_string(),
+            "--known-resource".to_string(),
+            "Exec/exec-1=rv-exec".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("hosted run watch should forward selectors and all known resources");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_watch_follow_polls_with_returned_resource_cursors() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(2, |request, index| match index {
+            0 => {
+                assert_eq!(request.method, "GET");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/watch?kind=RunnerInstance&allow%5Fbookmarks=true"
+                );
+                json!({
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RuntimeResourceWatchList",
+                    "cloud_run_id": "run-1",
+                    "resource_versions": {
+                        "runnerinstance/runner-1": "rv-runner-1",
+                        "exec/exec-1": "rv-exec-1"
+                    },
+                    "events": [{
+                        "type": "ADDED",
+                        "resource_ref": { "kind": "RunnerInstance", "name": "runner-1" },
+                        "resource_version": "rv-runner-1"
+                    }],
+                    "resource_inventory": {
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "RuntimeResourceList",
+                        "metadata": { "resourceVersion": "rv-list-1", "continue": null, "remainingItemCount": 0, "total": 1, "returned": 1 },
+                        "cloud_run_id": "run-1",
+                        "core_run_ids": [],
+                        "resources": []
+                    }
+                })
+            }
+            1 => {
+                assert_eq!(request.method, "GET");
+                assert_eq!(
+                    request.path,
+                    path_with_query(
+                        "/v1/runs/run%2D1/runtime/resources/watch",
+                        &[
+                            ("resource_version", Some("rv-list-1".to_string())),
+                            ("kind", Some("RunnerInstance".to_string())),
+                            ("known_resource", Some("exec/exec-1=rv-exec-1".to_string())),
+                            (
+                                "known_resource",
+                                Some("runnerinstance/runner-1=rv-runner-1".to_string())
+                            ),
+                            ("allow_bookmarks", Some("true".to_string())),
+                        ],
+                    )
+                );
+                json!({
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RuntimeResourceWatchList",
+                    "cloud_run_id": "run-1",
+                    "resource_versions": {
+                        "runnerinstance/runner-1": "rv-runner-2"
+                    },
+                    "events": [{
+                        "type": "MODIFIED",
+                        "resource_ref": { "kind": "RunnerInstance", "name": "runner-1" },
+                        "resource_version": "rv-runner-2",
+                        "previous_resource_version": "rv-runner-1"
+                    }],
+                    "resource_inventory": {
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "RuntimeResourceList",
+                        "metadata": { "resourceVersion": "rv-list-2", "continue": null, "remainingItemCount": 0, "total": 1, "returned": 1 },
+                        "cloud_run_id": "run-1",
+                        "core_run_ids": [],
+                        "resources": []
+                    }
+                })
+            }
+            _ => unreachable!(),
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_watch_follow_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "watch".to_string(),
+            "run-1".to_string(),
+            "--kind".to_string(),
+            "RunnerInstance".to_string(),
+            "--follow".to_string(),
+            "--max-polls".to_string(),
+            "2".to_string(),
+            "--interval-seconds".to_string(),
+            "0".to_string(),
+        ])
+        .expect("hosted run resource watch should follow resource-version cursors");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runtime_subresource_commands_reject_mismatched_cloud_run_ids() {
+        fn assert_mismatched_runtime_response_fails(
+            label: &str,
+            args: &[&str],
+            expected_path: &'static str,
+            response: Value,
+        ) {
+            let server = MockCloudServer::start_with_stateful_handler(1, move |request, _index| {
+                assert_eq!(request.method, "GET");
+                assert_eq!(request.path, expected_path);
+                response.clone()
+            });
+            let api_url = server.api_url();
+            let home = temp_dir(label);
+            let home_s = home.display().to_string();
+            let _env = EnvVarGuard::set(&[
+                ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+                (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+                (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+            ]);
+
+            let err = run(args.iter().map(|arg| (*arg).to_string()).collect())
+                .expect_err("mismatched runtime cloud_run_id should fail before rendering")
+                .to_string();
+            assert!(
+                err.contains(
+                    "runtime response run id mismatch: requested run-1, API returned run-2"
+                ),
+                "expected runtime run-id mismatch for {label}, got {err}"
+            );
+            let requests = server.join();
+            assert_eq!(requests.len(), 1);
+            let _ = fs::remove_dir_all(home);
+        }
+
+        assert_mismatched_runtime_response_fails(
+            "runtime_status_mismatched_run_home",
+            &["runs", "status", "run-1", "Trial/trial-1", "--json"],
+            "/v1/runs/run%2D1/runtime/resources/Trial/trial%2D1/status",
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceStatus",
+                "cloud_run_id": "run-2",
+                "resource_ref": { "kind": "Trial", "name": "trial-1" },
+                "phase": "running",
+                "conditions": []
+            }),
+        );
+        assert_mismatched_runtime_response_fails(
+            "runtime_wait_mismatched_run_home",
+            &[
+                "runs",
+                "wait",
+                "run-1",
+                "Trial/trial-1",
+                "--for",
+                "phase=running",
+                "--timeout-seconds",
+                "1",
+                "--interval-seconds",
+                "1",
+                "--json",
+            ],
+            "/v1/runs/run%2D1/runtime/resources/Trial/trial%2D1/status",
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceStatus",
+                "cloud_run_id": "run-2",
+                "resource_ref": { "kind": "Trial", "name": "trial-1" },
+                "phase": "running",
+                "conditions": []
+            }),
+        );
+        assert_mismatched_runtime_response_fails(
+            "runtime_can_i_mismatched_run_home",
+            &["runs", "can-i", "run-1", "exec", "Trial/trial-1", "--json"],
+            "/v1/runs/run%2D1/runtime/resources/Trial/trial%2D1/operations/exec",
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceOperationReview",
+                "cloud_run_id": "run-2",
+                "resource_ref": { "kind": "Trial", "name": "trial-1" },
+                "operation": "exec",
+                "matched_operation": "exec",
+                "supported": true,
+                "resource_version": "sha256:review"
+            }),
+        );
+        assert_mismatched_runtime_response_fails(
+            "runtime_watch_mismatched_run_home",
+            &["runs", "watch", "run-1", "--kind", "Trial", "--json"],
+            "/v1/runs/run%2D1/runtime/resources/watch?kind=Trial",
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceWatchList",
+                "cloud_run_id": "run-2",
+                "resource_versions": {},
+                "events": [],
+                "resource_inventory": {
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RuntimeResourceList",
+                    "cloud_run_id": "run-2",
+                    "core_run_ids": [],
+                    "metadata": {
+                        "resourceVersion": "rv-list",
+                        "continue": null,
+                        "remainingItemCount": 0,
+                        "total": 0,
+                        "returned": 0
+                    },
+                    "resources": []
+                }
+            }),
+        );
+    }
+
+    #[test]
+    fn runs_mutating_resource_commands_send_reason_and_resource_version() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(4, |request, index| match index {
+            0 => {
+                assert_eq!(request.method, "POST");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/Exec/exec%2D1/actions/cancel"
+                );
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    json!({
+                        "reason": "stop debug command",
+                        "resource_version": "sha256:exec-review"
+                    })
+                );
+                json!({
+                    "cloud_run_id": "run-1",
+                    "resource": runtime_resource("Exec", "exec-1"),
+                    "operations": [],
+                    "related_resources": [],
+                    "event_list": { "events": [] }
+                })
+            }
+            1 => {
+                assert_eq!(request.method, "DELETE");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/PortForward/pf%2D1"
+                );
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    json!({
+                        "reason": "done debugging",
+                        "resource_version": "sha256:pf-review"
+                    })
+                );
+                json!({
+                    "cloud_run_id": "run-1",
+                    "resource": runtime_resource("PortForward", "pf-1"),
+                    "operations": [],
+                    "related_resources": [],
+                    "event_list": { "events": [] }
+                })
+            }
+            2 => {
+                assert_eq!(request.method, "POST");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/PortForward/pf%2Dactive/actions/complete"
+                );
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    json!({
+                        "reason": "local tunnel exited",
+                        "resource_version": "sha256:pf-active-review"
+                    })
+                );
+                json!({
+                    "cloud_run_id": "run-1",
+                    "resource": runtime_access_resource(
+                        "PortForward",
+                        "pf-active",
+                        "completed",
+                        json!({ "mode": "gcp_iap_ssh" }),
+                    ),
+                    "operations": [],
+                    "related_resources": [],
+                    "event_list": { "events": [] }
+                })
+            }
+            3 => {
+                assert_eq!(request.method, "POST");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/PortForward/pf%2Dcompat/actions/complete"
+                );
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    json!({
+                        "reason": "compat local tunnel exited",
+                        "resource_version": "sha256:pf-compat-review"
+                    })
+                );
+                json!({
+                    "cloud_run_id": "run-1",
+                    "resource": runtime_access_resource(
+                        "PortForward",
+                        "pf-compat",
+                        "completed",
+                        json!({ "mode": "gcp_iap_ssh" }),
+                    ),
+                    "operations": [],
+                    "related_resources": [],
+                    "event_list": { "events": [] }
+                })
+            }
+            _ => unreachable!(),
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_mutating_resource_body_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "cancel".to_string(),
+            "run-1".to_string(),
+            "Exec/exec-1".to_string(),
+            "--reason".to_string(),
+            "stop debug command".to_string(),
+            "--resource-version".to_string(),
+            "sha256:exec-review".to_string(),
+        ])
+        .expect("runs cancel should send optimistic concurrency and audit reason");
+        run(vec![
+            "runs".to_string(),
+            "delete".to_string(),
+            "run-1".to_string(),
+            "PortForward/pf-1".to_string(),
+            "--reason".to_string(),
+            "done debugging".to_string(),
+            "--resource-version".to_string(),
+            "sha256:pf-review".to_string(),
+        ])
+        .expect("runs delete should send optimistic concurrency and audit reason");
+        run(vec![
+            "runs".to_string(),
+            "complete".to_string(),
+            "run-1".to_string(),
+            "PortForward/pf-active".to_string(),
+            "--reason".to_string(),
+            "local tunnel exited".to_string(),
+            "--resource-version".to_string(),
+            "sha256:pf-active-review".to_string(),
+        ])
+        .expect("runs complete should send optimistic concurrency and audit reason");
+        run(vec![
+            "runs".to_string(),
+            "action".to_string(),
+            "run-1".to_string(),
+            "PortForward/pf-compat".to_string(),
+            "complete".to_string(),
+            "--reason".to_string(),
+            "compat local tunnel exited".to_string(),
+            "--resource-version".to_string(),
+            "sha256:pf-compat-review".to_string(),
+        ])
+        .expect(
+            "runs action should send complete compatibility command with optimistic concurrency",
+        );
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 4);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_mutating_resource_commands_require_reviewed_resource_version_before_api_request() {
+        let _lock = lock_env();
+        let home = temp_dir("runs_mutating_resource_version_required_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, None),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+        let cases = [
+            (
+                vec![
+                    "runs",
+                    "port-forward",
+                    "run-1",
+                    "Trial/trial-1",
+                    "--target-port",
+                    "8080",
+                    "--no-wait",
+                ],
+                "runtime port-forward requires --resource-version",
+            ),
+            (
+                vec![
+                    "runs",
+                    "exec",
+                    "run-1",
+                    "Trial/trial-1",
+                    "--no-wait",
+                    "--",
+                    "python",
+                    "-V",
+                ],
+                "runtime exec requires --resource-version",
+            ),
+            (
+                vec![
+                    "runs",
+                    "action",
+                    "run-1",
+                    "RunnerInstance/runner-1",
+                    "cordon",
+                ],
+                "runtime cordon requires --resource-version",
+            ),
+            (
+                vec!["runs", "delete", "run-1", "PortForward/pf-1"],
+                "runtime delete requires --resource-version",
+            ),
+            (
+                vec!["runs", "complete", "run-1", "PortForward/pf-1"],
+                "runtime complete requires --resource-version",
+            ),
+        ];
+
+        for (args, expected) in cases {
+            let err = run(args.into_iter().map(String::from).collect())
+                .expect_err("runtime mutation without resource version should fail locally");
+            let message = err.to_string();
+            assert!(
+                message.contains(expected),
+                "expected {expected:?} in {message:?}"
+            );
+            assert!(
+                message.contains("buc runs can-i") && message.contains("buc runs describe"),
+                "missing resource-version error should point to review commands: {message}"
+            );
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_can_i_exits_nonzero_when_operation_review_denies() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(1, |request, _index| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                "/v1/runs/run%2D1/runtime/resources/Trial/trial%2D1/operations/exec"
+            );
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceOperationReview",
+                "cloud_run_id": "run-1",
+                "resource_ref": {
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "Trial",
+                    "name": "trial-1"
+                },
+                "operation": "exec",
+                "matched_operation": "exec",
+                "supported": false,
+                "reason": "runtime_exec_unavailable",
+                "message": "exec requires an active runner attempt whose runner advertises runtime_exec",
+                "resource_version": "sha256:review"
+            })
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_can_i_denied_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        let err = run(vec![
+            "runs".to_string(),
+            "can-i".to_string(),
+            "run-1".to_string(),
+            "exec".to_string(),
+            "Trial/trial-1".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("runtime operation exec is not supported for Trial/trial-1"));
+        assert!(err.contains("runner advertises runtime_exec"));
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_can_i_reviews_observability_operations() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(5, |request, index| match index {
+            0 => {
+                assert_eq!(request.method, "GET");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/TrialContainer/trial%2D1%2Eagent%2Econtainer%2D1/operations/top"
+                );
+                json!({
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RuntimeResourceOperationReview",
+                    "cloud_run_id": "run-1",
+                    "resource_ref": {
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "TrialContainer",
+                        "name": "trial-1.agent.container-1"
+                    },
+                    "operation": "top",
+                    "matched_operation": "top",
+                    "supported": true,
+                    "reason": null,
+                    "message": null,
+                    "verb": "get",
+                    "subresource": "metrics",
+                    "action": null,
+                    "requires_running_run": false,
+                    "resource_version": "sha256:top-review",
+                    "command": "buc runs top run-1 --kind TrialContainer"
+                })
+            }
+            1 => {
+                assert_eq!(request.method, "GET");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/operations/audit"
+                );
+                json!({
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RuntimeResourceOperationReview",
+                    "cloud_run_id": "run-1",
+                    "resource_ref": {
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "RunnerInstance",
+                        "name": "runner-1"
+                    },
+                    "operation": "audit",
+                    "matched_operation": "audit",
+                    "supported": true,
+                    "reason": null,
+                    "message": null,
+                    "verb": "watch",
+                    "subresource": "events",
+                    "action": null,
+                    "requires_running_run": false,
+                    "resource_version": "sha256:audit-review",
+                    "command": "buc runs audit run-1 RunnerInstance/runner-1"
+                })
+            }
+            2 => {
+                assert_eq!(request.method, "GET");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/TrialContainer/trial%2D1%2Eagent%2Econtainer%2D1/operations/logs%2Fstdout"
+                );
+                json!({
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RuntimeResourceOperationReview",
+                    "cloud_run_id": "run-1",
+                    "resource_ref": {
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "TrialContainer",
+                        "name": "trial-1.agent.container-1"
+                    },
+                    "operation": "logs/stdout",
+                    "matched_operation": "logs/stdout",
+                    "supported": true,
+                    "reason": null,
+                    "message": null,
+                    "verb": "get",
+                    "subresource": "logs",
+                    "action": null,
+                    "requires_running_run": false,
+                    "resource_version": "sha256:stdout-review",
+                    "command": "buc runs logs run-1 TrialContainer/trial-1.agent.container-1 --stream stdout --metadata-out FILE.metadata.json"
+                })
+            }
+            3 => {
+                assert_eq!(request.method, "GET");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/TrialContainer/trial%2D1%2Eagent%2Econtainer%2D1/operations/logs%2Fstderr"
+                );
+                json!({
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RuntimeResourceOperationReview",
+                    "cloud_run_id": "run-1",
+                    "resource_ref": {
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "TrialContainer",
+                        "name": "trial-1.agent.container-1"
+                    },
+                    "operation": "logs/stderr",
+                    "matched_operation": "logs/stderr",
+                    "supported": true,
+                    "reason": null,
+                    "message": null,
+                    "verb": "get",
+                    "subresource": "logs",
+                    "action": null,
+                    "requires_running_run": false,
+                    "resource_version": "sha256:stderr-review",
+                    "command": "buc runs logs run-1 TrialContainer/trial-1.agent.container-1 --stream stderr --metadata-out FILE.metadata.json"
+                })
+            }
+            4 => {
+                assert_eq!(request.method, "GET");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/TrialArtifact/trial%2D1%2Eagent%2Dresult%2Esha256%2Dbbbbbbbb/operations/content"
+                );
+                json!({
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RuntimeResourceOperationReview",
+                    "cloud_run_id": "run-1",
+                    "resource_ref": {
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "TrialArtifact",
+                        "name": "trial-1.agent-result.sha256-bbbbbbbb"
+                    },
+                    "operation": "content",
+                    "matched_operation": "content",
+                    "supported": true,
+                    "reason": null,
+                    "message": null,
+                    "verb": "get",
+                    "subresource": "content",
+                    "action": null,
+                    "requires_running_run": false,
+                    "resource_version": "sha256:content-review",
+                    "command": "buc runs content run-1 TrialArtifact/trial-1.agent-result.sha256-bbbbbbbb --out FILE --metadata-out FILE.metadata.json"
+                })
+            }
+            _ => panic!(
+                "unexpected mock Cloud API request #{index}: {} {}",
+                request.method, request.path
+            ),
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_can_i_observability_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "can-i".to_string(),
+            "run-1".to_string(),
+            "top".to_string(),
+            "TrialContainer/trial-1.agent.container-1".to_string(),
+        ])
+        .expect("can-i should review runtime top through the operation subresource");
+        run(vec![
+            "runs".to_string(),
+            "can-i".to_string(),
+            "run-1".to_string(),
+            "audit".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+        ])
+        .expect("can-i should review runtime audit through the operation subresource");
+        run(vec![
+            "runs".to_string(),
+            "can-i".to_string(),
+            "run-1".to_string(),
+            "logs/stdout".to_string(),
+            "TrialContainer/trial-1.agent.container-1".to_string(),
+        ])
+        .expect("can-i should review runtime stdout logs through the operation subresource");
+        run(vec![
+            "runs".to_string(),
+            "can-i".to_string(),
+            "run-1".to_string(),
+            "logs/stderr".to_string(),
+            "TrialContainer/trial-1.agent.container-1".to_string(),
+        ])
+        .expect("can-i should review runtime stderr logs through the operation subresource");
+        run(vec![
+            "runs".to_string(),
+            "can-i".to_string(),
+            "run-1".to_string(),
+            "content".to_string(),
+            "TrialArtifact/trial-1.agent-result.sha256-bbbbbbbb".to_string(),
+        ])
+        .expect("can-i should review runtime artifact content through the operation subresource");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 5);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_can_i_reviews_runtime_access_cancel_operation() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(1, |request, _index| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.path,
+                "/v1/runs/run%2D1/runtime/resources/Exec/exec%2D1/operations/cancel"
+            );
+            json!({
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceOperationReview",
+                "cloud_run_id": "run-1",
+                "resource_ref": {
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "Exec",
+                    "name": "exec-1"
+                },
+                "operation": "cancel",
+                "matched_operation": "cancel",
+                "supported": true,
+                "reason": null,
+                "message": null,
+                "verb": null,
+                "subresource": "actions/cancel",
+                "action": "cancel",
+                "requires_running_run": false,
+                "resource_version": "sha256:exec-cancel-review",
+                "command": "buc runs cancel run-1 Exec/exec-1 --resource-version sha256:exec-cancel-review"
+            })
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_can_i_cancel_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "can-i".to_string(),
+            "run-1".to_string(),
+            "cancel".to_string(),
+            "Exec/exec-1".to_string(),
+        ])
+        .expect("can-i should review runtime access cancel through the operation subresource");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn can_i_summary_prints_reviewed_command_and_resource_version() {
+        let summary = runtime_operation_review_summary(
+            &json!({
+                "kind": "RuntimeResourceOperationReview",
+                "operation": "exec",
+                "matched_operation": "exec",
+                "supported": true,
+                "verb": "create",
+                "subresource": "exec",
+                "action": null,
+                "requires_running_run": true,
+                "resource_generation": 12,
+                "observed_generation": 12,
+                "generated_at": "2026-06-18T00:00:00Z",
+                "core_run_ids": ["core-run-1"],
+                "resource_ref": {
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "TrialContainer",
+                    "name": "trial-1.agent.container-1"
+                },
+                "resource_version": "sha256:reviewed",
+                "command": "buc runs exec run-1 TrialContainer/trial-1.agent.container-1 --resource-version <metadata.resourceVersion> -- COMMAND [ARG...]"
+            }),
+            "exec",
+            "TrialContainer",
+            "trial-1.agent.container-1",
+        );
+
+        assert_eq!(
+            summary,
+            vec![
+                "can-i: yes exec TrialContainer/trial-1.agent.container-1".to_string(),
+                "command: buc runs exec run-1 TrialContainer/trial-1.agent.container-1 --resource-version sha256:reviewed -- COMMAND [ARG...]".to_string(),
+                "review: verb=create subresource=exec requires_running_run=true generation=12/12".to_string(),
+                "generated_at: 2026-06-18T00:00:00Z".to_string(),
+                "core_run_ids: core-run-1".to_string(),
+                "resource_version: sha256:reviewed".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_events_summary_surfaces_follow_cursors() {
+        let lines = runtime_events_summary_lines(&json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "kind": "RuntimeEventList",
+            "cloud_run_id": "run-1",
+            "metadata": {
+                "resourceVersion": "event-row-seq:41",
+                "continue": "event-row-seq:42",
+                "after_row_seq": 37,
+                "next_after_row_seq": 42,
+                "remainingItemCount": 3,
+                "limit": 5,
+                "returned": 2
+            },
+            "events": [
+                {
+                    "row_seq": 40,
+                    "event_type": "runtime.access.exec.requested",
+                    "source": "cloud.runtime_access_requests",
+                    "resource_refs": [
+                        { "kind": "Exec", "name": "exec-1" },
+                        { "kind": "TrialContainer", "name": "trial-1.agent.container-1" }
+                    ],
+                    "payload": {
+                        "requester": "issuer:user-a",
+                        "resource_version_precondition": "sha256:reviewed",
+                        "access_resource_ref": { "kind": "Exec", "name": "exec-1" },
+                        "resolved_target": {
+                            "kind": "TrialContainer",
+                            "name": "trial-1.agent.container-1",
+                            "runner_binding": {
+                                "runner_instance_id": "runner-1",
+                                "worker_id": "worker-1"
+                            }
+                        },
+                        "status": "requested",
+                        "reason": "debug"
+                    }
+                },
+                {
+                    "row_seq": 41,
+                    "event_type": "runtime.access.exec.completed",
+                    "payload": {
+                        "resource_kind": "Exec",
+                        "resource_name": "exec-1",
+                        "previous_status": "active",
+                        "status": "completed",
+                        "connection": {
+                            "exit_code": 0,
+                            "stdout_bytes": 20000,
+                            "stdout_tail_bytes": 16000,
+                            "stdout_tail_truncated": true,
+                            "stderr_bytes": 5,
+                            "stderr_tail_bytes": 5,
+                            "stderr_tail_truncated": false
+                        },
+                        "message": "exit code 0"
+                    }
+                }
+            ]
+        }));
+
+        assert_eq!(lines[0], "events: 2");
+        assert!(lines.contains(&"resource_version: event-row-seq:41".to_string()));
+        assert!(lines.contains(&"continue: event-row-seq:42".to_string()));
+        assert!(lines.contains(&"after_row_seq: 37".to_string()));
+        assert!(lines.contains(&"next_after_row_seq: 42".to_string()));
+        assert!(lines.contains(&"remaining: 3".to_string()));
+        assert!(lines.contains(&"limit: 5".to_string()));
+        assert!(lines.contains(&"returned: 2".to_string()));
+        assert!(lines.contains(&"  - row=40 runtime.access.exec.requested source=cloud.runtime_access_requests actor=issuer:user-a resource=Exec/exec-1 target=TrialContainer/trial-1.agent.container-1 runner=runner-1 worker=worker-1 reviewed-rv=sha256:reviewed reason=debug status=requested".to_string()));
+        assert!(lines.contains(&"  - row=41 runtime.access.exec.completed resource=Exec/exec-1 exit=0 stdout=bytes=20000,tail=16000,truncated=true stderr=bytes=5,tail=5,truncated=false transition=active->completed message=exit code 0".to_string()));
+        assert_eq!(
+            runtime_events_follow_cursor(&json!({
+                "metadata": {
+                    "resourceVersion": "event-row-seq:41",
+                    "continue": "event-row-seq:42"
+                }
+            })),
+            Some("event-row-seq:42".to_string())
+        );
+        assert_eq!(
+            runtime_events_follow_cursor(&json!({
+                "metadata": {
+                    "resourceVersion": "event-row-seq:41",
+                    "continue": null
+                }
+            })),
+            Some("event-row-seq:41".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_events_summary_uses_primary_resource_refs_and_keeps_secondary_involved_refs() {
+        let line = runtime_event_summary_line(&json!({
+            "row_seq": 42,
+            "event_type": "runtime.access.port_forward.active",
+            "source": "cloud.run_events",
+            "resource_refs": [
+                { "kind": "PortForward", "name": "pf-1", "uid": "pf-1" },
+                { "kind": "RunnerInstance", "name": "runner-1", "uid": "runner-1" }
+            ],
+            "payload": {
+                "requester": "issuer:user-a",
+                "access_resource_ref": { "kind": "PortForward", "name": "pf-1" },
+                "status": "active",
+                "message": "tunnel active"
+            }
+        }));
+
+        assert_eq!(
+            line,
+            "  - row=42 runtime.access.port_forward.active source=cloud.run_events actor=issuer:user-a resource=PortForward/pf-1 involved=RunnerInstance/runner-1 status=active message=tunnel active"
+        );
+    }
+
+    #[test]
+    fn runtime_events_summary_surfaces_raw_byte_read_audit_metadata() {
+        let lines = runtime_events_summary_lines(&json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "kind": "RuntimeEventList",
+            "cloud_run_id": "run-1",
+            "events": [
+                {
+                    "row_seq": 12,
+                    "event_type": "runtime.resource.logs.read",
+                    "source": "cloud.run_events",
+                    "resource_refs": [{ "kind": "Trial", "name": "trial-1", "uid": "trial-1" }],
+                    "payload": {
+                        "requester": "issuer:user-a",
+                        "resource_ref": {
+                            "kind": "Trial",
+                            "name": "trial-1",
+                            "uid": "trial-1"
+                        },
+                        "stream": "stdout",
+                        "object_ref": "artifact://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "byte_size": 14,
+                        "media_type": "text/plain; charset=utf-8"
+                    }
+                },
+                {
+                    "row_seq": 13,
+                    "event_type": "runtime.resource.content.read",
+                    "source": "cloud.run_events",
+                    "resource_refs": [{ "kind": "TrialArtifact", "name": "trial-1.agent-result.sha256-bbbbbbbb" }],
+                    "payload": {
+                        "requester": "issuer:user-a",
+                        "resource_ref": {
+                            "kind": "TrialArtifact",
+                            "name": "trial-1.agent-result.sha256-bbbbbbbb"
+                        },
+                        "object_ref": "artifact://sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "byte_size": 11,
+                        "media_type": "application/json; charset=utf-8"
+                    }
+                },
+                {
+                    "row_seq": 14,
+                    "event_type": "runtime.resource.content.read.failed",
+                    "source": "cloud.run_events",
+                    "resource_refs": [{ "kind": "Trial", "name": "trial-1" }],
+                    "payload": {
+                        "requester": "issuer:user-a",
+                        "resource_ref": {
+                            "kind": "Trial",
+                            "name": "trial-1"
+                        },
+                        "status": "failed",
+                        "error_code": "runtime_resource_content_not_found",
+                        "error_status": 404,
+                        "error_message": "Runtime resource content subresource is only available for TrialArtifact resources"
+                    }
+                }
+            ]
+        }));
+
+        assert_eq!(lines[0], "events: 3");
+        assert!(lines.contains(&"  - row=12 runtime.resource.logs.read source=cloud.run_events actor=issuer:user-a resource=Trial/trial-1 stream=stdout object=artifact://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa sha256=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bytes=14 media=text/plain; charset=utf-8".to_string()));
+        assert!(lines.contains(&"  - row=13 runtime.resource.content.read source=cloud.run_events actor=issuer:user-a resource=TrialArtifact/trial-1.agent-result.sha256-bbbbbbbb object=artifact://sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb sha256=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bytes=11 media=application/json; charset=utf-8".to_string()));
+        assert!(lines.contains(&"  - row=14 runtime.resource.content.read.failed source=cloud.run_events actor=issuer:user-a resource=Trial/trial-1 error=runtime_resource_content_not_found http=404 status=failed message=Runtime resource content subresource is only available for TrialArtifact resources".to_string()));
+    }
+
+    #[test]
+    fn runtime_events_summary_surfaces_api_resources_read_audit_metadata() {
+        let lines = runtime_events_summary_lines(&json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "kind": "RuntimeEventList",
+            "cloud_run_id": "run-1",
+            "events": [
+                {
+                    "row_seq": 15,
+                    "event_type": "runtime.api_resources.read",
+                    "source": "cloud.run_events",
+                    "payload": {
+                        "operation": "api-resources",
+                        "requester": "issuer:user-a",
+                        "resource_ref": {
+                            "kind": "Run",
+                            "name": "run-1",
+                            "uid": "run-1"
+                        },
+                        "api_resources_returned": 37,
+                        "core_run_ids": ["core-run-1", "core-run-2"]
+                    }
+                },
+                {
+                    "row_seq": 16,
+                    "event_type": "runtime.api_resources.read.failed",
+                    "source": "cloud.run_events",
+                    "payload": {
+                        "operation": "api-resource",
+                        "requester": "issuer:user-a",
+                        "resource_ref": {
+                            "kind": "Run",
+                            "name": "run-1",
+                            "uid": "run-1"
+                        },
+                        "selected_kind": "missing-kind",
+                        "api_resource_kind": "RunnerInstance",
+                        "api_resource_name": "runnerinstances",
+                        "api_resource_categories": ["runner", "access-target"],
+                        "api_resource_verbs": ["list", "get", "watch", "describe"],
+                        "api_resource_subresources": ["logs", "port-forward", "exec"],
+                        "api_resource_actions": ["cordon", "drain", "uncordon"],
+                        "api_resource_access": ["logs", "port-forward", "exec"],
+                        "api_resource_count": 1,
+                        "status": "failed",
+                        "error_code": "runtime_api_resource_not_found",
+                        "error_status": 404,
+                        "error_message": "Runtime API resource kind not found: missing-kind"
+                    }
+                }
+            ]
+        }));
+
+        assert_eq!(lines[0], "events: 2");
+        assert!(lines.contains(&"  - row=15 runtime.api_resources.read source=cloud.run_events actor=issuer:user-a resource=Run/run-1 operation=api-resources api_resources=37 core_runs=core-run-1,core-run-2".to_string()));
+        assert!(lines.contains(&"  - row=16 runtime.api_resources.read.failed source=cloud.run_events actor=issuer:user-a resource=Run/run-1 operation=api-resource selected=missing-kind api_kind=RunnerInstance api_name=runnerinstances count=1 categories=runner,access-target verbs=list,get,watch,describe subresources=logs,port-forward,exec actions=cordon,drain,uncordon access=logs,port-forward,exec error=runtime_api_resource_not_found http=404 status=failed message=Runtime API resource kind not found: missing-kind".to_string()));
+    }
+
+    #[test]
+    fn runtime_events_summary_surfaces_inspect_bundle_read_audit_metadata() {
+        let lines = runtime_events_summary_lines(&json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "kind": "RuntimeEventList",
+            "cloud_run_id": "run-1",
+            "events": [
+                {
+                    "row_seq": 15,
+                    "event_type": "runtime.inspect.bundle.read",
+                    "source": "cloud.run_events",
+                    "payload": {
+                        "operation": "inspect",
+                        "requester": "issuer:user-a",
+                        "resource_ref": {
+                            "kind": "Run",
+                            "name": "run-1",
+                            "uid": "run-1"
+                        },
+                        "resource_filter": {
+                            "kinds": ["RunnerInstance", "Trial"],
+                            "categories": ["runner", "access-target"],
+                            "label_selector": "bucephalus.dev/run-id=run-1",
+                            "field_selector": "status.phase!=completed"
+                        },
+                        "event_limit": 250,
+                        "inventory_resource_version": "sha256:inspect-inventory",
+                        "inventory_total": 12,
+                        "inventory_returned": 10,
+                        "event_resource_version": "event-row-seq:42",
+                        "event_returned": 9,
+                        "api_resources_returned": 37,
+                        "health_summary": {
+                            "total": 10,
+                            "ready": 4,
+                            "degraded": 1,
+                            "problem": 1,
+                            "unknown": 4
+                        },
+                        "metrics_summary": {
+                            "resources_total": 10,
+                            "resources_returned": 8,
+                            "events_total": 24
+                        },
+                        "log_refs": 6
+                    }
+                },
+                {
+                    "row_seq": 16,
+                    "event_type": "runtime.inspect.bundle.read.failed",
+                    "source": "cloud.run_events",
+                    "payload": {
+                        "operation": "inspect",
+                        "status": "failed",
+                        "requester": "issuer:user-a",
+                        "resource_ref": {
+                            "kind": "Run",
+                            "name": "run-1",
+                            "uid": "run-1"
+                        },
+                        "resource_filter": {
+                            "kinds": ["RunnerInstance"],
+                            "categories": ["access-target"]
+                        },
+                        "event_limit": 250,
+                        "error_code": "runtime_inventory_unavailable",
+                        "error_status": 503,
+                        "error_message": "Runtime inventory unavailable"
+                    }
+                }
+            ]
+        }));
+
+        assert_eq!(lines[0], "events: 2");
+        assert!(lines.contains(&"  - row=15 runtime.inspect.bundle.read source=cloud.run_events actor=issuer:user-a resource=Run/run-1 operation=inspect kinds=RunnerInstance,Trial categories=runner,access-target label_selector=bucephalus.dev/run-id=run-1 field_selector=status.phase!=completed event_limit=250 inventory-rv=sha256:inspect-inventory inventory=10/12 event-rv=event-row-seq:42 events=9 api_resources=37 health_total=10 metrics_resources=8/10 metric_events=24 log_refs=6".to_string()));
+        assert!(lines.contains(&"  - row=16 runtime.inspect.bundle.read.failed source=cloud.run_events actor=issuer:user-a resource=Run/run-1 operation=inspect kinds=RunnerInstance categories=access-target event_limit=250 error=runtime_inventory_unavailable http=503 status=failed message=Runtime inventory unavailable".to_string()));
+    }
+
+    #[test]
+    fn runtime_events_summary_surfaces_resource_query_read_audit_metadata() {
+        let lines = runtime_events_summary_lines(&json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "kind": "RuntimeEventList",
+            "cloud_run_id": "run-1",
+            "events": [
+                {
+                    "row_seq": 17,
+                    "event_type": "runtime.resource.list.read",
+                    "source": "cloud.run_events",
+                    "payload": {
+                        "operation": "list",
+                        "requester": "issuer:user-a",
+                        "resource_ref": {
+                            "kind": "Run",
+                            "name": "run-1",
+                            "uid": "run-1"
+                        },
+                        "resource_filter": {
+                            "kinds": ["RunnerInstance", "Trial"],
+                            "categories": ["runner", "access-target"],
+                            "label_selector": "bucephalus.dev/run-id=run-1",
+                            "field_selector": "status.access.exec=true"
+                        },
+                        "limit": 10,
+                        "resource_version": "sha256:list",
+                        "total": 12,
+                        "returned": 10,
+                        "remaining": 2
+                    }
+                },
+                {
+                    "row_seq": 18,
+                    "event_type": "runtime.resource.watch.read",
+                    "source": "cloud.run_events",
+                    "payload": {
+                        "operation": "watch",
+                        "requester": "issuer:user-a",
+                        "resource_ref": {
+                            "kind": "Run",
+                            "name": "run-1"
+                        },
+                        "resource_filter": {
+                            "kinds": ["RunnerInstance"],
+                            "categories": ["runner"],
+                            "field_selector": "status.phase=online"
+                        },
+                        "resource_version": "sha256:inventory",
+                        "resource_version_cursor": "sha256:previous",
+                        "known_resources": 7,
+                        "allow_bookmarks": true,
+                        "total": 3,
+                        "returned": 3,
+                        "watch_events_returned": 1
+                    }
+                },
+                {
+                    "row_seq": 19,
+                    "event_type": "runtime.resource.describe.read.failed",
+                    "source": "cloud.run_events",
+                    "payload": {
+                        "operation": "describe",
+                        "requester": "issuer:user-a",
+                        "resource_ref": {
+                            "kind": "Trial",
+                            "name": "missing-trial"
+                        },
+                        "resource_kind": "Trial",
+                        "resource_name": "missing-trial",
+                        "status": "failed",
+                        "error_code": "runtime_resource_not_found",
+                        "error_status": 404,
+                        "error_message": "Runtime resource not found"
+                    }
+                }
+            ]
+        }));
+
+        assert_eq!(lines[0], "events: 3");
+        assert!(lines.contains(&"  - row=17 runtime.resource.list.read source=cloud.run_events actor=issuer:user-a resource=Run/run-1 operation=list kinds=RunnerInstance,Trial categories=runner,access-target label_selector=bucephalus.dev/run-id=run-1 field_selector=status.access.exec=true limit=10 rv=sha256:list returned=10/12 remaining=2".to_string()));
+        assert!(lines.contains(&"  - row=18 runtime.resource.watch.read source=cloud.run_events actor=issuer:user-a resource=Run/run-1 operation=watch kinds=RunnerInstance categories=runner field_selector=status.phase=online rv=sha256:inventory cursor-rv=sha256:previous known=7 bookmarks=true returned=3/3 watch_events=1".to_string()));
+        assert!(lines.contains(&"  - row=19 runtime.resource.describe.read.failed source=cloud.run_events actor=issuer:user-a resource=Trial/missing-trial operation=describe error=runtime_resource_not_found http=404 status=failed message=Runtime resource not found".to_string()));
+    }
+
+    #[test]
+    fn runtime_events_summary_surfaces_operation_review_audit_metadata() {
+        let lines = runtime_events_summary_lines(&json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "kind": "RuntimeEventList",
+            "cloud_run_id": "run-1",
+            "events": [
+                {
+                    "row_seq": 21,
+                    "event_type": "runtime.resource.operation.reviewed",
+                    "source": "cloud.run_events",
+                    "resource_refs": [{ "kind": "TrialContainer", "name": "trial-1.agent.container-1" }],
+                    "payload": {
+                        "requester": "issuer:user-a",
+                        "operation": "audit",
+                        "matched_operation": "audit",
+                        "supported": true,
+                        "status": "supported",
+                        "resource_ref": {
+                            "kind": "TrialContainer",
+                            "name": "trial-1.agent.container-1"
+                        },
+                        "resource_version": "sha256:reviewed",
+                        "command": "buc runs audit run-1 TrialContainer/trial-1.agent.container-1",
+                        "verb": "watch",
+                        "subresource": "events"
+                    }
+                },
+                {
+                    "row_seq": 22,
+                    "event_type": "runtime.resource.operation.review.failed",
+                    "source": "cloud.run_events",
+                    "resource_refs": [{ "kind": "TrialContainer", "name": "missing-container" }],
+                    "payload": {
+                        "requester": "issuer:user-a",
+                        "operation": "exec",
+                        "status": "failed",
+                        "resource_ref": {
+                            "kind": "TrialContainer",
+                            "name": "missing-container"
+                        },
+                        "error_code": "runtime_resource_not_found",
+                        "error_status": 404,
+                        "error_message": "Runtime resource not found"
+                    }
+                }
+            ]
+        }));
+
+        assert_eq!(lines[0], "events: 2");
+        assert!(lines.contains(&"  - row=21 runtime.resource.operation.reviewed source=cloud.run_events actor=issuer:user-a resource=TrialContainer/trial-1.agent.container-1 operation=audit matched=audit status=supported".to_string()));
+        assert!(lines.contains(&"  - row=22 runtime.resource.operation.review.failed source=cloud.run_events actor=issuer:user-a resource=TrialContainer/missing-container operation=exec error=runtime_resource_not_found http=404 status=failed message=Runtime resource not found".to_string()));
+    }
+
+    #[test]
+    fn runtime_list_metadata_summary_surfaces_list_cursors() {
+        let lines = runtime_list_metadata_summary_lines(&json!({
+            "metadata": {
+                "resourceVersion": "rv-41",
+                "continue": "cursor-42",
+                "remainingItemCount": 3,
+                "total": 10,
+                "returned": 7,
+                "limit": 7
+            }
+        }));
+
+        assert_eq!(
+            lines,
+            vec![
+                "resource_version: rv-41".to_string(),
+                "continue: cursor-42".to_string(),
+                "remaining: 3".to_string(),
+                "total: 10".to_string(),
+                "returned: 7".to_string(),
+                "limit: 7".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_inspect_summary_surfaces_bundle_observability() {
+        let lines = runtime_inspect_summary_lines(&json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "kind": "RuntimeInspectBundle",
+            "cloud_run_id": "run-1",
+            "resource_filter": {
+                "kinds": ["RunnerInstance", "Trial"],
+                "categories": ["access-target"],
+                "label_selector": "bucephalus.dev/run-id=run-1",
+                "field_selector": "status.phase!=completed"
+            },
+            "api_resources": {
+                "resources": [
+                    { "kind": "RunnerInstance" },
+                    { "kind": "Trial" }
+                ]
+            },
+            "resource_inventory": {
+                "metadata": {
+                    "resourceVersion": "sha256:inventory",
+                    "continue": "runtime-resource:next",
+                    "remainingItemCount": 4,
+                    "total": 9,
+                    "returned": 5,
+                    "limit": 5
+                },
+                "resources": [
+                    { "kind": "RunnerInstance" },
+                    { "kind": "Trial" },
+                    { "kind": "PortForward" }
+                ]
+            },
+            "resource_health": {
+                "summary": {
+                    "total": 3,
+                    "ready": 1,
+                    "degraded": 1,
+                    "problem": 1,
+                    "unknown": 0,
+                    "access_targets": 2,
+                    "reachable_access_targets": 1,
+                    "actions_available": 2,
+                    "observed_stale": 1
+                }
+            },
+            "resource_metrics": {
+                "summary": {
+                    "resources_total": 3,
+                    "resources_returned": 2,
+                    "metrics_total": 19,
+                    "events_total": 7
+                },
+                "resources": [{}, {}]
+            },
+            "event_list": {
+                "metadata": {
+                    "resourceVersion": "event-row-seq:42",
+                    "continue": "event-row-seq:43",
+                    "remainingItemCount": 8,
+                    "limit": 25,
+                    "returned": 2,
+                    "after_row_seq": 40,
+                    "next_after_row_seq": 42
+                },
+                "events": [
+                    { "row_seq": 41, "event_type": "runtime.resource.runner_instance.online" },
+                    { "row_seq": 42, "event_type": "runtime.access.exec.completed" }
+                ]
+            },
+            "log_refs": [
+                {
+                    "resource": { "kind": "RunnerInstance", "name": "runner-1" },
+                    "streams": ["stdout", "stderr"]
+                },
+                {
+                    "resource": { "kind": "Exec", "name": "exec-1" },
+                    "streams": ["stdout"]
+                }
+            ]
+        }));
+
+        assert_eq!(
+            lines,
+            vec![
+                "inspect: resources=3 api_resources=2 events=2 metrics_resources=2 log_refs=2".to_string(),
+                "filter: kinds=RunnerInstance,Trial categories=access-target label_selector=bucephalus.dev/run-id=run-1 field_selector=status.phase!=completed".to_string(),
+                "inventory_resource_version: sha256:inventory".to_string(),
+                "inventory_continue: runtime-resource:next".to_string(),
+                "inventory_remaining: 4".to_string(),
+                "inventory_total: 9".to_string(),
+                "inventory_returned: 5".to_string(),
+                "inventory_limit: 5".to_string(),
+                "health: total=3 ready=1 degraded=1 problem=1 unknown=0 access_targets=2 reachable=1 actions=2 observed_stale=1".to_string(),
+                "metrics: resources_total=3 resources_returned=2 metrics_total=19 events_total=7".to_string(),
+                "event_events: 2".to_string(),
+                "event_resource_version: event-row-seq:42".to_string(),
+                "event_continue: event-row-seq:43".to_string(),
+                "event_after_row_seq: 40".to_string(),
+                "event_next_after_row_seq: 42".to_string(),
+                "event_remaining: 8".to_string(),
+                "event_limit: 25".to_string(),
+                "event_returned: 2".to_string(),
+                "log_ref: RunnerInstance/runner-1 streams=stdout,stderr".to_string(),
+                "log_ref: Exec/exec-1 streams=stdout".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_resource_summary_surfaces_precondition_metadata() {
+        let lines = runtime_resource_summary_lines(&json!({
+            "generated_at": "2026-06-18T00:00:00Z",
+            "core_run_ids": ["core-run-1", "core-run-2"],
+            "resource": {
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RunnerInstance",
+                "metadata": {
+                    "name": "runner-1",
+                    "uid": "runner-uid-1",
+                    "resourceVersion": "sha256:runner-rv",
+                    "generation": 9,
+                    "ownerReferences": [{
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "RunnerAttempt",
+                        "name": "attempt-1",
+                        "uid": "attempt-uid-1"
+                    }]
+                },
+                "status": {
+                    "phase": "Running",
+                    "reason": "Ready",
+                    "observedGeneration": 7,
+                    "conditions": [{
+                        "type": "Observed",
+                        "status": "False",
+                        "reason": "ObservedGenerationStale",
+                        "message": "Status is behind desired state"
+                    }]
+                }
+            },
+            "operations": [
+                {
+                    "purpose": "cordon",
+                    "command": "buc runs cordon run-1 RunnerInstance/runner-1 --resource-version <metadata.resourceVersion>",
+                    "supported": true,
+                    "verb": "update",
+                    "subresource": "actions",
+                    "action": "cordon",
+                    "requires_running_run": false
+                },
+                {
+                    "purpose": "exec",
+                    "command": "buc runs exec run-1 RunnerInstance/runner-1 --resource-version <metadata.resourceVersion> -- COMMAND [ARG...]",
+                    "supported": false,
+                    "reason": "run_not_running",
+                    "message": "exec requires a running Cloud run",
+                    "verb": "create",
+                    "subresource": "exec",
+                    "requires_running_run": true
+                }
+            ],
+            "event_list": { "events": [{ "row_seq": 1 }, { "row_seq": 2 }] }
+        }));
+
+        assert_eq!(
+            lines,
+            vec![
+                "resource: RunnerInstance/runner-1 phase=Running ready=Unknown reason=Ready"
+                    .to_string(),
+                "generated_at: 2026-06-18T00:00:00Z".to_string(),
+                "core_run_ids: core-run-1,core-run-2".to_string(),
+                "uid: runner-uid-1".to_string(),
+                "resource_version: sha256:runner-rv".to_string(),
+                "generation: 9 observed=7 freshness=stale".to_string(),
+                "owners: RunnerAttempt/attempt-1".to_string(),
+                "condition: Observed=False reason=ObservedGenerationStale message=Status is behind desired state".to_string(),
+                "operations: cordon".to_string(),
+                "operation: cordon supported=yes verb=update subresource=actions action=cordon requires_running_run=false command='buc runs cordon run-1 RunnerInstance/runner-1 --resource-version <metadata.resourceVersion>'".to_string(),
+                "operation: exec supported=no verb=create subresource=exec reason=run_not_running message='exec requires a running Cloud run' requires_running_run=true command='buc runs exec run-1 RunnerInstance/runner-1 --resource-version <metadata.resourceVersion> -- COMMAND [ARG...]'".to_string(),
+                "events: 2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_resource_summary_surfaces_related_event_rows() {
+        let lines = runtime_resource_summary_lines(&json!({
+            "resource": {
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RunnerInstance",
+                "metadata": {
+                    "name": "runner-1",
+                    "resourceVersion": "sha256:runner-rv"
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{ "type": "Ready", "status": "True" }]
+                }
+            },
+            "event_list": {
+                "metadata": {
+                    "resourceVersion": "event-row-seq:41",
+                    "continue": "event-row-seq:42",
+                    "after_row_seq": 37,
+                    "next_after_row_seq": 42,
+                    "remainingItemCount": 3,
+                    "limit": 5,
+                    "returned": 2
+                },
+                "events": [
+                    {
+                        "row_seq": 40,
+                        "event_type": "runtime.resource.operation.reviewed",
+                        "source": "cloud.run_events",
+                        "payload": {
+                            "requester": "issuer:user-a",
+                            "resource_ref": {
+                                "kind": "RunnerInstance",
+                                "name": "runner-1"
+                            },
+                            "resource_version_precondition": "sha256:runner-rv",
+                            "operation": "cordon",
+                            "matched_operation": "cordon",
+                            "reason": "maintenance",
+                            "status": "supported"
+                        }
+                    },
+                    {
+                        "row_seq": 41,
+                        "event_type": "runtime.access.port_forward.completed",
+                        "payload": {
+                            "access_resource_ref": {
+                                "kind": "PortForward",
+                                "name": "pf-1"
+                            },
+                            "resolved_target": {
+                                "kind": "RunnerInstance",
+                                "name": "runner-1",
+                                "runner_binding": {
+                                    "runner_instance_id": "runner-1",
+                                    "worker_id": "worker-1"
+                                }
+                            },
+                            "connection": {
+                                "exit_code": 0
+                            },
+                            "previous_status": "active",
+                            "status": "completed",
+                            "message": "operator cleanup"
+                        }
+                    }
+                ]
+            }
+        }));
+
+        assert_eq!(
+            lines,
+            vec![
+                "resource: RunnerInstance/runner-1 phase=Running ready=True".to_string(),
+                "resource_version: sha256:runner-rv".to_string(),
+                "condition: Ready=True".to_string(),
+                "events: 2".to_string(),
+                "event_resource_version: event-row-seq:41".to_string(),
+                "event_continue: event-row-seq:42".to_string(),
+                "event_after_row_seq: 37".to_string(),
+                "event_next_after_row_seq: 42".to_string(),
+                "event_remaining: 3".to_string(),
+                "event_limit: 5".to_string(),
+                "event_returned: 2".to_string(),
+                "event: row=40 runtime.resource.operation.reviewed source=cloud.run_events actor=issuer:user-a resource=RunnerInstance/runner-1 reviewed-rv=sha256:runner-rv operation=cordon matched=cordon reason=maintenance status=supported".to_string(),
+                "event: row=41 runtime.access.port_forward.completed access=PortForward/pf-1 target=RunnerInstance/runner-1 runner=runner-1 worker=worker-1 exit=0 transition=active->completed message=operator cleanup".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_resource_summary_surfaces_related_resource_graph() {
+        let lines = runtime_resource_summary_lines(&json!({
+            "resource": {
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "TrialContainer",
+                "metadata": {
+                    "name": "trial-1.agent.container-1",
+                    "resourceVersion": "sha256:container-rv"
+                },
+                "status": {
+                    "phase": "Running",
+                    "reason": "ContainerReady",
+                    "conditions": [{ "type": "Ready", "status": "True" }]
+                }
+            },
+            "related_resources": [
+                {
+                    "relationship": "owner",
+                    "resource": {
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "RunnerInstance",
+                        "metadata": {
+                            "name": "runner-1",
+                            "resourceVersion": "sha256:runner-rv"
+                        },
+                        "status": {
+                            "phase": "Online",
+                            "reason": "RunnerReady",
+                            "conditions": [{ "type": "Ready", "status": "True" }]
+                        }
+                    }
+                },
+                {
+                    "relationship": "dependent",
+                    "resource": {
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "PortForward",
+                        "metadata": {
+                            "name": "pf-1",
+                            "resourceVersion": "sha256:pf-rv"
+                        },
+                        "status": {
+                            "phase": "Active",
+                            "reason": "TunnelReady",
+                            "conditions": [{ "type": "Ready", "status": "True" }]
+                        }
+                    }
+                }
+            ],
+            "event_list": { "events": [] }
+        }));
+
+        assert_eq!(
+            lines,
+            vec![
+                "resource: TrialContainer/trial-1.agent.container-1 phase=Running ready=True reason=ContainerReady".to_string(),
+                "resource_version: sha256:container-rv".to_string(),
+                "condition: Ready=True".to_string(),
+                "related: owner RunnerInstance/runner-1 phase=Online ready=True reason=RunnerReady resource_version=sha256:runner-rv".to_string(),
+                "related: dependent PortForward/pf-1 phase=Active ready=True reason=TunnelReady resource_version=sha256:pf-rv".to_string(),
+                "events: 0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_resource_status_summary_surfaces_freshness_conditions_actions_and_audit() {
+        let lines = runtime_resource_status_summary_lines(&json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "kind": "RuntimeResourceStatus",
+            "cloud_run_id": "run-1",
+            "generated_at": "2026-06-19T12:00:01Z",
+            "core_run_ids": ["core-run-1"],
+            "resource_ref": {
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RunnerInstance",
+                "name": "runner-1",
+                "uid": "runner-uid-1"
+            },
+            "generation": 9,
+            "observedGeneration": 7,
+            "resourceVersion": "sha256:runner-rv",
+            "deletionTimestamp": "2026-06-19T12:00:00Z",
+            "phase": "Running",
+            "reason": "Ready",
+            "message": "runner reachable",
+            "conditions": [
+                {
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "RunnerReady",
+                    "message": "runner reachable"
+                },
+                {
+                    "type": "Observed",
+                    "status": "False",
+                    "reason": "ObservedGenerationStale",
+                    "message": "status behind desired generation"
+                }
+            ],
+            "actions": ["cordon", "drain"],
+            "status": { "phase": "Running" },
+            "audit": { "source": "cloud.runner_instances" }
+        }));
+
+        assert_eq!(
+            lines,
+            vec![
+                "status: RunnerInstance/runner-1 phase=Running reason=Ready".to_string(),
+                "message: runner reachable".to_string(),
+                "resource_version: sha256:runner-rv".to_string(),
+                "generated_at: 2026-06-19T12:00:01Z".to_string(),
+                "generation: 9 observed=7 freshness=stale".to_string(),
+                "deletion_timestamp: 2026-06-19T12:00:00Z".to_string(),
+                "condition: Ready=True reason=RunnerReady message=runner reachable".to_string(),
+                "condition: Observed=False reason=ObservedGenerationStale message=status behind desired generation".to_string(),
+                "actions: cordon,drain".to_string(),
+                "audit_source: cloud.runner_instances".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_metrics_summary_surfaces_collection_cursors() {
+        let lines = runtime_metrics_summary_lines(&json!({
+            "metadata": {
+                "resourceVersion": "metrics-rv-1",
+                "continue": "metrics-cursor-2",
+                "remainingItemCount": 1,
+                "total": 3,
+                "returned": 2
+            },
+            "summary": { "resources_total": 2, "metrics_total": 4 },
+            "resources": [{
+                "resource_ref": {
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RunnerInstance",
+                    "name": "runner-1"
+                },
+                "metrics": [
+                    { "name": "lifecycle.ready", "value": 1 },
+                    { "name": "cpu.usage", "value": 0.42 }
+                ]
+            }]
+        }));
+
+        assert_eq!(
+            lines,
+            vec![
+                "metrics: resources=1 summary={\"metrics_total\":4,\"resources_total\":2}"
+                    .to_string(),
+                "resource_version: metrics-rv-1".to_string(),
+                "continue: metrics-cursor-2".to_string(),
+                "remaining: 1".to_string(),
+                "total: 3".to_string(),
+                "returned: 2".to_string(),
+                "  - RunnerInstance/runner-1 metrics=2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_watch_summary_surfaces_resource_cursors_and_event_versions() {
+        let lines = runtime_watch_summary_lines(&json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "kind": "RuntimeResourceWatchList",
+            "cloud_run_id": "run-1",
+            "resource_versions": {
+                "runnerinstance/runner-1": "rv-runner-2",
+                "exec/exec-1": "rv-exec-1"
+            },
+            "events": [{
+                "type": "MODIFIED",
+                "resource_ref": { "kind": "RunnerInstance", "name": "runner-1" },
+                "resource_version": "rv-runner-2",
+                "previous_resource_version": "rv-runner-1"
+            }],
+            "resource_inventory": {
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceList",
+                "metadata": {
+                    "resourceVersion": "rv-list-2",
+                    "continue": null,
+                    "remainingItemCount": 0,
+                    "total": 1,
+                    "returned": 1
+                },
+                "resources": [runtime_resource("RunnerInstance", "runner-1")]
+            }
+        }));
+
+        assert_eq!(
+            lines,
+            vec![
+                "watch_events: 1".to_string(),
+                "resource_version: rv-list-2".to_string(),
+                "remaining: 0".to_string(),
+                "total: 1".to_string(),
+                "returned: 1".to_string(),
+                "inventory_resources: 1".to_string(),
+                "known_resource: exec/exec-1=rv-exec-1".to_string(),
+                "known_resource: runnerinstance/runner-1=rv-runner-2".to_string(),
+                "  - MODIFIED RunnerInstance/runner-1 rv=rv-runner-2 previous=rv-runner-1"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runs_access_commands_can_create_async_resources_without_waiting() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start(2);
+        let api_url = server.api_url();
+        let home = temp_dir("runs_access_no_wait_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "port-forward".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--target-port".to_string(),
+            "8080".to_string(),
+            "--no-wait".to_string(),
+            "--resource-version".to_string(),
+            "sha256:runner-port-forward".to_string(),
+        ])
+        .expect("hosted run port-forward should support async creation");
+        run(vec![
+            "runs".to_string(),
+            "exec".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--no-wait".to_string(),
+            "--resource-version".to_string(),
+            "sha256:runner-exec".to_string(),
+            "--".to_string(),
+            "python".to_string(),
+            "-V".to_string(),
+        ])
+        .expect("hosted run exec should support async creation");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(
+            requests[0].path,
+            "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/port-forward"
+        );
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(
+            requests[1].path,
+            "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/exec"
+        );
+        let port_forward_body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            port_forward_body["resource_version"],
+            json!("sha256:runner-port-forward")
+        );
+        let exec_body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(exec_body["resource_version"], json!("sha256:runner-exec"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_port_forward_attach_completes_active_resource_after_local_tunnel_exits() {
+        let _lock = lock_env();
+        let fake_bin = temp_dir("runs_port_forward_attach_fake_bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_gcloud = fake_bin.join("gcloud");
+        fs::write(&fake_gcloud, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&fake_gcloud).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&fake_gcloud, permissions).unwrap();
+        }
+
+        let server = MockCloudServer::start_with_handler(2, |request, index| match index {
+            0 => {
+                assert_eq!(request.method, "POST");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/port-forward"
+                );
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["target_port"], json!(8080));
+                assert_eq!(body["local_port"], json!(18080));
+                assert_eq!(
+                    body["resource_version"],
+                    json!("sha256:runner-port-forward")
+                );
+                let mut resource = runtime_access_resource(
+                    "PortForward",
+                    "pf-1",
+                    "active",
+                    json!({
+                        "mode": "gcp_iap_ssh",
+                        "project_id": "buc-prod",
+                        "zone": "us-central1-a",
+                        "instance_name": "runner-vm-1",
+                        "target_host": "127.0.0.1",
+                        "target_port": 8080,
+                        "local_port": 18080
+                    }),
+                );
+                resource["metadata"]["resourceVersion"] = json!("sha256:pf-active");
+                json!({
+                    "cloud_run_id": "run-1",
+                    "resource": resource,
+                    "operations": [],
+                    "related_resources": [],
+                    "event_list": { "events": [] }
+                })
+            }
+            1 => {
+                assert_eq!(request.method, "POST");
+                assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/PortForward/pf%2D1/actions/complete"
+                );
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    json!({
+                        "reason": "local port-forward attach ended",
+                        "resource_version": "sha256:pf-active"
+                    })
+                );
+                json!({
+                    "cloud_run_id": "run-1",
+                    "resource": runtime_access_resource(
+                        "PortForward",
+                        "pf-1",
+                        "completed",
+                        json!({ "mode": "gcp_iap_ssh" }),
+                    ),
+                    "operations": [],
+                    "related_resources": [],
+                    "event_list": { "events": [] }
+                })
+            }
+            _ => unreachable!(),
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_port_forward_attach_cleanup_home");
+        let home_s = home.display().to_string();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let path = if old_path.is_empty() {
+            fake_bin.display().to_string()
+        } else {
+            format!("{}:{}", fake_bin.display(), old_path)
+        };
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+            ("PATH", Some(path.as_str())),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "port-forward".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--target-port".to_string(),
+            "8080".to_string(),
+            "--local-port".to_string(),
+            "18080".to_string(),
+            "--attach".to_string(),
+            "--resource-version".to_string(),
+            "sha256:runner-port-forward".to_string(),
+        ])
+        .expect("attached hosted run port-forward should complete after local tunnel exits");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(fake_bin);
+    }
+
+    #[test]
+    fn runs_port_forward_attach_reports_worker_client_endpoint_without_cleanup() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(1, |request, _index| {
+            assert_eq!(request.method, "POST");
+            assert_eq!(
+                request.path,
+                "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/port-forward"
+            );
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["target_port"], json!(8080));
+            assert_eq!(body["local_port"], json!(18080));
+            assert_eq!(
+                body["resource_version"],
+                json!("sha256:runner-port-forward")
+            );
+            let mut resource = runtime_access_resource(
+                "PortForward",
+                "pf-1",
+                "active",
+                json!({
+                    "kind": "loopback",
+                    "local_port": 18080,
+                    "client_reachable": true,
+                    "client_endpoint": "tcp://127.0.0.1:18080"
+                }),
+            );
+            resource["metadata"]["resourceVersion"] = json!("sha256:pf-active");
+            json!({
+                "cloud_run_id": "run-1",
+                "resource": resource,
+                "operations": [],
+                "related_resources": [],
+                "event_list": { "events": [] }
+            })
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_port_forward_client_endpoint_attach_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "port-forward".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--target-port".to_string(),
+            "8080".to_string(),
+            "--local-port".to_string(),
+            "18080".to_string(),
+            "--attach".to_string(),
+            "--resource-version".to_string(),
+            "sha256:runner-port-forward".to_string(),
+        ])
+        .expect("worker-managed client endpoint should be accepted by --attach");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_port_forward_exits_nonzero_when_tunnel_fails() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(2, |request, _index| {
+            match (request.method.as_str(), request.path.as_str()) {
+                (
+                    "POST",
+                    "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/port-forward",
+                ) => {
+                    json!({
+                        "resource": runtime_access_resource(
+                            "PortForward",
+                            "pf-1",
+                            "requested",
+                            json!({ "mode": "runner_reverse_tunnel" }),
+                        )
+                    })
+                }
+                ("GET", "/v1/runs/run%2D1/runtime/resources/PortForward/pf%2D1") => {
+                    let mut resource = runtime_access_resource(
+                        "PortForward",
+                        "pf-1",
+                        "failed",
+                        json!({ "error": "helper failed" }),
+                    );
+                    if let Some(status) = resource.get_mut("status").and_then(Value::as_object_mut)
+                    {
+                        status.insert("reason".to_string(), json!("WorkerPortForwardFailed"));
+                    }
+                    json!({
+                        "cloud_run_id": "run-1",
+                        "resource": resource,
+                        "operations": [],
+                        "related_resources": [],
+                        "event_list": { "events": [] }
+                    })
+                }
+                _ => panic!(
+                    "unexpected mock Cloud API request: {} {}",
+                    request.method, request.path
+                ),
+            }
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_runtime_port_forward_failure_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        let err = run(vec![
+            "runs".to_string(),
+            "port-forward".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--target-port".to_string(),
+            "8080".to_string(),
+            "--resource-version".to_string(),
+            "sha256:runner-port-forward".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        assert!(err.contains("runtime port-forward PortForward/pf-1 ended with phase=failed"));
+        assert!(err.contains("reason=WorkerPortForwardFailed"));
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["target_port"], json!(8080));
+        assert_eq!(
+            body["resource_version"],
+            json!("sha256:runner-port-forward")
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_exec_exits_nonzero_when_remote_command_fails() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(2, |request, _index| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/exec") => {
+                    json!({
+                        "resource": runtime_access_resource(
+                            "Exec",
+                            "exec-1",
+                            "requested",
+                            json!({ "mode": "worker_exec" }),
+                        )
+                    })
+                }
+                ("GET", "/v1/runs/run%2D1/runtime/resources/Exec/exec%2D1") => json!({
+                    "cloud_run_id": "run-1",
+                    "resource": runtime_access_resource(
+                        "Exec",
+                        "exec-1",
+                        "completed",
+                        json!({ "exit_code": 42, "stderr_tail": "boom\n" }),
+                    ),
+                    "operations": [],
+                    "related_resources": [],
+                    "event_list": { "events": [] }
+                }),
+                _ => panic!(
+                    "unexpected mock Cloud API request: {} {}",
+                    request.method, request.path
+                ),
+            }
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_runtime_exec_failure_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        let err = run(vec![
+            "runs".to_string(),
+            "exec".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--resource-version".to_string(),
+            "sha256:runner-exec".to_string(),
+            "--".to_string(),
+            "false".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        assert!(err.contains("runtime exec Exec/exec-1 exited with code 42"));
+        let exec_body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(exec_body["command"], json!(["false"]));
+        assert_eq!(exec_body["resource_version"], json!("sha256:runner-exec"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runtime_access_summaries_surface_connection_and_exec_output() {
+        let mut port_forward = runtime_access_resource(
+            "PortForward",
+            "pf-1",
+            "active",
+            json!({
+                "mode": "gcp_iap_ssh",
+                "project_id": "buc-prod",
+                "zone": "us-central1-a",
+                "instance_name": "runner-vm-1",
+                "target_host": "127.0.0.1",
+                "target_port": 8080,
+                "local_port": 18080,
+                "client_endpoint": "tcp://127.0.0.1:18080",
+                "provider_tunnel_url": "gce-iap://buc-prod/us-central1-a/runner-vm-1"
+            }),
+        );
+        port_forward["metadata"]["resourceVersion"] = json!("sha256:pf-rv");
+        port_forward["spec"] = json!({
+            "target_ref": {
+                "kind": "Trial",
+                "name": "trial-1",
+                "uid": "trial-uid-1",
+                "resourceVersion": "sha256:trial-rv"
+            },
+            "target_port": 8080,
+            "local_port": 18080,
+            "reason": "debug web server"
+        });
+        port_forward["status"]["runner_binding"] = json!({
+            "runner_instance_id": "runner-1",
+            "attempt_id": "attempt-1",
+            "worker_id": "worker-1"
+        });
+        port_forward["status"]["expires_at"] = json!("2026-06-20T12:00:00Z");
+        port_forward["audit"] = json!({
+            "source": "cloud.runtime_access_requests",
+            "requester": "issuer:user-a",
+            "target_ref": {
+                "kind": "Trial",
+                "name": "trial-1"
+            },
+            "target_resource_version": "sha256:trial-rv",
+            "runner_binding": {
+                "runner_instance_id": "runner-1",
+                "attempt_id": "attempt-1",
+                "worker_id": "worker-1"
+            }
+        });
+        let port_lines = runtime_access_detail_lines(&port_forward, Some("run-1"));
+        assert!(port_lines
+            .iter()
+            .any(|line| line
+                == "target: Trial/trial-1 uid=trial-uid-1 resource_version=sha256:trial-rv"));
+        assert!(port_lines.iter().any(|line| {
+            line == "request: requester=issuer:user-a reason=debug web server expires_at=2026-06-20T12:00:00Z source=cloud.runtime_access_requests"
+        }));
+        assert!(port_lines.iter().any(
+            |line| line == "runner_binding: runner=runner-1 attempt=attempt-1 worker=worker-1"
+        ));
+        assert!(port_lines
+            .iter()
+            .any(|line| line == "connection_mode: gcp_iap_ssh"));
+        assert!(port_lines.iter().any(|line| line == "local_port: 18080"));
+        assert!(port_lines
+            .iter()
+            .any(|line| line == "client_endpoint: tcp://127.0.0.1:18080"));
+        assert!(port_lines.iter().any(|line| {
+            line == "provider_tunnel_url: gce-iap://buc-prod/us-central1-a/runner-vm-1"
+        }));
+        assert!(port_lines.iter().any(|line| {
+            line == "attach_command: gcloud compute ssh runner-vm-1 --project buc-prod --zone us-central1-a --tunnel-through-iap -- -N -L 127.0.0.1:18080:127.0.0.1:8080"
+        }));
+        assert!(port_lines.iter().any(|line| {
+            line == "cleanup_command: buc runs complete run-1 PortForward/pf-1 --reason cleanup --resource-version sha256:pf-rv"
+        }));
+
+        let mut exec = runtime_access_resource(
+            "Exec",
+            "exec-1",
+            "completed",
+            json!({
+                "exit_code": 0,
+                "stdout_tail": "Python 3.12.0\n",
+                "stdout_bytes": 14,
+                "stdout_tail_bytes": 14,
+                "stdout_tail_truncated": false,
+                "stderr_tail": "warning\n",
+                "stderr_bytes": 7,
+                "stderr_tail_bytes": 7,
+                "stderr_tail_truncated": false
+            }),
+        );
+        exec["spec"] = json!({
+            "target_ref": {
+                "kind": "TrialContainer",
+                "name": "trial-1.agent.container-1",
+                "resourceVersion": "sha256:container-rv"
+            },
+            "command": ["python", "-V"],
+            "reason": "check interpreter"
+        });
+        exec["status"]["runner_binding"] = json!({
+            "runner_instance_id": "runner-1",
+            "attempt_id": "attempt-1",
+            "worker_id": "worker-1"
+        });
+        exec["audit"] = json!({
+            "source": "cloud.runtime_access_requests",
+            "requester": "issuer:user-a"
+        });
+        let exec_lines = runtime_access_detail_lines(&exec, Some("run-1"));
+        assert!(exec_lines.iter().any(|line| {
+            line == "target: TrialContainer/trial-1.agent.container-1 resource_version=sha256:container-rv"
+        }));
+        assert!(exec_lines
+            .iter()
+            .any(|line| line == "request: requester=issuer:user-a reason=check interpreter source=cloud.runtime_access_requests"));
+        assert!(exec_lines.iter().any(
+            |line| line == "runner_binding: runner=runner-1 attempt=attempt-1 worker=worker-1"
+        ));
+        assert!(exec_lines.iter().any(|line| line == "command: python -V"));
+        assert!(exec_lines.iter().any(|line| line == "exit_code: 0"));
+        assert!(exec_lines
+            .iter()
+            .any(|line| line.contains("stdout_tail:\nPython 3.12.0")));
+        assert!(exec_lines
+            .iter()
+            .any(|line| line == "stdout_evidence: bytes=14 tail_bytes=14 truncated=false"));
+        assert!(exec_lines
+            .iter()
+            .any(|line| line.contains("stderr_tail:\nwarning")));
+        assert!(exec_lines
+            .iter()
+            .any(|line| line == "stderr_evidence: bytes=7 tail_bytes=7 truncated=false"));
+        assert!(!exec_lines
+            .iter()
+            .any(|line| line.starts_with("cleanup_command:")));
+
+        let stream_field_exec = runtime_access_resource(
+            "Exec",
+            "exec-stdout-fields",
+            "completed",
+            json!({
+                "exit_code": 0,
+                "stdout": "v22.0.0\n",
+                "stderr": "node warning\n"
+            }),
+        );
+        let stream_field_lines = runtime_access_detail_lines(&stream_field_exec, Some("run-1"));
+        assert!(stream_field_lines
+            .iter()
+            .any(|line| line.contains("stdout:\nv22.0.0")));
+        assert!(stream_field_lines
+            .iter()
+            .any(|line| line.contains("stderr:\nnode warning")));
+
+        let mut running_exec =
+            runtime_access_resource("Exec", "exec-2", "running", json!({ "mode": "ssh_exec" }));
+        running_exec["metadata"]["resourceVersion"] = json!("sha256:exec-rv");
+        let running_exec_lines = runtime_access_detail_lines(&running_exec, Some("run-1"));
+        assert!(running_exec_lines.iter().any(|line| {
+            line == "cleanup_command: buc runs delete run-1 Exec/exec-2 --reason cleanup --resource-version sha256:exec-rv"
+        }));
+    }
+
+    #[test]
+    fn runtime_port_forward_success_guard_reports_terminal_tunnel_failures() {
+        let requested = json!({
+            "resource": runtime_access_resource(
+                "PortForward",
+                "pf-1",
+                "requested",
+                json!({ "mode": "runner_reverse_tunnel" }),
+            )
+        });
+        ensure_runtime_port_forward_success(&requested)
+            .expect("async requested port-forward should not fail yet");
+
+        let active = json!({
+            "resource": runtime_access_resource(
+                "PortForward",
+                "pf-1",
+                "active",
+                json!({ "client_endpoint": "tcp://127.0.0.1:18080" }),
+            )
+        });
+        ensure_runtime_port_forward_success(&active).expect("active port-forward should pass");
+
+        let mut failed_resource =
+            runtime_access_resource("PortForward", "pf-1", "failed", json!({ "error": "boom" }));
+        if let Some(status) = failed_resource
+            .get_mut("status")
+            .and_then(Value::as_object_mut)
+        {
+            status.insert("reason".to_string(), json!("WorkerPortForwardFailed"));
+        }
+        let failed = json!({ "resource": failed_resource });
+        let failed_err = ensure_runtime_port_forward_success(&failed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            failed_err.contains("runtime port-forward PortForward/pf-1 ended with phase=failed")
+        );
+        assert!(failed_err.contains("reason=WorkerPortForwardFailed"));
+    }
+
+    #[test]
+    fn runtime_exec_success_guard_reports_terminal_command_failures() {
+        let pending = json!({
+            "resource": runtime_access_resource(
+                "Exec",
+                "exec-1",
+                "accepted",
+                json!({ "mode": "worker_exec" }),
+            )
+        });
+        ensure_runtime_exec_success(&pending).expect("async accepted exec should not fail yet");
+
+        let ok = json!({
+            "resource": runtime_access_resource(
+                "Exec",
+                "exec-1",
+                "completed",
+                json!({ "exit_code": 0 }),
+            )
+        });
+        ensure_runtime_exec_success(&ok).expect("zero exit code should be successful");
+
+        let nonzero = json!({
+            "resource": runtime_access_resource(
+                "Exec",
+                "exec-1",
+                "completed",
+                json!({ "exit_code": 42 }),
+            )
+        });
+        let nonzero_err = ensure_runtime_exec_success(&nonzero)
+            .unwrap_err()
+            .to_string();
+        assert!(nonzero_err.contains("runtime exec Exec/exec-1 exited with code 42"));
+
+        let mut failed_resource =
+            runtime_access_resource("Exec", "exec-1", "failed", json!({ "message": "boom" }));
+        if let Some(status) = failed_resource
+            .get_mut("status")
+            .and_then(Value::as_object_mut)
+        {
+            status.insert("reason".to_string(), json!("WorkerExecFailed"));
+        }
+        let failed = json!({ "resource": failed_resource });
+        let failed_err = ensure_runtime_exec_success(&failed)
+            .unwrap_err()
+            .to_string();
+        assert!(failed_err.contains("runtime exec Exec/exec-1 ended with phase=failed"));
+        assert!(failed_err.contains("reason=WorkerExecFailed"));
+    }
+
+    #[test]
+    fn port_forward_attach_uses_gce_iap_connection_handle() {
+        let response = json!({
+            "resource": {
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "PortForward",
+                "metadata": { "name": "pf-1" },
+                "spec": {
+                    "target_port": 8080
+                },
+                "status": {
+                    "phase": "active",
+                    "connection": {
+                        "mode": "gcp_iap_ssh",
+                        "project_id": "proj-1",
+                        "zone": "us-central1-a",
+                        "instance_name": "runner-vm-1",
+                        "target_host": "10.0.0.2",
+                        "target_port": 8080
+                    }
+                }
+            }
+        });
+
+        let plan = runtime_port_forward_attach_plan(&response, Some(18080), 8080)
+            .expect("gce iap port-forward attach spec should parse");
+        let RuntimePortForwardAttachPlan::GceIap(spec) = plan else {
+            panic!("expected GCE IAP attach plan");
+        };
+
+        assert_eq!(
+            spec,
+            RuntimePortForwardAttachSpec {
+                project_id: "proj-1".to_string(),
+                zone: "us-central1-a".to_string(),
+                instance_name: "runner-vm-1".to_string(),
+                target_host: "10.0.0.2".to_string(),
+                target_port: 8080,
+                local_port: 18080,
+            }
+        );
+        assert_eq!(
+            gcloud_iap_port_forward_args(&spec),
+            vec![
+                "compute",
+                "ssh",
+                "runner-vm-1",
+                "--project",
+                "proj-1",
+                "--zone",
+                "us-central1-a",
+                "--tunnel-through-iap",
+                "--",
+                "-N",
+                "-L",
+                "127.0.0.1:18080:10.0.0.2:8080",
+            ]
+        );
+    }
+
+    #[test]
+    fn port_forward_attach_accepts_client_reachable_handles() {
+        let response = json!({
+            "resource": {
+                "kind": "PortForward",
+                "metadata": { "name": "pf-1" },
+                "spec": { "target_port": 8080, "local_port": 18080 },
+                "status": {
+                    "phase": "active",
+                    "connection": {
+                        "kind": "loopback",
+                        "client_reachable": true,
+                        "client_endpoint": "tcp://127.0.0.1:18080"
+                    }
+                }
+            }
+        });
+
+        let plan = runtime_port_forward_attach_plan(&response, None, 8080)
+            .expect("client-reachable port-forward attach handle should parse");
+
+        assert_eq!(
+            plan,
+            RuntimePortForwardAttachPlan::ClientEndpoint(
+                RuntimePortForwardClientEndpointAttachSpec {
+                    endpoint: "tcp://127.0.0.1:18080".to_string(),
+                    local_port: Some(18080),
+                }
+            )
+        );
     }
 
     #[test]
@@ -7358,16 +16522,649 @@ mod tests {
     }
 
     #[test]
-    fn runs_runtime_rejects_mismatched_cloud_run_id() {
+    fn runs_get_can_list_runtime_resources_by_kind() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(3, |request, index| {
+            assert_eq!(request.method, "GET");
+            match index {
+                0 => assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources?limit=5&kind=Trial"
+                ),
+                1 => assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources?kind=Trial&label%5Fselector=app%3Ddemo"
+                ),
+                2 => assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources?kind=RunnerInstance%2CTrial"
+                ),
+                _ => unreachable!(),
+            }
+            json!({
+                "cloud_run_id": "run-1",
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceList",
+                "metadata": {
+                    "resourceVersion": "rv-1",
+                    "continue": null,
+                    "remainingItemCount": 0,
+                    "total": 1,
+                    "returned": 1
+                },
+                "core_run_ids": [],
+                "resources": [runtime_resource("Trial", "trial-1")]
+            })
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_get_resource_list_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "--kind".to_string(),
+            "Trial".to_string(),
+            "--limit".to_string(),
+            "5".to_string(),
+        ])
+        .expect("runs get --kind should list runtime resources");
+        run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "Trial".to_string(),
+            "--label-selector".to_string(),
+            "app=demo".to_string(),
+        ])
+        .expect("runs get <kind> should list runtime resources");
+        run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance,Trial".to_string(),
+        ])
+        .expect("runs get <kind,kind> should list multiple runtime resource kinds");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 3);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_resources_wide_fetches_discovery_and_renders_printer_columns() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(2, |request, index| {
+            assert_eq!(request.method, "GET");
+            match index {
+                0 => {
+                    assert_eq!(
+                        request.path,
+                        "/v1/runs/run%2D1/runtime/resources?kind=RunnerInstance"
+                    );
+                    let mut runner = runtime_resource("RunnerInstance", "runner-1");
+                    if let Some(status) = runner.get_mut("status").and_then(Value::as_object_mut) {
+                        status.insert(
+                            "access".to_string(),
+                            json!({
+                                "reachable": true,
+                                "port_forward": true,
+                                "exec": false,
+                                "runner_instance_id": "runner-instance-1"
+                            }),
+                        );
+                        status.insert("provider".to_string(), json!("gcp"));
+                        status.insert("instance_name".to_string(), json!("runner-vm-1"));
+                        status.insert("actions".to_string(), json!(["cordon", "drain"]));
+                    }
+                    json!({
+                        "cloud_run_id": "run-1",
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "RuntimeResourceList",
+                        "metadata": { "resourceVersion": "rv-1", "continue": null, "remainingItemCount": 0, "total": 1, "returned": 1 },
+                        "core_run_ids": [],
+                        "resources": [runner]
+                    })
+                }
+                1 => {
+                    assert_eq!(request.path, "/v1/runs/run%2D1/runtime/api-resources");
+                    json!({
+                        "cloud_run_id": "run-1",
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "RuntimeApiResourceList",
+                        "generated_at": "2026-06-18T00:00:00Z",
+                        "core_run_ids": ["core-run-1"],
+                        "resources": [{
+                            "cloud_run_id": "run-1",
+                            "generated_at": "2026-06-18T00:00:00Z",
+                            "core_run_ids": ["core-run-1"],
+                            "kind": "RunnerInstance",
+                            "printerColumns": [
+                                { "name": "Name", "type": "string", "jsonPath": ".metadata.name", "priority": 0 },
+                                { "name": "Phase", "type": "string", "jsonPath": ".status.phase", "priority": 0 },
+                                { "name": "Ready", "type": "string", "jsonPath": ".status.conditions[?(@.type==\"Ready\")].status", "priority": 0 },
+                                { "name": "Reachable", "type": "boolean", "jsonPath": ".status.access.reachable", "priority": 0 },
+                                { "name": "PortForward", "type": "boolean", "jsonPath": ".status.access.port_forward", "priority": 0 },
+                                { "name": "Exec", "type": "boolean", "jsonPath": ".status.access.exec", "priority": 0 },
+                                { "name": "Provider", "type": "string", "jsonPath": ".status.provider", "priority": 0 },
+                                { "name": "VM", "type": "string", "jsonPath": ".status.instance_name", "priority": 0 },
+                                { "name": "Actions", "type": "string", "jsonPath": ".status.actions", "priority": 1 }
+                            ]
+                        }]
+                    })
+                }
+                _ => unreachable!(),
+            }
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_resources_wide_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "resources".to_string(),
+            "run-1".to_string(),
+            "--kind".to_string(),
+            "RunnerInstance".to_string(),
+            "--wide".to_string(),
+        ])
+        .expect("runs resources --wide should fetch discovery printer columns");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+
+        let mut runner = runtime_resource("RunnerInstance", "runner-1");
+        if let Some(status) = runner.get_mut("status").and_then(Value::as_object_mut) {
+            status.insert(
+                "access".to_string(),
+                json!({
+                    "reachable": true,
+                    "port_forward": true,
+                    "exec": false,
+                    "runner_instance_id": "runner-instance-1"
+                }),
+            );
+            status.insert("provider".to_string(), json!("gcp"));
+            status.insert("instance_name".to_string(), json!("runner-vm-1"));
+            status.insert("actions".to_string(), json!(["cordon", "drain"]));
+        }
+        let rendered = runtime_resources_wide_lines(
+            &json!({
+                "metadata": { "resourceVersion": "rv-1", "continue": null, "remainingItemCount": 0, "total": 1, "returned": 1 },
+                "resources": [runner]
+            }),
+            &json!({
+                "resources": [{
+                    "kind": "RunnerInstance",
+                    "printerColumns": [
+                        { "name": "Name", "jsonPath": ".metadata.name", "priority": 0 },
+                        { "name": "Ready", "jsonPath": ".status.conditions[?(@.type==\"Ready\")].status", "priority": 0 },
+                        { "name": "Reachable", "jsonPath": ".status.access.reachable", "priority": 0 },
+                        { "name": "Provider", "jsonPath": ".status.provider", "priority": 0 },
+                        { "name": "Actions", "jsonPath": ".status.actions", "priority": 1 }
+                    ]
+                }]
+            }),
+        )
+        .join("\n");
+        assert!(rendered.contains("resource_version: rv-1"));
+        assert!(rendered.contains("remaining: 0"));
+        assert!(rendered.contains("total: 1"));
+        assert!(rendered.contains("returned: 1"));
+        assert!(rendered.contains("RunnerInstance: 1"));
+        assert!(rendered.contains("NAME      READY  REACHABLE  PROVIDER  ACTIONS"));
+        assert!(rendered.contains("runner-1  True   true       gcp       cordon,drain"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runtime_resources_wide_renders_access_resource_operator_columns() {
+        let mut port_forward = runtime_access_resource(
+            "PortForward",
+            "pf-1",
+            "active",
+            json!({
+                "mode": "gcp_iap_ssh",
+                "target_port": 8080,
+                "local_port": 18080,
+                "provider_tunnel_url": "gcp-iap-ssh://projects/p/zones/z/instances/i"
+            }),
+        );
+        port_forward["spec"] = json!({
+            "target_ref": {
+                "kind": "Trial",
+                "name": "trial-1",
+                "resourceVersion": "sha256:trial-rv"
+            },
+            "target_port": 8080,
+            "local_port": 18080
+        });
+        port_forward["status"]["runner_binding"] = json!({
+            "runner_instance_id": "runner-1",
+            "worker_id": "worker-1"
+        });
+        port_forward["status"]["expires_at"] = json!("2026-06-20T12:00:00Z");
+        port_forward["status"]["conditions"] = json!([
+            { "type": "Ready", "status": "True" },
+            { "type": "ClientReachable", "status": "True" }
+        ]);
+        port_forward["audit"] = json!({
+            "source": "cloud.runtime_access_requests",
+            "requester": "issuer:user-a"
+        });
+
+        let mut exec = runtime_access_resource(
+            "Exec",
+            "exec-1",
+            "completed",
+            json!({
+                "mode": "worker_exec",
+                "exit_code": 0,
+                "stdout_bytes": 20_000,
+                "stdout_tail_bytes": 16_000,
+                "stdout_tail_truncated": true,
+                "stderr_bytes": 5,
+                "stderr_tail_bytes": 5,
+                "stderr_tail_truncated": false
+            }),
+        );
+        exec["spec"] = json!({
+            "target_ref": {
+                "kind": "TrialContainer",
+                "name": "trial-1.agent.container-1",
+                "resourceVersion": "sha256:container-rv"
+            },
+            "command": ["python", "-V"]
+        });
+        exec["status"]["runner_binding"] = json!({
+            "runner_instance_id": "runner-1",
+            "worker_id": "worker-1"
+        });
+        exec["status"]["expires_at"] = json!("2026-06-20T12:05:00Z");
+        exec["audit"] = json!({
+            "source": "cloud.runtime_access_requests",
+            "requester": "issuer:user-a"
+        });
+
+        let rendered = runtime_resources_wide_lines(
+            &json!({
+                "metadata": { "resourceVersion": "rv-access", "continue": null, "remainingItemCount": 0, "total": 2, "returned": 2 },
+                "resources": [port_forward, exec]
+            }),
+            &json!({
+                "resources": [
+                    {
+                        "kind": "PortForward",
+                        "printerColumns": [
+                            { "name": "Name", "jsonPath": ".metadata.name", "priority": 0 },
+                            { "name": "Target", "jsonPath": ".spec.target_ref.name", "priority": 0 },
+                            { "name": "TargetKind", "jsonPath": ".spec.target_ref.kind", "priority": 1 },
+                            { "name": "TargetRV", "jsonPath": ".spec.target_ref.resourceVersion", "priority": 1 },
+                            { "name": "TargetPort", "jsonPath": ".spec.target_port", "priority": 0 },
+                            { "name": "LocalPort", "jsonPath": ".spec.local_port", "priority": 0 },
+                            { "name": "ClientReachable", "jsonPath": ".status.conditions[?(@.type==\"ClientReachable\")].status", "priority": 0 },
+                            { "name": "Runner", "jsonPath": ".status.runner_binding.runner_instance_id", "priority": 0 },
+                            { "name": "Worker", "jsonPath": ".status.runner_binding.worker_id", "priority": 1 },
+                            { "name": "Requester", "jsonPath": ".audit.requester", "priority": 1 },
+                            { "name": "Mode", "jsonPath": ".status.connection.mode", "priority": 1 },
+                            { "name": "ProviderTunnel", "jsonPath": ".status.connection.provider_tunnel_url", "priority": 1 },
+                            { "name": "Expires", "jsonPath": ".status.expires_at", "priority": 1 }
+                        ]
+                    },
+                    {
+                        "kind": "Exec",
+                        "printerColumns": [
+                            { "name": "Name", "jsonPath": ".metadata.name", "priority": 0 },
+                            { "name": "Target", "jsonPath": ".spec.target_ref.name", "priority": 0 },
+                            { "name": "TargetKind", "jsonPath": ".spec.target_ref.kind", "priority": 1 },
+                            { "name": "TargetRV", "jsonPath": ".spec.target_ref.resourceVersion", "priority": 1 },
+                            { "name": "Command", "jsonPath": ".spec.command", "priority": 0 },
+                            { "name": "Exit", "jsonPath": ".status.connection.exit_code", "priority": 0 },
+                            { "name": "StdoutBytes", "jsonPath": ".status.connection.stdout_bytes", "priority": 1 },
+                            { "name": "StdoutTailBytes", "jsonPath": ".status.connection.stdout_tail_bytes", "priority": 1 },
+                            { "name": "StdoutTruncated", "jsonPath": ".status.connection.stdout_tail_truncated", "priority": 1 },
+                            { "name": "StderrBytes", "jsonPath": ".status.connection.stderr_bytes", "priority": 1 },
+                            { "name": "StderrTailBytes", "jsonPath": ".status.connection.stderr_tail_bytes", "priority": 1 },
+                            { "name": "StderrTruncated", "jsonPath": ".status.connection.stderr_tail_truncated", "priority": 1 },
+                            { "name": "Runner", "jsonPath": ".status.runner_binding.runner_instance_id", "priority": 0 },
+                            { "name": "Worker", "jsonPath": ".status.runner_binding.worker_id", "priority": 1 },
+                            { "name": "Requester", "jsonPath": ".audit.requester", "priority": 1 },
+                            { "name": "Mode", "jsonPath": ".status.connection.mode", "priority": 1 },
+                            { "name": "Expires", "jsonPath": ".status.expires_at", "priority": 1 }
+                        ]
+                    }
+                ]
+            }),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("resource_version: rv-access"));
+        assert!(rendered.contains("PortForward: 1"));
+        assert!(rendered.contains("Exec: 1"));
+        assert!(rendered.contains("TARGET RV"));
+        assert!(rendered.contains("PROVIDER TUNNEL"));
+        assert!(rendered.contains("STDOUT BYTES"));
+        assert!(rendered.contains("STDOUT TAIL BYTES"));
+        assert!(rendered.contains("STDOUT TRUNCATED"));
+        assert!(rendered.contains("STDERR BYTES"));
+        assert!(rendered.contains("STDERR TAIL BYTES"));
+        assert!(rendered.contains("STDERR TRUNCATED"));
+        assert!(rendered.contains("pf-1"));
+        assert!(rendered.contains("trial-1"));
+        assert!(rendered.contains("sha256:trial-rv"));
+        assert!(rendered.contains("gcp-iap-ssh://projects/p/zones/z/instances/i"));
+        assert!(rendered.contains("exec-1"));
+        assert!(rendered.contains("trial-1.agent.container-1"));
+        assert!(rendered.contains("sha256:container-rv"));
+        assert!(rendered.contains("python -V"));
+        assert!(rendered.contains("20000"));
+        assert!(rendered.contains("16000"));
+        assert!(rendered.contains("true"));
+        assert!(rendered.contains("false"));
+        assert!(rendered.contains("worker_exec"));
+        assert!(rendered.contains("issuer:user-a"));
+    }
+
+    #[test]
+    fn runtime_resources_wide_renders_event_involved_object_columns() {
+        let mut event = runtime_resource("Event", "event-runtime-access-port-forward-requested-7");
+        event["spec"] = json!({
+            "event_type": "runtime.access.port_forward.requested",
+            "row_seq": 7,
+            "involved_object": {
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "PortForward",
+                "name": "pf-1",
+                "uid": "pf-1"
+            },
+            "involved_resources": [
+                { "kind": "PortForward", "name": "pf-1", "uid": "pf-1" },
+                { "kind": "TrialContainer", "name": "trial-1.agent.container-1" }
+            ]
+        });
+        event["status"] = json!({
+            "phase": "recorded",
+            "reason": "RuntimeAccessPortForwardRequested",
+            "message": "Port forward requested",
+            "involved": "PortForward/pf-1",
+            "involved_kind": "PortForward",
+            "involved_name": "pf-1",
+            "involved_uid": "pf-1",
+            "involved_count": 2
+        });
+
+        let rendered = runtime_resources_wide_lines(
+            &json!({
+                "metadata": { "resourceVersion": "rv-events", "continue": null, "remainingItemCount": 0, "total": 1, "returned": 1 },
+                "resources": [event]
+            }),
+            &json!({
+                "resources": [{
+                    "kind": "Event",
+                    "printerColumns": [
+                        { "name": "Name", "jsonPath": ".metadata.name", "priority": 0 },
+                        { "name": "Involved", "jsonPath": ".status.involved", "priority": 0 },
+                        { "name": "Type", "jsonPath": ".spec.event_type", "priority": 0 },
+                        { "name": "Seq", "jsonPath": ".spec.row_seq", "priority": 0 },
+                        { "name": "InvolvedKind", "jsonPath": ".status.involved_kind", "priority": 1 },
+                        { "name": "Message", "jsonPath": ".status.message", "priority": 1 }
+                    ]
+                }]
+            }),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("resource_version: rv-events"));
+        assert!(rendered.contains("Event: 1"));
+        assert!(rendered.contains("INVOLVED"));
+        assert!(rendered.contains("INVOLVED KIND"));
+        assert!(rendered.contains("PortForward/pf-1"));
+        assert!(rendered.contains("runtime.access.port_forward.requested"));
+        assert!(rendered.contains("Port forward requested"));
+    }
+
+    #[test]
+    fn runtime_resources_name_lines_render_pipeline_refs() {
+        let lines = runtime_resources_name_lines(&json!({
+            "metadata": { "resourceVersion": "rv-name" },
+            "resources": [
+                runtime_resource("RunnerInstance", "runner-1"),
+                runtime_resource("Trial", "trial-1"),
+                runtime_resource("Exec", "exec-1")
+            ]
+        }))
+        .expect("runtime resource name output should render Kind/name refs");
+
+        assert_eq!(
+            lines,
+            vec![
+                "RunnerInstance/runner-1".to_string(),
+                "Trial/trial-1".to_string(),
+                "Exec/exec-1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runs_resources_output_name_lists_refs_without_discovery() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(3, |request, index| {
+            assert_eq!(request.method, "GET");
+            match index {
+                0..=2 => {
+                    assert_eq!(
+                        request.path,
+                        "/v1/runs/run%2D1/runtime/resources?kind=Trial"
+                    );
+                    json!({
+                        "cloud_run_id": "run-1",
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "RuntimeResourceList",
+                        "metadata": { "resourceVersion": "rv-name", "continue": null, "remainingItemCount": 0, "total": 1, "returned": 1 },
+                        "core_run_ids": [],
+                        "resources": [runtime_resource("Trial", "trial-1")]
+                    })
+                }
+                _ => unreachable!(),
+            }
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_resources_output_name_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "resources".to_string(),
+            "run-1".to_string(),
+            "--kind".to_string(),
+            "Trial".to_string(),
+            "--output".to_string(),
+            "name".to_string(),
+        ])
+        .expect("runs resources --output name should render resource refs");
+
+        run(vec![
+            "runs".to_string(),
+            "resources".to_string(),
+            "run-1".to_string(),
+            "--kind".to_string(),
+            "Trial".to_string(),
+            "-o".to_string(),
+            "name".to_string(),
+        ])
+        .expect("runs resources -o name should render resource refs");
+
+        run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "Trial".to_string(),
+            "-o".to_string(),
+            "name".to_string(),
+        ])
+        .expect("runs get <kind> -o name should render resource refs");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 3);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_resources_category_forwards_server_owned_category_selector() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(1, |request, index| {
+            assert_eq!(request.method, "GET");
+            match index {
+                0 => {
+                    assert_eq!(
+                        request.path,
+                        "/v1/runs/run%2D1/runtime/resources?category=runner"
+                    );
+                    json!({
+                        "cloud_run_id": "run-1",
+                        "apiVersion": "bucephalus.dev/v1alpha1",
+                        "kind": "RuntimeResourceList",
+                        "metadata": { "resourceVersion": "rv-runner", "continue": null, "remainingItemCount": 0, "total": 2, "returned": 2 },
+                        "core_run_ids": [],
+                        "resources": [
+                            runtime_resource("RunnerInstance", "runner-1"),
+                            runtime_resource("RunnerAttempt", "attempt-1")
+                        ]
+                    })
+                }
+                _ => unreachable!(),
+            }
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_resources_category_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "resources".to_string(),
+            "run-1".to_string(),
+            "--category".to_string(),
+            "runner".to_string(),
+        ])
+        .expect("runs resources --category should forward API category selectors");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_get_can_fetch_raw_runtime_resource_by_identity() {
+        let _lock = lock_env();
+        let server = MockCloudServer::start_with_handler(2, |request, index| {
+            assert_eq!(request.method, "GET");
+            match index {
+                0 => assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/Trial/trial%2D1?view=resource"
+                ),
+                1 => assert_eq!(
+                    request.path,
+                    "/v1/runs/run%2D1/runtime/resources/Trial/trial%2D2?view=describe"
+                ),
+                _ => unreachable!(),
+            }
+            if index == 0 {
+                runtime_resource("Trial", "trial-1")
+            } else {
+                json!({
+                    "cloud_run_id": "run-1",
+                    "apiVersion": "bucephalus.dev/v1alpha1",
+                    "kind": "RuntimeResourceDescribe",
+                    "generated_at": "2026-06-18T00:00:00Z",
+                    "core_run_ids": [],
+                    "resource": runtime_resource("Trial", "trial-2"),
+                    "operations": [],
+                    "related_resources": [],
+                    "event_list": { "events": [] }
+                })
+            }
+        });
+        let api_url = server.api_url();
+        let home = temp_dir("runs_get_resource_item_home");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some(api_url.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("test-token")),
+        ]);
+
+        run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "Trial/trial-1".to_string(),
+        ])
+        .expect("runs get Kind/name should fetch the raw runtime resource by default");
+        run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "Trial".to_string(),
+            "trial-2".to_string(),
+            "--view".to_string(),
+            "describe".to_string(),
+        ])
+        .expect("runs get KIND NAME should preserve an explicit describe view");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn runs_get_rejects_ambiguous_runtime_resource_kind_aliases_before_network() {
+        let err = run(vec![
+            "runs".to_string(),
+            "get".to_string(),
+            "run-1".to_string(),
+            "Trial".to_string(),
+            "--kind".to_string(),
+            "RunnerInstance".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(err
+            .contains("runtime resource kind must be provided either positionally or with --kind"));
+        assert!(!err.contains("hosted API URL"));
+    }
+
+    #[test]
+    fn runs_resources_rejects_mismatched_cloud_run_id() {
         let _lock = lock_env();
         let server = MockCloudServer::start_with_handler(1, |request, _index| {
             assert_eq!(request.method, "GET");
-            assert_eq!(request.path, "/v1/runs/run%2D1/runtime");
+            assert_eq!(request.path, "/v1/runs/run%2D1/runtime/resources");
             json!({
                 "cloud_run_id": "run-2",
-                "summary": {
-                    "status": "running"
-                }
+                "resources": []
             })
         });
         let api_url = server.api_url();
@@ -7381,7 +17178,7 @@ mod tests {
 
         let err = run(vec![
             "runs".to_string(),
-            "runtime".to_string(),
+            "resources".to_string(),
             "run-1".to_string(),
         ])
         .unwrap_err()
@@ -7746,8 +17543,8 @@ mod tests {
             "4096".to_string(),
             "--max-parallel-trials".to_string(),
             "3".to_string(),
-            "--runtime-option".to_string(),
-            "executor=runner-docker".to_string(),
+            "--backend".to_string(),
+            "runner-docker".to_string(),
             "--env".to_string(),
             "PUBLIC_MODE=smoke".to_string(),
             "--label".to_string(),
@@ -7776,7 +17573,7 @@ mod tests {
             json!({
                 "memory_mb": 4096,
                 "max_parallel_trials": 3,
-                "executor": "runner-docker"
+                "backend": "runner-docker"
             })
         );
         assert!(doctor_body.get("env").is_none());
@@ -8138,29 +17935,53 @@ mod tests {
             assert!(!err.contains("hosted API URL"));
         }
 
-        let run_value_extra_arg_err = run(vec![
+        let resource_identity_err = run(vec![
             "runs".to_string(),
-            "value".to_string(),
+            "describe".to_string(),
             "run-1".to_string(),
-            "metric".to_string(),
-            "extra".to_string(),
+            "RunnerInstance".to_string(),
         ])
         .unwrap_err()
         .to_string();
-        assert!(run_value_extra_arg_err
-            .contains("runtime value lookup requires exactly two positional arguments"));
+        assert!(resource_identity_err.contains("runtime resource must be written as Kind/name"));
 
-        let run_value_mixed_arg_err = run(vec![
+        let exec_separator_err = run(vec![
             "runs".to_string(),
-            "value".to_string(),
+            "exec".to_string(),
             "run-1".to_string(),
-            "--key".to_string(),
-            "metric".to_string(),
+            "RunnerInstance/runner-1".to_string(),
         ])
         .unwrap_err()
         .to_string();
-        assert!(run_value_mixed_arg_err
-            .contains("runtime value lookup must be provided either as positional arguments"));
+        assert!(exec_separator_err.contains("requires `-- COMMAND [ARG...]`"));
+
+        let wait_conflict_err = run(vec![
+            "runs".to_string(),
+            "port-forward".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--target-port".to_string(),
+            "8080".to_string(),
+            "--wait-seconds".to_string(),
+            "1".to_string(),
+            "--no-wait".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(wait_conflict_err.contains("--no-wait and --wait-seconds are mutually exclusive"));
+
+        let bad_log_stream_err = run(vec![
+            "runs".to_string(),
+            "logs".to_string(),
+            "run-1".to_string(),
+            "RunnerInstance/runner-1".to_string(),
+            "--stream".to_string(),
+            "combined".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(bad_log_stream_err.contains("--stream must be stdout or stderr"));
+        assert!(!bad_log_stream_err.contains("hosted API URL"));
 
         let list_extra_arg_err = run(vec![
             "runs".to_string(),
@@ -8212,15 +18033,102 @@ mod tests {
         assert!(help.contains("buc packages list"));
         assert!(help.contains("buc secrets put <name>"));
         assert!(help.contains("buc runs list"));
-        assert!(help.contains("buc runs runtime"));
+        assert!(help.contains("buc runs explain"));
+        assert!(help.contains("buc runs resources"));
+        assert!(help.contains("buc runs tree"));
+        assert!(help.contains("buc runs describe"));
+        assert!(help.contains("buc runs wait"));
+        assert!(help.contains("buc runs can-i"));
+        assert!(help.contains("buc runs port-forward"));
+        assert!(help.contains("buc runs exec"));
+        assert!(help.contains("buc runs logs"));
+        assert!(help.contains("buc runs content"));
         assert!(help.contains("buc runs events"));
-        assert!(help.contains("buc runs results"));
-        assert!(help.contains("buc runs value"));
+        assert!(help.contains("buc runs audit"));
+        assert!(help.contains("buc runs top"));
+        assert!(help.contains("buc runs get <run-id> [kind|--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--wide|--output name|-o name] [--json]"));
+        assert!(RUNS_RESOURCES_HELP.contains("buc runs resources <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--wide|--output name|-o name] [--json]"));
+        assert!(RUNS_METRICS_HELP.contains("buc runs metrics <run-id> [Kind/name] [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]"));
+        assert!(RUNS_TOP_HELP.contains("buc runs top <run-id> [Kind/name] [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]"));
+        assert!(RUNS_CAN_I_HELP
+            .contains("buc runs can-i <run-id> port-forward RunnerInstance/<runner-name>"));
+        assert!(
+            RUNS_CAN_I_HELP.contains("buc runs can-i <run-id> top TrialContainer/<container-name>")
+        );
+        assert!(
+            RUNS_CAN_I_HELP.contains("buc runs can-i <run-id> audit RunnerInstance/<runner-name>")
+        );
+        assert!(RUNS_CAN_I_HELP
+            .contains("buc runs can-i <run-id> logs/stdout TrialContainer/<container-name>"));
+        assert!(RUNS_CAN_I_HELP
+            .contains("buc runs can-i <run-id> logs/stderr TrialContainer/<container-name>"));
+        assert!(RUNS_CAN_I_HELP
+            .contains("buc runs can-i <run-id> content TrialArtifact/<artifact-name>"));
+        assert!(
+            RUNS_CAN_I_HELP.contains("buc runs can-i <run-id> cordon RunnerInstance/<runner-name>")
+        );
+        assert!(RUNS_CAN_I_HELP.contains("buc runs can-i <run-id> cancel Exec/<exec-name>"));
+        assert!(help.contains("buc runs events <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]"));
+        assert!(help.contains("buc runs audit <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]"));
+        assert!(RUNS_EVENTS_HELP.contains("List run-wide or resource-scoped runtime audit/events."));
+        let retired_events_scope = format!(
+            "List run-{}",
+            "scoped or resource-scoped runtime audit/events."
+        );
+        assert!(!RUNS_EVENTS_HELP.contains(&retired_events_scope));
+        assert!(RUNS_EVENTS_HELP.contains("buc runs events <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]"));
+        assert!(RUNS_AUDIT_HELP.contains("buc runs audit <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]"));
+        assert!(help.contains("buc runs watch <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--resource-version VERSION] [--known-resource Kind/name=VERSION] [--follow] [--interval-seconds N] [--max-polls N] [--json]"));
+        assert!(help.contains("buc runs explain <run-id> <kind> [--json]"));
+        assert!(RUNS_EXPLAIN_HELP.contains(
+            "aliases, categories, verbs, subresources, actions, access, printer columns"
+        ));
+        assert!(help.contains("buc runs tree <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]"));
+        assert!(RUNS_TREE_HELP.contains("owner-reference tree"));
+        assert!(RUNS_HELP.contains("buc runs watch <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--resource-version VERSION] [--known-resource Kind/name=VERSION] [--follow] [--interval-seconds N] [--max-polls N] [--json]"));
+        assert!(RUNS_WATCH_HELP.contains("buc runs watch <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--resource-version VERSION] [--known-resource Kind/name=VERSION] [--follow] [--interval-seconds N] [--max-polls N] [--json]"));
+        assert!(!help.contains("buc runs results"));
+        assert!(!help.contains("buc runs value"));
         assert!(!help.contains("runner-pool"));
         assert!(!help.contains("runner-instance"));
         assert!(!help.contains("build-upload"));
         assert!(!help.contains("--core-cmd"));
         assert!(!help.contains("bucephalus-cloud"));
+    }
+
+    #[test]
+    fn runtime_action_help_exposes_reviewed_precondition_flags_on_aliases() {
+        let help = help_text();
+
+        assert!(help.contains("buc runs port-forward <run-id> <Kind/name> --target-port PORT [--local-port PORT] [--attach] [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(help.contains("buc runs exec <run-id> <Kind/name> [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json] -- COMMAND [ARG...]"));
+        assert!(RUNS_HELP.contains("buc runs port-forward <run-id> <Kind/name> --target-port PORT [--local-port PORT] [--attach] [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_HELP.contains("buc runs exec <run-id> <Kind/name> [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json] -- COMMAND [ARG...]"));
+        assert!(RUNS_PORT_FORWARD_HELP.contains("buc runs port-forward <run-id> <Kind/name> --target-port PORT [--local-port PORT] [--attach] [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_EXEC_HELP.contains("buc runs exec <run-id> <Kind/name> [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json] -- COMMAND [ARG...]"));
+        assert!(!RUNS_HELP.contains(
+            "buc runs action <run-id> <Kind/name> <cordon|drain|uncordon|cancel|complete>"
+        ));
+        assert!(RUNS_ACTION_HELP.contains("Compatibility:"));
+        assert!(RUNS_ACTION_HELP.contains("buc runs action <run-id> <Kind/name> <cordon|drain|uncordon|cancel|complete> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(help.contains("buc runs cordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_HELP.contains("buc runs cordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(help.contains("buc runs drain <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_HELP.contains("buc runs drain <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(help.contains("buc runs uncordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_HELP.contains("buc runs uncordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(help.contains("buc runs cancel <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_HELP.contains("buc runs cancel <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(help.contains("buc runs complete <run-id> <PortForward/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_HELP.contains("buc runs complete <run-id> <PortForward/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(help.contains("buc runs delete <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_HELP.contains("buc runs delete <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_DELETE_HELP.contains("buc runs delete <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_ACTION_HELP.contains("buc runs cordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_ACTION_HELP.contains("buc runs drain <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_ACTION_HELP.contains("buc runs uncordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_ACTION_HELP.contains("buc runs cancel <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]"));
+        assert!(RUNS_ACTION_HELP.contains("buc runs complete <run-id> <PortForward/name> [--reason TEXT] --resource-version VERSION [--json]"));
     }
 
     #[test]
@@ -8267,16 +18175,111 @@ mod tests {
         assert!(known_hosted_command(Some("secrets"), Some("delete")));
         assert!(known_hosted_command(Some("secrets"), Some("rm")));
         assert!(known_hosted_command(Some("runs"), Some("list")));
-        assert!(known_hosted_command(Some("runs"), Some("runtime")));
+        assert!(known_hosted_command(Some("runs"), Some("api-resources")));
+        assert!(known_hosted_command(Some("runs"), Some("explain")));
+        assert!(known_hosted_command(Some("runs"), Some("inspect")));
+        assert!(known_hosted_command(Some("runs"), Some("resources")));
+        assert!(known_hosted_command(Some("runs"), Some("tree")));
+        assert!(known_hosted_command(Some("runs"), Some("describe")));
+        assert!(known_hosted_command(Some("runs"), Some("status")));
+        assert!(known_hosted_command(Some("runs"), Some("health")));
+        assert!(known_hosted_command(Some("runs"), Some("metrics")));
+        assert!(known_hosted_command(Some("runs"), Some("top")));
+        assert!(known_hosted_command(Some("runs"), Some("watch")));
         assert!(known_hosted_command(Some("runs"), Some("events")));
-        assert!(known_hosted_command(Some("runs"), Some("results")));
-        assert!(known_hosted_command(Some("runs"), Some("value")));
-        assert!(known_hosted_command(Some("runs"), Some("kv")));
+        assert!(known_hosted_command(Some("runs"), Some("audit")));
+        assert!(known_hosted_command(Some("runs"), Some("logs")));
+        assert!(known_hosted_command(Some("runs"), Some("content")));
+        assert!(known_hosted_command(Some("runs"), Some("wait")));
+        assert!(known_hosted_command(Some("runs"), Some("can-i")));
+        assert!(known_hosted_command(Some("runs"), Some("port-forward")));
+        assert!(known_hosted_command(Some("runs"), Some("exec")));
+        assert!(known_hosted_command(Some("runs"), Some("action")));
+        assert!(known_hosted_command(Some("runs"), Some("complete")));
+        assert!(known_hosted_command(Some("runs"), Some("delete")));
+        assert!(!known_hosted_command(Some("runs"), Some("runtime")));
+        assert!(!known_hosted_command(Some("runs"), Some("results")));
+        assert!(!known_hosted_command(Some("runs"), Some("value")));
+        assert!(!known_hosted_command(Some("runs"), Some("kv")));
         assert!(known_hosted_command(Some("drafts"), Some("diff")));
         assert!(!known_hosted_command(Some("runner-pool"), Some("create")));
         assert!(!known_hosted_command(Some("deploy"), None));
         assert!(!known_hosted_command(Some("build-upload"), None));
         assert!(!known_hosted_command(Some("draft"), Some("export")));
+    }
+
+    #[test]
+    fn runs_audit_filter_covers_runner_lifecycle_and_access_events() {
+        let event_types: Vec<&str> = RUNTIME_AUDIT_EVENT_TYPES.split(',').collect();
+        for required in [
+            "runtime.resource.runner_instance.cordoned",
+            "runtime.resource.runner_instance.drained",
+            "runtime.resource.runner_instance.offline",
+            "runtime.resource.runner_instance.unhealthy",
+            "runtime.resource.runner_instance.online",
+            "runtime.resource.runner_instance.heartbeat_restored",
+            "runtime.resource.runner_instance.uncordoned",
+            "worker.runtime.image_pull.pulling",
+            "worker.runtime.image_pull.pulled",
+            "worker.runtime.image_pull.failed",
+            "worker.runtime.secret_binding.materialized",
+            "worker.runtime.sidecar_requirement.checking",
+            "worker.runtime.sidecar_requirement.available",
+            "worker.runtime.sidecar_requirement.failed",
+            "worker.runtime.accelerator_requirement.checking",
+            "worker.runtime.accelerator_requirement.available",
+            "worker.runtime.accelerator_requirement.failed",
+            "worker.runtime.network_perimeter.applying",
+            "worker.runtime.network_perimeter.applied",
+            "worker.runtime.network_perimeter.failed",
+            "runtime.resource.operation.reviewed",
+            "runtime.resource.operation.review.failed",
+            "runtime.api_resources.read",
+            "runtime.api_resources.read.failed",
+            "runtime.resource.list.read",
+            "runtime.resource.list.read.failed",
+            "runtime.resource.watch.read",
+            "runtime.resource.watch.read.failed",
+            "runtime.resource.health.read",
+            "runtime.resource.health.read.failed",
+            "runtime.resource.describe.read",
+            "runtime.resource.describe.read.failed",
+            "runtime.resource.get.read",
+            "runtime.resource.get.read.failed",
+            "runtime.resource.events.read",
+            "runtime.resource.events.read.failed",
+            "runtime.resource.status.read",
+            "runtime.resource.status.read.failed",
+            "runtime.resource.metrics.read",
+            "runtime.resource.metrics.read.failed",
+            "runtime.resource.metrics.list.read",
+            "runtime.resource.metrics.list.read.failed",
+            "runtime.inspect.bundle.read",
+            "runtime.inspect.bundle.read.failed",
+            "runtime.access.port_forward.requested",
+            "runtime.access.port_forward.accepted",
+            "runtime.access.port_forward.active",
+            "runtime.access.port_forward.completed",
+            "runtime.access.port_forward.failed",
+            "runtime.access.port_forward.expired",
+            "runtime.access.port_forward.cancelled",
+            "runtime.access.exec.requested",
+            "runtime.access.exec.accepted",
+            "runtime.access.exec.active",
+            "runtime.access.exec.completed",
+            "runtime.access.exec.failed",
+            "runtime.access.exec.expired",
+            "runtime.access.exec.cancelled",
+            "runtime.resource.logs.read",
+            "runtime.resource.logs.read.failed",
+            "runtime.resource.content.read",
+            "runtime.resource.content.read.failed",
+        ] {
+            assert!(
+                event_types.contains(&required),
+                "missing runtime audit event type: {required}"
+            );
+        }
     }
 
     #[test]
@@ -9453,18 +19456,19 @@ mod tests {
         .to_string();
         assert!(missing_runtime_run_id.contains("missing cloud_run_id"));
 
-        let key_mismatch = ensure_runtime_value_response_matches(
-            &json!({
-                "cloud_run_id": "run-1",
-                "key": "other/key",
-                "values": []
-            }),
-            "run-1",
-            "trial/status",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(key_mismatch.contains("runtime value response key mismatch"));
+        ensure_resource_envelope(&json!({
+            "resource": {
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "Exec",
+                "metadata": { "name": "exec-1" }
+            }
+        }))
+        .expect("runtime access resource envelopes should pass");
+
+        let missing_resource = ensure_resource_envelope(&json!({ "accepted": true }))
+            .unwrap_err()
+            .to_string();
+        assert!(missing_resource.contains("missing resource object"));
     }
 
     #[test]
@@ -9574,6 +19578,28 @@ mod tests {
         .to_string();
         assert!(bad_key.contains("unsupported hosted Cloud runtime option `materialize`"));
 
+        let bad_executor_alias = runtime_options_from_args(&[
+            "--runtime-option".to_string(),
+            "executor=runner-docker".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(bad_executor_alias.contains("unsupported hosted Cloud runtime option `executor`"));
+
+        let bad_cpu_alias =
+            runtime_options_from_args(&["--runtime-option".to_string(), "cpu=4".to_string()])
+                .unwrap_err()
+                .to_string();
+        assert!(bad_cpu_alias.contains("unsupported hosted Cloud runtime option `cpu`"));
+
+        let bad_region = runtime_options_from_args(&[
+            "--runtime-option".to_string(),
+            "region=us-east-1".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(bad_region.contains("unsupported hosted Cloud runtime option `region`"));
+
         let bad_number = runtime_options_from_args(&[
             "--runtime-option".to_string(),
             "memory_mb=large".to_string(),
@@ -9609,17 +19635,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(conflicting_flag.contains("runtime option `memory_mb` was provided more than once"));
-
-        let conflicting_alias = runtime_options_from_args(&[
-            "--backend".to_string(),
-            "runner-docker".to_string(),
-            "--runtime-option".to_string(),
-            "executor=modal".to_string(),
-        ])
-        .unwrap_err()
-        .to_string();
-        assert!(conflicting_alias
-            .contains("runtime options `backend` and `executor` cannot both be provided"));
 
         let bad_backend =
             runtime_options_from_args(&["--backend".to_string(), "cloud-runner".to_string()])
@@ -9757,6 +19772,77 @@ mod tests {
                         Ok((stream, _addr)) => {
                             let index = requests.len();
                             let request = handle_mock_cloud_connection(stream, index, &mut handler);
+                            requests.push(request);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                panic!(
+                                    "mock Cloud API timed out after {} request(s)",
+                                    requests.len()
+                                );
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("mock Cloud API accept failed: {error}"),
+                    }
+                }
+                requests
+            });
+            Self { api_url, handle }
+        }
+
+        fn start_with_raw_handler(
+            expected_requests: usize,
+            handler: fn(&RecordedRequest, usize) -> (u16, &'static str, Vec<u8>),
+        ) -> Self {
+            Self::start_with_raw_header_handler(expected_requests, move |request, index| {
+                let (status, content_type, body) = handler(request, index);
+                (status, content_type, Vec::new(), body)
+            })
+        }
+
+        fn start_with_raw_header_handler<F>(expected_requests: usize, mut handler: F) -> Self
+        where
+            F: FnMut(
+                    &RecordedRequest,
+                    usize,
+                ) -> (
+                    u16,
+                    &'static str,
+                    Vec<(&'static str, &'static str)>,
+                    Vec<u8>,
+                ) + Send
+                + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let api_url = format!("http://{}", listener.local_addr().unwrap());
+            let handle = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut requests = Vec::new();
+                while requests.len() < expected_requests {
+                    match listener.accept() {
+                        Ok((mut stream, _addr)) => {
+                            stream.set_nonblocking(false).expect(
+                                "mock Cloud API stream should switch back to blocking reads",
+                            );
+                            let index = requests.len();
+                            let request = read_http_request(&mut stream);
+                            let (status, content_type, extra_headers, body) =
+                                handler(&request, index);
+                            write!(
+                                stream,
+                                "HTTP/1.1 {} OK\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n",
+                                status,
+                                content_type,
+                                body.len()
+                            )
+                            .unwrap();
+                            for (name, value) in extra_headers {
+                                write!(stream, "{name}: {value}\r\n").unwrap();
+                            }
+                            write!(stream, "\r\n").unwrap();
+                            stream.write_all(&body).unwrap();
                             requests.push(request);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -10042,39 +20128,181 @@ mod tests {
                     "run_label": "demo"
                 }]
             }),
-            ("GET", "/v1/runs/run%2D1/runtime") => json!({
+            ("GET", "/v1/runs/run%2D1/runtime/api-resources") => json!({
                 "cloud_run_id": "run-1",
-                "summary": {
-                    "status": "running"
-                }
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeApiResourceList",
+                "generated_at": "2026-06-18T00:00:00Z",
+                "core_run_ids": ["core-run-1"],
+                "resources": [{
+                    "cloud_run_id": "run-1",
+                    "generated_at": "2026-06-18T00:00:00Z",
+                    "core_run_ids": ["core-run-1"],
+                    "kind": "RunnerInstance",
+                    "name": "runnerinstances",
+                    "verbs": ["get", "list"],
+                    "access": ["port-forward", "exec"]
+                }]
             }),
-            ("GET", "/v1/runs/run%2D1/runtime/events?limit=5&after%5Frow%5Fseq=12") => json!({
+            ("GET", "/v1/runs/run%2D1/runtime/resources?limit=9&kind=RunnerInstance") => json!({
+                "cloud_run_id": "run-1",
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceList",
+                "metadata": { "resourceVersion": "rv-1", "continue": null, "remainingItemCount": 0, "total": 1, "returned": 1 },
+                "core_run_ids": [],
+                "resources": [runtime_resource("RunnerInstance", "runner-1")]
+            }),
+            ("GET", "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1") => json!({
+                "cloud_run_id": "run-1",
+                "apiVersion": "bucephalus.dev/v1alpha1",
+                "kind": "RuntimeResourceDescribe",
+                "generated_at": "2026-06-18T00:00:00Z",
+                "core_run_ids": [],
+                "resource": runtime_resource("RunnerInstance", "runner-1"),
+                "operations": [],
+                "related_resources": [],
+                "event_list": { "events": [] }
+            }),
+            ("GET", "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/status") => json!({
+                "resource_ref": { "apiVersion": "bucephalus.dev/v1alpha1", "kind": "RunnerInstance", "name": "runner-1" },
+                "phase": "Running",
+                "reason": null,
+                "actions": ["cordon"]
+            }),
+            ("GET", "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/operations/port%2Dforward") => json!({
+                "resource_ref": { "apiVersion": "bucephalus.dev/v1alpha1", "kind": "RunnerInstance", "name": "runner-1" },
+                "operation": "port-forward",
+                "supported": true,
+                "reason": null
+            }),
+            ("GET", "/v1/runs/run%2D1/runtime/resources/health?kind=RunnerInstance") => json!({
+                "cloud_run_id": "run-1",
+                "summary": { "total": 1, "ready": 1, "problem": 0 },
+                "resources": []
+            }),
+            ("GET", "/v1/runs/run%2D1/runtime/resources/metrics?limit=3&kind=RunnerInstance") => json!({
+                "cloud_run_id": "run-1",
+                "kind": "RuntimeResourceMetricsList",
+                "metadata": { "resourceVersion": "metrics-rv-1", "continue": null, "remainingItemCount": 0, "total": 1, "returned": 1 },
+                "summary": { "resources_total": 1, "metrics_total": 1 },
+                "resources": [{
+                    "resource_ref": { "apiVersion": "bucephalus.dev/v1alpha1", "kind": "RunnerInstance", "name": "runner-1" },
+                    "summary": { "metrics_total": 1 },
+                    "metrics": [{ "name": "lifecycle.ready", "value": 1, "unit": "state" }]
+                }]
+            }),
+            ("GET", "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/events?limit=5&after%5Frow%5Fseq=12") => json!({
                 "cloud_run_id": "run-1",
                 "events": [{
                     "row_seq": 13,
                     "event_type": "trial_started"
                 }]
             }),
-            ("GET", "/v1/runs/run%2D1/runtime/results?limit=9") => json!({
+            ("GET", path) if path == path_with_query(
+                "/v1/runs/run%2D1/runtime/events",
+                &[
+                    ("limit", Some("7".to_string())),
+                    ("event_type", Some(RUNTIME_AUDIT_EVENT_TYPES.to_string())),
+                ],
+            ) => json!({
                 "cloud_run_id": "run-1",
-                "results": [{
-                    "trial_id": "trial-1",
-                    "outcome": "success"
+                "kind": "RuntimeEventList",
+                "event_filter": { "event_types": ["runtime.access.exec.requested"] },
+                "events": [{
+                    "row_seq": 14,
+                    "event_type": "runtime.access.exec.requested",
+                    "resource_refs": [{ "kind": "Exec", "name": "exec-1" }]
                 }]
             }),
-            ("GET", "/v1/runs/run%2D1/runtime/kv/trial%2Fstatus") => json!({
+            ("POST", "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/port-forward") => json!({
+                "resource": runtime_resource("PortForward", "pf-1")
+            }),
+            ("GET", "/v1/runs/run%2D1/runtime/resources/PortForward/pf%2D1") => json!({
                 "cloud_run_id": "run-1",
-                "key": "trial/status",
-                "values": [{
-                    "trial_id": "trial-1",
-                    "value": "running"
-                }]
+                "resource": runtime_access_resource(
+                    "PortForward",
+                    "pf-1",
+                    "active",
+                    json!({ "local_port": 18080, "client_endpoint": "tcp://127.0.0.1:18080" }),
+                ),
+                "operations": [],
+                "related_resources": [],
+                "event_list": { "events": [] }
+            }),
+            ("POST", "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/exec") => json!({
+                "resource": runtime_resource("Exec", "exec-1")
+            }),
+            ("GET", "/v1/runs/run%2D1/runtime/resources/Exec/exec%2D1") => json!({
+                "cloud_run_id": "run-1",
+                "resource": runtime_access_resource(
+                    "Exec",
+                    "exec-1",
+                    "completed",
+                    json!({ "exit_code": 0, "stdout_tail": "Python 3.12.0\n" }),
+                ),
+                "operations": [],
+                "related_resources": [],
+                "event_list": { "events": [] }
+            }),
+            ("POST", "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/actions/cordon") => json!({
+                "cloud_run_id": "run-1",
+                "resource": runtime_resource("RunnerInstance", "runner-1"),
+                "operations": [],
+                "related_resources": [],
+                "event_list": { "events": [] }
+            }),
+            ("DELETE", "/v1/runs/run%2D1/runtime/resources/PortForward/pf%2D1") => json!({
+                "cloud_run_id": "run-1",
+                "resource": runtime_resource("PortForward", "pf-1"),
+                "operations": [],
+                "related_resources": [],
+                "event_list": { "events": [] }
+            }),
+            ("GET", "/v1/runs/run%2D1/runtime/inspect?event%5Flimit=25") => json!({
+                "cloud_run_id": "run-1",
+                "resource_inventory": { "resources": [runtime_resource("RunnerInstance", "runner-1")] },
+                "api_resources": { "resources": [] },
+                "event_list": { "events": [] }
             }),
             _ => panic!(
                 "unexpected mock Cloud API request #{index}: {} {}",
                 request.method, request.path
             ),
         }
+    }
+
+    fn runtime_resource(kind: &str, name: &str) -> Value {
+        json!({
+            "apiVersion": "bucephalus.dev/v1alpha1",
+            "kind": kind,
+            "metadata": {
+                "name": name,
+                "labels": {},
+                "annotations": {},
+                "ownerReferences": []
+            },
+            "spec": {},
+            "status": {
+                "phase": "Running",
+                "reason": null,
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "Ready",
+                    "message": ""
+                }]
+            },
+            "audit": {}
+        })
+    }
+
+    fn runtime_access_resource(kind: &str, name: &str, phase: &str, connection: Value) -> Value {
+        let mut resource = runtime_resource(kind, name);
+        if let Some(status) = resource.get_mut("status").and_then(Value::as_object_mut) {
+            status.insert("phase".to_string(), json!(phase));
+            status.insert("connection".to_string(), connection);
+        }
+        resource
     }
 
     fn runtime_options_from_build_request(request: &RecordedRequest) -> Value {

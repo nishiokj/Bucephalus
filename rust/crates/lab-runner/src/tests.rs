@@ -296,6 +296,19 @@ mod tests {
     }
 
     #[test]
+    fn stdout_progress_cloud_hints_use_product_runtime_cli() {
+        let runner_rs = include_str!("experiment/runner.rs");
+
+        assert!(runner_rs.contains("buc runs watch <cloud-run-id> --kind Trial"));
+        assert!(runner_rs.contains("buc runs resources <cloud-run-id> --kind Trial"));
+        assert!(runner_rs.contains("buc runs health <cloud-run-id>"));
+        assert!(runner_rs.contains("buc runs events <cloud-run-id> --limit 100"));
+        assert!(!runner_rs.contains("bucephalus-cloud run"));
+        assert!(!runner_rs.contains("--resources-only"));
+        assert!(!runner_rs.contains("run audit"));
+    }
+
+    #[test]
     fn stdout_progress_option_is_not_persisted_in_run_session() {
         let execution = RunExecutionOptions {
             stdout_progress: true,
@@ -9679,8 +9692,8 @@ mod tests {
     }
 
     #[test]
-    fn nova_result_adapter_normalizes_native_response_to_artifact_envelope() {
-        let root = TempDirGuard::new("bucephalus_nova_result_adapter");
+    fn result_adapter_normalizes_native_response_to_artifact_envelope() {
+        let root = TempDirGuard::new("bucephalus_result_adapter");
         let result_path = root.path.join("result.json");
         fs::write(
             &result_path,
@@ -9696,14 +9709,14 @@ mod tests {
                     "tool_calls": 3
                 }
             }))
-            .expect("raw nova result"),
+            .expect("raw adapter result"),
         )
-        .expect("write raw nova result");
+        .expect("write raw adapter result");
         let runtime_experiment = json!({
             "trial_runtime": {
                 "agent": {
                     "adapter": {
-                        "kind": "nova",
+                        "executable": "/usr/local/bin/myagent",
                         "result": "structured_json"
                     }
                 }
@@ -9711,7 +9724,7 @@ mod tests {
         });
 
         crate::trial::artifacts::normalize_agent_result_adapter(&runtime_experiment, &result_path)
-            .expect("normalize Nova result");
+            .expect("normalize adapter result");
 
         let normalized: Value =
             serde_json::from_slice(&fs::read(&result_path).expect("normalized result bytes"))

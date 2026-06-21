@@ -50,7 +50,7 @@ stages:
 | Field | Meaning |
 | --- | --- |
 | `stages.agent.command` | Process argv for command agents. `$NAME` resolves from variant config or explicit launch-time `--env` / `--env-file` inputs. Use this for non-secret variant configuration. |
-| `stages.agent.adapter` | Built-in launch adapter for a known agent CLI. The adapter owns the runner contract argv and result normalization. `kind: nova` is currently supported. |
+| `stages.agent.adapter` | Built-in launch adapter for an agent CLI that natively speaks the runner's trial contract. The adapter owns the runner contract argv and result normalization. Requires `executable`. |
 | `stages.agent.image` | Container image for the agent process. Implies `agent_site: agent_container` when `stages.execution.agent_site` is omitted; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
 | `stages.agent.services` | Optional list of top-level service ids attached to the agent stage. The runner injects each service's `expose` env into the agent process. Forbidden when `agent_site: host`. |
 | `stages.agent.mount` | Optional explicit agent file mount object. Omit for image-native agents. |
@@ -68,16 +68,16 @@ Removed execution-shaping fields such as `workspace_patches`, `launch`, `protoco
 
 ## Agent Adapters
 
-Use an adapter when the platform knows how to launch and normalize a specific
-agent CLI. This keeps runner-owned paths, result envelope conversion, and trace
-argv out of cookbook YAML.
+Use an adapter when the agent CLI natively speaks the runner's trial contract,
+so the platform can launch and normalize it. This keeps runner-owned paths,
+result envelope conversion, and trace argv out of cookbook YAML.
 
 ```yaml
 stages:
   agent:
     adapter:
-      kind: nova
-      config: /opt/agent/nova-config.json
+      executable: /usr/local/bin/myagent
+      config: /opt/agent/config.json
       mcp_config: /opt/agent/mcp.json
       timeout_ms: 540000
       dangerous: true
@@ -87,11 +87,12 @@ stages:
       GOOGLE_API_KEY: "$GEMINI_API_KEY"
 ```
 
-`kind: nova` lowers to a sealed command that reads the trial input and writes
-the canonical result. When the agent has a declared event sink, the adapter also
-passes the trace path; set `adapter.events: false` to suppress that argv, or
-`adapter.events: true` to require a declared sink. The runner normalizes Nova's
-native result into the structured JSON artifact contract after execution.
+The adapter lowers to a sealed command — `<executable> run --input-file …
+--output …` — that reads the trial input and writes the canonical result. When
+the agent has a declared event sink, the adapter also passes the trace path; set
+`adapter.events: false` to suppress that argv, or `adapter.events: true` to
+require a declared sink. The runner normalizes the agent's native
+`structured_json` result into the artifact envelope contract after execution.
 Declare either `command` or `adapter`, not both.
 
 ## Agent Site
@@ -303,8 +304,9 @@ The full JSON line is stored as opaque payload, with best-effort columns such as
 the `events` analysis view when those fields are present.
 
 Events are optional for the first successful run, but they become important for
-live progress, token counts, step counts, trace diagnostics, and control
+progress, token counts, step counts, trace diagnostics, and control
 acknowledgements. Declared event captures are ingested into the account SQLite
-database during trial execution and exposed through `bucephalus views-live` and the
-`events` analysis view. The raw JSONL file is retained only when the capture
-sets `retain_raw: true`.
+database during trial execution and exposed first through hosted Cloud runtime
+event/resource watch APIs. For local account-database analysis, direct SQL
+queries can read the `events` analysis view. The raw JSONL file is retained
+only when the capture sets `retain_raw: true`.

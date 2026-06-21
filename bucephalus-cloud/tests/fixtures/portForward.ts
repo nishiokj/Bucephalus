@@ -17,7 +17,7 @@ process.stdout.write(`${JSON.stringify({
     kind: "loopback",
     target: `${input.port_forward.protocol}:${input.port_forward.target_port}`,
     local_port: input.port_forward.local_port,
-    client_reachable: true,
+    client_reachable: Boolean(input.port_forward.local_port),
     ...(input.port_forward.local_port ? { client_endpoint: `tcp://127.0.0.1:${input.port_forward.local_port}` } : {}),
   },
 })}\n`);

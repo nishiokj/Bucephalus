@@ -1466,7 +1466,7 @@ fn print_secret_requirements(
     lines.extend([
         String::new(),
         "Queue with:".to_string(),
-        format!("  bucephalus-cloud run create --package-digest {package_digest} --secret-ref-file secrets.yaml"),
+        format!("  buc run {package_digest} --secret-ref-file secrets.yaml"),
     ]);
     println!("{}", lines.join("\n"));
     Ok(())

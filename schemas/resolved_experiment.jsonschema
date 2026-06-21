@@ -859,9 +859,8 @@
     "agent_adapter": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind"],
+      "required": ["executable"],
       "properties": {
-        "kind": { "type": "string", "enum": ["nova"] },
         "executable": { "type": "string", "minLength": 1 },
         "config": { "type": "string", "minLength": 1 },
         "mcp_config": { "type": "string", "minLength": 1 },

@@ -67,8 +67,11 @@ const RUNTIME_SNAPSHOT_PAYLOAD_ENVELOPE_BYTES = 128 * 1024;
 const RUNTIME_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024;
 const WORKER_JSON_COMMAND_MAX_STDOUT_BYTES = 1024 * 1024;
 const WORKER_JSON_COMMAND_MAX_STDERR_BYTES = 128 * 1024;
+const RUNTIME_EXEC_OUTPUT_TAIL_BYTES = 16_000;
 const DOCKER_SOCKET_PATH = "/var/run/docker.sock";
 const DOCKER_API_VERSION = "v1.41";
+const RUNTIME_DOCKER_EXEC_HELPER_MODE = "runtime-docker-exec";
+const RUNTIME_GCE_IAP_PORT_FORWARD_HELPER_MODE = "runtime-gce-iap-port-forward";
 const RUNTIME_ARTIFACT_SPECS = [
   { role: "agent_result", relativePath: "agent/result.json", mediaType: "application/json; charset=utf-8" },
   { role: "agent_stdout", relativePath: "agent/stdout.log", mediaType: "text/plain; charset=utf-8" },
@@ -104,6 +107,14 @@ let runnerInstancePoisoned = false;
 let workerContext: TraceContext = newTraceContext({ component: "worker" });
 
 async function main(): Promise<void> {
+  if (process.argv[2] === RUNTIME_DOCKER_EXEC_HELPER_MODE) {
+    await runRuntimeDockerExecCommand();
+    return;
+  }
+  if (process.argv[2] === RUNTIME_GCE_IAP_PORT_FORWARD_HELPER_MODE) {
+    await runRuntimeGceIapPortForwardCommand();
+    return;
+  }
   await initTelemetry();
   const config = loadWorkerConfig();
   workerContext = newTraceContext({ component: "worker", requestId: `worker-${config.workerId}` });
@@ -195,6 +206,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
   });
 
   let heartbeatStop = false;
+  let materialized: MaterializedPackage | null = null;
   const heartbeatLoop = (async () => {
     while (!heartbeatStop && !shuttingDown) {
       await sleep(config.heartbeatMs);
@@ -215,7 +227,6 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
     }
   })();
 
-  let materialized: MaterializedPackage | null = null;
   let evidencePump: EvidencePump | null = null;
   let coreError: unknown = null;
   let cleanupError: unknown = null;
@@ -235,9 +246,23 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         run_root_dir: materialized.runRootDir,
         manifest_experiment_id: stringAt(materialized.manifestJson, "/resolved_experiment/experiment/id"),
       });
+      for (const secretId of Object.keys(claim.run.secret_refs).sort()) {
+        await appendEvent(config, claim, "worker.runtime.secret_binding.materialized", {
+          resource_kind: "SecretBinding",
+          resource_name: runtimeDeclaredResourceName(secretId),
+          secret_id: secretId,
+          status: "materialized",
+          attempt_id: attemptId,
+          run_id: runId,
+          runner_instance_id: requireRunnerInstanceId(config),
+          worker_id: config.workerId,
+        });
+      }
       evidencePump = startLiveEvidencePump(config, claim, materialized, runContext);
-      await prePullRunImages(config, claim);
-      await applyRuntimeNetworkPolicy(config, claim, materialized);
+      await validateSidecarRequirementsWithAudit(config, claim, runContext);
+      await validateAcceleratorRequirementsWithAudit(config, claim, runContext);
+      await prePullRunImagesWithAudit(config, claim, runContext);
+      await applyRuntimeNetworkPolicyWithAudit(config, claim, materialized, runContext);
       if (config.portForwardCommand) {
         await processPortForwardRequests(config, claim, materialized);
       }
@@ -1243,9 +1268,1050 @@ export async function applyRuntimeNetworkPolicy(
   });
 }
 
+export async function applyRuntimeNetworkPolicyWithAudit(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "run" | "attempt">,
+  materialized: Pick<MaterializedPackage, "workspaceDir" | "runRootDir">,
+  context: TraceContext = newTraceContext({
+    component: "worker-network-policy",
+    runId: claim.run.run_id,
+    attemptId: claim.attempt.attempt_id,
+  }),
+): Promise<void> {
+  const networkPerimeter = runtimeNetworkPerimeter(claim.run.run_requirements);
+  if (networkPerimeter.egress_hosts.length === 0) {
+    return;
+  }
+  const eventPayload = () => ({
+    resource_kind: "NetworkPerimeter",
+    resource_name: "declared",
+    status: "applied",
+    attempt_id: claim.attempt.attempt_id,
+    run_id: claim.run.run_id,
+    runner_instance_id: requireRunnerInstanceId(config),
+    worker_id: config.workerId,
+    default: networkPerimeter.default,
+    task_sandbox: networkPerimeter.task_sandbox,
+    agent: networkPerimeter.agent,
+    egress_hosts: networkPerimeter.egress_hosts,
+  });
+  await appendEvent(config, claim, "worker.runtime.network_perimeter.applying", {
+    ...eventPayload(),
+    status: "applying",
+  });
+  try {
+    await applyRuntimeNetworkPolicy(config, claim, materialized);
+  } catch (error) {
+    await appendEvent(config, claim, "worker.runtime.network_perimeter.failed", {
+      ...eventPayload(),
+      status: "failed",
+      error: errorMessage(error),
+    }).catch((eventError) => {
+      logError("worker.runtime_network_policy_failure_event_failed", context, { error: errorMessage(eventError) });
+    });
+    throw error;
+  }
+  await appendEvent(config, claim, "worker.runtime.network_perimeter.applied", eventPayload());
+}
+
+export async function processPortForwardRequests(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "run" | "attempt">,
+  materialized: Pick<MaterializedPackage, "workspaceDir" | "extractedDir" | "runRootDir">,
+): Promise<void> {
+  if (!config.portForwardCommand) {
+    return;
+  }
+  const runnerInstanceId = requireRunnerInstanceId(config);
+  const response = await cloudFetch(
+    config,
+    `/v1/worker/run-attempts/${claim.attempt.attempt_id}/runtime/resources/PortForward?runner_instance_id=${encodeURIComponent(runnerInstanceId)}`,
+    { authToken: claim.attempt.attempt_token },
+  );
+  const requests = isRecord(response) && Array.isArray(response.resources)
+    ? response.resources.filter(isRecord).map(runtimePortForwardRequestFromResponse).filter(isRuntimePortForwardRequest)
+    : [];
+  for (const request of requests) {
+    if (request.status !== "requested" && request.status !== "accepted") {
+      continue;
+    }
+    await fulfillPortForwardRequest(config, claim, materialized, request);
+  }
+}
+
+export async function processExecRequests(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "run" | "attempt">,
+  materialized: Pick<MaterializedPackage, "workspaceDir" | "extractedDir" | "runRootDir">,
+): Promise<void> {
+  if (!config.execCommand) {
+    return;
+  }
+  const runnerInstanceId = requireRunnerInstanceId(config);
+  const response = await cloudFetch(
+    config,
+    `/v1/worker/run-attempts/${claim.attempt.attempt_id}/runtime/resources/Exec?runner_instance_id=${encodeURIComponent(runnerInstanceId)}`,
+    { authToken: claim.attempt.attempt_token },
+  );
+  const requests = isRecord(response) && Array.isArray(response.resources)
+    ? response.resources.filter(isRecord).map(runtimeExecRequestFromResponse).filter(isRuntimeExecRequest)
+    : [];
+  for (const request of requests) {
+    if (request.status !== "requested" && request.status !== "accepted" && request.status !== "active") {
+      continue;
+    }
+    await fulfillExecRequest(config, claim, materialized, request);
+  }
+}
+
+function runtimePortForwardRequestFromResponse(value: Record<string, unknown>): RuntimePortForwardRequest | null {
+  if (stringAtRecord(value, "kind") !== "PortForward") {
+    return null;
+  }
+  const spec = objectAtRecord(value, "spec");
+  const status = objectAtRecord(value, "status");
+  const metadata = objectAtRecord(value, "metadata");
+  const labels = objectAtRecord(metadata, "labels");
+  const audit = objectAtRecord(value, "audit");
+  const targetRef = objectAtRecord(spec, "target_ref");
+  const runnerBinding = objectAtRecord(status, "runner_binding");
+  const accessRequestId = stringAtRecord(spec, "access_request_id")
+    ?? stringAtRecord(metadata, "uid")
+    ?? stringAtRecord(metadata, "name");
+  const targetPort = numberAtRecord(spec, "target_port");
+  const resourceKind = stringAtRecord(spec, "resource_kind") ?? stringAtRecord(targetRef, "kind");
+  const resourceName = stringAtRecord(spec, "resource_name") ?? stringAtRecord(targetRef, "name");
+  if (!accessRequestId || !validPortForwardConnectionPort(targetPort) || !resourceKind || !resourceName) {
+    return null;
+  }
+  return {
+    access_request_id: accessRequestId,
+    run_id: stringAtRecord(labels, "bucephalus.dev/run-id") ?? "",
+    kind: "port_forward",
+    status: stringAtRecord(status, "phase") ?? "unknown",
+    resource_kind: resourceKind,
+    resource_name: resourceName,
+    protocol: stringAtRecord(spec, "protocol") ?? "tcp",
+    target_port: targetPort,
+    local_port: numberAtRecord(spec, "local_port"),
+    runner_instance_id: stringAtRecord(status, "runner_instance_id") ?? stringAtRecord(runnerBinding, "runner_instance_id"),
+    attempt_id: stringAtRecord(status, "attempt_id") ?? stringAtRecord(runnerBinding, "attempt_id"),
+    requester: stringAtRecord(audit, "requester"),
+    reason: stringAtRecord(spec, "reason"),
+    connection: objectAtRecord(status, "connection"),
+    error_message: stringAtRecord(status, "error_message"),
+    created_at: stringAtRecord(metadata, "created_at") ?? "",
+    updated_at: stringAtRecord(metadata, "updated_at") ?? stringAtRecord(metadata, "created_at") ?? "",
+  };
+}
+
+function runtimeExecRequestFromResponse(value: Record<string, unknown>): RuntimeExecRequest | null {
+  if (stringAtRecord(value, "kind") !== "Exec") {
+    return null;
+  }
+  const spec = objectAtRecord(value, "spec");
+  const status = objectAtRecord(value, "status");
+  const metadata = objectAtRecord(value, "metadata");
+  const labels = objectAtRecord(metadata, "labels");
+  const audit = objectAtRecord(value, "audit");
+  const targetRef = objectAtRecord(spec, "target_ref");
+  const runnerBinding = objectAtRecord(status, "runner_binding");
+  const accessRequestId = stringAtRecord(spec, "access_request_id")
+    ?? stringAtRecord(metadata, "uid")
+    ?? stringAtRecord(metadata, "name");
+  const resourceKind = stringAtRecord(spec, "resource_kind") ?? stringAtRecord(targetRef, "kind");
+  const resourceName = stringAtRecord(spec, "resource_name") ?? stringAtRecord(targetRef, "name");
+  const command = stringArrayAtRecord(spec, "command");
+  if (!accessRequestId || !resourceKind || !resourceName || command.length === 0) {
+    return null;
+  }
+  return {
+    access_request_id: accessRequestId,
+    run_id: stringAtRecord(labels, "bucephalus.dev/run-id") ?? "",
+    kind: "exec",
+    status: stringAtRecord(status, "phase") ?? "unknown",
+    resource_kind: resourceKind,
+    resource_name: resourceName,
+    protocol: stringAtRecord(spec, "protocol") ?? "exec",
+    target_port: null,
+    local_port: null,
+    command,
+    runner_instance_id: stringAtRecord(status, "runner_instance_id") ?? stringAtRecord(runnerBinding, "runner_instance_id"),
+    attempt_id: stringAtRecord(status, "attempt_id") ?? stringAtRecord(runnerBinding, "attempt_id"),
+    requester: stringAtRecord(audit, "requester"),
+    reason: stringAtRecord(spec, "reason"),
+    connection: objectAtRecord(status, "connection"),
+    error_message: stringAtRecord(status, "error_message"),
+    created_at: stringAtRecord(metadata, "created_at") ?? "",
+    updated_at: stringAtRecord(metadata, "updated_at") ?? stringAtRecord(metadata, "created_at") ?? "",
+  };
+}
+
+function isRuntimePortForwardRequest(value: RuntimePortForwardRequest | null): value is RuntimePortForwardRequest {
+  return value !== null;
+}
+
+function isRuntimeExecRequest(value: RuntimeExecRequest | null): value is RuntimeExecRequest {
+  return value !== null;
+}
+
+async function fulfillPortForwardRequest(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "run" | "attempt">,
+  materialized: Pick<MaterializedPackage, "workspaceDir" | "extractedDir" | "runRootDir">,
+  request: RuntimePortForwardRequest,
+): Promise<void> {
+  if (!config.portForwardCommand) {
+    return;
+  }
+  if (request.status === "requested") {
+    const accepted = await tryUpdatePortForwardRequest(config, claim, request, "accept", {
+      connection: {
+        mode: "worker_command",
+        worker_id: config.workerId,
+      },
+    });
+    if (!accepted) {
+      return;
+    }
+  }
+  let output: JsonObject;
+  try {
+    const result = await runJsonCommand(config.portForwardCommand, {
+      schema_version: "runtime_port_forward_command_v1",
+      worker_id: config.workerId,
+      runner_instance_id: requireRunnerInstanceId(config),
+      provider_instance_id: config.providerInstanceId,
+      run_id: claim.run.run_id,
+      attempt_id: claim.attempt.attempt_id,
+      workspace_dir: materialized.workspaceDir,
+      package_dir: materialized.extractedDir,
+      run_root_dir: materialized.runRootDir,
+      port_forward: request,
+    });
+    output = isRecord(result) ? result : {};
+  } catch (error) {
+    await tryUpdatePortForwardRequest(config, claim, request, "fail", {
+      error_message: errorMessage(error),
+    });
+    return;
+  }
+  try {
+    const status = stringAtRecord(output, "status");
+    const connection = isRecord(output.connection) ? output.connection as JsonObject : {};
+    const action = status === "accepted"
+      ? "accept"
+      : status === "failed"
+        ? "fail"
+        : status === "expired"
+          ? "expire"
+          : portForwardCommandConnectionHasHandle(connection)
+            ? "active"
+            : "fail";
+    await tryUpdatePortForwardRequest(config, claim, request, action, {
+      connection,
+      error_message: action === "fail"
+        ? stringAtRecord(output, "error_message") ?? "port-forward command did not report a usable connection handle"
+        : stringAtRecord(output, "error_message") ?? null,
+    });
+  } catch (error) {
+    if (isStaleRuntimeAccessUpdate(error)) {
+      return;
+    }
+    throw error;
+  }
+}
+
+function portForwardCommandConnectionHasHandle(connection: JsonObject): boolean {
+  if (validPortForwardConnectionPort(connection.local_port)) {
+    return true;
+  }
+  return [
+    "local_probe",
+    "endpoint",
+    "url",
+    "listen",
+    "listen_address",
+    "local_address",
+    "address",
+    "client_endpoint",
+    "client_url",
+    "client_listen",
+    "provider_tunnel_url",
+    "tunnel",
+  ].some((key) => Boolean(stringAtRecord(connection, key)));
+}
+
+function validPortForwardConnectionPort(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
+}
+
+async function fulfillExecRequest(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "run" | "attempt">,
+  materialized: Pick<MaterializedPackage, "workspaceDir" | "extractedDir" | "runRootDir">,
+  request: RuntimeExecRequest,
+): Promise<void> {
+  if (!config.execCommand) {
+    return;
+  }
+  if (request.status === "requested") {
+    const accepted = await tryUpdateExecRequest(config, claim, request, "accept", {
+      connection: {
+        mode: "worker_command",
+        worker_id: config.workerId,
+      },
+    });
+    if (!accepted) {
+      return;
+    }
+  }
+  let output: JsonObject;
+  try {
+    const result = await runJsonCommand(config.execCommand, {
+      schema_version: "runtime_exec_command_v1",
+      worker_id: config.workerId,
+      runner_instance_id: requireRunnerInstanceId(config),
+      run_id: claim.run.run_id,
+      attempt_id: claim.attempt.attempt_id,
+      workspace_dir: materialized.workspaceDir,
+      package_dir: materialized.extractedDir,
+      run_root_dir: materialized.runRootDir,
+      exec: request,
+    });
+    output = isRecord(result) ? result : {};
+  } catch (error) {
+    await tryUpdateExecRequest(config, claim, request, "fail", {
+      error_message: errorMessage(error),
+    });
+    return;
+  }
+  try {
+    const status = stringAtRecord(output, "status");
+    const connection = execCommandConnection(output, config.workerId);
+    const action = execCommandAction(status, connection);
+    await tryUpdateExecRequest(config, claim, request, action, {
+      connection,
+      error_message: action === "fail"
+        ? stringAtRecord(output, "error_message") ?? execCommandFailureMessage(status, connection)
+        : stringAtRecord(output, "error_message") ?? null,
+    });
+  } catch (error) {
+    if (isStaleRuntimeAccessUpdate(error)) {
+      return;
+    }
+    throw error;
+  }
+}
+
+function execCommandAction(
+  status: string | null,
+  connection: JsonObject,
+): "accept" | "active" | "fail" | "expire" | "complete" {
+  if (status === "accepted") {
+    return "accept";
+  }
+  if (status === "active") {
+    return "active";
+  }
+  if (status === "failed") {
+    return "fail";
+  }
+  if (status === "expired") {
+    return "expire";
+  }
+  return execCommandConnectionHasExitCode(connection) ? "complete" : "fail";
+}
+
+function execCommandConnectionHasExitCode(connection: JsonObject): boolean {
+  return validRuntimeExecExitCode(connection.exit_code);
+}
+
+function execCommandFailureMessage(status: string | null, connection: JsonObject): string | null {
+  if (status === "failed") {
+    return null;
+  }
+  return execCommandConnectionHasExitCode(connection)
+    ? null
+    : "runtime exec command did not report an exit_code";
+}
+
+function validRuntimeExecExitCode(value: unknown): boolean {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 255;
+}
+
+async function updatePortForwardRequest(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "attempt">,
+  request: RuntimePortForwardRequest,
+  action: "accept" | "active" | "fail" | "expire",
+  body: { connection?: JsonObject; error_message?: string | null },
+): Promise<void> {
+  await cloudFetch(
+    config,
+    `/v1/worker/run-attempts/${claim.attempt.attempt_id}/runtime/resources/PortForward/${encodeURIComponent(request.access_request_id)}/${action}`,
+    {
+      method: "POST",
+      authToken: claim.attempt.attempt_token,
+      body: {
+        runner_instance_id: requireRunnerInstanceId(config),
+        ...body,
+      },
+    },
+  );
+}
+
+async function tryUpdatePortForwardRequest(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "attempt">,
+  request: RuntimePortForwardRequest,
+  action: "accept" | "active" | "fail" | "expire",
+  body: { connection?: JsonObject; error_message?: string | null },
+): Promise<boolean> {
+  try {
+    await updatePortForwardRequest(config, claim, request, action, body);
+    return true;
+  } catch (error) {
+    if (isStaleRuntimeAccessUpdate(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function updateExecRequest(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "attempt">,
+  request: RuntimeExecRequest,
+  action: "accept" | "active" | "complete" | "fail" | "expire",
+  body: { connection?: JsonObject; error_message?: string | null },
+): Promise<void> {
+  await cloudFetch(
+    config,
+    `/v1/worker/run-attempts/${claim.attempt.attempt_id}/runtime/resources/Exec/${encodeURIComponent(request.access_request_id)}/${action}`,
+    {
+      method: "POST",
+      authToken: claim.attempt.attempt_token,
+      body: {
+        runner_instance_id: requireRunnerInstanceId(config),
+        ...body,
+      },
+    },
+  );
+}
+
+async function tryUpdateExecRequest(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "attempt">,
+  request: RuntimeExecRequest,
+  action: "accept" | "active" | "complete" | "fail" | "expire",
+  body: { connection?: JsonObject; error_message?: string | null },
+): Promise<boolean> {
+  try {
+    await updateExecRequest(config, claim, request, action, body);
+    return true;
+  } catch (error) {
+    if (isStaleRuntimeAccessUpdate(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function isStaleRuntimeAccessUpdate(error: unknown): boolean {
+  return error instanceof CloudApiError
+    && error.status === 409
+    && (
+      error.code === "runtime_access_request_not_active"
+      || error.code === "runtime_access_transition_invalid"
+    );
+}
+
+function execCommandConnection(output: JsonObject, workerId: string): JsonObject {
+  const connection: JsonObject = isRecord(output.connection) ? { ...output.connection as JsonObject } : {};
+  if (!connection.mode) {
+    connection.mode = "worker_command";
+  }
+  if (!connection.worker_id) {
+    connection.worker_id = workerId;
+  }
+  const exitCode = output.exit_code;
+  if (typeof exitCode === "number" && Number.isInteger(exitCode)) {
+    connection.exit_code = exitCode;
+  }
+  const stdout = output.stdout;
+  if (typeof stdout === "string") {
+    addExecOutputConnectionEvidence(connection, "stdout", stdout);
+  }
+  const stderr = output.stderr;
+  if (typeof stderr === "string") {
+    addExecOutputConnectionEvidence(connection, "stderr", stderr);
+  }
+  return connection;
+}
+
+function addExecOutputConnectionEvidence(
+  connection: JsonObject,
+  stream: "stdout" | "stderr",
+  value: string,
+): void {
+  const bytes = Buffer.byteLength(value, "utf8");
+  connection[`${stream}_tail`] = tail(value, RUNTIME_EXEC_OUTPUT_TAIL_BYTES);
+  connection[`${stream}_bytes`] = bytes;
+  connection[`${stream}_tail_bytes`] = Math.min(bytes, RUNTIME_EXEC_OUTPUT_TAIL_BYTES);
+  connection[`${stream}_tail_truncated`] = bytes > RUNTIME_EXEC_OUTPUT_TAIL_BYTES;
+}
+
+export type RuntimeExecCommandTarget =
+  | {
+    mode: "docker_container";
+    coreRunId: string;
+    trialId: string;
+    scheduleIdx: number | null;
+    role: string;
+    containerId: string;
+    workdir: string | null;
+    resourceName: string;
+  }
+  | {
+    mode: "worker_process";
+    resourceKind: string;
+    resourceName: string;
+  };
+
+type RuntimePortForwardCommandTarget =
+  | {
+    mode: "docker_container";
+    coreRunId: string;
+    trialId: string;
+    role: string;
+    containerId: string;
+    targetHost: string;
+    targetPort: number;
+  }
+  | {
+    mode: "worker_host";
+    resourceKind: string;
+    resourceName: string;
+    targetHost: string;
+    targetPort: number;
+  };
+
+async function runRuntimeGceIapPortForwardCommand(): Promise<void> {
+  const input = await readRuntimePortForwardCommandInput();
+  const portForward = objectAtRecord(input, "port_forward");
+  const targetPort = numberAtRecord(portForward, "target_port");
+  if (!validPortForwardConnectionPort(targetPort)) {
+    throw new WorkerError("runtime port-forward helper input must include port_forward.target_port");
+  }
+  const targetPortValue = targetPort as number;
+  const resourceKind = stringAtRecord(portForward, "resource_kind");
+  const resourceName = stringAtRecord(portForward, "resource_name");
+  if (!resourceKind || !resourceName) {
+    throw new WorkerError("runtime port-forward helper input must include port_forward.resource_kind and port_forward.resource_name");
+  }
+  const runRootDir = stringAtRecord(input, "run_root_dir");
+  if (!runRootDir) {
+    throw new WorkerError("runtime port-forward helper input must include run_root_dir");
+  }
+  const provider = parseGceProviderInstanceId(
+    stringAtRecord(input, "provider_instance_id")
+      ?? process.env.BUCEPHALUS_RUNNER_PROVIDER_INSTANCE_ID
+      ?? "",
+  );
+  if (!provider) {
+    throw new WorkerError("runtime GCE IAP port-forward helper requires a gce:// provider_instance_id");
+  }
+  const target = await resolveRuntimePortForwardCommandTarget(runRootDir, resourceKind, resourceName, targetPortValue);
+  const localPort = numberAtRecord(portForward, "local_port");
+  const connection = compactWorkerJson({
+    mode: "gcp_iap_ssh",
+    provider: "gce-iap-ssh-local-forward",
+    project_id: provider.projectId,
+    zone: provider.zone,
+    instance_name: provider.instanceName,
+    target_host: target.targetHost,
+    target_port: target.targetPort,
+    requested_target_port: targetPortValue,
+    local_port: validPortForwardConnectionPort(localPort) ? localPort : undefined,
+    target_mode: target.mode,
+    client_reachable: false,
+    provider_tunnel_url: `gcp-iap-ssh://projects/${encodeURIComponent(provider.projectId)}/zones/${encodeURIComponent(provider.zone)}/instances/${encodeURIComponent(provider.instanceName)}?target_host=${encodeURIComponent(target.targetHost)}&target_port=${encodeURIComponent(String(target.targetPort))}`,
+    tunnel: `gcp-iap-ssh ${provider.instanceName} ${target.targetHost}:${target.targetPort}`,
+    worker_id: stringAtRecord(input, "worker_id"),
+    ...(target.mode === "docker_container"
+      ? {
+        core_run_id: target.coreRunId,
+        trial_id: target.trialId,
+        role: target.role,
+        container_id: target.containerId,
+      }
+      : {
+        resource_kind: target.resourceKind,
+        resource_name: target.resourceName,
+      }),
+  });
+  console.log(JSON.stringify({
+    status: "active",
+    connection,
+  }));
+}
+
+async function readRuntimePortForwardCommandInput(): Promise<JsonObject> {
+  const text = await new Response(Bun.stdin.stream()).text();
+  if (text.trim().length === 0) {
+    throw new WorkerError("runtime port-forward helper requires JSON on stdin");
+  }
+  const parsed = JSON.parse(text);
+  if (!isRecord(parsed)) {
+    throw new WorkerError("runtime port-forward helper input must be a JSON object");
+  }
+  if (stringAtRecord(parsed, "schema_version") !== "runtime_port_forward_command_v1") {
+    throw new WorkerError("runtime port-forward helper input schema_version must be runtime_port_forward_command_v1");
+  }
+  return parsed as JsonObject;
+}
+
+async function resolveRuntimePortForwardCommandTarget(
+  runRootDir: string,
+  resourceKind: string,
+  resourceName: string,
+  targetPort: number,
+): Promise<RuntimePortForwardCommandTarget> {
+  const execTarget = await resolveRuntimeExecCommandTarget(runRootDir, resourceKind, resourceName);
+  if (execTarget.mode === "docker_container") {
+    return {
+      mode: "docker_container",
+      coreRunId: execTarget.coreRunId,
+      trialId: execTarget.trialId,
+      role: execTarget.role,
+      containerId: execTarget.containerId,
+      targetHost: await dockerContainerIpAddress(execTarget.containerId),
+      targetPort,
+    };
+  }
+  return {
+    mode: "worker_host",
+    resourceKind: execTarget.resourceKind,
+    resourceName: execTarget.resourceName,
+    targetHost: "127.0.0.1",
+    targetPort,
+  };
+}
+
+async function dockerContainerIpAddress(containerId: string): Promise<string> {
+  const inspect = await dockerRequest<{ NetworkSettings?: unknown }>(
+    "GET",
+    `/containers/${encodeURIComponent(containerId)}/json`,
+  );
+  const networkSettings = isRecord(inspect.NetworkSettings) ? inspect.NetworkSettings : {};
+  const bridgeAddress = stringAtRecord(networkSettings, "IPAddress");
+  if (bridgeAddress) {
+    return bridgeAddress;
+  }
+  const networks = isRecord(networkSettings.Networks) ? networkSettings.Networks : {};
+  for (const network of Object.values(networks)) {
+    if (!isRecord(network)) {
+      continue;
+    }
+    const address = stringAtRecord(network, "IPAddress");
+    if (address) {
+      return address;
+    }
+  }
+  throw new WorkerError(`Docker container ${containerId} does not have an inspectable IP address for port-forward`);
+}
+
+function parseGceProviderInstanceId(value: string): { projectId: string; zone: string; instanceName: string } | null {
+  const match = /^gce:\/\/projects\/([^/]+)\/zones\/([^/]+)\/instances\/([^/]+)$/.exec(value);
+  if (!match) {
+    return null;
+  }
+  return {
+    projectId: decodeURIComponent(match[1] ?? ""),
+    zone: decodeURIComponent(match[2] ?? ""),
+    instanceName: decodeURIComponent(match[3] ?? ""),
+  };
+}
+
+function compactWorkerJson(input: Record<string, unknown>): JsonObject {
+  const out: JsonObject = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (value !== undefined && value !== null && value !== "") {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+async function runRuntimeDockerExecCommand(): Promise<void> {
+  const input = await readRuntimeExecCommandInput();
+  const exec = objectAtRecord(input, "exec");
+  const command = Array.isArray(exec.command)
+    ? exec.command.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
+  if (command.length === 0) {
+    throw new WorkerError("runtime exec command input must include exec.command");
+  }
+  const resourceKind = stringAtRecord(exec, "resource_kind");
+  const resourceName = stringAtRecord(exec, "resource_name");
+  if (!resourceKind || !resourceName) {
+    throw new WorkerError("runtime exec command input must include exec.resource_kind and exec.resource_name");
+  }
+  const runRootDir = stringAtRecord(input, "run_root_dir");
+  if (!runRootDir) {
+    throw new WorkerError("runtime exec command input must include run_root_dir");
+  }
+  const target = await resolveRuntimeExecCommandTarget(runRootDir, resourceKind, resourceName);
+  const result = target.mode === "docker_container"
+    ? await executeDockerContainerExec(target, command)
+    : await executeWorkerProcessExec(command, stringAtRecord(input, "workspace_dir") ?? process.cwd());
+  const stdout = tail(result.stdout, 16_000);
+  const stderr = tail(result.stderr, 16_000);
+  const connection: JsonObject = target.mode === "docker_container"
+    ? {
+      mode: "docker_exec",
+      provider: "gce-docker-socket",
+      core_run_id: target.coreRunId,
+      trial_id: target.trialId,
+      role: target.role,
+      container_id: target.containerId,
+      workdir: target.workdir,
+      provider_exec_id: result.providerExecId,
+    }
+    : {
+      mode: "worker_process",
+      provider: "gce-worker-container",
+      resource_kind: target.resourceKind,
+      resource_name: target.resourceName,
+    };
+  console.log(JSON.stringify({
+    status: result.exitCode === 0 ? "completed" : "failed",
+    exit_code: result.exitCode,
+    stdout,
+    stderr,
+    error_message: result.exitCode === 0 ? null : `runtime exec exited ${result.exitCode}`,
+    connection,
+  }));
+}
+
+async function readRuntimeExecCommandInput(): Promise<JsonObject> {
+  const text = await new Response(Bun.stdin.stream()).text();
+  if (text.trim().length === 0) {
+    throw new WorkerError("runtime exec helper requires JSON on stdin");
+  }
+  const parsed = JSON.parse(text);
+  if (!isRecord(parsed)) {
+    throw new WorkerError("runtime exec helper input must be a JSON object");
+  }
+  if (stringAtRecord(parsed, "schema_version") !== "runtime_exec_command_v1") {
+    throw new WorkerError("runtime exec helper input schema_version must be runtime_exec_command_v1");
+  }
+  return parsed as JsonObject;
+}
+
+export async function resolveRuntimeExecCommandTarget(
+  runRootDir: string,
+  resourceKind: string,
+  resourceName: string,
+): Promise<RuntimeExecCommandTarget> {
+  const kind = canonicalRuntimeExecTargetKind(resourceKind);
+  if (kind === "Run" || kind === "RunnerInstance" || kind === "RunnerAttempt") {
+    return { mode: "worker_process", resourceKind: kind, resourceName };
+  }
+  const targets = await runtimeExecContainerTargets(runRootDir);
+  if (kind === "TrialContainer") {
+    const selected = targets.find((target) =>
+      target.resourceName === resourceName
+      || target.containerId === resourceName
+      || shortRuntimeResourceName(target.containerId) === resourceName
+    );
+    if (!selected) {
+      throw new WorkerError(`No runtime container matches TrialContainer/${resourceName}`);
+    }
+    return selected;
+  }
+  if (kind === "Trial") {
+    const selected = preferredRuntimeExecContainer(targets.filter((target) =>
+      runtimeResourceName(target.trialId) === resourceName || target.trialId === resourceName
+    ));
+    if (!selected) {
+      throw new WorkerError(`No live runtime container matches Trial/${resourceName}`);
+    }
+    return selected;
+  }
+  if (kind === "ScheduleSlot") {
+    const parsed = parseScheduleSlotResourceName(resourceName);
+    const selected = parsed
+      ? preferredRuntimeExecContainer(targets.filter((target) =>
+        runtimeResourceName(target.coreRunId) === parsed.coreRunName
+        && target.scheduleIdx === parsed.scheduleIdx
+      ))
+      : null;
+    if (!selected) {
+      throw new WorkerError(`No live runtime container matches ScheduleSlot/${resourceName}`);
+    }
+    return selected;
+  }
+  throw new WorkerError(`Runtime exec helper does not support ${resourceKind}/${resourceName}`);
+}
+
+async function executeDockerContainerExec(
+  target: Extract<RuntimeExecCommandTarget, { mode: "docker_container" }>,
+  command: string[],
+): Promise<{ exitCode: number; stdout: string; stderr: string; providerExecId: string }> {
+  const create = await dockerRequest<{ Id?: unknown }>(
+    "POST",
+    `/containers/${encodeURIComponent(target.containerId)}/exec`,
+    {
+      AttachStdout: true,
+      AttachStderr: true,
+      Cmd: command,
+      Tty: false,
+      ...(target.workdir ? { WorkingDir: target.workdir } : {}),
+    },
+  );
+  const execId = typeof create.Id === "string" && create.Id.length > 0 ? create.Id : null;
+  if (!execId) {
+    throw new WorkerError("Docker exec create did not return an exec id");
+  }
+  const output = await dockerRawRequest("POST", `/exec/${encodeURIComponent(execId)}/start`, {
+    body: {
+      Detach: false,
+      Tty: false,
+    },
+  });
+  const inspect = await dockerRequest<{ ExitCode?: unknown }>("GET", `/exec/${encodeURIComponent(execId)}/json`);
+  const exitCode = typeof inspect.ExitCode === "number" && Number.isInteger(inspect.ExitCode)
+    ? inspect.ExitCode
+    : 1;
+  const streams = demuxDockerExecOutput(output.body);
+  return {
+    exitCode,
+    stdout: streams.stdout,
+    stderr: streams.stderr,
+    providerExecId: execId,
+  };
+}
+
+async function executeWorkerProcessExec(
+  command: string[],
+  cwd: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string; providerExecId: string }> {
+  const [executable, ...args] = command;
+  if (!executable) {
+    throw new WorkerError("runtime exec command is empty");
+  }
+  const result = await runProcess(executable, args, {
+    cwd,
+    env: process.env,
+  });
+  return {
+    ...result,
+    providerExecId: `worker-process:${Date.now()}`,
+  };
+}
+
+export function demuxDockerExecOutput(buffer: Buffer): { stdout: string; stderr: string } {
+  let offset = 0;
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  let frames = 0;
+  while (offset + 8 <= buffer.length) {
+    const stream = buffer[offset];
+    const length = buffer.readUInt32BE(offset + 4);
+    const next = offset + 8 + length;
+    if (next > buffer.length) {
+      break;
+    }
+    const payload = buffer.subarray(offset + 8, next);
+    if (stream === 2) {
+      stderr.push(payload);
+    } else {
+      stdout.push(payload);
+    }
+    frames += 1;
+    offset = next;
+  }
+  if (frames > 0 && offset === buffer.length) {
+    return {
+      stdout: Buffer.concat(stdout).toString("utf8"),
+      stderr: Buffer.concat(stderr).toString("utf8"),
+    };
+  }
+  return {
+    stdout: buffer.toString("utf8"),
+    stderr: "",
+  };
+}
+
+async function runtimeExecContainerTargets(runRootDir: string): Promise<Array<Extract<RuntimeExecCommandTarget, { mode: "docker_container" }>>> {
+  const targets: Array<Extract<RuntimeExecCommandTarget, { mode: "docker_container" }>> = [];
+  const coreRunIds = await discoverCoreRunIdsFromRunRoot(runRootDir);
+  for (const coreRunId of coreRunIds) {
+    const trialsDir = join(runRootDir, coreRunId, "trials");
+    const trialEntries = await readdir(trialsDir, { withFileTypes: true }).catch((error) => {
+      if (isNodeError(error) && error.code === "ENOENT") {
+        return [];
+      }
+      throw error;
+    });
+    for (const trialEntry of trialEntries) {
+      if (!trialEntry.isDirectory()) {
+        continue;
+      }
+      const trialId = trialEntry.name;
+      const statePayload = await readJsonObjectIfExists(join(trialsDir, trialId, "runner", "trial_runtime_state.json"));
+      const state = isRecord(statePayload?.state) ? statePayload.state : null;
+      if (!state) {
+        continue;
+      }
+      const key = objectAtRecord(state, "key");
+      const scheduleIdx = numberAtRecord(key, "schedule_idx");
+      for (const container of runtimeExecContainersFromState(state)) {
+        targets.push({
+          mode: "docker_container",
+          coreRunId,
+          trialId,
+          scheduleIdx,
+          role: container.role,
+          containerId: container.containerId,
+          workdir: container.workdir,
+          resourceName: [
+            runtimeResourceName(trialId),
+            runtimeResourceName(container.role),
+            shortRuntimeResourceName(container.containerId),
+          ].join("."),
+        });
+      }
+    }
+  }
+  return targets;
+}
+
+function runtimeExecContainersFromState(state: Record<string, unknown>): Array<{ role: string; containerId: string; workdir: string | null }> {
+  const containers: Array<{ role: string; containerId: string; workdir: string | null }> = [];
+  const task = isRecord(state.task_sandbox) ? state.task_sandbox : null;
+  const taskContainerId = task ? stringAtRecord(task, "container_id") : null;
+  if (taskContainerId) {
+    containers.push({
+      role: "task",
+      containerId: taskContainerId,
+      workdir: task ? stringAtRecord(task, "workdir") : null,
+    });
+  }
+  const grading = isRecord(state.grading_sandbox) ? state.grading_sandbox : null;
+  const gradingContainerId = grading ? stringAtRecord(grading, "container_id") : null;
+  if (gradingContainerId && gradingContainerId !== "host" && !containers.some((container) => container.containerId === gradingContainerId)) {
+    containers.push({
+      role: "grading",
+      containerId: gradingContainerId,
+      workdir: grading ? stringAtRecord(grading, "workdir") : null,
+    });
+  }
+  const ephemerals = Array.isArray(state.ephemerals) ? state.ephemerals.filter(isRecord) : [];
+  for (const ephemeral of ephemerals) {
+    const containerId = stringAtRecord(ephemeral, "container_id");
+    if (!containerId || containers.some((container) => container.containerId === containerId)) {
+      continue;
+    }
+    const id = stringAtRecord(ephemeral, "id") ?? "ephemeral";
+    containers.push({
+      role: `ephemeral-${id}`,
+      containerId,
+      workdir: null,
+    });
+  }
+  return containers;
+}
+
+async function readJsonObjectIfExists(path: string): Promise<JsonObject | null> {
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8"));
+    return isRecord(parsed) ? parsed as JsonObject : null;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function preferredRuntimeExecContainer(
+  targets: Array<Extract<RuntimeExecCommandTarget, { mode: "docker_container" }>>,
+): Extract<RuntimeExecCommandTarget, { mode: "docker_container" }> | null {
+  return targets.find((target) => target.role === "task")
+    ?? targets.find((target) => target.role === "agent")
+    ?? targets[0]
+    ?? null;
+}
+
+function canonicalRuntimeExecTargetKind(kind: string): string {
+  const normalized = kind.trim().toLowerCase().replaceAll(/[^a-z0-9]/g, "");
+  switch (normalized) {
+    case "run":
+    case "runs":
+      return "Run";
+    case "runnerinstance":
+    case "runnerinstances":
+    case "runner":
+    case "runners":
+      return "RunnerInstance";
+    case "runnerattempt":
+    case "runnerattempts":
+    case "attempt":
+    case "attempts":
+      return "RunnerAttempt";
+    case "trial":
+    case "trials":
+      return "Trial";
+    case "scheduleslot":
+    case "scheduleslots":
+    case "slot":
+    case "slots":
+      return "ScheduleSlot";
+    case "trialcontainer":
+    case "trialcontainers":
+    case "container":
+    case "containers":
+      return "TrialContainer";
+    default:
+      return kind.trim();
+  }
+}
+
+function parseScheduleSlotResourceName(resourceName: string): { coreRunName: string; scheduleIdx: number } | null {
+  const index = resourceName.lastIndexOf(".");
+  if (index <= 0 || index === resourceName.length - 1) {
+    return null;
+  }
+  const scheduleIdx = Number.parseInt(resourceName.slice(index + 1), 10);
+  if (!Number.isInteger(scheduleIdx) || scheduleIdx < 0) {
+    return null;
+  }
+  return {
+    coreRunName: resourceName.slice(0, index),
+    scheduleIdx,
+  };
+}
+
+function runtimeResourceName(value: string): string {
+  const normalized = value
+    .toLowerCase()
+    .replace(/^sha256:/, "sha256-")
+    .replace(/[^a-z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized.slice(0, 96) || "resource";
+}
+
+function shortRuntimeResourceName(value: string): string {
+  return runtimeResourceName(value).slice(0, 32) || "resource";
+}
+
 export async function prePullRunImages(
   config: Pick<WorkerConfig, "capabilities">,
   claim: Pick<RunClaim, "run" | "attempt">,
+  pullImage: (imageRef: string) => Promise<void> = dockerPullImage,
 ): Promise<void> {
   if (!config.capabilities.resources.includes("docker_daemon")
     || !config.capabilities.resources.includes("registry_pull")) {
@@ -1255,7 +2321,143 @@ export async function prePullRunImages(
     ? claim.run.run_requirements.image_refs.filter((item): item is string => typeof item === "string")
     : [];
   for (const imageRef of [...new Set(imageRefs)]) {
-    await dockerPullImage(imageRef);
+    await pullImage(imageRef);
+  }
+}
+
+export async function prePullRunImagesWithAudit(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "run" | "attempt">,
+  context: TraceContext = newTraceContext({
+    component: "worker-image-pull",
+    runId: claim.run.run_id,
+    attemptId: claim.attempt.attempt_id,
+  }),
+  pullImage: (imageRef: string) => Promise<void> = dockerPullImage,
+): Promise<void> {
+  if (!config.capabilities.resources.includes("docker_daemon")
+    || !config.capabilities.resources.includes("registry_pull")) {
+    return;
+  }
+  const imageRefs = Array.isArray(claim.run.run_requirements.image_refs)
+    ? claim.run.run_requirements.image_refs.filter((item): item is string => typeof item === "string")
+    : [];
+  for (const imageRef of [...new Set(imageRefs)]) {
+    const eventPayload = () => ({
+      resource_kind: "ImagePull",
+      resource_name: runtimeDeclaredResourceName(imageRef),
+      image_ref: imageRef,
+      status: "pulled",
+      attempt_id: claim.attempt.attempt_id,
+      run_id: claim.run.run_id,
+      runner_instance_id: requireRunnerInstanceId(config),
+      worker_id: config.workerId,
+    });
+    await appendEvent(config, claim, "worker.runtime.image_pull.pulling", {
+      ...eventPayload(),
+      status: "pulling",
+    });
+    try {
+      await pullImage(imageRef);
+    } catch (error) {
+      await appendEvent(config, claim, "worker.runtime.image_pull.failed", {
+        ...eventPayload(),
+        status: "failed",
+        error: errorMessage(error),
+      }).catch((eventError) => {
+        logError("worker.runtime_image_pull_failure_event_failed", context, { error: errorMessage(eventError) });
+      });
+      throw error;
+    }
+    await appendEvent(config, claim, "worker.runtime.image_pull.pulled", eventPayload());
+  }
+}
+
+export async function validateSidecarRequirementsWithAudit(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "run" | "attempt">,
+  context: TraceContext = newTraceContext({
+    component: "worker-sidecar-requirement",
+    runId: claim.run.run_id,
+    attemptId: claim.attempt.attempt_id,
+  }),
+): Promise<void> {
+  const sidecars = Array.isArray(claim.run.run_requirements.sidecars)
+    ? claim.run.run_requirements.sidecars.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+  for (const sidecar of [...new Set(sidecars)].sort()) {
+    const requiredCapability = `sidecar:${sidecar}`;
+    const eventPayload = () => ({
+      resource_kind: "SidecarRequirement",
+      resource_name: runtimeDeclaredResourceName(sidecar),
+      sidecar,
+      required_capability: requiredCapability,
+      status: "available",
+      attempt_id: claim.attempt.attempt_id,
+      run_id: claim.run.run_id,
+      runner_instance_id: requireRunnerInstanceId(config),
+      worker_id: config.workerId,
+    });
+    await appendEvent(config, claim, "worker.runtime.sidecar_requirement.checking", {
+      ...eventPayload(),
+      status: "checking",
+    });
+    if (!config.capabilities.resources.includes(requiredCapability)) {
+      const message = `Runner worker does not advertise required ${requiredCapability}`;
+      await appendEvent(config, claim, "worker.runtime.sidecar_requirement.failed", {
+        ...eventPayload(),
+        status: "failed",
+        error: message,
+      }).catch((eventError) => {
+        logError("worker.runtime_sidecar_requirement_failure_event_failed", context, { error: errorMessage(eventError) });
+      });
+      throw new WorkerError(message);
+    }
+    await appendEvent(config, claim, "worker.runtime.sidecar_requirement.available", eventPayload());
+  }
+}
+
+export async function validateAcceleratorRequirementsWithAudit(
+  config: WorkerConfig,
+  claim: Pick<RunClaim, "run" | "attempt">,
+  context: TraceContext = newTraceContext({
+    component: "worker-accelerator-requirement",
+    runId: claim.run.run_id,
+    attemptId: claim.attempt.attempt_id,
+  }),
+): Promise<void> {
+  const accelerators = Array.isArray(claim.run.run_requirements.accelerators)
+    ? claim.run.run_requirements.accelerators.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+  for (const accelerator of [...new Set(accelerators)].sort()) {
+    const requiredCapability = `accelerator:${accelerator}`;
+    const eventPayload = () => ({
+      resource_kind: "AcceleratorRequirement",
+      resource_name: runtimeDeclaredResourceName(accelerator),
+      accelerator,
+      required_capability: requiredCapability,
+      status: "available",
+      attempt_id: claim.attempt.attempt_id,
+      run_id: claim.run.run_id,
+      runner_instance_id: requireRunnerInstanceId(config),
+      worker_id: config.workerId,
+    });
+    await appendEvent(config, claim, "worker.runtime.accelerator_requirement.checking", {
+      ...eventPayload(),
+      status: "checking",
+    });
+    if (!config.capabilities.resources.includes(requiredCapability)) {
+      const message = `Runner worker does not advertise required ${requiredCapability}`;
+      await appendEvent(config, claim, "worker.runtime.accelerator_requirement.failed", {
+        ...eventPayload(),
+        status: "failed",
+        error: message,
+      }).catch((eventError) => {
+        logError("worker.runtime_accelerator_requirement_failure_event_failed", context, { error: errorMessage(eventError) });
+      });
+      throw new WorkerError(message);
+    }
+    await appendEvent(config, claim, "worker.runtime.accelerator_requirement.available", eventPayload());
   }
 }
 
@@ -1291,6 +2493,15 @@ function assertSecretRef(ref: string): void {
   if (ref.includes("\n") || ref.includes("\r")) {
     throw new WorkerError(`Invalid secret ref '${ref}'`);
   }
+}
+
+function runtimeDeclaredResourceName(value: string): string {
+  const normalized = value
+    .toLowerCase()
+    .replace(/^sha256:/, "sha256-")
+    .replace(/[^a-z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized.slice(0, 96) || "resource";
 }
 
 function resolvedSecretOutputPath(secretDir: string, resolverPath: string): string {
@@ -1559,43 +2770,67 @@ function registryHostFromImageRef(imageRef: string): string {
   return "index.docker.io";
 }
 
-async function dockerRequest<T = unknown>(method: "GET" | "DELETE", apiPath: string): Promise<T> {
-  const { body } = await dockerRequestText(method, apiPath);
-  if (body.trim() === "") {
+type DockerHttpMethod = "GET" | "POST" | "DELETE";
+
+async function dockerRequest<T = unknown>(method: DockerHttpMethod, apiPath: string, body?: unknown): Promise<T> {
+  const response = await dockerRawRequest(method, apiPath, { body });
+  if (response.body.length === 0 || response.body.toString("utf8").trim() === "") {
     return undefined as T;
   }
-  return JSON.parse(body) as T;
+  return JSON.parse(response.body.toString("utf8")) as T;
 }
 
 async function dockerRequestText(
-  method: "GET" | "DELETE" | "POST",
+  method: DockerHttpMethod,
   apiPath: string,
-  options: { headers?: Record<string, string> } = {},
+  options: { headers?: Record<string, string>; body?: unknown } = {},
 ): Promise<{ statusCode: number; body: string }> {
+  const response = await dockerRawRequest(method, apiPath, options);
+  return { statusCode: response.statusCode, body: response.body.toString("utf8") };
+}
+
+async function dockerRawRequest(
+  method: DockerHttpMethod,
+  apiPath: string,
+  options: { headers?: Record<string, string>; body?: unknown } = {},
+): Promise<{ statusCode: number; body: Buffer }> {
   const path = `/${DOCKER_API_VERSION}${apiPath}`;
-  const { statusCode, body } = await new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+  const encodedBody = options.body === undefined ? null : Buffer.from(JSON.stringify(options.body), "utf8");
+  const headers = {
+    ...(options.headers ?? {}),
+    ...(encodedBody
+      ? {
+        "content-type": "application/json",
+        "content-length": String(encodedBody.byteLength),
+      }
+      : {}),
+  };
+  const { statusCode, responseBody } = await new Promise<{ statusCode: number; responseBody: Buffer }>((resolve, reject) => {
     const request = httpRequest({
       socketPath: DOCKER_SOCKET_PATH,
       path,
       method,
-      headers: options.headers,
+      headers,
     }, (response) => {
       const chunks: Buffer[] = [];
       response.on("data", (chunk: Buffer) => chunks.push(chunk));
       response.on("end", () => {
         resolve({
           statusCode: response.statusCode ?? 0,
-          body: Buffer.concat(chunks).toString("utf8"),
+          responseBody: Buffer.concat(chunks),
         });
       });
     });
     request.on("error", reject);
+    if (encodedBody) {
+      request.write(encodedBody);
+    }
     request.end();
   });
   if (statusCode < 200 || statusCode >= 300) {
-    throw new WorkerError(`Docker API ${method} ${apiPath} returned ${statusCode}: ${tail(body, 1000)}`);
+    throw new WorkerError(`Docker API ${method} ${apiPath} returned ${statusCode}: ${tail(responseBody.toString("utf8"), 1000)}`);
   }
-  return { statusCode, body };
+  return { statusCode, body: responseBody };
 }
 
 async function validateWorkerHost(config: WorkerConfig): Promise<void> {
@@ -1682,7 +2917,7 @@ function startLiveEvidencePump(
 
 async function appendEvent(
   config: WorkerConfig,
-  claim: RunClaim,
+  claim: Pick<RunClaim, "attempt">,
   eventType: string,
   payload: JsonObject,
 ): Promise<void> {
@@ -1746,10 +2981,15 @@ async function cloudFetch(
   const text = await response.text();
   const payload = text.trim().length > 0 ? JSON.parse(text) : null;
   if (!response.ok) {
-    throw new WorkerError(
+    const code = isRecord(payload) && typeof payload.code === "string" ? payload.code : null;
+    const detail = isRecord(payload) && isRecord(payload.detail) ? payload.detail as JsonObject : null;
+    throw new CloudApiError(
+      response.status,
+      code,
       isRecord(payload) && typeof payload.message === "string"
         ? payload.message
         : `Cloud API request failed: ${response.status}`,
+      detail,
     );
   }
   return payload;
@@ -1794,6 +3034,22 @@ function workerApiRequestTimeoutMs(config: WorkerConfig): number {
 export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
   const apiUrl = requiredEnv(env.BUCEPHALUS_CLOUD_API_URL, "BUCEPHALUS_CLOUD_API_URL");
   const leaseSeconds = numberEnv(env.BUCEPHALUS_WORKER_LEASE_SECONDS, 30);
+  const secretResolverCommand = optionalCommandJson(
+    env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON,
+    "BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON",
+  );
+  const networkPolicyCommand = optionalCommandJson(
+    env.BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON,
+    "BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON",
+  );
+  const portForwardCommand = optionalCommandJson(
+    env.BUCEPHALUS_WORKER_PORT_FORWARD_CMD_JSON,
+    "BUCEPHALUS_WORKER_PORT_FORWARD_CMD_JSON",
+  );
+  const execCommand = optionalCommandJson(
+    env.BUCEPHALUS_WORKER_EXEC_CMD_JSON,
+    "BUCEPHALUS_WORKER_EXEC_CMD_JSON",
+  );
   return {
     apiUrl: apiUrl.replace(/\/+$/, ""),
     workerId: env.BUCEPHALUS_WORKER_ID ?? `worker-${randomUUID()}`,
@@ -1806,15 +3062,16 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
     dataDir: resolve(env.BUCEPHALUS_CLOUD_DATA_DIR ?? ".data"),
     coreRunnerCommand: env.BUCEPHALUS_CORE_RUNNER_CMD ?? "bucephalus",
     workerToken: requiredEnv(env.BUCEPHALUS_CLOUD_WORKER_TOKEN, "BUCEPHALUS_CLOUD_WORKER_TOKEN"),
-    secretResolverCommand: optionalCommandJson(
-      env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON,
-      "BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON",
-    ),
-    networkPolicyCommand: optionalCommandJson(
-      env.BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON,
-      "BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON",
-    ),
-    capabilities: workerCapabilities(env),
+    secretResolverCommand,
+    networkPolicyCommand,
+    portForwardCommand,
+    execCommand,
+    capabilities: workerCapabilities(env, {
+      secretResolverCommand,
+      networkPolicyCommand,
+      portForwardCommand,
+      execCommand,
+    }),
     minFreeBytes: numberEnv(
       env.BUCEPHALUS_WORKER_MIN_FREE_BYTES ?? env.BUCEPHALUS_MIN_FREE_BYTES,
       20 * 1024 * 1024 * 1024,
@@ -1858,24 +3115,65 @@ async function runJsonCommand(command: string[], input: JsonObject): Promise<unk
   if (!executable) {
     throw new WorkerError("command is empty");
   }
-  const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolvePromise, reject) => {
+  const result = await new Promise<{
+    exitCode: number;
+    stdout: string;
+    stderr: string;
+    stdoutExceeded: boolean;
+    stderrExceeded: boolean;
+  }>((resolvePromise, reject) => {
     const child = spawn(executable, args, {
       stdio: ["pipe", "pipe", "pipe"],
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let stdoutExceeded = false;
+    let stderrExceeded = false;
+    let killedForOutputLimit = false;
+    const killForOutputLimit = () => {
+      if (!killedForOutputLimit) {
+        killedForOutputLimit = true;
+        child.kill("SIGKILL");
+      }
+    };
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdoutBytes += chunk.byteLength;
+      if (stdoutBytes <= WORKER_JSON_COMMAND_MAX_STDOUT_BYTES) {
+        stdout.push(chunk);
+        return;
+      }
+      stdoutExceeded = true;
+      killForOutputLimit();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrBytes += chunk.byteLength;
+      if (stderrBytes <= WORKER_JSON_COMMAND_MAX_STDERR_BYTES) {
+        stderr.push(chunk);
+        return;
+      }
+      stderrExceeded = true;
+      killForOutputLimit();
+    });
     child.on("error", reject);
     child.on("close", (code) => {
       resolvePromise({
         exitCode: code ?? 1,
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
+        stdoutExceeded,
+        stderrExceeded,
       });
     });
     child.stdin.end(`${JSON.stringify(input)}\n`);
   });
+  if (result.stdoutExceeded) {
+    throw new WorkerError(`${executable} command stdout exceeded ${WORKER_JSON_COMMAND_MAX_STDOUT_BYTES} bytes; worker control commands must return compact JSON`);
+  }
+  if (result.stderrExceeded) {
+    throw new WorkerError(`${executable} command stderr exceeded ${WORKER_JSON_COMMAND_MAX_STDERR_BYTES} bytes`);
+  }
   if (result.exitCode !== 0) {
     throw new WorkerError(`${executable} exited ${result.exitCode}: ${tail(result.stderr || result.stdout, 1000)}`);
   }
@@ -1926,14 +3224,35 @@ function requiredEnv(value: string | undefined, name: string): string {
   return value.trim();
 }
 
-function workerCapabilities(env: NodeJS.ProcessEnv): WorkerCapabilities {
+function workerCapabilities(
+  env: NodeJS.ProcessEnv,
+  commands: Pick<WorkerConfig, "secretResolverCommand" | "networkPolicyCommand" | "portForwardCommand" | "execCommand">,
+): WorkerCapabilities {
   const resources = csvEnv(env.BUCEPHALUS_WORKER_RESOURCES, ["core_runner", "docker_daemon", "registry_pull"]);
-  if (env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON && !resources.includes("secret_resolver")) {
-    resources.push("secret_resolver");
-  }
-  if (env.BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON && !resources.includes("network_perimeter")) {
-    resources.push("network_perimeter");
-  }
+  addCommandBackedCapability(
+    resources,
+    "secret_resolver",
+    commands.secretResolverCommand,
+    "BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON",
+  );
+  addCommandBackedCapability(
+    resources,
+    "network_perimeter",
+    commands.networkPolicyCommand,
+    "BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON",
+  );
+  addCommandBackedCapability(
+    resources,
+    "runtime_port_forward",
+    commands.portForwardCommand,
+    "BUCEPHALUS_WORKER_PORT_FORWARD_CMD_JSON",
+  );
+  addCommandBackedCapability(
+    resources,
+    "runtime_exec",
+    commands.execCommand,
+    "BUCEPHALUS_WORKER_EXEC_CMD_JSON",
+  );
   return {
     executors: csvEnv(env.BUCEPHALUS_WORKER_EXECUTORS, ["runner-docker"]),
     resources,
@@ -1943,6 +3262,24 @@ function workerCapabilities(env: NodeJS.ProcessEnv): WorkerCapabilities {
     disk_mb: numberEnv(env.BUCEPHALUS_WORKER_DISK_MB, Math.floor(numberEnv(env.BUCEPHALUS_WORKER_MIN_FREE_BYTES ?? env.BUCEPHALUS_MIN_FREE_BYTES, 20 * 1024 * 1024 * 1024) / 1024 / 1024)),
     isolation: csvEnv(env.BUCEPHALUS_WORKER_ISOLATION, ["reusable_vm"]),
   };
+}
+
+function addCommandBackedCapability(
+  resources: string[],
+  resource: string,
+  command: string[] | null,
+  commandEnvName: string,
+): void {
+  const declared = resources.includes(resource);
+  if (command) {
+    if (!declared) {
+      resources.push(resource);
+    }
+    return;
+  }
+  if (declared) {
+    throw new WorkerError(`${resource} requires ${commandEnvName} to be configured`);
+  }
 }
 
 function normalizeArch(value: string): string {
@@ -2007,6 +3344,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function objectAtRecord(value: Record<string, unknown>, key: string): JsonObject {
+  const child = value[key];
+  return isRecord(child) ? child as JsonObject : {};
+}
+
+function stringAtRecord(value: Record<string, unknown>, key: string): string | null {
+  const child = value[key];
+  return typeof child === "string" && child.length > 0 ? child : null;
+}
+
+function numberAtRecord(value: Record<string, unknown>, key: string): number | null {
+  const child = value[key];
+  if (typeof child === "number" && Number.isFinite(child)) {
+    return child;
+  }
+  if (typeof child === "string" && child.trim().length > 0) {
+    const parsed = Number.parseInt(child, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function stringArrayAtRecord(value: Record<string, unknown>, key: string): string[] {
+  const child = value[key];
+  if (!Array.isArray(child)) {
+    return [];
+  }
+  return child.filter((item): item is string => typeof item === "string" && item.length > 0);
+}
+
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
 }
@@ -2059,6 +3426,47 @@ interface RuntimeNetworkPerimeter extends JsonObject {
   task_sandbox: RuntimeNetworkMode;
   agent: RuntimeNetworkMode;
   egress_hosts: string[];
+}
+
+interface RuntimePortForwardRequest extends JsonObject {
+  access_request_id: string;
+  run_id: string;
+  kind: "port_forward";
+  status: string;
+  resource_kind: string;
+  resource_name: string;
+  protocol: string;
+  target_port: number;
+  local_port: number | null;
+  runner_instance_id: string | null;
+  attempt_id: string | null;
+  requester: string | null;
+  reason: string | null;
+  connection: JsonObject;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface RuntimeExecRequest extends JsonObject {
+  access_request_id: string;
+  run_id: string;
+  kind: "exec";
+  status: string;
+  resource_kind: string;
+  resource_name: string;
+  protocol: string;
+  target_port: null;
+  local_port: null;
+  command: string[];
+  runner_instance_id: string | null;
+  attempt_id: string | null;
+  requester: string | null;
+  reason: string | null;
+  connection: JsonObject;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 interface WorkerCapabilities {

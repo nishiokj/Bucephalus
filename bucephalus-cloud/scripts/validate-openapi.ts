@@ -91,6 +91,7 @@ function validateDocumentContracts(absPath: string, document: unknown): void {
 
 function validateRunsRuntimeContracts(document: Record<string, unknown>): void {
   assertCloudRunIdContract(document);
+  assertCreateRunRuntimeOptionsContract(document);
 
   for (const [path, method, operationId] of [
     ["/v1/runs/{run_id}/runtime/events", "get", "listRunRuntimeEvents"],
@@ -113,6 +114,7 @@ function validateRunsRuntimeContracts(document: Record<string, unknown>): void {
     ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/drain", "post", "drainRunRuntimeRunnerInstance"],
     ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/uncordon", "post", "uncordonRunRuntimeRunnerInstance"],
     ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/cancel", "post", "cancelRunRuntimeAccessResource"],
+    ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/complete", "post", "completeRunRuntimePortForward"],
     ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/port-forward", "post", "createRunRuntimeResourcePortForward"],
     ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/exec", "post", "createRunRuntimeResourceExec"],
     ["/v1/worker/run-attempts/{attempt_id}/runtime/resources/PortForward", "get", "listWorkerRunAttemptPortForwardResources"],
@@ -123,6 +125,7 @@ function validateRunsRuntimeContracts(document: Record<string, unknown>): void {
   ] as const) {
     assertOperationId(document, path, method, operationId);
   }
+  assertRuntimeMutationRequestPreconditionContracts(document);
   assertRuntimeAccessCreateResponseContracts(document);
   assertWorkerRuntimeResourceResponseContracts(document);
   assertWorkerExpireLeasesResponseContract(document);
@@ -163,7 +166,7 @@ function validateRunsRuntimeContracts(document: Record<string, unknown>): void {
     "200",
     "#/components/schemas/RuntimeResourceDescribe",
   );
-  for (const action of ["cordon", "drain", "uncordon", "cancel"]) {
+  for (const action of ["cordon", "drain", "uncordon", "cancel", "complete"]) {
     assertOperationResponseHasExactJsonRef(
       document,
       `/v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/${action}`,
@@ -249,9 +252,26 @@ function validateRunsRuntimeContracts(document: Record<string, unknown>): void {
     }
   }
   assertOperationParameter(document, "/v1/runs/{run_id}/runtime/resources/watch", "get", "known_resource");
+  assertOperationParameter(document, "/v1/runs/{run_id}/runtime/resources/watch", "get", "allow_bookmarks");
+  assertOperationParameterDescriptionIncludes(document, "/v1/runs/{run_id}/runtime/resources/watch", "get", "allow_bookmarks", "BOOKMARK");
   for (const parameter of ["limit", "after_row_seq", "event_type", "source", "resource_kind", "resource_name", "trial_id", "task_id"]) {
     assertOperationParameter(document, "/v1/runs/{run_id}/runtime/events", "get", parameter);
     assertOperationParameter(document, "/v1/runs/{run_id}/runtime/resources/{kind}/{name}/events", "get", parameter);
+  }
+  for (const path of [
+    "/v1/runs/{run_id}/runtime/events",
+    "/v1/runs/{run_id}/runtime/resources/{kind}/{name}/events",
+  ]) {
+    assertOperationParameter(document, path, "get", "continue");
+    assertOperationResponseHasRef(document, path, "get", "400", "./common.yaml#/components/responses/BadRequest");
+    assertOperationParameterDescriptionIncludes(document, path, "get", "after_row_seq", "rejects requests that provide both");
+    assertOperationParameterDescriptionIncludes(document, path, "get", "continue", "metadata.resourceVersion");
+    assertOperationParameterDescriptionIncludes(document, path, "get", "continue", "event-row-seq:<row_seq>");
+    assertOperationParameterDescriptionIncludes(document, path, "get", "event_type", "runtime.api_resources.read");
+    assertOperationParameterDescriptionIncludes(document, path, "get", "event_type", "runtime.api_resources.read.failed");
+    assertOperationParameterDescriptionIncludes(document, path, "get", "event_type", "runtime.inspect.bundle.read");
+    assertOperationParameterDescriptionIncludes(document, path, "get", "event_type", "runtime.inspect.bundle.read.failed");
+    assertOperationParameterDescriptionIncludes(document, path, "get", "event_type", "raw log/content reads");
   }
   for (const parameter of ["stream", "tail_lines"]) {
     assertOperationParameter(document, "/v1/runs/{run_id}/runtime/resources/{kind}/{name}/logs", "get", parameter);
@@ -261,6 +281,19 @@ function validateRunsRuntimeContracts(document: Record<string, unknown>): void {
   const operationReviewDescription = typeof operationReview.description === "string" ? operationReview.description : "";
   if (!operationReviewDescription.includes("logs%2Fstdout")) {
     throw new Error("runs.yaml runtime operation review must document percent-encoded slash-qualified operation labels");
+  }
+  if (!operationReviewDescription.includes("status-subresource wait checks")) {
+    throw new Error("runs.yaml runtime operation review must document wait as a status-subresource operation label");
+  }
+  const deleteRuntimeResource = operationObject(document, "/v1/runs/{run_id}/runtime/resources/{kind}/{name}", "delete");
+  const deleteKindParameter = Array.isArray(deleteRuntimeResource.parameters)
+    ? deleteRuntimeResource.parameters.filter(isRecord).find((parameter) => parameter.name === "kind")
+    : null;
+  assertRecord(deleteKindParameter, "paths./v1/runs/{run_id}/runtime/resources/{kind}/{name}.delete.parameters.kind");
+  const deleteKindSchema = deleteKindParameter.schema;
+  assertRecord(deleteKindSchema, "paths./v1/runs/{run_id}/runtime/resources/{kind}/{name}.delete.parameters.kind.schema");
+  if (Array.isArray(deleteKindSchema.enum)) {
+    throw new Error("runs.yaml runtime DELETE kind parameter must accept runtime API aliases; do not constrain it to canonical PortForward/Exec enums");
   }
   for (const header of [
     "X-Bucephalus-Run-Id",
@@ -295,48 +328,214 @@ function validateRunsRuntimeContracts(document: Record<string, unknown>): void {
   assertSchemaRequired(document, "RuntimeEvent", ["source", "core_run_id", "trial_id", "schedule_idx", "attempt", "row_seq", "slot_commit_id", "variant_id", "task_id", "repl_idx", "seq", "event_type", "ts", "resource_refs", "payload", "row"]);
   assertSchemaRequired(document, "RuntimeResourceEventList", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids", "resource", "event_filter", "metadata", "events"]);
   assertSchemaRequired(document, "RuntimeResourceHealth", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids", "summary", "resources"]);
-  assertSchemaRequired(document, "RuntimeResourceHealthSummary", ["total", "ready", "degraded", "problem", "unknown", "access_targets", "reachable_access_targets", "port_forward_ready", "exec_ready", "actions_available"]);
+  assertSchemaRequired(document, "RuntimeResourceHealthSummary", [
+    "total",
+    "ready",
+    "degraded",
+    "problem",
+    "unknown",
+    "access_targets",
+    "reachable_access_targets",
+    "port_forward_ready",
+    "exec_ready",
+    "actions_available",
+    "observed_resources",
+    "observed_current",
+    "observed_stale",
+    "observed_unknown",
+  ]);
   assertSchemaRequired(document, "RuntimeResourceHealthRow", ["resource", "resource_ref", "health", "phase", "ready", "reason", "message", "condition_summary", "degraded_conditions", "actions", "access", "access_summary", "source", "updated_at", "resource_version"]);
+  assertSchemaPropertiesPresent(document, "RuntimeResourceAccessStatus", ["reachable", "reason", "port_forward", "exec", "runner_instance_id", "runner_instance_status", "attempt_id", "worker_id"]);
+  const runtimeResourceHealthRow = componentSchema(document, "RuntimeResourceHealthRow");
+  const healthRowAccess = schemaProperty(runtimeResourceHealthRow, "access", "RuntimeResourceHealthRow");
+  if ((healthRowAccess as Record<string, unknown>).$ref !== "#/components/schemas/RuntimeResourceAccessStatus") {
+    throw new Error("RuntimeResourceHealthRow.access must use RuntimeResourceAccessStatus");
+  }
   assertSchemaRequired(document, "RuntimeResourceCondition", ["type", "status", "reason", "message"]);
-  assertSchemaRequired(document, "RuntimeResourceWatchList", ["apiVersion", "kind", "resource_versions", "events", "resource_inventory"]);
-  assertSchemaRequired(document, "RuntimeResourceDescribe", ["apiVersion", "kind", "cloud_run_id", "core_run_ids", "resource", "operations", "related_resources", "event_list"]);
+  assertSchemaRequired(document, "RuntimeResourceWatchList", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids", "resource_versions", "events", "resource_inventory"]);
+  const runtimeResourceWatchList = componentSchema(document, "RuntimeResourceWatchList");
+  assertSchemaPropertyRef(runtimeResourceWatchList, "cloud_run_id", "RuntimeResourceWatchList", "#/components/schemas/CloudRunId");
+  const watchGeneratedAt = schemaProperty(runtimeResourceWatchList, "generated_at", "RuntimeResourceWatchList");
+  if (watchGeneratedAt.type !== "string" || watchGeneratedAt.format !== "date-time") {
+    throw new Error("RuntimeResourceWatchList.generated_at must be a date-time string");
+  }
+  const watchCoreRunIds = schemaProperty(runtimeResourceWatchList, "core_run_ids", "RuntimeResourceWatchList");
+  if (watchCoreRunIds.type !== "array") {
+    throw new Error("RuntimeResourceWatchList.core_run_ids must be an array");
+  }
+  assertRecord(watchCoreRunIds.items, "RuntimeResourceWatchList.core_run_ids.items");
+  if (watchCoreRunIds.items.type !== "string") {
+    throw new Error("RuntimeResourceWatchList.core_run_ids items must be strings");
+  }
+  const watchEvents = schemaProperty(runtimeResourceWatchList, "events", "RuntimeResourceWatchList");
+  if (watchEvents.type !== "array") {
+    throw new Error("RuntimeResourceWatchList.events must be an array");
+  }
+  assertRecord(watchEvents.items, "RuntimeResourceWatchList.events.items");
+  if (watchEvents.items.$ref !== "#/components/schemas/RuntimeResourceWatchEvent") {
+    throw new Error("RuntimeResourceWatchList.events.items must use RuntimeResourceWatchEvent");
+  }
+  assertSchemaPropertyRef(runtimeResourceWatchList, "resource_inventory", "RuntimeResourceWatchList", "#/components/schemas/RuntimeResourceList");
+  assertSchemaRequired(document, "RuntimeResourceWatchEvent", ["type", "resource_ref"]);
+  const runtimeResourceWatchEvent = componentSchema(document, "RuntimeResourceWatchEvent");
+  const watchEventType = schemaProperty(runtimeResourceWatchEvent, "type", "RuntimeResourceWatchEvent");
+  const watchEventTypeEnum = watchEventType.enum;
+  if (!Array.isArray(watchEventTypeEnum) || !["ADDED", "MODIFIED", "DELETED", "BOOKMARK"].every((type) => watchEventTypeEnum.includes(type))) {
+    throw new Error("RuntimeResourceWatchEvent.type must enumerate ADDED, MODIFIED, DELETED, and BOOKMARK");
+  }
+  assertSchemaPropertyRef(runtimeResourceWatchEvent, "resource_ref", "RuntimeResourceWatchEvent", "#/components/schemas/RuntimeResourceWatchRef");
+  for (const propertyName of ["resource_version", "previous_resource_version"]) {
+    const property = schemaProperty(runtimeResourceWatchEvent, propertyName, "RuntimeResourceWatchEvent");
+    if (property.type !== "string") {
+      throw new Error(`RuntimeResourceWatchEvent.${propertyName} must be a string cursor`);
+    }
+  }
+  assertSchemaPropertyRef(runtimeResourceWatchEvent, "resource", "RuntimeResourceWatchEvent", "#/components/schemas/RuntimeResource");
+  assertSchemaRequired(document, "RuntimeResourceWatchRef", ["apiVersion", "kind", "name"]);
+  assertSchemaRequired(document, "RuntimeResourceDescribe", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids", "resource", "operations", "related_resources", "event_list"]);
   const runtimeResourceDescribe = componentSchema(document, "RuntimeResourceDescribe");
+  assertSchemaPropertyRef(runtimeResourceDescribe, "cloud_run_id", "RuntimeResourceDescribe", "#/components/schemas/CloudRunId");
+  const describeGeneratedAt = schemaProperty(runtimeResourceDescribe, "generated_at", "RuntimeResourceDescribe");
+  if (describeGeneratedAt.type !== "string" || describeGeneratedAt.format !== "date-time") {
+    throw new Error("RuntimeResourceDescribe.generated_at must be a date-time string");
+  }
+  const describeCoreRunIds = schemaProperty(runtimeResourceDescribe, "core_run_ids", "RuntimeResourceDescribe");
+  if (describeCoreRunIds.type !== "array") {
+    throw new Error("RuntimeResourceDescribe.core_run_ids must be an array");
+  }
+  assertRecord(describeCoreRunIds.items, "RuntimeResourceDescribe.core_run_ids.items");
+  if (describeCoreRunIds.items.type !== "string") {
+    throw new Error("RuntimeResourceDescribe.core_run_ids items must be strings");
+  }
   const describeEventList = schemaProperty(runtimeResourceDescribe, "event_list", "RuntimeResourceDescribe");
   if ((describeEventList as Record<string, unknown>).$ref !== "#/components/schemas/RuntimeResourceEventList") {
     throw new Error("RuntimeResourceDescribe.event_list must use RuntimeResourceEventList");
   }
-  assertSchemaRequired(document, "RuntimeResourceOperation", ["purpose", "command", "supported", "reason", "message", "verb", "subresource", "action", "requires_active_run"]);
-  assertSchemaRequired(document, "RuntimeResourceOperationReview", ["apiVersion", "kind", "cloud_run_id", "resource_ref", "resource_version", "resource_generation", "observed_generation", "operation", "matched_operation", "supported", "reason", "message", "command", "verb", "subresource", "action", "requires_active_run"]);
-  assertSchemaRequired(document, "RuntimeResourceStatus", ["resource_ref", "generation", "observedGeneration", "resourceVersion", "phase", "reason", "message", "conditions", "actions", "status", "audit"]);
+  assertSchemaRequired(document, "RuntimeResourceOperation", ["purpose", "command", "supported", "reason", "message", "verb", "subresource", "action", "requires_running_run"]);
+  assertSchemaRequired(document, "RuntimeResourceOperationReview", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids", "resource_ref", "resource_version", "resource_generation", "observed_generation", "operation", "matched_operation", "supported", "reason", "message", "command", "verb", "subresource", "action", "requires_running_run"]);
+  const runtimeResourceOperationReview = componentSchema(document, "RuntimeResourceOperationReview");
+  assertSchemaPropertyRef(runtimeResourceOperationReview, "cloud_run_id", "RuntimeResourceOperationReview", "#/components/schemas/CloudRunId");
+  const operationReviewGeneratedAt = schemaProperty(runtimeResourceOperationReview, "generated_at", "RuntimeResourceOperationReview");
+  if (operationReviewGeneratedAt.type !== "string" || operationReviewGeneratedAt.format !== "date-time") {
+    throw new Error("RuntimeResourceOperationReview.generated_at must be a date-time string");
+  }
+  const operationReviewCoreRunIds = schemaProperty(runtimeResourceOperationReview, "core_run_ids", "RuntimeResourceOperationReview");
+  if (operationReviewCoreRunIds.type !== "array") {
+    throw new Error("RuntimeResourceOperationReview.core_run_ids must be an array");
+  }
+  assertRecord(operationReviewCoreRunIds.items, "RuntimeResourceOperationReview.core_run_ids.items");
+  if (operationReviewCoreRunIds.items.type !== "string") {
+    throw new Error("RuntimeResourceOperationReview.core_run_ids items must be strings");
+  }
+  assertSchemaPropertyRef(runtimeResourceOperationReview, "resource_ref", "RuntimeResourceOperationReview", "#/components/schemas/RuntimeResourceWatchRef");
+  assertSchemaRequired(document, "RuntimeResourceStatus", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids", "resource_ref", "generation", "observedGeneration", "resourceVersion", "phase", "reason", "message", "conditions", "actions", "status", "audit"]);
+  assertRuntimeResourceStatusLifecycleFields(document);
   assertSchemaRequired(document, "RuntimeResourceMetrics", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids", "resource_ref", "resource_version", "phase", "summary", "metrics"]);
   assertSchemaRequired(document, "RuntimeResourceMetricsSummary", ["metrics_total", "lifecycle_metrics", "condition_metrics", "access_metrics", "event_metrics", "numeric_spec_metrics", "numeric_status_metrics", "events_total"]);
   assertSchemaRequired(document, "RuntimeResourceMetric", ["name", "value", "unit", "source", "description", "labels"]);
   assertSchemaRequired(document, "RuntimeResourceMetricsList", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids", "metadata", "summary", "resources"]);
   assertSchemaRequired(document, "RuntimeInspectBundle", ["apiVersion", "kind", "cloud_run_id", "generated_at", "resource_filter", "api_resources", "resource_inventory", "resource_health", "resource_metrics", "event_list", "log_refs"]);
   const runtimeInspectBundle = componentSchema(document, "RuntimeInspectBundle");
-  const inspectEventList = schemaProperty(runtimeInspectBundle, "event_list", "RuntimeInspectBundle");
-  if ((inspectEventList as Record<string, unknown>).$ref !== "#/components/schemas/RuntimeEventList") {
-    throw new Error("RuntimeInspectBundle.event_list must use RuntimeEventList");
+  assertSchemaPropertyRef(runtimeInspectBundle, "resource_filter", "RuntimeInspectBundle", "#/components/schemas/RuntimeInspectBundleFilter");
+  assertSchemaPropertyRef(runtimeInspectBundle, "api_resources", "RuntimeInspectBundle", "#/components/schemas/RuntimeApiResourceList");
+  assertSchemaPropertyRef(runtimeInspectBundle, "resource_inventory", "RuntimeInspectBundle", "#/components/schemas/RuntimeResourceList");
+  assertSchemaPropertyRef(runtimeInspectBundle, "resource_health", "RuntimeInspectBundle", "#/components/schemas/RuntimeResourceHealth");
+  assertSchemaPropertyRef(runtimeInspectBundle, "resource_metrics", "RuntimeInspectBundle", "#/components/schemas/RuntimeResourceMetricsList");
+  assertSchemaPropertyRef(runtimeInspectBundle, "event_list", "RuntimeInspectBundle", "#/components/schemas/RuntimeEventList");
+  const inspectLogRefs = schemaProperty(runtimeInspectBundle, "log_refs", "RuntimeInspectBundle");
+  if (inspectLogRefs.type !== "array") {
+    throw new Error("RuntimeInspectBundle.log_refs must be an array");
   }
+  assertRecord(inspectLogRefs.items, "RuntimeInspectBundle.log_refs.items");
+  assertSchemaRequiredFields(inspectLogRefs.items, "RuntimeInspectBundle.log_refs.items", ["resource", "streams", "urls"]);
+  const inspectLogRefResource = schemaProperty(inspectLogRefs.items, "resource", "RuntimeInspectBundle.log_refs.items");
+  assertSchemaRequiredFields(inspectLogRefResource, "RuntimeInspectBundle.log_refs.items.resource", ["apiVersion", "kind", "name"]);
+  const inspectLogRefStreams = schemaProperty(inspectLogRefs.items, "streams", "RuntimeInspectBundle.log_refs.items");
+  assertRecord(inspectLogRefStreams.items, "RuntimeInspectBundle.log_refs.items.streams.items");
+  if (!Array.isArray(inspectLogRefStreams.items.enum) || !inspectLogRefStreams.items.enum.includes("stdout") || !inspectLogRefStreams.items.enum.includes("stderr")) {
+    throw new Error("RuntimeInspectBundle.log_refs.items.streams must enumerate stdout and stderr");
+  }
+  const inspectLogRefUrls = schemaProperty(inspectLogRefs.items, "urls", "RuntimeInspectBundle.log_refs.items");
+  assertSchemaRequiredFields(inspectLogRefUrls, "RuntimeInspectBundle.log_refs.items.urls", ["stdout", "stderr"]);
   assertSchemaRequiredFields(
     schemaProperty(componentSchema(document, "RuntimeResourceMetricsList"), "metadata", "RuntimeResourceMetricsList"),
     "RuntimeResourceMetricsList.metadata",
     ["resourceVersion", "continue", "remainingItemCount", "total", "returned"],
   );
   assertSchemaRequired(document, "RuntimeResourceMetricsListSummary", ["resources_total", "resources_returned", "metrics_total", "lifecycle_metrics", "condition_metrics", "access_metrics", "event_metrics", "numeric_spec_metrics", "numeric_status_metrics", "events_total"]);
-  assertSchemaRequired(document, "RuntimeApiResourceList", ["apiVersion", "kind", "cloud_run_id", "resources"]);
-  assertSchemaRequired(document, "RuntimeApiResource", ["verbs", "subresources", "actions", "access", "supports", "pathTemplates", "exampleCommands", "printerColumns", "fieldSelectors", "labelSelectors", "labelSelector"]);
+  assertSchemaRequired(document, "RuntimeApiResourceList", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids", "resources"]);
+  const runtimeApiResourceList = componentSchema(document, "RuntimeApiResourceList");
+  assertSchemaPropertyRef(runtimeApiResourceList, "cloud_run_id", "RuntimeApiResourceList", "#/components/schemas/CloudRunId");
+  const apiResourceListGeneratedAt = schemaProperty(runtimeApiResourceList, "generated_at", "RuntimeApiResourceList");
+  if (apiResourceListGeneratedAt.type !== "string" || apiResourceListGeneratedAt.format !== "date-time") {
+    throw new Error("RuntimeApiResourceList.generated_at must be a date-time string");
+  }
+  const apiResourceListCoreRunIds = schemaProperty(runtimeApiResourceList, "core_run_ids", "RuntimeApiResourceList");
+  if (apiResourceListCoreRunIds.type !== "array") {
+    throw new Error("RuntimeApiResourceList.core_run_ids must be an array");
+  }
+  assertRecord(apiResourceListCoreRunIds.items, "RuntimeApiResourceList.core_run_ids.items");
+  if (apiResourceListCoreRunIds.items.type !== "string") {
+    throw new Error("RuntimeApiResourceList.core_run_ids items must be strings");
+  }
+  assertSchemaRequired(document, "RuntimeApiResource", ["cloud_run_id", "generated_at", "core_run_ids", "verbs", "subresources", "actions", "access", "supports", "pathTemplates", "exampleCommands", "printerColumns", "fieldSelectors", "labelSelectors", "labelSelector"]);
+  const runtimeApiResource = componentSchema(document, "RuntimeApiResource");
+  assertSchemaPropertyRef(runtimeApiResource, "cloud_run_id", "RuntimeApiResource", "#/components/schemas/CloudRunId");
+  const apiResourceGeneratedAt = schemaProperty(runtimeApiResource, "generated_at", "RuntimeApiResource");
+  if (apiResourceGeneratedAt.type !== "string" || apiResourceGeneratedAt.format !== "date-time") {
+    throw new Error("RuntimeApiResource.generated_at must be a date-time string");
+  }
+  const apiResourceCoreRunIds = schemaProperty(runtimeApiResource, "core_run_ids", "RuntimeApiResource");
+  if (apiResourceCoreRunIds.type !== "array") {
+    throw new Error("RuntimeApiResource.core_run_ids must be an array");
+  }
+  assertRecord(apiResourceCoreRunIds.items, "RuntimeApiResource.core_run_ids.items");
+  if (apiResourceCoreRunIds.items.type !== "string") {
+    throw new Error("RuntimeApiResource.core_run_ids items must be strings");
+  }
   assertSchemaRequired(document, "RuntimeApiResourcePathTemplates", ["collection", "resource", "describe", "operationReview", "watch", "subresources"]);
   assertSchemaPropertiesPresent(document, "RuntimeApiResourcePathTemplates", ["create", "delete"]);
   assertSchemaRequired(document, "RuntimeApiResourceExampleCommand", ["purpose", "command"]);
   assertSchemaRequired(document, "RuntimeApiResourcePrinterColumn", ["name", "type", "jsonPath", "description", "priority"]);
-  assertOperationParameter(document, "/v1/runs/{run_id}/runtime/events", "get", "continue");
-  assertOperationParameter(document, "/v1/runs/{run_id}/runtime/resources/{kind}/{name}/events", "get", "continue");
-  assertSchemaRequired(document, "RuntimeInspectBundle", ["api_resources", "resource_inventory", "event_list", "log_refs"]);
+  assertSchemaPropertyDescriptionIncludes(runtimeApiResource, "fieldSelectors", "RuntimeApiResource", "Concrete field selector paths");
+  assertSchemaPropertyDescriptionIncludes(runtimeApiResource, "fieldSelectors", "RuntimeApiResource", "list/watch/inspect endpoints");
+  assertSchemaPropertyDescriptionIncludes(runtimeApiResource, "fieldSelectors", "RuntimeApiResource", "spec.involved_object.kind");
+  assertSchemaPropertyDescriptionIncludes(runtimeApiResource, "fieldSelectors", "RuntimeApiResource", "status.involved_uid");
+  const runtimeEventListMetadata = componentSchema(document, "RuntimeEventListMetadata");
+  assertSchemaPropertyDescriptionIncludes(runtimeEventListMetadata, "resourceVersion", "RuntimeEventListMetadata", "event-row-seq:<row_seq>");
+  assertSchemaPropertyDescriptionIncludes(runtimeEventListMetadata, "resourceVersion", "RuntimeEventListMetadata", "continue");
+  assertSchemaPropertyDescriptionIncludes(runtimeEventListMetadata, "continue", "RuntimeEventListMetadata", "event-row-seq:<row_seq>");
+  assertSchemaPropertyDescriptionIncludes(runtimeEventListMetadata, "after_row_seq", "RuntimeEventListMetadata", "normalizing either");
+  assertSchemaPropertyDescriptionIncludes(runtimeEventListMetadata, "next_after_row_seq", "RuntimeEventListMetadata", "metadata.resourceVersion");
+  const runtimeEvent = componentSchema(document, "RuntimeEvent");
+  assertSchemaPropertyDescriptionIncludes(runtimeEvent, "resource_refs", "RuntimeEvent", "primary involved runtime object");
+  assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "runtime.api_resources.read");
+  assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "runtime.api_resources.read.failed");
+  assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "runtime.inspect.bundle.read");
+  assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "runtime.inspect.bundle.read.failed");
+  assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "Run/<run_id>");
+  assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "inventory and event");
+  assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "log-reference count");
 
   const runtimeResource = componentSchema(document, "RuntimeResource");
   const metadata = schemaProperty(runtimeResource, "metadata", "RuntimeResource");
-  assertSchemaRequiredFields(metadata, "RuntimeResource.metadata", ["name", "labels", "annotations", "ownerReferences"]);
+  assertSchemaRequiredFields(metadata, "RuntimeResource.metadata", ["name", "uid", "generation", "resourceVersion", "labels", "annotations", "ownerReferences"]);
+  const metadataUid = schemaProperty(metadata, "uid", "RuntimeResource.metadata");
+  if (metadataUid.type !== "string" || metadataUid.minLength !== 1) {
+    throw new Error("RuntimeResource.metadata.uid must be a non-empty string");
+  }
+  const metadataGeneration = schemaProperty(metadata, "generation", "RuntimeResource.metadata");
+  if (metadataGeneration.type !== "integer" || metadataGeneration.minimum !== 1) {
+    throw new Error("RuntimeResource.metadata.generation must be an integer with minimum 1");
+  }
+  const metadataResourceVersion = schemaProperty(metadata, "resourceVersion", "RuntimeResource.metadata");
+  if (metadataResourceVersion.type !== "string" || metadataResourceVersion.minLength !== 1) {
+    throw new Error("RuntimeResource.metadata.resourceVersion must be a non-empty string");
+  }
+  assertSchemaPropertyDescriptionIncludes(metadata, "generation", "RuntimeResource.metadata", "desired-state generation");
+  assertSchemaPropertyDescriptionIncludes(metadata, "resourceVersion", "RuntimeResource.metadata", "Opaque Kubernetes-style change token");
+  assertSchemaPropertyDescriptionIncludes(metadata, "creationTimestamp", "RuntimeResource.metadata", "Kubernetes-style creation timestamp");
+  assertSchemaPropertyDescriptionIncludes(metadata, "deletionTimestamp", "RuntimeResource.metadata", "audited delete/cancel");
   const ownerReferences = schemaProperty(metadata, "ownerReferences", "RuntimeResource.metadata");
   assertRecord(ownerReferences.items, "RuntimeResource.metadata.ownerReferences.items");
   assertSchemaRequiredFields(ownerReferences.items, "RuntimeResource.metadata.ownerReferences.items", ["apiVersion", "kind", "name"]);
@@ -351,6 +550,10 @@ function validateRunsRuntimeContracts(document: Record<string, unknown>): void {
     "runner_instance_id",
     "attempt_id",
     "worker_id",
+    "status.involved",
+    "status.involved_kind",
+    "status.involved_name",
+    "status.involved_count",
   ]) {
     if (!statusDescription.includes(requiredText)) {
       throw new Error(`RuntimeResource.status description must document ${requiredText}`);
@@ -359,15 +562,112 @@ function validateRunsRuntimeContracts(document: Record<string, unknown>): void {
 
   assertSchemaAbsent(document, "CreateRuntimePortForwardRequest");
   assertSchemaAbsent(document, "CreateRuntimeExecRequest");
-  assertSchemaRequired(document, "CreateRuntimeResourcePortForwardRequest", ["target_port"]);
-  assertSchemaRequired(document, "CreateRuntimeResourceExecRequest", ["command"]);
-  assertSchemaPropertiesPresent(document, "CreateRuntimeResourcePortForwardRequest", ["resource_version"]);
-  assertSchemaPropertiesPresent(document, "CreateRuntimeResourceExecRequest", ["resource_version"]);
+  assertSchemaRequired(document, "CreateRuntimeResourcePortForwardRequest", ["target_port", "resource_version"]);
+  assertSchemaRequired(document, "CreateRuntimeResourceExecRequest", ["command", "resource_version"]);
   assertSchemaPropertiesAbsent(document, "CreateRuntimeResourcePortForwardRequest", ["resource_kind", "resource_name"]);
   assertSchemaPropertiesAbsent(document, "CreateRuntimeResourceExecRequest", ["resource_kind", "resource_name"]);
   assertSchemaAbsent(document, "RuntimePortForward");
   assertSchemaAbsent(document, "RuntimeExec");
   assertSchemaPropertiesAbsent(document, "CloudRuntimeOptions", ["region", "runtime_region", "placement", "zone", "executor", "cpu"]);
+  const cloudRuntimeOptions = componentSchema(document, "CloudRuntimeOptions");
+  const cloudRuntimeOptionsDescription = typeof cloudRuntimeOptions.description === "string" ? cloudRuntimeOptions.description : "";
+  for (const requiredText of [
+    "does not include region",
+    "runtime_region",
+    "placement",
+    "zone",
+    "executor",
+    "cpu",
+  ]) {
+    if (!cloudRuntimeOptionsDescription.includes(requiredText)) {
+      throw new Error(`CloudRuntimeOptions description must document unsupported hosted Cloud option ${requiredText}`);
+    }
+  }
+}
+
+function assertCreateRunRuntimeOptionsContract(document: Record<string, unknown>): void {
+  const { schema, label } = operationRequestJsonSchema(document, "/v1/runs", "post");
+  const runtimeOptions = schemaProperty(schema, "runtime_options", label);
+  const description = typeof runtimeOptions.description === "string" ? runtimeOptions.description : "";
+  for (const requiredText of [
+    "must not send region",
+    "runtime_region",
+    "placement",
+    "zone",
+    "executor",
+    "cpu",
+    "backend",
+    "cpu_count",
+  ]) {
+    if (!description.includes(requiredText)) {
+      throw new Error(`createRun runtime_options description must document hosted Cloud option contract: ${requiredText}`);
+    }
+  }
+}
+
+function assertRuntimeResourceStatusLifecycleFields(document: Record<string, unknown>): void {
+  const status = componentSchema(document, "RuntimeResourceStatus");
+  assertSchemaPropertyRef(status, "cloud_run_id", "RuntimeResourceStatus", "#/components/schemas/CloudRunId");
+  const generatedAt = schemaProperty(status, "generated_at", "RuntimeResourceStatus");
+  if (generatedAt.type !== "string" || generatedAt.format !== "date-time") {
+    throw new Error("RuntimeResourceStatus.generated_at must be a date-time string");
+  }
+  const coreRunIds = schemaProperty(status, "core_run_ids", "RuntimeResourceStatus");
+  if (coreRunIds.type !== "array") {
+    throw new Error("RuntimeResourceStatus.core_run_ids must be an array");
+  }
+  assertRecord(coreRunIds.items, "RuntimeResourceStatus.core_run_ids.items");
+  if (coreRunIds.items.type !== "string") {
+    throw new Error("RuntimeResourceStatus.core_run_ids items must be strings");
+  }
+  assertSchemaPropertyRef(status, "resource_ref", "RuntimeResourceStatus", "#/components/schemas/RuntimeResourceWatchRef");
+  for (const propertyName of ["generation", "observedGeneration"]) {
+    const property = schemaProperty(status, propertyName, "RuntimeResourceStatus");
+    if (property.type !== "integer" || property.minimum !== 1) {
+      throw new Error(`RuntimeResourceStatus.${propertyName} must be a non-null integer with minimum 1`);
+    }
+  }
+  const resourceVersion = schemaProperty(status, "resourceVersion", "RuntimeResourceStatus");
+  if (resourceVersion.type !== "string" || resourceVersion.minLength !== 1) {
+    throw new Error("RuntimeResourceStatus.resourceVersion must be a non-empty string");
+  }
+  const deletionTimestamp = schemaProperty(status, "deletionTimestamp", "RuntimeResourceStatus");
+  if (!Array.isArray(deletionTimestamp.type) || !deletionTimestamp.type.includes("string") || !deletionTimestamp.type.includes("null")) {
+    throw new Error("RuntimeResourceStatus.deletionTimestamp must stay nullable for non-deleting resources");
+  }
+}
+
+function assertRuntimeMutationRequestPreconditionContracts(document: Record<string, unknown>): void {
+  for (const [path, method, requiredFields] of [
+    ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}", "delete", ["resource_version"]],
+    ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/cordon", "post", ["resource_version"]],
+    ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/drain", "post", ["resource_version"]],
+    ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/uncordon", "post", ["resource_version"]],
+    ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/cancel", "post", ["resource_version"]],
+    ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/complete", "post", ["resource_version"]],
+    ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/port-forward", "post", ["target_port", "resource_version"]],
+    ["/v1/runs/{run_id}/runtime/resources/{kind}/{name}/exec", "post", ["command", "resource_version"]],
+  ] as const) {
+    const { schema, label } = operationRequestJsonSchema(document, path, method);
+    assertSchemaRequiredFields(schema, label, requiredFields);
+    assertRuntimeResourceVersionPreconditionField(schema, label);
+  }
+}
+
+function assertRuntimeResourceVersionPreconditionField(schema: Record<string, unknown>, label: string): void {
+  const resourceVersion = schemaProperty(schema, "resource_version", label);
+  if (resourceVersion.type !== "string") {
+    throw new Error(`${label}.resource_version must be a string`);
+  }
+  if (resourceVersion.minLength !== 1) {
+    throw new Error(`${label}.resource_version must require a non-empty value`);
+  }
+  const description = typeof resourceVersion.description === "string" ? resourceVersion.description : "";
+  for (const requiredText of ["operation review", "Precondition Required", "Conflict"]) {
+    if (!description.includes(requiredText)) {
+      throw new Error(`${label}.resource_version description must include ${requiredText}`);
+    }
+  }
 }
 
 function assertWorkerRuntimeResourceResponseContracts(document: Record<string, unknown>): void {
@@ -533,6 +833,20 @@ function assertOperationParameter(document: Record<string, unknown>, path: strin
   }
 }
 
+function assertOperationParameterDescriptionIncludes(
+  document: Record<string, unknown>,
+  path: string,
+  method: string,
+  parameterName: string,
+  requiredText: string,
+): void {
+  const parameter = operationParameterObject(document, path, method, parameterName);
+  const description = typeof parameter.description === "string" ? parameter.description : "";
+  if (!description.includes(requiredText)) {
+    throw new Error(`runs.yaml ${method.toUpperCase()} ${path} parameter ${parameterName} description must include ${requiredText}`);
+  }
+}
+
 function assertOperationResponseHasRef(
   document: Record<string, unknown>,
   path: string,
@@ -587,6 +901,62 @@ function assertOperationRequestHasRef(
   if (!containsRef(operation.requestBody, expectedRef)) {
     throw new Error(`runs.yaml ${method.toUpperCase()} ${path} request body must reference ${expectedRef}`);
   }
+}
+
+function operationRequestJsonSchema(
+  document: Record<string, unknown>,
+  path: string,
+  method: string,
+): { schema: Record<string, unknown>; label: string } {
+  const operation = operationObject(document, path, method);
+  const label = `paths.${path}.${method}.requestBody.content.application/json.schema`;
+  assertRecord(operation.requestBody, `paths.${path}.${method}.requestBody`);
+  if (operation.requestBody.required !== true) {
+    throw new Error(`runs.yaml ${method.toUpperCase()} ${path} request body must be required`);
+  }
+  assertRecord(operation.requestBody.content, `paths.${path}.${method}.requestBody.content`);
+  const json = operation.requestBody.content["application/json"];
+  assertRecord(json, `paths.${path}.${method}.requestBody.content.application/json`);
+  assertRecord(json.schema, label);
+  return resolveLocalSchema(document, json.schema, label);
+}
+
+function resolveLocalSchema(
+  document: Record<string, unknown>,
+  schema: Record<string, unknown>,
+  label: string,
+): { schema: Record<string, unknown>; label: string } {
+  if (typeof schema.$ref !== "string") {
+    return { schema, label };
+  }
+  if (!schema.$ref.startsWith("#/components/schemas/")) {
+    throw new Error(`${label} must use an inline schema or local component schema ref`);
+  }
+  const schemaName = schema.$ref.slice("#/components/schemas/".length);
+  return { schema: componentSchema(document, schemaName), label: `components.schemas.${schemaName}` };
+}
+
+function operationParameterObject(
+  document: Record<string, unknown>,
+  path: string,
+  method: string,
+  parameterName: string,
+): Record<string, unknown> {
+  const operation = operationObject(document, path, method);
+  const parameters = operation.parameters;
+  if (!Array.isArray(parameters)) {
+    throw new Error(`runs.yaml ${method.toUpperCase()} ${path} must declare parameter ${parameterName}`);
+  }
+  for (const parameter of parameters) {
+    if (!isRecord(parameter)) continue;
+    const resolved = typeof parameter.$ref === "string" && parameter.$ref.startsWith("#/components/parameters/")
+      ? componentParameter(document, parameter.$ref.slice("#/components/parameters/".length))
+      : parameter;
+    if (resolved.name === parameterName) {
+      return resolved;
+    }
+  }
+  throw new Error(`runs.yaml ${method.toUpperCase()} ${path} must declare parameter ${parameterName}`);
 }
 
 function operationObject(document: Record<string, unknown>, path: string, method: string): Record<string, unknown> {
@@ -720,7 +1090,32 @@ function schemaProperty(schema: Record<string, unknown>, propertyName: string, l
   return property;
 }
 
-function assertSchemaRequired(document: Record<string, unknown>, schemaName: string, fields: string[]): void {
+function assertSchemaPropertyDescriptionIncludes(
+  schema: Record<string, unknown>,
+  propertyName: string,
+  label: string,
+  requiredText: string,
+): void {
+  const property = schemaProperty(schema, propertyName, label);
+  const description = typeof property.description === "string" ? property.description : "";
+  if (!description.includes(requiredText)) {
+    throw new Error(`${label}.${propertyName} description must include ${requiredText}`);
+  }
+}
+
+function assertSchemaPropertyRef(
+  schema: Record<string, unknown>,
+  propertyName: string,
+  label: string,
+  expectedRef: string,
+): void {
+  const property = schemaProperty(schema, propertyName, label);
+  if (property.$ref !== expectedRef) {
+    throw new Error(`${label}.${propertyName} must use ${expectedRef}`);
+  }
+}
+
+function assertSchemaRequired(document: Record<string, unknown>, schemaName: string, fields: readonly string[]): void {
   assertSchemaRequiredFields(componentSchema(document, schemaName), `components.schemas.${schemaName}`, fields);
 }
 
@@ -732,7 +1127,7 @@ function assertSchemaAbsent(document: Record<string, unknown>, schemaName: strin
   }
 }
 
-function assertSchemaRequiredFields(schema: Record<string, unknown>, label: string, fields: string[]): void {
+function assertSchemaRequiredFields(schema: Record<string, unknown>, label: string, fields: readonly string[]): void {
   const required = schema.required;
   if (!Array.isArray(required)) {
     throw new Error(`${label} must declare required fields`);

@@ -18,6 +18,8 @@ const RUNTIME_RESOURCE_FIELD_SELECTORS = [
   "metadata.uid",
   "metadata.generation",
   "metadata.resourceVersion",
+  "metadata.creationTimestamp",
+  "metadata.deletionTimestamp",
   "metadata.labels.<key>",
   "metadata.ownerReferences",
   "metadata.ownerReferences.apiVersion",
@@ -45,6 +47,21 @@ const RUNTIME_RESOURCE_FIELD_SELECTORS = [
   "status.<path>",
   "audit.<path>",
 ];
+const RUNTIME_RESOURCE_FIELD_SELECTOR_EXTRAS: Record<string, string[]> = {
+  Event: [
+    "spec.event_type",
+    "spec.source",
+    "spec.row_seq",
+    "spec.involved_object.kind",
+    "spec.involved_object.name",
+    "spec.involved_object.uid",
+    "status.involved",
+    "status.involved_kind",
+    "status.involved_name",
+    "status.involved_uid",
+    "status.involved_count",
+  ],
+};
 const RUNTIME_RESOURCE_BASE_LABEL_SELECTORS = ["bucephalus.dev/run-id"];
 const RUNTIME_RESOURCE_LABEL_SELECTOR_EXTRAS: Record<string, string[]> = {
   Run: ["bucephalus.dev/package-digest"],
@@ -242,12 +259,14 @@ const RUNTIME_RESOURCE_LABEL_SELECTOR_EXTRAS: Record<string, string[]> = {
   PortForward: [
     "bucephalus.dev/runner-instance-id",
     "bucephalus.dev/attempt-id",
+    "bucephalus.dev/worker-id",
     "bucephalus.dev/resource-kind",
     "bucephalus.dev/resource-name",
   ],
   Exec: [
     "bucephalus.dev/runner-instance-id",
     "bucephalus.dev/attempt-id",
+    "bucephalus.dev/worker-id",
     "bucephalus.dev/resource-kind",
     "bucephalus.dev/resource-name",
   ],
@@ -658,7 +677,7 @@ export interface RuntimeResourceWatchList {
 }
 
 export interface RuntimeResourceWatchEvent {
-  type: "ADDED" | "MODIFIED" | "DELETED";
+  type: "ADDED" | "MODIFIED" | "DELETED" | "BOOKMARK";
   resource_ref: RuntimeResourceWatchRef;
   resource_version?: string | undefined;
   previous_resource_version?: string | undefined;
@@ -676,10 +695,15 @@ export interface RuntimeApiResourceList {
   apiVersion: "bucephalus.dev/v1alpha1";
   kind: "RuntimeApiResourceList";
   cloud_run_id: string;
+  generated_at: string;
+  core_run_ids: string[];
   resources: RuntimeApiResourceRecord[];
 }
 
 export interface RuntimeApiResourceRecord {
+  cloud_run_id: string;
+  generated_at: string;
+  core_run_ids: string[];
   group: "bucephalus.dev";
   version: "v1alpha1";
   name: string;
@@ -702,6 +726,10 @@ export interface RuntimeApiResourceRecord {
   labelSelector: true;
   count: number;
   description: string;
+}
+
+export interface RuntimeApiResourcesInput {
+  requester?: string | null | undefined;
 }
 
 export interface RuntimeApiResourceExampleCommand {
@@ -757,12 +785,14 @@ export interface RuntimeInspectBundle {
 
 export interface RuntimeInspectBundleFilter {
   kinds: string[];
+  categories: string[];
   label_selector: string | null;
   field_selector: string | null;
 }
 
 export interface RuntimeInspectBundleInput extends RuntimeResourceFilter {
   eventLimit?: number | undefined;
+  requester?: string | null | undefined;
 }
 
 export interface RuntimeInspectLogRef {
@@ -776,6 +806,7 @@ export interface RuntimeInspectLogRef {
 
 export interface RuntimeResourceFilter {
   kinds?: string[] | undefined;
+  categories?: string[] | undefined;
   labelSelector?: string | null | undefined;
   fieldSelector?: string | null | undefined;
 }
@@ -783,12 +814,15 @@ export interface RuntimeResourceFilter {
 export interface RuntimeResourceListInput extends RuntimeResourceFilter {
   limit?: number | undefined;
   continueToken?: string | null | undefined;
+  requester?: string | null | undefined;
 }
 
 export interface RuntimeResourceWatchInput {
   filter?: RuntimeResourceFilter | undefined;
   resourceVersion?: string | null | undefined;
   knownResourceVersions?: Map<string, string> | undefined;
+  allowBookmarks?: boolean | undefined;
+  requester?: string | null | undefined;
 }
 
 export interface RuntimeEventFilter {
@@ -803,6 +837,7 @@ export interface RuntimeEventFilter {
 export interface RuntimeEventRowsInput extends RuntimeEventFilter {
   limit?: number | undefined;
   afterRowSeq?: number | undefined;
+  continueToken?: string | null | undefined;
 }
 
 export interface RuntimeEventList {
@@ -838,6 +873,7 @@ export interface RuntimeResourceDescribe {
   apiVersion: "bucephalus.dev/v1alpha1";
   kind: "RuntimeResourceDescribe";
   cloud_run_id: string;
+  generated_at: string;
   core_run_ids: string[];
   resource: RuntimeResourceRecord;
   operations: RuntimeResourceOperation[];
@@ -854,13 +890,15 @@ export interface RuntimeResourceOperation {
   verb: string | null;
   subresource: string | null;
   action: string | null;
-  requires_active_run: boolean;
+  requires_running_run: boolean;
 }
 
 export interface RuntimeResourceOperationReview {
   apiVersion: "bucephalus.dev/v1alpha1";
   kind: "RuntimeResourceOperationReview";
   cloud_run_id: string;
+  generated_at: string;
+  core_run_ids: string[];
   resource_ref: RuntimeResourceWatchRef;
   resource_version: string;
   resource_generation: number | null;
@@ -874,7 +912,7 @@ export interface RuntimeResourceOperationReview {
   verb: string | null;
   subresource: string | null;
   action: string | null;
-  requires_active_run: boolean | null;
+  requires_running_run: boolean | null;
 }
 
 export interface RuntimeResourceEventList {
@@ -948,11 +986,13 @@ export interface RuntimeResourceStatus {
   apiVersion: "bucephalus.dev/v1alpha1";
   kind: "RuntimeResourceStatus";
   cloud_run_id: string;
+  generated_at: string;
   core_run_ids: string[];
   resource_ref: RuntimeResourceWatchRef;
-  generation: number | null;
-  observedGeneration: number | null;
-  resourceVersion: string | null;
+  generation: number;
+  observedGeneration: number;
+  resourceVersion: string;
+  deletionTimestamp: string | null;
   phase: string | null;
   reason: string | null;
   message: string | null;
@@ -991,6 +1031,18 @@ export interface RuntimeResourceHealthSummary {
   observed_unknown: number;
 }
 
+export interface RuntimeResourceAccessStatus {
+  [key: string]: JsonValue | undefined;
+  reachable?: boolean;
+  reason?: string;
+  port_forward?: boolean;
+  exec?: boolean;
+  runner_instance_id?: string;
+  runner_instance_status?: string;
+  attempt_id?: string;
+  worker_id?: string;
+}
+
 export interface RuntimeResourceHealthRow {
   resource: string;
   resource_ref: RuntimeResourceWatchRef;
@@ -1003,7 +1055,7 @@ export interface RuntimeResourceHealthRow {
   condition_summary: string | null;
   degraded_conditions: RuntimeResourceCondition[];
   actions: string[];
-  access: JsonObject;
+  access: RuntimeResourceAccessStatus;
   access_summary: string | null;
   source: string | null;
   updated_at: string | null;
@@ -1024,9 +1076,31 @@ export interface RuntimeResourceActionInput {
   reason?: string | null | undefined;
 }
 
+export interface RuntimeResourceLogsInput {
+  kind: string;
+  name: string;
+  stream?: string | null;
+  tailLines?: number | undefined;
+  requester?: string | null | undefined;
+}
+
+export interface RuntimeResourceArtifactContentInput {
+  kind: string;
+  name: string;
+  requester?: string | null | undefined;
+}
+
+export interface RuntimeResourceOperationReviewInput {
+  kind: string;
+  name: string;
+  operation: string;
+  requester?: string | null | undefined;
+}
+
 export interface RuntimeResourceMetricsListInput extends RuntimeResourceFilter {
   limit?: number | undefined;
   continueToken?: string | null | undefined;
+  requester?: string | null | undefined;
 }
 
 export interface RuntimeResourceLogs {
@@ -1049,9 +1123,9 @@ export interface RuntimeResourceRecord {
   kind: string;
   metadata: {
     name: string;
-    uid?: string;
-    generation?: number;
-    resourceVersion?: string;
+    uid: string;
+    generation: number;
+    resourceVersion: string;
     labels: Record<string, string>;
     annotations: Record<string, string>;
     ownerReferences: Array<{
@@ -1060,6 +1134,8 @@ export interface RuntimeResourceRecord {
       name: string;
       uid?: string;
     }>;
+    creationTimestamp?: string;
+    deletionTimestamp?: string;
     created_at?: string;
     updated_at?: string;
   };
@@ -1067,6 +1143,16 @@ export interface RuntimeResourceRecord {
   status: JsonObject;
   audit: JsonObject;
 }
+
+type RuntimeResourceDraft = Omit<RuntimeResourceRecord, "metadata"> & {
+  metadata: Omit<RuntimeResourceRecord["metadata"], "uid" | "generation" | "resourceVersion"> & {
+    uid?: string;
+    generation?: number;
+    resourceVersion?: string;
+  };
+};
+
+type RuntimeResourceReadable = RuntimeResourceRecord | RuntimeResourceDraft;
 
 export interface RuntimeAccessTarget {
   kind: string;
@@ -1657,12 +1743,13 @@ export class RuntimeRepository {
     return rows[0] ? attemptObjectContentRecordFromRow(rows[0]) : null;
   }
 
-  async workerLifecycleEvents(cloudRunId: string, input?: { limit?: number }): Promise<WorkerLifecycleEventRecord[]> {
+  async workerLifecycleEvents(cloudRunId: string, input?: { limit?: number; afterRowSeq?: number | undefined }): Promise<WorkerLifecycleEventRecord[]> {
     const limit = boundedLimit(input?.limit, 200);
     const rows = await this.sql`
       select event_id, seq, event_type, payload, created_at
       from cloud.run_events
       where run_id = ${cloudRunId}
+        and seq > ${input?.afterRowSeq ?? -1}
       order by seq
       limit ${limit}
     `;
@@ -1683,18 +1770,58 @@ export class RuntimeRepository {
   async apiResources(
     cloudRunId: string,
     run: CloudRunRecord,
+    input: RuntimeApiResourcesInput = {},
   ): Promise<RuntimeApiResourceList> {
-    const inventory = await this.resources(cloudRunId, run);
-    return runtimeApiResourceList(cloudRunId, inventory.resources);
+    let apiResources: RuntimeApiResourceList;
+    try {
+      const inventory = await this.resources(cloudRunId, run);
+      apiResources = runtimeApiResourceList(cloudRunId, inventory.resources, inventory.core_run_ids);
+    } catch (error) {
+      await appendRuntimeApiResourcesReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        operation: "api-resources",
+        requester: input.requester,
+        error,
+      });
+      throw error;
+    }
+    await appendRuntimeApiResourcesReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      operation: "api-resources",
+      requester: input.requester,
+      apiResources,
+    });
+    return apiResources;
   }
 
   async apiResource(
     cloudRunId: string,
     run: CloudRunRecord,
     kind: string,
+    input: RuntimeApiResourcesInput = {},
   ): Promise<RuntimeApiResourceRecord> {
-    const inventory = await this.resources(cloudRunId, run);
-    return runtimeApiResourceForKind(cloudRunId, inventory.resources, kind);
+    let apiResource: RuntimeApiResourceRecord;
+    try {
+      const inventory = await this.resources(cloudRunId, run);
+      apiResource = runtimeApiResourceForKind(cloudRunId, inventory.resources, kind, inventory.core_run_ids);
+    } catch (error) {
+      await appendRuntimeApiResourcesReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        operation: "api-resource",
+        requester: input.requester,
+        selectedKind: kind,
+        error,
+      });
+      throw error;
+    }
+    await appendRuntimeApiResourcesReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      operation: "api-resource",
+      requester: input.requester,
+      selectedKind: kind,
+      apiResource,
+    });
+    return apiResource;
   }
 
   runtimeAccessRequestResource(
@@ -1718,50 +1845,67 @@ export class RuntimeRepository {
   ): Promise<RuntimeInspectBundle> {
     const filter = runtimeInspectBundleFilter(input);
     const eventLimit = boundedLimit(input.eventLimit, 250);
-    const [resourceInventory, events] = await Promise.all([
-      this.resources(cloudRunId, run, filter),
-      this.eventRows(cloudRunId, { limit: Math.min(eventLimit + 1, 1000) }),
-    ]);
-    const eventList = runtimeEventListView(cloudRunId, {}, eventLimit, events);
-    const resourceMetricsPage = paginateRuntimeResources(resourceInventory.resources, { limit: 100 });
-    const resourceMetricsInventory: RuntimeResourceList = {
-      ...resourceInventory,
-      metadata: resourceMetricsPage.metadata,
-      resources: resourceMetricsPage.resources,
-    };
-    const resourceMetrics = await Promise.all(resourceMetricsPage.resources
-      .map(async (resource) => {
-        const eventInput = runtimeResourceEventScanFilter(resource, undefined);
-        const eventRows = await this.eventRows(cloudRunId, { limit: RUNTIME_EVENT_RESOURCE_LIMIT, ...eventInput });
-        return runtimeResourceMetricsView(
+    const resourceFilter = runtimeInspectBundleFilterView(filter);
+    let bundle: RuntimeInspectBundle;
+    try {
+      const [resourceInventory, events] = await Promise.all([
+        this.resources(cloudRunId, run, filter),
+        this.eventRows(cloudRunId, { limit: Math.min(eventLimit + 1, 1000) }),
+      ]);
+      const eventList = runtimeEventListView(cloudRunId, {}, eventLimit, events);
+      const resourceMetricsPage = paginateRuntimeResources(resourceInventory.resources, { limit: 100 });
+      const resourceMetricsInventory: RuntimeResourceList = {
+        ...resourceInventory,
+        metadata: resourceMetricsPage.metadata,
+        resources: resourceMetricsPage.resources,
+      };
+      const resourceMetrics = await Promise.all(resourceMetricsPage.resources
+        .map(async (resource) => {
+          const eventInput = runtimeResourceEventScanFilter(resource, undefined);
+          const eventRows = await this.eventRows(cloudRunId, { limit: RUNTIME_EVENT_RESOURCE_LIMIT, ...eventInput });
+          return runtimeResourceMetricsView(
+            cloudRunId,
+            resourceInventory.core_run_ids,
+            resource,
+            runtimeResourceEventsForResource(eventRows, resource),
+          );
+        }));
+      bundle = {
+        apiVersion: RUNTIME_API_VERSION,
+        kind: "RuntimeInspectBundle",
+        cloud_run_id: cloudRunId,
+        generated_at: new Date().toISOString(),
+        resource_filter: resourceFilter,
+        api_resources: runtimeApiResourceList(cloudRunId, resourceInventory.resources, resourceInventory.core_run_ids),
+        resource_inventory: resourceInventory,
+        resource_health: runtimeResourceHealthSummary(resourceInventory),
+        resource_metrics: runtimeResourceMetricsListView(
           cloudRunId,
-          resourceInventory.core_run_ids,
-          resource,
-          runtimeResourceEventsForResource(eventRows, resource),
-        );
-      }));
-    return {
-      apiVersion: RUNTIME_API_VERSION,
-      kind: "RuntimeInspectBundle",
-      cloud_run_id: cloudRunId,
-      generated_at: new Date().toISOString(),
-      resource_filter: {
-        kinds: filter.kinds ?? [],
-        label_selector: filter.labelSelector ?? null,
-        field_selector: filter.fieldSelector ?? null,
-      },
-      api_resources: runtimeApiResourceList(cloudRunId, resourceInventory.resources),
-      resource_inventory: resourceInventory,
-      resource_health: runtimeResourceHealthSummary(resourceInventory),
-      resource_metrics: runtimeResourceMetricsListView(
-        cloudRunId,
-        resourceMetricsInventory,
-        resourceMetrics,
-        resourceInventory.resources.length,
-      ),
-      event_list: eventList,
-      log_refs: runtimeInspectLogRefs(cloudRunId, resourceInventory.resources),
-    };
+          resourceMetricsInventory,
+          resourceMetrics,
+          resourceInventory.resources.length,
+        ),
+        event_list: eventList,
+        log_refs: runtimeInspectLogRefs(cloudRunId, resourceInventory.resources),
+      };
+    } catch (error) {
+      await appendRuntimeInspectBundleAuditEvent(this.sql, {
+        runId: cloudRunId,
+        requester: input.requester,
+        eventLimit,
+        resourceFilter,
+        error,
+      });
+      throw error;
+    }
+    await appendRuntimeInspectBundleAuditEvent(this.sql, {
+      runId: cloudRunId,
+      requester: input.requester,
+      eventLimit,
+      resourceFilter,
+      bundle,
+    });
+    return bundle;
   }
 
   async resources(
@@ -1769,137 +1913,159 @@ export class RuntimeRepository {
     run: CloudRunRecord,
     input: RuntimeResourceListInput = {},
   ): Promise<RuntimeResourceList> {
-    const eventRows = typeof this.eventRows === "function"
-      ? this.eventRows(cloudRunId, { limit: RUNTIME_EVENT_RESOURCE_LIMIT })
-      : Promise.resolve([]);
-    const [coreRunIds, runtimeSnapshots, attempts, provisionRequests, portForwards, execRequests, events] = await Promise.all([
-      this.coreRunIdsForCloudRun(cloudRunId),
-      this.workerRuntimeSnapshots(cloudRunId),
-      this.runAttempts(cloudRunId),
-      this.provisionRequests(cloudRunId),
-      this.listPortForwards(cloudRunId),
-      this.listExecRequests(cloudRunId),
-      eventRows,
-    ]);
-    const accessRequests = [...portForwards, ...execRequests];
-    const runnerPoolIds = runtimeRunnerPoolIds(attempts, provisionRequests);
-    const coreRunRows = typeof this.coreRuns === "function"
-      ? this.coreRuns(coreRunIds)
-      : Promise.resolve([]);
-    const runManifestRows = typeof this.runManifests === "function"
-      ? this.runManifests(coreRunIds)
-      : Promise.resolve([]);
-    const metricDefinitionRows = typeof this.metricDefinitions === "function"
-      ? runManifestRows.then((manifests) => this.metricDefinitions(runtimeManifestExperimentIds(manifests)))
-      : Promise.resolve([]);
-    const trialAttemptRows = typeof this.trialAttempts === "function"
-      ? this.trialAttempts(coreRunIds)
-      : Promise.resolve([]);
-    const attemptObjectRows = typeof this.attemptObjects === "function"
-      ? this.attemptObjects(coreRunIds, runtimeSnapshots)
-      : Promise.resolve(runtimeAttemptObjectsFromSnapshots(runtimeSnapshots));
-    const contractStageRows = typeof this.contractStages === "function"
-      ? this.contractStages(coreRunIds, runtimeSnapshots)
-      : Promise.resolve(runtimeContractStagesFromSnapshots(runtimeSnapshots));
-    const runtimeValueRows = typeof this.runtimeValueRecords === "function"
-      ? this.runtimeValueRecords(coreRunIds, runtimeSnapshots)
-      : Promise.resolve(runtimeValueRecordsFromSnapshots(runtimeSnapshots));
-    const metricObservationRows = typeof this.metricObservations === "function"
-      ? this.metricObservations(coreRunIds, runtimeSnapshots)
-      : Promise.resolve(runtimeMetricObservationsFromTrialResults(runtimeTrialResultsFromSnapshots(runtimeSnapshots)));
-    const performanceSampleRows = typeof this.performanceSamples === "function"
-      ? this.performanceSamples(coreRunIds)
-      : Promise.resolve([]);
-    const runtimeOperationRows = typeof this.runtimeOperations === "function"
-      ? this.runtimeOperations(coreRunIds)
-      : Promise.resolve([]);
-    const slotCommitRows = typeof this.slotCommitRecords === "function"
-      ? this.slotCommitRecords(coreRunIds)
-      : Promise.resolve([]);
-    const pendingCompletionRows = typeof this.pendingTrialCompletions === "function"
-      ? this.pendingTrialCompletions(coreRunIds)
-      : Promise.resolve([]);
-    const variantSnapshotRows = typeof this.variantSnapshots === "function"
-      ? this.variantSnapshots(coreRunIds)
-      : Promise.resolve([]);
-    const evidenceRows = typeof this.evidenceRows === "function"
-      ? this.evidenceRows(coreRunIds)
-      : Promise.resolve([]);
-    const chainStateRows = typeof this.chainStateRows === "function"
-      ? this.chainStateRows(coreRunIds)
-      : Promise.resolve([]);
-    const trialConclusionRows = typeof this.trialConclusionRows === "function"
-      ? this.trialConclusionRows(coreRunIds)
-      : Promise.resolve([]);
-    const lineageVersionRows = typeof this.lineageVersions === "function"
-      ? this.lineageVersions(coreRunIds)
-      : Promise.resolve([]);
-    const lineageHeadRows = typeof this.lineageHeads === "function"
-      ? this.lineageHeads(coreRunIds)
-      : Promise.resolve([]);
-    const [runnerPools, coreRuns, runManifests, metricDefinitions, slots, slotCommits, pendingCompletions, variantSnapshots, evidenceRecords, chainStates, trialConclusions, lineageVersions, lineageHeads, trialAttempts, containers, contractStages, runtimeValues, metricObservations, performanceSamples, runtimeOperations, attemptObjects] = await Promise.all([
-      this.runnerPools(runnerPoolIds),
-      coreRunRows,
-      runManifestRows,
-      metricDefinitionRows,
-      this.scheduleSlots(coreRunIds),
-      slotCommitRows,
-      pendingCompletionRows,
-      variantSnapshotRows,
-      evidenceRows,
-      chainStateRows,
-      trialConclusionRows,
-      lineageVersionRows,
-      lineageHeadRows,
-      trialAttemptRows,
-      this.trialContainers(coreRunIds),
-      contractStageRows,
-      runtimeValueRows,
-      metricObservationRows,
-      performanceSampleRows,
-      runtimeOperationRows,
-      attemptObjectRows,
-    ]);
-    const trials = runtimeTrialRecords(trialAttempts, runtimeSnapshots);
-    const filteredResources = filterRuntimeResources([
-      ...declaredRuntimeResources(run, attempts),
-      ...coreRuns.map((coreRun) => coreRunResource(run, coreRun)),
-      ...runManifests.map((manifest) => runManifestResource(run, manifest)),
-      ...metricDefinitions.map((definition) => metricDefinitionResource(run, definition, runManifests)),
-      ...runnerPools.map((pool) => runnerPoolResource(run, pool, attempts, provisionRequests)),
-      ...runnerInstanceResources(run, attempts),
-      ...attempts.map((attempt) => attemptResource(run, attempt)),
-      ...provisionRequests.map((request) => provisionRequestResource(run, request)),
-      ...trials.map((trial) => trialResource(run, trial, slots, containers, attempts)),
-      ...slots.map((slot) => scheduleSlotResource(run, slot, attempts)),
-      ...slotCommits.map((commit) => slotCommitResource(run, commit)),
-      ...pendingCompletions.map((completion) => pendingTrialCompletionResource(run, completion)),
-      ...variantSnapshots.map((snapshot) => variantSnapshotResource(run, snapshot)),
-      ...evidenceRecords.map((record) => provenanceRowResource(run, "EvidenceRecord", record)),
-      ...chainStates.map((record) => provenanceRowResource(run, "ChainState", record)),
-      ...trialConclusions.map((record) => provenanceRowResource(run, "TrialConclusion", record)),
-      ...lineageVersions.map((version) => lineageVersionResource(run, version, lineageHeads)),
-      ...lineageHeads.map((head) => lineageHeadResource(run, head)),
-      ...containers.map((container) => trialContainerResource(run, container, slots, attempts)),
-      ...contractStages.map((stage) => trialStageResource(run, stage)),
-      ...runtimeValues.map((value) => runtimeValueResource(run, value)),
-      ...metricObservations.map((observation) => metricObservationResource(run, observation)),
-      ...performanceSamples.map((sample) => performanceSampleResource(run, sample)),
-      ...runtimeOperations.map((operation) => runtimeOperationResource(run, operation)),
-      ...attemptObjects.map((object) => trialArtifactResource(run, object)),
-      ...runtimeSnapshots.map((snapshot) => runtimeSnapshotResource(run, snapshot)),
-      ...accessRequests.map((request) => accessRequestResource(run, request)),
-      ...runtimeEventResources(run, events),
-    ], input);
-    const page = paginateRuntimeResources(filteredResources, input);
-    return {
-      apiVersion: RUNTIME_API_VERSION,
-      kind: "RuntimeResourceList",
-      metadata: page.metadata,
-      cloud_run_id: cloudRunId,
-      core_run_ids: coreRunIds,
-      resources: page.resources,
-    };
+    let list: RuntimeResourceList;
+    try {
+      const eventRows = typeof this.eventRows === "function"
+        ? this.eventRows(cloudRunId, { limit: RUNTIME_EVENT_RESOURCE_LIMIT })
+        : Promise.resolve([]);
+      const [coreRunIds, runtimeSnapshots, attempts, provisionRequests, portForwards, execRequests, events] = await Promise.all([
+        this.coreRunIdsForCloudRun(cloudRunId),
+        this.workerRuntimeSnapshots(cloudRunId),
+        this.runAttempts(cloudRunId),
+        this.provisionRequests(cloudRunId),
+        this.listPortForwards(cloudRunId),
+        this.listExecRequests(cloudRunId),
+        eventRows,
+      ]);
+      const accessRequests = [...portForwards, ...execRequests];
+      const runnerPoolIds = runtimeRunnerPoolIds(attempts, provisionRequests);
+      const coreRunRows = typeof this.coreRuns === "function"
+        ? this.coreRuns(coreRunIds)
+        : Promise.resolve([]);
+      const runManifestRows = typeof this.runManifests === "function"
+        ? this.runManifests(coreRunIds)
+        : Promise.resolve([]);
+      const metricDefinitionRows = typeof this.metricDefinitions === "function"
+        ? runManifestRows.then((manifests) => this.metricDefinitions(runtimeManifestExperimentIds(manifests)))
+        : Promise.resolve([]);
+      const trialAttemptRows = typeof this.trialAttempts === "function"
+        ? this.trialAttempts(coreRunIds)
+        : Promise.resolve([]);
+      const attemptObjectRows = typeof this.attemptObjects === "function"
+        ? this.attemptObjects(coreRunIds, runtimeSnapshots)
+        : Promise.resolve(runtimeAttemptObjectsFromSnapshots(runtimeSnapshots));
+      const contractStageRows = typeof this.contractStages === "function"
+        ? this.contractStages(coreRunIds, runtimeSnapshots)
+        : Promise.resolve(runtimeContractStagesFromSnapshots(runtimeSnapshots));
+      const runtimeValueRows = typeof this.runtimeValueRecords === "function"
+        ? this.runtimeValueRecords(coreRunIds, runtimeSnapshots)
+        : Promise.resolve(runtimeValueRecordsFromSnapshots(runtimeSnapshots));
+      const metricObservationRows = typeof this.metricObservations === "function"
+        ? this.metricObservations(coreRunIds, runtimeSnapshots)
+        : Promise.resolve(runtimeMetricObservationsFromTrialResults(runtimeTrialResultsFromSnapshots(runtimeSnapshots)));
+      const performanceSampleRows = typeof this.performanceSamples === "function"
+        ? this.performanceSamples(coreRunIds)
+        : Promise.resolve([]);
+      const runtimeOperationRows = typeof this.runtimeOperations === "function"
+        ? this.runtimeOperations(coreRunIds)
+        : Promise.resolve([]);
+      const slotCommitRows = typeof this.slotCommitRecords === "function"
+        ? this.slotCommitRecords(coreRunIds)
+        : Promise.resolve([]);
+      const pendingCompletionRows = typeof this.pendingTrialCompletions === "function"
+        ? this.pendingTrialCompletions(coreRunIds)
+        : Promise.resolve([]);
+      const variantSnapshotRows = typeof this.variantSnapshots === "function"
+        ? this.variantSnapshots(coreRunIds)
+        : Promise.resolve([]);
+      const evidenceRows = typeof this.evidenceRows === "function"
+        ? this.evidenceRows(coreRunIds)
+        : Promise.resolve([]);
+      const chainStateRows = typeof this.chainStateRows === "function"
+        ? this.chainStateRows(coreRunIds)
+        : Promise.resolve([]);
+      const trialConclusionRows = typeof this.trialConclusionRows === "function"
+        ? this.trialConclusionRows(coreRunIds)
+        : Promise.resolve([]);
+      const lineageVersionRows = typeof this.lineageVersions === "function"
+        ? this.lineageVersions(coreRunIds)
+        : Promise.resolve([]);
+      const lineageHeadRows = typeof this.lineageHeads === "function"
+        ? this.lineageHeads(coreRunIds)
+        : Promise.resolve([]);
+      const [runnerPools, coreRuns, runManifests, metricDefinitions, slots, slotCommits, pendingCompletions, variantSnapshots, evidenceRecords, chainStates, trialConclusions, lineageVersions, lineageHeads, trialAttempts, containers, contractStages, runtimeValues, metricObservations, performanceSamples, runtimeOperations, attemptObjects] = await Promise.all([
+        this.runnerPools(runnerPoolIds),
+        coreRunRows,
+        runManifestRows,
+        metricDefinitionRows,
+        this.scheduleSlots(coreRunIds),
+        slotCommitRows,
+        pendingCompletionRows,
+        variantSnapshotRows,
+        evidenceRows,
+        chainStateRows,
+        trialConclusionRows,
+        lineageVersionRows,
+        lineageHeadRows,
+        trialAttemptRows,
+        this.trialContainers(coreRunIds),
+        contractStageRows,
+        runtimeValueRows,
+        metricObservationRows,
+        performanceSampleRows,
+        runtimeOperationRows,
+        attemptObjectRows,
+      ]);
+      const trials = runtimeTrialRecords(trialAttempts, runtimeSnapshots);
+      const filteredResources = filterRuntimeResources([
+        ...declaredRuntimeResources(run, attempts, events),
+        ...coreRuns.map((coreRun) => coreRunResource(run, coreRun)),
+        ...runManifests.map((manifest) => runManifestResource(run, manifest)),
+        ...metricDefinitions.map((definition) => metricDefinitionResource(run, definition, runManifests)),
+        ...runnerPools.map((pool) => runnerPoolResource(run, pool, attempts, provisionRequests)),
+        ...runnerInstanceResources(run, attempts),
+        ...attempts.map((attempt) => attemptResource(run, attempt)),
+        ...provisionRequests.map((request) => provisionRequestResource(run, request)),
+        ...trials.map((trial) => trialResource(run, trial, slots, containers, attempts)),
+        ...slots.map((slot) => scheduleSlotResource(run, slot, attempts)),
+        ...slotCommits.map((commit) => slotCommitResource(run, commit)),
+        ...pendingCompletions.map((completion) => pendingTrialCompletionResource(run, completion)),
+        ...variantSnapshots.map((snapshot) => variantSnapshotResource(run, snapshot)),
+        ...evidenceRecords.map((record) => provenanceRowResource(run, "EvidenceRecord", record)),
+        ...chainStates.map((record) => provenanceRowResource(run, "ChainState", record)),
+        ...trialConclusions.map((record) => provenanceRowResource(run, "TrialConclusion", record)),
+        ...lineageVersions.map((version) => lineageVersionResource(run, version, lineageHeads)),
+        ...lineageHeads.map((head) => lineageHeadResource(run, head)),
+        ...containers.map((container) => trialContainerResource(run, container, slots, attempts)),
+        ...contractStages.map((stage) => trialStageResource(run, stage)),
+        ...runtimeValues.map((value) => runtimeValueResource(run, value)),
+        ...metricObservations.map((observation) => metricObservationResource(run, observation)),
+        ...performanceSamples.map((sample) => performanceSampleResource(run, sample)),
+        ...runtimeOperations.map((operation) => runtimeOperationResource(run, operation)),
+        ...attemptObjects.map((object) => trialArtifactResource(run, object)),
+        ...runtimeSnapshots.map((snapshot) => runtimeSnapshotResource(run, snapshot)),
+        ...accessRequests.map((request) => accessRequestResource(run, request)),
+        ...runtimeEventResources(run, events),
+      ], input);
+      const page = paginateRuntimeResources(filteredResources, input);
+      list = {
+        apiVersion: RUNTIME_API_VERSION,
+        kind: "RuntimeResourceList",
+        metadata: page.metadata,
+        cloud_run_id: cloudRunId,
+        core_run_ids: coreRunIds,
+        resources: page.resources,
+      };
+    } catch (error) {
+      await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.list.read.failed",
+        operation: "list",
+        requester: input.requester,
+        input,
+        error,
+      });
+      throw error;
+    }
+    await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      eventType: "runtime.resource.list.read",
+      operation: "list",
+      requester: input.requester,
+      input,
+      list,
+    });
+    return list;
   }
 
   async watchResources(
@@ -1907,186 +2073,314 @@ export class RuntimeRepository {
     run: CloudRunRecord,
     input: RuntimeResourceWatchInput = {},
   ): Promise<RuntimeResourceWatchList> {
-    const inventory = await this.resources(cloudRunId, run, input.filter ?? {});
-    const currentListVersion = inventory.metadata.resourceVersion;
-    const known = runtimeResourceKnownVersions(input.knownResourceVersions);
-    const currentVersions: Record<string, string> = {};
-    const currentKeys = new Set<string>();
-    const events: RuntimeResourceWatchEvent[] = [];
+    let watch: RuntimeResourceWatchList;
+    try {
+      const inventory = await this.resources(cloudRunId, run, input.filter ?? {});
+      const currentListVersion = inventory.metadata.resourceVersion;
+      const known = runtimeResourceKnownVersions(input.knownResourceVersions);
+      const currentVersions: Record<string, string> = {};
+      const currentKeys = new Set<string>();
+      const events: RuntimeResourceWatchEvent[] = [];
 
-    for (const resource of inventory.resources) {
-      const key = runtimeResourceWatchKey(resource);
-      const version = resource.metadata.resourceVersion ?? runtimeResourceVersion(resource);
-      currentKeys.add(key);
-      currentVersions[key] = version;
-      if (input.resourceVersion && input.resourceVersion === currentListVersion && known.size === 0) {
-        continue;
-      }
-      const previousVersion = known.get(key);
-      if (!previousVersion) {
-        events.push({
-          type: "ADDED",
-          resource_ref: runtimeResourceWatchRef(resource),
-          resource_version: version,
-          resource,
-        });
-      } else if (previousVersion !== version) {
-        events.push({
-          type: "MODIFIED",
-          resource_ref: runtimeResourceWatchRef(resource),
-          resource_version: version,
-          previous_resource_version: previousVersion,
-          resource,
-        });
-      }
-    }
-
-    if (!(input.resourceVersion && input.resourceVersion === currentListVersion && known.size === 0)) {
-      for (const [key, previousVersion] of known.entries()) {
-        if (currentKeys.has(key)) {
+      for (const resource of inventory.resources) {
+        const key = runtimeResourceWatchKey(resource);
+        const version = resource.metadata.resourceVersion ?? runtimeResourceVersion(resource);
+        currentKeys.add(key);
+        currentVersions[key] = version;
+        if (input.resourceVersion && input.resourceVersion === currentListVersion && known.size === 0) {
           continue;
         }
+        const previousVersion = known.get(key);
+        if (!previousVersion) {
+          events.push({
+            type: "ADDED",
+            resource_ref: runtimeResourceWatchRef(resource),
+            resource_version: version,
+            resource,
+          });
+        } else if (previousVersion !== version) {
+          events.push({
+            type: "MODIFIED",
+            resource_ref: runtimeResourceWatchRef(resource),
+            resource_version: version,
+            previous_resource_version: previousVersion,
+            resource,
+          });
+        }
+      }
+
+      if (!(input.resourceVersion && input.resourceVersion === currentListVersion && known.size === 0)) {
+        for (const [key, previousVersion] of known.entries()) {
+          if (currentKeys.has(key)) {
+            continue;
+          }
+          events.push({
+            type: "DELETED",
+            resource_ref: runtimeResourceWatchRefFromKey(key),
+            previous_resource_version: previousVersion,
+          });
+        }
+      }
+
+      if (input.allowBookmarks && events.length === 0) {
         events.push({
-          type: "DELETED",
-          resource_ref: runtimeResourceWatchRefFromKey(key),
-          previous_resource_version: previousVersion,
+          type: "BOOKMARK",
+          resource_ref: {
+            apiVersion: RUNTIME_API_VERSION,
+            kind: "RuntimeResourceList",
+            name: cloudRunId,
+          },
+          resource_version: currentListVersion,
         });
       }
-    }
 
-    return {
-      apiVersion: RUNTIME_API_VERSION,
-      kind: "RuntimeResourceWatchList",
-      cloud_run_id: cloudRunId,
-      generated_at: new Date().toISOString(),
-      core_run_ids: inventory.core_run_ids,
-      resource_versions: currentVersions,
-      events,
-      resource_inventory: inventory,
-    };
+      watch = {
+        apiVersion: RUNTIME_API_VERSION,
+        kind: "RuntimeResourceWatchList",
+        cloud_run_id: cloudRunId,
+        generated_at: new Date().toISOString(),
+        core_run_ids: inventory.core_run_ids,
+        resource_versions: currentVersions,
+        events,
+        resource_inventory: inventory,
+      };
+    } catch (error) {
+      await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.watch.read.failed",
+        operation: "watch",
+        requester: input.requester,
+        input,
+        error,
+      });
+      throw error;
+    }
+    await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      eventType: "runtime.resource.watch.read",
+      operation: "watch",
+      requester: input.requester,
+      input,
+      watch,
+    });
+    return watch;
   }
 
   async resourceHealth(
     cloudRunId: string,
     run: CloudRunRecord,
-    filter: RuntimeResourceFilter = {},
+    filter: RuntimeResourceFilter & { requester?: string | null | undefined } = {},
   ): Promise<RuntimeResourceHealth> {
-    return runtimeResourceHealthSummary(await this.resources(cloudRunId, run, filter));
+    let health: RuntimeResourceHealth;
+    try {
+      health = runtimeResourceHealthSummary(await this.resources(cloudRunId, run, runtimeResourceFilterOnly(filter)));
+    } catch (error) {
+      await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.health.read.failed",
+        operation: "health",
+        requester: filter.requester,
+        input: filter,
+        error,
+      });
+      throw error;
+    }
+    await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      eventType: "runtime.resource.health.read",
+      operation: "health",
+      requester: filter.requester,
+      input: filter,
+      health,
+    });
+    return health;
   }
 
   async describeResource(
     cloudRunId: string,
     run: CloudRunRecord,
-    input: { kind: string; name: string; eventLimit?: number | undefined },
+    input: { kind: string; name: string; eventLimit?: number | undefined; requester?: string | null | undefined },
   ): Promise<RuntimeResourceDescribe> {
-    const list = await this.resources(cloudRunId, run);
-    const resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
-    if (!resource) {
-      throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
-        kind: input.kind,
-        name: input.name,
+    let described: RuntimeResourceDescribe;
+    try {
+      const list = await this.resources(cloudRunId, run);
+      const resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
+      if (!resource) {
+        throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
+          kind: input.kind,
+          name: input.name,
+        });
+      }
+      const eventLimit = boundedLimit(input.eventLimit, 100);
+      const eventScanLimit = Math.max(eventLimit + 1, RUNTIME_EVENT_RESOURCE_LIMIT);
+      const eventInput: RuntimeEventRowsInput = runtimeResourceEventScanFilter(resource, undefined);
+      const relatedEvents = runtimeResourceEventsForResource(
+        await this.eventRows(cloudRunId, { limit: eventScanLimit, ...eventInput }),
+        resource,
+      );
+      const eventList = runtimeResourceEventListView(
+        cloudRunId,
+        list.core_run_ids,
+        resource,
+        eventInput,
+        eventLimit,
+        relatedEvents,
+      );
+      described = {
+        apiVersion: RUNTIME_API_VERSION,
+        kind: "RuntimeResourceDescribe",
+        cloud_run_id: cloudRunId,
+        generated_at: new Date().toISOString(),
+        core_run_ids: list.core_run_ids,
+        resource,
+        operations: runtimeResourceOperationsForDescribe(cloudRunId, run, list.resources, resource),
+        related_resources: relatedRuntimeResources(list.resources, resource),
+        event_list: eventList,
+      };
+    } catch (error) {
+      await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.describe.read.failed",
+        operation: "describe",
+        requester: input.requester,
+        input,
+        error,
       });
+      throw error;
     }
-    const eventLimit = boundedLimit(input.eventLimit, 100);
-    const eventScanLimit = Math.max(eventLimit + 1, RUNTIME_EVENT_RESOURCE_LIMIT);
-    const eventInput: RuntimeEventRowsInput = runtimeResourceEventScanFilter(resource, undefined);
-    const relatedEvents = runtimeResourceEventsForResource(
-      await this.eventRows(cloudRunId, { limit: eventScanLimit, ...eventInput }),
-      resource,
-    );
-    const eventList = runtimeResourceEventListView(
-      cloudRunId,
-      list.core_run_ids,
-      resource,
-      eventInput,
-      eventLimit,
-      relatedEvents,
-    );
-    return {
-      apiVersion: RUNTIME_API_VERSION,
-      kind: "RuntimeResourceDescribe",
-      cloud_run_id: cloudRunId,
-      core_run_ids: list.core_run_ids,
-      resource,
-      operations: runtimeResourceOperationsForDescribe(cloudRunId, run, list.resources, resource),
-      related_resources: relatedRuntimeResources(list.resources, resource),
-      event_list: eventList,
-    };
+    await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      eventType: "runtime.resource.describe.read",
+      operation: "describe",
+      requester: input.requester,
+      input,
+      resource: described.resource,
+      eventList: described.event_list,
+      relatedResources: described.related_resources.length,
+    });
+    return described;
   }
 
   async reviewResourceOperation(
     cloudRunId: string,
     run: CloudRunRecord,
-    input: { kind: string; name: string; operation: string },
+    input: RuntimeResourceOperationReviewInput,
   ): Promise<RuntimeResourceOperationReview> {
-    const requestedOperation = runtimeResourceOperationKey(input.operation);
-    if (!requestedOperation) {
-      throw new HttpError(400, "runtime_operation_required", "Runtime operation is required", {
+    let review: RuntimeResourceOperationReview;
+    try {
+      const requestedOperation = runtimeResourceOperationKey(input.operation);
+      if (!requestedOperation) {
+        throw new HttpError(400, "runtime_operation_required", "Runtime operation is required", {
+          operation: input.operation,
+        });
+      }
+      const list = await this.resources(cloudRunId, run);
+      const resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
+      if (!resource) {
+        throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
+          kind: input.kind,
+          name: input.name,
+        });
+      }
+      const operations = runtimeResourceOperationsForDescribe(cloudRunId, run, list.resources, resource);
+      const matched = operations.find((operation) => runtimeResourceOperationKey(operation.purpose) === requestedOperation)
+        ?? operations.find((operation) => runtimeResourceOperationMatches(operation.purpose, requestedOperation));
+      const reviewEvidence = runtimeResourceOperationReviewEvidence(resource);
+      if (matched) {
+        review = {
+          apiVersion: RUNTIME_API_VERSION,
+          kind: "RuntimeResourceOperationReview",
+          cloud_run_id: cloudRunId,
+          generated_at: new Date().toISOString(),
+          core_run_ids: list.core_run_ids,
+          resource_ref: runtimeResourceWatchRef(resource),
+          ...reviewEvidence,
+          operation: input.operation,
+          matched_operation: matched.purpose,
+          supported: matched.supported,
+          reason: matched.reason,
+          message: matched.message,
+          command: matched.command,
+          verb: matched.verb,
+          subresource: matched.subresource,
+          action: matched.action,
+          requires_running_run: matched.requires_running_run,
+        };
+      } else {
+        review = {
+          apiVersion: RUNTIME_API_VERSION,
+          kind: "RuntimeResourceOperationReview",
+          cloud_run_id: cloudRunId,
+          generated_at: new Date().toISOString(),
+          core_run_ids: list.core_run_ids,
+          resource_ref: runtimeResourceWatchRef(resource),
+          ...reviewEvidence,
+          operation: input.operation,
+          matched_operation: null,
+          supported: false,
+          reason: "operation_unavailable",
+          message: `${resource.kind}/${resource.metadata.name} does not currently advertise runtime operation ${input.operation}`,
+          command: null,
+          verb: null,
+          subresource: null,
+          action: null,
+          requires_running_run: null,
+        };
+      }
+    } catch (error) {
+      await appendRuntimeOperationReviewAuditEvent(this.sql, {
+        runId: cloudRunId,
+        requester: input.requester,
+        requestedKind: input.kind,
+        requestedName: input.name,
         operation: input.operation,
+        error,
       });
+      throw error;
     }
-    const list = await this.resources(cloudRunId, run);
-    const resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
-    if (!resource) {
-      throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
-        kind: input.kind,
-        name: input.name,
-      });
-    }
-    const matched = runtimeResourceOperationsForDescribe(cloudRunId, run, list.resources, resource)
-      .find((operation) => runtimeResourceOperationMatches(operation.purpose, requestedOperation));
-    const reviewEvidence = runtimeResourceOperationReviewEvidence(resource);
-    if (matched) {
-      return {
-        apiVersion: RUNTIME_API_VERSION,
-        kind: "RuntimeResourceOperationReview",
-        cloud_run_id: cloudRunId,
-        resource_ref: runtimeResourceWatchRef(resource),
-        ...reviewEvidence,
-        operation: input.operation,
-        matched_operation: matched.purpose,
-        supported: matched.supported,
-        reason: matched.reason,
-        message: matched.message,
-        command: matched.command,
-        verb: matched.verb,
-        subresource: matched.subresource,
-        action: matched.action,
-        requires_active_run: matched.requires_active_run,
-      };
-    }
-    return {
-      apiVersion: RUNTIME_API_VERSION,
-      kind: "RuntimeResourceOperationReview",
-      cloud_run_id: cloudRunId,
-      resource_ref: runtimeResourceWatchRef(resource),
-      ...reviewEvidence,
-      operation: input.operation,
-      matched_operation: null,
-      supported: false,
-      reason: "operation_unavailable",
-      message: `${resource.kind}/${resource.metadata.name} does not currently advertise runtime operation ${input.operation}`,
-      command: null,
-      verb: null,
-      subresource: null,
-      action: null,
-      requires_active_run: null,
-    };
+    await appendRuntimeOperationReviewAuditEvent(this.sql, {
+      runId: cloudRunId,
+      requester: input.requester,
+      review,
+    });
+    return review;
   }
 
   async getResource(
     cloudRunId: string,
     run: CloudRunRecord,
-    input: { kind: string; name: string },
+    input: { kind: string; name: string; requester?: string | null | undefined },
   ): Promise<RuntimeResourceRecord> {
-    const list = await this.resources(cloudRunId, run);
-    const resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
-    if (!resource) {
-      throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
-        kind: input.kind,
-        name: input.name,
+    let resource: RuntimeResourceRecord;
+    try {
+      const list = await this.resources(cloudRunId, run);
+      const found = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
+      if (!found) {
+        throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
+          kind: input.kind,
+          name: input.name,
+        });
+      }
+      resource = found;
+    } catch (error) {
+      await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.get.read.failed",
+        operation: "get",
+        requester: input.requester,
+        input,
+        error,
       });
+      throw error;
     }
+    await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      eventType: "runtime.resource.get.read",
+      operation: "get",
+      requester: input.requester,
+      input,
+      resource,
+    });
     return resource;
   }
 
@@ -2098,76 +2392,154 @@ export class RuntimeRepository {
       name: string;
       limit?: number | undefined;
       afterRowSeq?: number | undefined;
+      continueToken?: string | null | undefined;
       filter?: RuntimeEventFilter | undefined;
+      requester?: string | null | undefined;
     },
   ): Promise<RuntimeResourceEventList> {
-    const list = await this.resources(cloudRunId, run);
-    const resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
-    if (!resource) {
-      throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
-        kind: input.kind,
-        name: input.name,
+    let eventList: RuntimeResourceEventList;
+    let resource: RuntimeResourceRecord | undefined;
+    try {
+      const list = await this.resources(cloudRunId, run);
+      resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
+      if (!resource) {
+        throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
+          kind: input.kind,
+          name: input.name,
+        });
+      }
+      const eventLimit = boundedLimit(input.limit, 100);
+      const eventScanLimit = Math.max(eventLimit + 1, RUNTIME_EVENT_RESOURCE_LIMIT);
+      const resourceEventFilter = runtimeResourceEventScanFilter(resource, input.filter);
+      const eventInput = runtimeEventRowsInputWithContinue({
+        afterRowSeq: input.afterRowSeq,
+        continueToken: input.continueToken,
+        ...resourceEventFilter,
       });
+      const relatedEvents = runtimeResourceEventsForResource(
+        await this.eventRows(cloudRunId, {
+          limit: eventScanLimit,
+          ...eventInput,
+        }),
+        resource,
+      );
+      eventList = runtimeResourceEventListView(
+        cloudRunId,
+        list.core_run_ids,
+        resource,
+        eventInput,
+        eventLimit,
+        relatedEvents,
+      );
+    } catch (error) {
+      await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.events.read.failed",
+        operation: "events",
+        requester: input.requester,
+        input,
+        resource,
+        error,
+      });
+      throw error;
     }
-    const eventLimit = boundedLimit(input.limit, 100);
-    const eventScanLimit = Math.max(eventLimit + 1, RUNTIME_EVENT_RESOURCE_LIMIT);
-    const resourceEventFilter = runtimeResourceEventScanFilter(resource, input.filter);
-    const eventInput = {
-      afterRowSeq: input.afterRowSeq,
-      ...resourceEventFilter,
-    };
-    const relatedEvents = runtimeResourceEventsForResource(
-      await this.eventRows(cloudRunId, {
-        limit: eventScanLimit,
-        ...eventInput,
-      }),
+    await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      eventType: "runtime.resource.events.read",
+      operation: "events",
+      requester: input.requester,
+      input,
       resource,
-    );
-    return runtimeResourceEventListView(
-      cloudRunId,
-      list.core_run_ids,
-      resource,
-      eventInput,
-      eventLimit,
-      relatedEvents,
-    );
+      eventList,
+    });
+    return eventList;
   }
 
   async resourceStatus(
     cloudRunId: string,
     run: CloudRunRecord,
-    input: { kind: string; name: string },
+    input: { kind: string; name: string; requester?: string | null | undefined },
   ): Promise<RuntimeResourceStatus> {
-    const list = await this.resources(cloudRunId, run);
-    const resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
-    if (!resource) {
-      throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
-        kind: input.kind,
-        name: input.name,
+    let status: RuntimeResourceStatus;
+    let resource: RuntimeResourceRecord | undefined;
+    try {
+      const list = await this.resources(cloudRunId, run);
+      resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
+      if (!resource) {
+        throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
+          kind: input.kind,
+          name: input.name,
+        });
+      }
+      status = runtimeResourceStatusView(cloudRunId, list.core_run_ids, resource);
+    } catch (error) {
+      await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.status.read.failed",
+        operation: "status",
+        requester: input.requester,
+        input,
+        resource,
+        error,
       });
+      throw error;
     }
-    return runtimeResourceStatusView(cloudRunId, list.core_run_ids, resource);
+    await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      eventType: "runtime.resource.status.read",
+      operation: "status",
+      requester: input.requester,
+      input,
+      resource,
+      status,
+    });
+    return status;
   }
 
   async resourceMetrics(
     cloudRunId: string,
     run: CloudRunRecord,
-    input: { kind: string; name: string },
+    input: { kind: string; name: string; requester?: string | null | undefined },
   ): Promise<RuntimeResourceMetrics> {
-    const list = await this.resources(cloudRunId, run);
-    const resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
-    if (!resource) {
-      throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
-        kind: input.kind,
-        name: input.name,
+    let metrics: RuntimeResourceMetrics;
+    let resource: RuntimeResourceRecord | undefined;
+    try {
+      const list = await this.resources(cloudRunId, run);
+      resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity(input));
+      if (!resource) {
+        throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
+          kind: input.kind,
+          name: input.name,
+        });
+      }
+      const eventInput = runtimeResourceEventScanFilter(resource, undefined);
+      const events = runtimeResourceEventsForResource(
+        await this.eventRows(cloudRunId, { limit: RUNTIME_EVENT_RESOURCE_LIMIT, ...eventInput }),
+        resource,
+      );
+      metrics = runtimeResourceMetricsView(cloudRunId, list.core_run_ids, resource, events);
+    } catch (error) {
+      await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.metrics.read.failed",
+        operation: "metrics",
+        requester: input.requester,
+        input,
+        resource,
+        error,
       });
+      throw error;
     }
-    const eventInput = runtimeResourceEventScanFilter(resource, undefined);
-    const events = runtimeResourceEventsForResource(
-      await this.eventRows(cloudRunId, { limit: RUNTIME_EVENT_RESOURCE_LIMIT, ...eventInput }),
+    await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      eventType: "runtime.resource.metrics.read",
+      operation: "metrics",
+      requester: input.requester,
+      input,
       resource,
-    );
-    return runtimeResourceMetricsView(cloudRunId, list.core_run_ids, resource, events);
+      metrics,
+    });
+    return metrics;
   }
 
   async resourceMetricsList(
@@ -2175,115 +2547,235 @@ export class RuntimeRepository {
     run: CloudRunRecord,
     input: RuntimeResourceMetricsListInput = {},
   ): Promise<RuntimeResourceMetricsList> {
-    const { limit, continueToken, ...filter } = input;
-    const list = await this.resources(cloudRunId, run, filter);
-    const page = paginateRuntimeResources(list.resources, {
-      limit: boundedLimit(limit, 100),
-      continueToken,
+    let metricsList: RuntimeResourceMetricsList;
+    try {
+      const { limit, continueToken } = input;
+      const list = await this.resources(cloudRunId, run, runtimeResourceFilterOnly(input));
+      const page = paginateRuntimeResources(list.resources, {
+        limit: boundedLimit(limit, 100),
+        continueToken,
+      });
+      const pagedList: RuntimeResourceList = {
+        ...list,
+        metadata: page.metadata,
+        resources: page.resources,
+      };
+      const resources = await Promise.all(page.resources
+        .map(async (resource) => {
+          const eventInput = runtimeResourceEventScanFilter(resource, undefined);
+          const eventRows = await this.eventRows(cloudRunId, { limit: RUNTIME_EVENT_RESOURCE_LIMIT, ...eventInput });
+          return runtimeResourceMetricsView(
+            cloudRunId,
+            list.core_run_ids,
+            resource,
+            runtimeResourceEventsForResource(eventRows, resource),
+          );
+        }));
+      metricsList = runtimeResourceMetricsListView(cloudRunId, pagedList, resources, list.resources.length);
+    } catch (error) {
+      await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.metrics.list.read.failed",
+        operation: "metrics/list",
+        requester: input.requester,
+        input,
+        error,
+      });
+      throw error;
+    }
+    await appendRuntimeResourceQueryReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      eventType: "runtime.resource.metrics.list.read",
+      operation: "metrics/list",
+      requester: input.requester,
+      input,
+      metricsList,
     });
-    const pagedList: RuntimeResourceList = {
-      ...list,
-      metadata: page.metadata,
-      resources: page.resources,
-    };
-    const resources = await Promise.all(page.resources
-      .map(async (resource) => {
-        const eventInput = runtimeResourceEventScanFilter(resource, undefined);
-        const eventRows = await this.eventRows(cloudRunId, { limit: RUNTIME_EVENT_RESOURCE_LIMIT, ...eventInput });
-        return runtimeResourceMetricsView(
-          cloudRunId,
-          list.core_run_ids,
-          resource,
-          runtimeResourceEventsForResource(eventRows, resource),
-        );
-      }));
-    return runtimeResourceMetricsListView(cloudRunId, pagedList, resources, list.resources.length);
+    return metricsList;
   }
 
   async resourceLogs(
     cloudRunId: string,
     run: CloudRunRecord,
-    input: { kind: string; name: string; stream?: string | null; tailLines?: number | undefined },
+    input: RuntimeResourceLogsInput,
   ): Promise<RuntimeResourceLogs> {
-    const stream = runtimeLogStream(input.stream);
-    const described = await this.describeResource(cloudRunId, run, {
-      kind: input.kind,
-      name: input.name,
-      eventLimit: 25,
+    let stream: "stdout" | "stderr";
+    try {
+      stream = runtimeLogStream(input.stream);
+    } catch (error) {
+      await appendRuntimeResourceReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.logs.read.failed",
+        operation: "logs",
+        requester: input.requester,
+        requestedKind: input.kind,
+        requestedName: input.name,
+        stream: input.stream,
+        tailLines: input.tailLines,
+        error,
+      });
+      throw error;
+    }
+    let described: RuntimeResourceDescribe;
+    try {
+      described = await this.describeResource(cloudRunId, run, {
+        kind: input.kind,
+        name: input.name,
+        eventLimit: 25,
+      });
+    } catch (error) {
+      await appendRuntimeResourceReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.logs.read.failed",
+        operation: "logs",
+        requester: input.requester,
+        requestedKind: input.kind,
+        requestedName: input.name,
+        stream,
+        tailLines: input.tailLines,
+        error,
+      });
+      throw error;
+    }
+    let logs: RuntimeResourceLogs;
+    try {
+      if (described.resource.kind === "RunnerAttempt" || described.resource.kind === "RunnerInstance") {
+        const eventInput = runtimeResourceLogEventScanFilter(described.resource);
+        const events = runtimeResourceEventsForResource(
+          await this.eventRows(cloudRunId, { limit: RUNTIME_EVENT_RESOURCE_LIMIT, ...eventInput }),
+          described.resource,
+        );
+        logs = runnerResourceLogsFromEvents(cloudRunId, described.resource, events, stream, input.tailLines);
+      } else if (described.resource.kind === "Exec") {
+        logs = execResourceLogs(cloudRunId, described.resource, stream, input.tailLines);
+      } else {
+        const target = runtimeLogTargetForResource(described.resource);
+        const artifactInput: { trialId: string; role: string; coreRunId?: string | null; attempt?: number | undefined } = {
+          trialId: target.trialId,
+          role: stream,
+        };
+        if (target.coreRunId !== undefined) {
+          artifactInput.coreRunId = target.coreRunId;
+        }
+        if (target.attempt !== undefined) {
+          artifactInput.attempt = target.attempt;
+        }
+        const content = await this.artifactContent(cloudRunId, artifactInput);
+        const bytes = input.tailLines === undefined
+          ? content.bytes
+          : tailTextBytes(content.bytes, input.tailLines);
+        logs = {
+          resource: described.resource,
+          stream,
+          media_type: content.media_type,
+          bytes,
+          object: content.object,
+        };
+      }
+    } catch (error) {
+      await appendRuntimeResourceReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.logs.read.failed",
+        operation: "logs",
+        requester: input.requester,
+        resource: described.resource,
+        stream,
+        tailLines: input.tailLines,
+        error,
+      });
+      throw error;
+    }
+    await appendRuntimeResourceReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      eventType: "runtime.resource.logs.read",
+      operation: "logs",
+      requester: input.requester,
+      resource: logs.resource,
+      object: logs.object,
+      mediaType: logs.media_type,
+      byteSize: logs.bytes.byteLength,
+      stream: logs.stream,
+      tailLines: input.tailLines,
     });
-    if (described.resource.kind === "RunnerAttempt" || described.resource.kind === "RunnerInstance") {
-      const eventInput = runtimeResourceLogEventScanFilter(described.resource);
-      const events = runtimeResourceEventsForResource(
-        await this.eventRows(cloudRunId, { limit: RUNTIME_EVENT_RESOURCE_LIMIT, ...eventInput }),
-        described.resource,
-      );
-      return runnerResourceLogsFromEvents(cloudRunId, described.resource, events, stream, input.tailLines);
-    }
-    if (described.resource.kind === "Exec") {
-      return execResourceLogs(cloudRunId, described.resource, stream, input.tailLines);
-    }
-    const target = runtimeLogTargetForResource(described.resource);
-    const artifactInput: { trialId: string; role: string; coreRunId?: string | null; attempt?: number | undefined } = {
-      trialId: target.trialId,
-      role: stream,
-    };
-    if (target.coreRunId !== undefined) {
-      artifactInput.coreRunId = target.coreRunId;
-    }
-    if (target.attempt !== undefined) {
-      artifactInput.attempt = target.attempt;
-    }
-    const content = await this.artifactContent(cloudRunId, artifactInput);
-    const bytes = input.tailLines === undefined
-      ? content.bytes
-      : tailTextBytes(content.bytes, input.tailLines);
-    return {
-      resource: described.resource,
-      stream,
-      media_type: content.media_type,
-      bytes,
-      object: content.object,
-    };
+    return logs;
   }
 
   async resourceArtifactContent(
     cloudRunId: string,
     run: CloudRunRecord,
-    input: { kind: string; name: string },
+    input: RuntimeResourceArtifactContentInput,
   ): Promise<RuntimeResourceArtifactContent> {
-    const described = await this.describeResource(cloudRunId, run, {
-      kind: input.kind,
-      name: input.name,
-      eventLimit: 25,
-    });
-    if (described.resource.kind !== "TrialArtifact") {
-      throw new HttpError(404, "runtime_resource_content_not_found", "Runtime resource content subresource is only available for TrialArtifact resources", {
-        kind: described.resource.kind,
-        name: described.resource.metadata.name,
+    let described: RuntimeResourceDescribe;
+    try {
+      described = await this.describeResource(cloudRunId, run, {
+        kind: input.kind,
+        name: input.name,
+        eventLimit: 25,
       });
-    }
-    const trialId = stringField(described.resource.spec.trial_id);
-    const role = stringField(described.resource.spec.role);
-    if (!trialId || !role) {
-      throw new HttpError(409, "runtime_artifact_resource_incomplete", "TrialArtifact resource is missing artifact identity fields", {
-        kind: described.resource.kind,
-        name: described.resource.metadata.name,
+    } catch (error) {
+      await appendRuntimeResourceReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.content.read.failed",
+        operation: "content",
+        requester: input.requester,
+        requestedKind: input.kind,
+        requestedName: input.name,
+        error,
       });
+      throw error;
     }
-    const attempt = numberField(described.resource.spec.attempt);
-    const content = await this.artifactContent(cloudRunId, {
-      trialId,
-      role,
-      coreRunId: stringField(described.resource.spec.core_run_id),
-      attempt: attempt ?? undefined,
-      objectRef: stringField(described.resource.spec.object_ref),
+    let artifact: RuntimeResourceArtifactContent;
+    try {
+      if (described.resource.kind !== "TrialArtifact") {
+        throw new HttpError(404, "runtime_resource_content_not_found", "Runtime resource content subresource is only available for TrialArtifact resources", {
+          kind: described.resource.kind,
+          name: described.resource.metadata.name,
+        });
+      }
+      const trialId = stringField(described.resource.spec.trial_id);
+      const role = stringField(described.resource.spec.role);
+      if (!trialId || !role) {
+        throw new HttpError(409, "runtime_artifact_resource_incomplete", "TrialArtifact resource is missing artifact identity fields", {
+          kind: described.resource.kind,
+          name: described.resource.metadata.name,
+        });
+      }
+      const attempt = numberField(described.resource.spec.attempt);
+      const content = await this.artifactContent(cloudRunId, {
+        trialId,
+        role,
+        coreRunId: stringField(described.resource.spec.core_run_id),
+        attempt: attempt ?? undefined,
+        objectRef: stringField(described.resource.spec.object_ref),
+      });
+      artifact = {
+        resource: described.resource,
+        media_type: content.media_type,
+        bytes: content.bytes,
+        object: content.object,
+      };
+    } catch (error) {
+      await appendRuntimeResourceReadAuditEvent(this.sql, {
+        runId: cloudRunId,
+        eventType: "runtime.resource.content.read.failed",
+        operation: "content",
+        requester: input.requester,
+        resource: described.resource,
+        error,
+      });
+      throw error;
+    }
+    await appendRuntimeResourceReadAuditEvent(this.sql, {
+      runId: cloudRunId,
+      eventType: "runtime.resource.content.read",
+      operation: "content",
+      requester: input.requester,
+      resource: artifact.resource,
+      object: artifact.object,
+      mediaType: artifact.media_type,
+      byteSize: artifact.bytes.byteLength,
     });
-    return {
-      resource: described.resource,
-      media_type: content.media_type,
-      bytes: content.bytes,
-      object: content.object,
-    };
+    return artifact;
   }
 
   async cordonRunnerInstanceResource(input: RuntimeResourceActionInput): Promise<RuntimeResourceDescribe> {
@@ -2298,7 +2790,7 @@ export class RuntimeRepository {
         name: input.resourceName,
       });
     }
-    assertRuntimeResourceVersionPrecondition(resource, input.resourceVersion);
+    assertRuntimeResourceVersionPrecondition(resource, input.resourceVersion, { required: true, operation: "cordon" });
     if (resource.kind !== "RunnerInstance") {
       throw new HttpError(409, "runtime_resource_action_unsupported", "Only RunnerInstance resources support cordon", {
         action: "cordon",
@@ -2377,7 +2869,7 @@ export class RuntimeRepository {
         name: input.resourceName,
       });
     }
-    assertRuntimeResourceVersionPrecondition(resource, input.resourceVersion);
+    assertRuntimeResourceVersionPrecondition(resource, input.resourceVersion, { required: true, operation: "drain" });
     if (resource.kind !== "RunnerInstance") {
       throw new HttpError(409, "runtime_resource_action_unsupported", "Only RunnerInstance resources support drain", {
         action: "drain",
@@ -2456,7 +2948,7 @@ export class RuntimeRepository {
         name: input.resourceName,
       });
     }
-    assertRuntimeResourceVersionPrecondition(resource, input.resourceVersion);
+    assertRuntimeResourceVersionPrecondition(resource, input.resourceVersion, { required: true, operation: "uncordon" });
     if (resource.kind !== "RunnerInstance") {
       throw new HttpError(409, "runtime_resource_action_unsupported", "Only RunnerInstance resources support uncordon", {
         action: "uncordon",
@@ -2535,7 +3027,7 @@ export class RuntimeRepository {
         name: input.resourceName,
       });
     }
-    assertRuntimeResourceVersionPrecondition(resource, input.resourceVersion);
+    assertRuntimeResourceVersionPrecondition(resource, input.resourceVersion, { required: true, operation: "cancel" });
     if (resource.kind !== "PortForward" && resource.kind !== "Exec") {
       throw new HttpError(409, "runtime_resource_action_unsupported", "Only PortForward and Exec resources support cancel", {
         action: "cancel",
@@ -2573,22 +3065,64 @@ export class RuntimeRepository {
     });
   }
 
+  async completeRuntimeAccessResource(input: RuntimeResourceActionInput): Promise<RuntimeResourceDescribe> {
+    const list = await this.resources(input.run.run_id, input.run);
+    const resource = list.resources.find((item) => resourceIdentity(item) === resourceIdentity({
+      kind: input.resourceKind,
+      name: input.resourceName,
+    }));
+    if (!resource) {
+      throw new HttpError(404, "runtime_resource_not_found", "Runtime resource not found", {
+        kind: input.resourceKind,
+        name: input.resourceName,
+      });
+    }
+    assertRuntimeResourceVersionPrecondition(resource, input.resourceVersion, { required: true, operation: "complete" });
+    if (resource.kind !== "PortForward") {
+      throw new HttpError(409, "runtime_resource_action_unsupported", "Only PortForward resources support complete", {
+        action: "complete",
+        resource_kind: resource.kind,
+        resource_name: resource.metadata.name,
+        supported_kinds: ["PortForward"],
+      });
+    }
+    assertRuntimeResourceSupportsAction(resource, "complete");
+    const accessRequestId = stringField(resource.spec.access_request_id) ?? resource.metadata.uid ?? null;
+    if (!accessRequestId) {
+      throw new HttpError(409, "runtime_resource_action_unavailable", `${resource.kind} is missing access_request_id`);
+    }
+    await this.completePortForwardRequest({
+      cloudRunId: input.run.run_id,
+      accessRequestId,
+      requester: input.requester ?? null,
+      reason: input.reason ?? null,
+      resourceVersion: input.resourceVersion ?? null,
+    });
+    return await this.describeResource(input.run.run_id, input.run, {
+      kind: resource.kind,
+      name: resource.metadata.name,
+      eventLimit: 100,
+    });
+  }
+
   async events(cloudRunId: string, input: RuntimeEventRowsInput = {}): Promise<RuntimeEventList> {
-    const limit = boundedLimit(input?.limit, 50);
+    const eventInput = runtimeEventRowsInputWithContinue(input);
+    const limit = boundedLimit(eventInput.limit, 50);
     const events = await this.eventRows(cloudRunId, {
-      ...input,
+      ...eventInput,
       limit: Math.min(limit + 1, 1000),
     });
-    return runtimeEventListView(cloudRunId, input, limit, events);
+    return runtimeEventListView(cloudRunId, eventInput, limit, events);
   }
 
   async eventRows(cloudRunId: string, input: RuntimeEventRowsInput = {}): Promise<RuntimeEventRecord[]> {
-    const limit = boundedLimit(input?.limit, 200);
-    const scanLimit = hasRuntimeEventFilter(input) ? 1000 : limit;
+    const eventInput = runtimeEventRowsInputWithContinue(input);
+    const limit = boundedLimit(eventInput.limit, 200);
+    const scanLimit = hasRuntimeEventFilter(eventInput) ? 1000 : limit;
     const [coreRunIds, runtimeSnapshots, cloudEvents] = await Promise.all([
       this.coreRunIdsForCloudRun(cloudRunId),
       this.workerRuntimeSnapshots(cloudRunId),
-      this.cloudControlPlaneEventRows(cloudRunId, input),
+      this.cloudControlPlaneEventRows(cloudRunId, eventInput),
     ]);
     let legacyEvents: RuntimeEventRecord[] = [];
     if (coreRunIds.length > 0) {
@@ -2610,7 +3144,7 @@ export class RuntimeRepository {
           row_json
         from ${this.table("event_rows")}
         where run_id = any(${coreRunIds})
-          and row_seq > ${input?.afterRowSeq ?? -1}
+          and row_seq > ${eventInput.afterRowSeq ?? -1}
         order by run_id, schedule_idx, attempt, row_seq
         limit ${scanLimit}
       `.catch((error) => {
@@ -2639,14 +3173,14 @@ export class RuntimeRepository {
       }));
     }
     const snapshotEvents = runtimeEventRowsFromSnapshots(runtimeSnapshots)
-      .filter((row) => row.row_seq > (input?.afterRowSeq ?? -1))
+      .filter((row) => row.row_seq > (eventInput.afterRowSeq ?? -1))
       .filter((row) => !legacyEvents.some((legacy) => runtimeEventKey(legacy) === runtimeEventKey(row)));
     return [
       ...cloudEvents,
       ...legacyEvents,
       ...snapshotEvents,
     ]
-      .filter((event) => runtimeEventMatchesFilter(event, input))
+      .filter((event) => runtimeEventMatchesFilter(event, eventInput))
       .sort((a, b) => {
         const time = eventTime(a) - eventTime(b);
         if (time !== 0) {
@@ -2862,7 +3396,7 @@ export class RuntimeRepository {
       resourceKind: input.resourceKind,
       resourceName: input.resourceName,
       resourceVersion: input.resourceVersion,
-    });
+    }, "port-forward");
     const targetRunnerInstanceId = requestedTarget.runnerInstanceId ?? null;
     const targetAttemptId = requestedTarget.attemptId ?? null;
     const targetWorkerId = requestedTarget.workerId ?? null;
@@ -3004,6 +3538,52 @@ export class RuntimeRepository {
     });
   }
 
+  async completePortForwardRequest(input: {
+    cloudRunId: string;
+    accessRequestId: string;
+    requester?: string | null;
+    reason?: string | null;
+    resourceVersion?: string | null;
+  }): Promise<RuntimeAccessRequestRecord> {
+    return await this.sql.begin(async (tx) => {
+      const rows = await tx`
+        with selected as (
+          select access_request_id, status as previous_status
+          from cloud.runtime_access_requests
+          where run_id = ${input.cloudRunId}
+            and access_request_id = ${input.accessRequestId}
+            and kind = 'port_forward'
+            and status = 'active'
+          for update
+        ),
+        updated as (
+          update cloud.runtime_access_requests request
+          set status = 'completed',
+              requester = coalesce(${normalizeOptionalString(input.requester)}, request.requester),
+              reason = coalesce(${normalizeOptionalString(input.reason)}, request.reason),
+              updated_at = now()
+          from selected
+          where request.access_request_id = selected.access_request_id
+          returning request.*, selected.previous_status
+        )
+        select * from updated
+      `;
+      const row = rows[0];
+      if (!row) {
+        throw new HttpError(404, "port_forward_not_found", "Active port-forward request not found");
+      }
+      const request = accessRequestFromRow(row);
+      const previousStatus = row.previous_status === null ? null : String(row.previous_status);
+      await appendAccessRequestEvent(tx, this.sql, {
+        runId: input.cloudRunId,
+        attemptId: request.attempt_id,
+        eventType: "runtime.access.port_forward.completed",
+        payload: accessRequestCompleteEventPayload(request, previousStatus, input.resourceVersion),
+      });
+      return request;
+    });
+  }
+
   async createExecRequest(input: CreateExecRequestInput): Promise<RuntimeAccessRequestRecord> {
     const command = validateCommand(input.command, "/command");
     const ttlSeconds = validateRuntimeAccessTtlSeconds(input.ttlSeconds);
@@ -3013,7 +3593,7 @@ export class RuntimeRepository {
       resourceKind: input.resourceKind,
       resourceName: input.resourceName,
       resourceVersion: input.resourceVersion,
-    });
+    }, "exec");
     const targetRunnerInstanceId = requestedTarget.runnerInstanceId ?? null;
     const targetAttemptId = requestedTarget.attemptId ?? null;
     const targetWorkerId = requestedTarget.workerId ?? null;
@@ -3114,6 +3694,7 @@ export class RuntimeRepository {
   private async resolveRuntimeAccessTarget(
     run: CloudRunRecord,
     input: { resourceKind?: string | null | undefined; resourceName?: string | null | undefined; resourceVersion?: string | null | undefined },
+    operation: string,
   ): Promise<RuntimeAccessTarget> {
     const resourceKind = normalizeOptionalString(input.resourceKind);
     const resourceName = normalizeOptionalString(input.resourceName);
@@ -3133,7 +3714,7 @@ export class RuntimeRepository {
       resourceKind,
       resourceName,
       resourceVersion: input.resourceVersion,
-    });
+    }, { required: true, operation });
   }
 
   async cancelExecRequest(input: {
@@ -3204,7 +3785,7 @@ export class RuntimeRepository {
     attemptId: string;
     runnerInstanceId: string;
     accessRequestId: string;
-    status: "accepted" | "active" | "failed" | "expired";
+    status: "accepted" | "active" | "completed" | "failed" | "expired";
     connection?: JsonObject | null;
     errorMessage?: string | null;
   }): Promise<RuntimeAccessRequestRecord> {
@@ -4350,17 +4931,27 @@ function runtimeResourceOperationReviewEvidence(resource: RuntimeResourceRecord)
   };
 }
 
-export function runtimeApiResourceList(cloudRunId: string, resources: RuntimeResourceRecord[]): RuntimeApiResourceList {
+export function runtimeApiResourceList(
+  cloudRunId: string,
+  resources: RuntimeResourceRecord[],
+  coreRunIds: string[] = [],
+): RuntimeApiResourceList {
   const counts = resources.reduce((map, resource) => {
     map.set(resource.kind, (map.get(resource.kind) ?? 0) + 1);
     return map;
   }, new Map<string, number>());
+  const generatedAt = new Date().toISOString();
   return {
     apiVersion: RUNTIME_API_VERSION,
     kind: "RuntimeApiResourceList",
     cloud_run_id: cloudRunId,
+    generated_at: generatedAt,
+    core_run_ids: [...coreRunIds],
     resources: RUNTIME_API_RESOURCE_DEFINITIONS.map((resource) => ({
       ...resource,
+      cloud_run_id: cloudRunId,
+      generated_at: generatedAt,
+      core_run_ids: [...coreRunIds],
       shortNames: [...resource.shortNames],
       categories: [...resource.categories],
       verbs: [...resource.verbs],
@@ -4380,9 +4971,10 @@ export function runtimeApiResourceForKind(
   cloudRunId: string,
   resources: RuntimeResourceRecord[],
   kind: string,
+  coreRunIds: string[] = [],
 ): RuntimeApiResourceRecord {
   const requested = runtimeApiResourceAliasKey(kind);
-  const resource = runtimeApiResourceList(cloudRunId, resources).resources.find((candidate) =>
+  const resource = runtimeApiResourceList(cloudRunId, resources, coreRunIds).resources.find((candidate) =>
     runtimeApiResourceAliases(candidate).some((alias) => runtimeApiResourceAliasKey(alias) === requested)
   );
   if (!resource) {
@@ -4402,7 +4994,7 @@ function runtimeApiResourceAliasKey(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-const RUNTIME_API_RESOURCE_DEFINITIONS: Omit<RuntimeApiResourceRecord, "count">[] = [
+const RUNTIME_API_RESOURCE_DEFINITIONS: Omit<RuntimeApiResourceRecord, "cloud_run_id" | "generated_at" | "core_run_ids" | "count">[] = [
   runtimeApiResource("runs", "run", "Run", ["run"], ["core", "access-target"], ["list", "get", "watch", "describe"], ["port-forward", "exec"], [], ["port-forward", "exec"], "Cloud run lifecycle resource."),
   runtimeApiResource("coreruns", "corerun", "CoreRun", ["core"], ["core", "observability"], ["list", "get", "watch", "describe"], [], [], [], "Core runtime run recorded by the runner store."),
   runtimeApiResource("packages", "package", "Package", ["pkg"], ["declared"], ["list", "get", "watch", "describe"], [], [], [], "Accepted experiment package backing the run."),
@@ -4438,7 +5030,7 @@ const RUNTIME_API_RESOURCE_DEFINITIONS: Omit<RuntimeApiResourceRecord, "count">[
   runtimeApiResource("trialartifacts", "trialartifact", "TrialArtifact", ["artifact"], ["trial", "observability"], ["list", "get", "watch", "describe"], ["content"], [], [], "Attempt artifact evidence emitted by a trial and owned by the Trial resource."),
   runtimeApiResource("runtimesnapshots", "runtimesnapshot", "RuntimeSnapshot", ["snapshot"], ["observability"], ["list", "get", "watch", "describe"], [], [], [], "Worker runtime snapshot and evidence summary."),
   runtimeApiResource("events", "event", "Event", ["ev"], ["observability"], ["list", "get", "watch", "describe"], [], [], [], "Runtime lifecycle and audit event projected as a resource."),
-  runtimeApiResource("portforwards", "portforward", "PortForward", ["pf"], ["access"], ["list", "get", "watch", "describe", "create", "delete"], ["actions/cancel"], ["cancel"], [], "Audited port-forward request and tunnel lifecycle."),
+  runtimeApiResource("portforwards", "portforward", "PortForward", ["pf"], ["access"], ["list", "get", "watch", "describe", "create", "delete"], ["actions/cancel", "actions/complete"], ["cancel", "complete"], [], "Audited port-forward request and tunnel lifecycle."),
   runtimeApiResource("execs", "exec", "Exec", ["exec"], ["access"], ["list", "get", "watch", "describe", "create", "delete"], ["logs", "actions/cancel"], ["cancel"], ["logs"], "Audited runtime exec request, command output, and lifecycle."),
 ];
 
@@ -4453,7 +5045,7 @@ function runtimeApiResource(
   actions: string[],
   access: string[],
   description: string,
-): Omit<RuntimeApiResourceRecord, "count"> {
+): Omit<RuntimeApiResourceRecord, "cloud_run_id" | "generated_at" | "core_run_ids" | "count"> {
   const resourceSubresources = Array.from(new Set(["status", "events", "metrics", ...subresources]));
   const pathTemplates = runtimeApiResourcePathTemplates(kind, verbs, resourceSubresources);
   const exampleCommands = runtimeApiResourceExampleCommands(kind, verbs, resourceSubresources, actions, access);
@@ -4487,7 +5079,7 @@ function runtimeApiResource(
     pathTemplates,
     exampleCommands,
     printerColumns,
-    fieldSelectors: RUNTIME_RESOURCE_FIELD_SELECTORS,
+    fieldSelectors: runtimeApiResourceFieldSelectors(kind),
     labelSelectors: runtimeApiResourceLabelSelectors(kind),
     labelSelector: true,
     description,
@@ -4501,6 +5093,13 @@ function runtimeApiResourceLabelSelectors(kind: string): string[] {
   ])];
 }
 
+function runtimeApiResourceFieldSelectors(kind: string): string[] {
+  return [...new Set([
+    ...RUNTIME_RESOURCE_FIELD_SELECTORS,
+    ...(RUNTIME_RESOURCE_FIELD_SELECTOR_EXTRAS[kind] ?? []),
+  ])];
+}
+
 function runtimeApiResourceExampleCommands(
   kind: string,
   verbs: string[],
@@ -4510,40 +5109,45 @@ function runtimeApiResourceExampleCommands(
 ): RuntimeApiResourceExampleCommand[] {
   const target = `${kind}/{name}`;
   const commands: RuntimeApiResourceExampleCommand[] = [
-    { purpose: "list", command: `bucephalus-cloud run resources {run_id} --kind ${kind}` },
-    { purpose: "watch", command: `bucephalus-cloud run watch {run_id} --kind ${kind}` },
-    { purpose: "watch/not-ready", command: `bucephalus-cloud run watch {run_id} --kind ${kind} --field-selector status.conditions.Ready!=True` },
-    { purpose: "get", command: `bucephalus-cloud run get {run_id} ${target}` },
-    { purpose: "describe", command: `bucephalus-cloud run describe {run_id} ${target}` },
-    { purpose: "manifest", command: `bucephalus-cloud run resource {run_id} ${target}` },
-    { purpose: "status", command: `bucephalus-cloud run status {run_id} ${target}` },
-    { purpose: "wait", command: `bucephalus-cloud run wait {run_id} ${target} --for condition=Ready` },
-    { purpose: "metrics", command: `bucephalus-cloud run metrics {run_id} ${target}` },
-    { purpose: "events", command: `bucephalus-cloud run events {run_id} ${target} --follow` },
+    { purpose: "list", command: `buc runs get {run_id} ${kind}` },
+    { purpose: "list/name", command: `buc runs get {run_id} ${kind} --output name` },
+    { purpose: "watch", command: `buc runs watch {run_id} --kind ${kind}` },
+    { purpose: "watch/not-ready", command: `buc runs watch {run_id} --kind ${kind} --field-selector status.conditions.Ready!=True` },
+    { purpose: "top", command: `buc runs top {run_id} --kind ${kind}` },
+    { purpose: "get", command: `buc runs get {run_id} ${target}` },
+    { purpose: "describe", command: `buc runs describe {run_id} ${target}` },
+    { purpose: "status", command: `buc runs status {run_id} ${target}` },
+    { purpose: "wait", command: `buc runs wait {run_id} ${target} --for condition=Ready` },
+    { purpose: "metrics", command: `buc runs metrics {run_id} ${target}` },
+    { purpose: "events", command: `buc runs events {run_id} ${target}` },
+    { purpose: "audit", command: `buc runs audit {run_id} ${target}` },
   ];
   if (subresources.includes("logs") || access.includes("logs")) {
     commands.push(
-      { purpose: "logs/stdout", command: `bucephalus-cloud run logs {run_id} ${target} --stream stdout --follow` },
-      { purpose: "logs/stderr", command: `bucephalus-cloud run logs {run_id} ${target} --stream stderr --follow` },
+      { purpose: "logs/stdout", command: `buc runs logs {run_id} ${target} --stream stdout --metadata-out FILE.metadata.json` },
+      { purpose: "logs/stderr", command: `buc runs logs {run_id} ${target} --stream stderr --metadata-out FILE.metadata.json` },
     );
   }
   if (subresources.includes("content")) {
-    commands.push({ purpose: "content", command: `bucephalus-cloud run artifact {run_id} ${target} --out FILE` });
+    commands.push({ purpose: "content", command: `buc runs content {run_id} ${target} --out FILE --metadata-out FILE.metadata.json` });
   }
   if (access.includes("port-forward")) {
-    commands.push({ purpose: "port-forward", command: `bucephalus-cloud run port-forward {run_id} ${target} --target-port PORT` });
+    commands.push({ purpose: "port-forward", command: `buc runs port-forward {run_id} ${target} --target-port PORT --local-port PORT --attach --resource-version <metadata.resourceVersion>` });
   }
   if (kind === "PortForward") {
-    commands.push({ purpose: "watch/client-unreachable", command: "bucephalus-cloud run watch {run_id} --kind PortForward --field-selector status.conditions.ClientReachable!=True" });
+    commands.push({ purpose: "watch/client-unreachable", command: "buc runs watch {run_id} --kind PortForward --field-selector status.conditions.ClientReachable!=True" });
   }
   if (access.includes("exec")) {
-    commands.push({ purpose: "exec", command: `bucephalus-cloud run exec {run_id} ${target} -- COMMAND [ARG...]` });
+    commands.push({ purpose: "exec", command: `buc runs exec {run_id} ${target} --resource-version <metadata.resourceVersion> -- COMMAND [ARG...]` });
   }
   if (verbs.includes("delete")) {
-    commands.push({ purpose: "delete", command: `bucephalus-cloud run delete {run_id} ${target}` });
+    commands.push(
+      { purpose: "delete", command: `buc runs delete {run_id} ${target} --resource-version <metadata.resourceVersion>` },
+      { purpose: "wait/delete", command: `buc runs wait {run_id} ${target} --for delete` },
+    );
   }
   for (const action of actions) {
-    commands.push({ purpose: action, command: `bucephalus-cloud run ${action} {run_id} ${target}` });
+    commands.push({ purpose: action, command: `buc runs ${action} {run_id} ${target} --resource-version <metadata.resourceVersion>` });
   }
   return commands;
 }
@@ -4562,14 +5166,14 @@ function runtimeResourceOperationsForDescribe(
       const support = runtimeResourceOperationSupport(run, resources, resource, example.purpose);
       return {
         purpose: example.purpose,
-        command: runtimeResourceOperationCommand(example.command, cloudRunId, name),
+        command: runtimeResourceOperationCommand(example.command, cloudRunId, name, example.purpose, resource),
         supported: support.supported,
         reason: support.reason,
         message: support.message,
         verb: runtimeResourceOperationVerb(example.purpose),
         subresource: runtimeResourceOperationSubresource(example.purpose),
         action: runtimeResourceOperationAction(example.purpose),
-        requires_active_run: runtimeResourceOperationRequiresActiveRun(example.purpose),
+        requires_running_run: runtimeResourceOperationRequiresRunningRun(example.purpose),
       };
     })
     .filter((operation) => {
@@ -4618,7 +5222,13 @@ function runtimeResourceOperationSupport(
         `${resource.kind}/${resource.metadata.name} does not currently advertise ${action}`,
       );
   }
-  return runtimeResourceOperationSupported();
+  if (runtimeResourceOperationReadOnlyPurpose(purpose)) {
+    return runtimeResourceOperationSupported();
+  }
+  return runtimeResourceOperationUnsupported(
+    "operation_support_unimplemented",
+    `${resource.kind}/${resource.metadata.name} advertises runtime operation ${purpose}, but the server has no explicit support rule for it`,
+  );
 }
 
 function runtimeResourceAccessOperationSupport(
@@ -4651,7 +5261,9 @@ function runtimeResourceAccessOperationSupport(
       `${resource.kind}/${resource.metadata.name} is not currently reachable for runtime access: target is not bound to an active runner attempt`,
     );
   }
-  const access = isRecord(resource.status.access) ? resource.status.access : {};
+  const access: RuntimeResourceAccessStatus = isRecord(resource.status.access)
+    ? resource.status.access as RuntimeResourceAccessStatus
+    : {};
   if (booleanField(access[accessField]) !== true) {
     return runtimeResourceOperationUnsupported(
       `${capability}_unavailable`,
@@ -4692,23 +5304,79 @@ function runtimeResourceOperationUnsupported(
   return { supported: false, reason, message };
 }
 
-function runtimeResourceOperationCommand(template: string, runId: string, name: string): string {
-  return template.replaceAll("{run_id}", runId).replaceAll("{name}", name);
+function runtimeResourceOperationCommand(
+  template: string,
+  runId: string,
+  name: string,
+  purpose: string,
+  resource: RuntimeResourceRecord,
+): string {
+  const command = template.replaceAll("{run_id}", runId).replaceAll("{name}", name);
+  return runtimeResourceCommandWithVersionPrecondition(command, purpose, resource.metadata.resourceVersion ?? runtimeResourceVersion(resource));
+}
+
+function runtimeResourceCommandWithVersionPrecondition(command: string, purpose: string, resourceVersion: string | null | undefined): string {
+  const version = normalizeOptionalString(resourceVersion);
+  const trimmedCommand = command.trim();
+  if (!version || !trimmedCommand || !runtimeResourceOperationAcceptsVersionPrecondition(purpose)) {
+    return command;
+  }
+  const versionPlaceholder = "--resource-version <metadata.resourceVersion>";
+  if (/\s--resource-version(?:\s|$)/.test(trimmedCommand)) {
+    return trimmedCommand.includes(versionPlaceholder)
+      ? trimmedCommand.replace(versionPlaceholder, `--resource-version ${shellQuoteCliToken(version)}`)
+      : command;
+  }
+  const versionArg = `--resource-version ${shellQuoteCliToken(version)}`;
+  const commandSeparator = trimmedCommand.indexOf(" -- ");
+  if (commandSeparator >= 0) {
+    return `${trimmedCommand.slice(0, commandSeparator)} ${versionArg}${trimmedCommand.slice(commandSeparator)}`;
+  }
+  return `${trimmedCommand} ${versionArg}`;
+}
+
+function runtimeResourceOperationAcceptsVersionPrecondition(purpose: string): boolean {
+  return purpose === "port-forward" || purpose === "exec" || purpose === "delete" || runtimeResourceOperationAction(purpose) !== null;
+}
+
+function runtimeResourceOperationReadOnlyPurpose(purpose: string): boolean {
+  return purpose === "list"
+    || purpose === "list/name"
+    || purpose === "watch"
+    || purpose.startsWith("watch/")
+    || purpose === "get"
+    || purpose === "describe"
+    || purpose === "status"
+    || purpose === "wait"
+    || purpose === "wait/delete"
+    || purpose === "top"
+    || purpose === "metrics"
+    || purpose === "events"
+    || purpose === "audit";
+}
+
+function shellQuoteCliToken(value: string): string {
+  return /^[A-Za-z0-9_./:=@%+-]+$/.test(value)
+    ? value
+    : `'${value.replaceAll("'", "'\"'\"'")}'`;
 }
 
 function runtimeResourceOperationVerb(purpose: string): string | null {
-  if (purpose === "list" || purpose === "watch" || purpose === "get" || purpose === "describe") return purpose;
+  if (purpose === "list" || purpose === "list/name") return "list";
+  if (purpose === "watch" || purpose === "get" || purpose === "describe") return purpose;
   if (purpose === "delete") return "delete";
   if (purpose === "manifest") return "get";
-  if (purpose === "status" || purpose === "wait" || purpose === "metrics" || purpose === "content") return "get";
+  if (purpose === "status" || purpose === "wait" || purpose === "wait/delete" || purpose === "top" || purpose === "metrics" || purpose === "content") return "get";
   if (purpose === "logs/stdout" || purpose === "logs/stderr") return "get";
-  if (purpose === "events") return "watch";
+  if (purpose === "events" || purpose === "audit") return "watch";
   if (purpose.startsWith("watch/")) return "watch";
   return null;
 }
 
 function runtimeResourceOperationSubresource(purpose: string): string | null {
-  if (purpose === "wait") return "status";
+  if (purpose === "wait" || purpose === "wait/delete") return "status";
+  if (purpose === "top") return "metrics";
+  if (purpose === "audit") return "events";
   if (purpose === "status" || purpose === "metrics" || purpose === "events" || purpose === "content") return purpose;
   if (purpose === "logs/stdout" || purpose === "logs/stderr") return "logs";
   if (purpose === "port-forward" || purpose === "exec") return purpose;
@@ -4718,12 +5386,12 @@ function runtimeResourceOperationSubresource(purpose: string): string | null {
 
 function runtimeResourceOperationAction(purpose: string): string | null {
   if (purpose === "delete") return "cancel";
-  return purpose === "cordon" || purpose === "drain" || purpose === "uncordon" || purpose === "cancel"
+  return purpose === "cordon" || purpose === "drain" || purpose === "uncordon" || purpose === "cancel" || purpose === "complete"
     ? purpose
     : null;
 }
 
-function runtimeResourceOperationRequiresActiveRun(purpose: string): boolean {
+function runtimeResourceOperationRequiresRunningRun(purpose: string): boolean {
   return purpose === "port-forward" || purpose === "exec";
 }
 
@@ -4752,7 +5420,7 @@ function runtimeApiResourcePrinterColumns(
     { name: "Observed", type: "string", jsonPath: '.status.conditions[?(@.type=="Observed")].status', description: "Whether status.observedGeneration has caught up to metadata.generation.", priority: 0 },
     { name: "Reason", type: "string", jsonPath: ".status.reason", description: "Machine-readable reason for the current phase or health state.", priority: 1 },
     { name: "Source", type: "string", jsonPath: ".audit.source", description: "Runtime subsystem that projected the resource.", priority: 1 },
-    { name: "Age", type: "date", jsonPath: ".metadata.created_at", description: "Resource creation timestamp when available.", priority: 1 },
+    { name: "Age", type: "date", jsonPath: ".metadata.creationTimestamp", description: "Resource creation timestamp when available.", priority: 1 },
   ];
   if (access.length > 0 || categories.includes("access-target")) {
     columns.push(
@@ -4776,8 +5444,10 @@ function runtimeApiResourcePrinterColumns(
   }
   if (kind === "Event") {
     columns.push(
+      { name: "Involved", type: "string", jsonPath: ".status.involved", description: "Primary runtime resource involved in the event.", priority: 0 },
       { name: "Type", type: "string", jsonPath: ".spec.event_type", description: "Runtime event type.", priority: 0 },
       { name: "Seq", type: "integer", jsonPath: ".spec.row_seq", description: "Monotonic runtime event sequence number.", priority: 0 },
+      { name: "InvolvedKind", type: "string", jsonPath: ".status.involved_kind", description: "Kind of the primary involved runtime resource.", priority: 1 },
       { name: "Message", type: "string", jsonPath: ".status.message", description: "Human-readable event summary.", priority: 1 },
     );
   }
@@ -4933,16 +5603,39 @@ function runtimeApiResourcePrinterColumns(
   }
   if (kind === "PortForward") {
     columns.push(
+      { name: "Target", type: "string", jsonPath: ".spec.target_ref.name", description: "Resolved runtime resource targeted by the port-forward request.", priority: 0 },
+      { name: "TargetKind", type: "string", jsonPath: ".spec.target_ref.kind", description: "Kind of the resolved runtime access target.", priority: 1 },
+      { name: "TargetRV", type: "string", jsonPath: ".spec.target_ref.resourceVersion", description: "Resource version reviewed for the selected access target.", priority: 1 },
       { name: "TargetPort", type: "integer", jsonPath: ".spec.target_port", description: "Remote target port requested for the tunnel.", priority: 0 },
       { name: "LocalPort", type: "integer", jsonPath: ".spec.local_port", description: "Requested local port, if one was specified.", priority: 0 },
       { name: "ClientReachable", type: "string", jsonPath: '.status.conditions[?(@.type=="ClientReachable")].status', description: "Whether the active tunnel reports a client-reachable endpoint.", priority: 0 },
+      { name: "Runner", type: "string", jsonPath: ".status.runner_binding.runner_instance_id", description: "Runner instance bound to the access request.", priority: 0 },
+      { name: "Worker", type: "string", jsonPath: ".status.runner_binding.worker_id", description: "Worker id bound to the access request.", priority: 1 },
+      { name: "Requester", type: "string", jsonPath: ".audit.requester", description: "Actor that requested the access resource.", priority: 1 },
+      { name: "Mode", type: "string", jsonPath: ".status.connection.mode", description: "Connection mode reported by the worker.", priority: 1 },
+      { name: "ProviderTunnel", type: "string", jsonPath: ".status.connection.provider_tunnel_url", description: "Provider tunnel handle for low-level attach, when available.", priority: 1 },
+      { name: "Expires", type: "date", jsonPath: ".status.expires_at", description: "Control-plane expiration timestamp for the access request.", priority: 1 },
       { name: "Connection", type: "string", jsonPath: ".status.connection", description: "Port-forward connection metadata reported by the worker.", priority: 1 },
     );
   }
   if (kind === "Exec") {
     columns.push(
+      { name: "Target", type: "string", jsonPath: ".spec.target_ref.name", description: "Resolved runtime resource targeted by the exec request.", priority: 0 },
+      { name: "TargetKind", type: "string", jsonPath: ".spec.target_ref.kind", description: "Kind of the resolved runtime access target.", priority: 1 },
+      { name: "TargetRV", type: "string", jsonPath: ".spec.target_ref.resourceVersion", description: "Resource version reviewed for the selected access target.", priority: 1 },
       { name: "Command", type: "string", jsonPath: ".spec.command", description: "Command requested for runtime exec.", priority: 0 },
       { name: "Exit", type: "integer", jsonPath: ".status.connection.exit_code", description: "Completed exec exit code.", priority: 0 },
+      { name: "StdoutBytes", type: "integer", jsonPath: ".status.connection.stdout_bytes", description: "Total stdout bytes observed by the exec worker.", priority: 1 },
+      { name: "StdoutTailBytes", type: "integer", jsonPath: ".status.connection.stdout_tail_bytes", description: "Stdout bytes retained in the bounded status tail.", priority: 1 },
+      { name: "StdoutTruncated", type: "boolean", jsonPath: ".status.connection.stdout_tail_truncated", description: "Whether stdout status evidence was truncated before storage.", priority: 1 },
+      { name: "StderrBytes", type: "integer", jsonPath: ".status.connection.stderr_bytes", description: "Total stderr bytes observed by the exec worker.", priority: 1 },
+      { name: "StderrTailBytes", type: "integer", jsonPath: ".status.connection.stderr_tail_bytes", description: "Stderr bytes retained in the bounded status tail.", priority: 1 },
+      { name: "StderrTruncated", type: "boolean", jsonPath: ".status.connection.stderr_tail_truncated", description: "Whether stderr status evidence was truncated before storage.", priority: 1 },
+      { name: "Runner", type: "string", jsonPath: ".status.runner_binding.runner_instance_id", description: "Runner instance bound to the access request.", priority: 0 },
+      { name: "Worker", type: "string", jsonPath: ".status.runner_binding.worker_id", description: "Worker id bound to the access request.", priority: 1 },
+      { name: "Requester", type: "string", jsonPath: ".audit.requester", description: "Actor that requested the access resource.", priority: 1 },
+      { name: "Mode", type: "string", jsonPath: ".status.connection.mode", description: "Connection mode reported by the worker.", priority: 1 },
+      { name: "Expires", type: "date", jsonPath: ".status.expires_at", description: "Control-plane expiration timestamp for the access request.", priority: 1 },
     );
   }
   return columns;
@@ -5029,7 +5722,11 @@ function runtimeResourceSupportsLogs(resource: RuntimeResourceRecord): boolean {
   }
 }
 
-export function declaredRuntimeResources(run: CloudRunRecord, attempts: RuntimeRunAttemptRecord[] = []): RuntimeResourceRecord[] {
+export function declaredRuntimeResources(
+  run: CloudRunRecord,
+  attempts: RuntimeRunAttemptRecord[] = [],
+  events: RuntimeEventRecord[] = [],
+): RuntimeResourceRecord[] {
   const requirements = run.run_requirements;
   const activeAttempts = attempts.filter(runtimeAttemptIsActive);
   const runnerShapeStatus = runtimeRunnerShapeRequirementStatus(requirements, activeAttempts);
@@ -5138,13 +5835,7 @@ export function declaredRuntimeResources(run: CloudRunRecord, attempts: RuntimeR
       spec: {
         image_ref: image,
       },
-      status: runtimeCapabilityBackedRequirementStatus("registry_pull", activeAttempts, {
-        pendingMessage: `No active runner attempt has reported whether registry pulls are available for ${image}.`,
-        satisfiedReason: "RegistryPullAvailable",
-        missingReason: "RegistryPullMissing",
-        satisfiedMessage: (attemptId) => `Active runner attempt ${attemptId} advertises registry_pull for pulling ${image}.`,
-        missingMessage: `No active runner attempt advertises registry_pull for pulling ${image}.`,
-      }),
+      status: runtimeImagePullStatus(image, activeAttempts, events),
       audit: {
         source: "cloud.runs.run_requirements.image_refs",
         observed_at: run.updated_at,
@@ -5162,13 +5853,7 @@ export function declaredRuntimeResources(run: CloudRunRecord, attempts: RuntimeR
       spec: {
         secret_id: secretId,
       },
-      status: runtimeCapabilityBackedRequirementStatus("secret_resolver", activeAttempts, {
-        pendingMessage: `No active runner attempt has reported whether secret resolution is available for ${secretId}.`,
-        satisfiedReason: "SecretResolverAvailable",
-        missingReason: "SecretResolverMissing",
-        satisfiedMessage: (attemptId) => `Active runner attempt ${attemptId} advertises secret_resolver for ${secretId}.`,
-        missingMessage: `No active runner attempt advertises secret_resolver for ${secretId}.`,
-      }),
+      status: runtimeSecretBindingStatus(secretId, activeAttempts, events),
       audit: {
         source: "cloud.runs.run_requirements.secret_ids",
         observed_at: run.updated_at,
@@ -5189,13 +5874,7 @@ export function declaredRuntimeResources(run: CloudRunRecord, attempts: RuntimeR
         agent: requirements.network_perimeter.agent,
         egress_hosts: requirements.network_perimeter.egress_hosts,
       },
-      status: runtimeCapabilityBackedRequirementStatus("network_perimeter", activeAttempts, {
-        pendingMessage: "No active runner attempt has reported whether network perimeter enforcement is available.",
-        satisfiedReason: "NetworkPerimeterAvailable",
-        missingReason: "NetworkPerimeterMissing",
-        satisfiedMessage: (attemptId) => `Active runner attempt ${attemptId} advertises network_perimeter.`,
-        missingMessage: "No active runner attempt advertises network_perimeter.",
-      }),
+      status: runtimeNetworkPerimeterStatus(activeAttempts, events),
       audit: {
         source: "cloud.runs.run_requirements.network_perimeter",
         observed_at: run.updated_at,
@@ -5213,13 +5892,7 @@ export function declaredRuntimeResources(run: CloudRunRecord, attempts: RuntimeR
       spec: {
         sidecar,
       },
-      status: runtimeCapabilityBackedRequirementStatus(`sidecar:${sidecar}`, activeAttempts, {
-        pendingMessage: `No active runner attempt has reported whether sidecar ${sidecar} is available.`,
-        satisfiedReason: "SidecarCapabilityAvailable",
-        missingReason: "SidecarCapabilityMissing",
-        satisfiedMessage: (attemptId) => `Active runner attempt ${attemptId} advertises sidecar:${sidecar}.`,
-        missingMessage: `No active runner attempt advertises sidecar:${sidecar}.`,
-      }),
+      status: runtimeSidecarRequirementStatus(sidecar, activeAttempts, events),
       audit: {
         source: "cloud.runs.run_requirements.sidecars",
         observed_at: run.updated_at,
@@ -5237,13 +5910,7 @@ export function declaredRuntimeResources(run: CloudRunRecord, attempts: RuntimeR
       spec: {
         accelerator,
       },
-      status: runtimeCapabilityBackedRequirementStatus(`accelerator:${accelerator}`, activeAttempts, {
-        pendingMessage: `No active runner attempt has reported whether accelerator ${accelerator} is available.`,
-        satisfiedReason: "AcceleratorCapabilityAvailable",
-        missingReason: "AcceleratorCapabilityMissing",
-        satisfiedMessage: (attemptId) => `Active runner attempt ${attemptId} advertises accelerator:${accelerator}.`,
-        missingMessage: `No active runner attempt advertises accelerator:${accelerator}.`,
-      }),
+      status: runtimeAcceleratorRequirementStatus(accelerator, activeAttempts, events),
       audit: {
         source: "cloud.runs.run_requirements.accelerators",
         observed_at: run.updated_at,
@@ -5392,6 +6059,269 @@ function runtimeUnavailableRunnerRequirementStatus(
       runner_instance_status: runtimeAttemptRunnerStatus(attempt) ?? "unknown",
     })),
   });
+}
+
+function runtimeSecretBindingStatus(
+  secretId: string,
+  activeAttempts: RuntimeRunAttemptRecord[],
+  events: RuntimeEventRecord[],
+): JsonObject {
+  const capabilityStatus = runtimeCapabilityBackedRequirementStatus("secret_resolver", activeAttempts, {
+    pendingMessage: `No active runner attempt has reported whether secret resolution is available for ${secretId}.`,
+    satisfiedReason: "SecretResolverAvailable",
+    missingReason: "SecretResolverMissing",
+    satisfiedMessage: (attemptId) => `Active runner attempt ${attemptId} advertises secret_resolver for ${secretId}.`,
+    missingMessage: `No active runner attempt advertises secret_resolver for ${secretId}.`,
+  });
+  const materialized = latestRuntimeResourceLifecycleEvent(
+    events,
+    "SecretBinding",
+    resourceName(secretId),
+    ["worker.runtime.secret_binding.materialized"],
+  );
+  if (!materialized) {
+    return capabilityStatus;
+  }
+  return {
+    ...capabilityStatus,
+    phase: "Materialized",
+    reason: "SecretBindingMaterialized",
+    message: `Worker attempt ${runtimeLifecycleEventAttemptId(materialized)} materialized SecretBinding/${resourceName(secretId)}.`,
+    ...runtimeLifecycleEventStatusFields(materialized),
+  };
+}
+
+function runtimeImagePullStatus(
+  imageRef: string,
+  activeAttempts: RuntimeRunAttemptRecord[],
+  events: RuntimeEventRecord[],
+): JsonObject {
+  const capabilityStatus = runtimeCapabilityBackedRequirementStatus("registry_pull", activeAttempts, {
+    pendingMessage: `No active runner attempt has reported whether registry pulls are available for ${imageRef}.`,
+    satisfiedReason: "RegistryPullAvailable",
+    missingReason: "RegistryPullMissing",
+    satisfiedMessage: (attemptId) => `Active runner attempt ${attemptId} advertises registry_pull for pulling ${imageRef}.`,
+    missingMessage: `No active runner attempt advertises registry_pull for pulling ${imageRef}.`,
+  });
+  const event = latestRuntimeResourceLifecycleEvent(events, "ImagePull", resourceName(imageRef), [
+    "worker.runtime.image_pull.pulled",
+    "worker.runtime.image_pull.failed",
+    "worker.runtime.image_pull.pulling",
+  ]);
+  if (!event) {
+    return capabilityStatus;
+  }
+  if (event.event_type === "worker.runtime.image_pull.failed") {
+    return {
+      ...capabilityStatus,
+      phase: "Failed",
+      reason: "ImagePullFailed",
+      message: stringField(event.payload.error) ?? `Worker failed to pull ImagePull/${resourceName(imageRef)}.`,
+      error_message: stringField(event.payload.error),
+      ...runtimeLifecycleEventStatusFields(event),
+    };
+  }
+  if (event.event_type === "worker.runtime.image_pull.pulling") {
+    return {
+      ...capabilityStatus,
+      phase: "Pulling",
+      reason: "ImagePulling",
+      message: `Worker attempt ${runtimeLifecycleEventAttemptId(event)} is pulling ImagePull/${resourceName(imageRef)}.`,
+      ...runtimeLifecycleEventStatusFields(event),
+    };
+  }
+  return {
+    ...capabilityStatus,
+    phase: "Pulled",
+    reason: "ImagePulled",
+    message: `Worker attempt ${runtimeLifecycleEventAttemptId(event)} pulled ImagePull/${resourceName(imageRef)}.`,
+    ...runtimeLifecycleEventStatusFields(event),
+  };
+}
+
+function runtimeSidecarRequirementStatus(
+  sidecar: string,
+  activeAttempts: RuntimeRunAttemptRecord[],
+  events: RuntimeEventRecord[],
+): JsonObject {
+  const capabilityStatus = runtimeCapabilityBackedRequirementStatus(`sidecar:${sidecar}`, activeAttempts, {
+    pendingMessage: `No active runner attempt has reported whether sidecar ${sidecar} is available.`,
+    satisfiedReason: "SidecarCapabilityAvailable",
+    missingReason: "SidecarCapabilityMissing",
+    satisfiedMessage: (attemptId) => `Active runner attempt ${attemptId} advertises sidecar:${sidecar}.`,
+    missingMessage: `No active runner attempt advertises sidecar:${sidecar}.`,
+  });
+  const event = latestRuntimeResourceLifecycleEvent(events, "SidecarRequirement", resourceName(sidecar), [
+    "worker.runtime.sidecar_requirement.available",
+    "worker.runtime.sidecar_requirement.failed",
+    "worker.runtime.sidecar_requirement.checking",
+  ]);
+  if (!event) {
+    return capabilityStatus;
+  }
+  if (event.event_type === "worker.runtime.sidecar_requirement.failed") {
+    return {
+      ...capabilityStatus,
+      phase: "Failed",
+      reason: "SidecarRequirementFailed",
+      message: stringField(event.payload.error) ?? `Worker failed to validate SidecarRequirement/${resourceName(sidecar)}.`,
+      error_message: stringField(event.payload.error),
+      required_capability: stringField(event.payload.required_capability),
+      ...runtimeLifecycleEventStatusFields(event),
+    };
+  }
+  if (event.event_type === "worker.runtime.sidecar_requirement.checking") {
+    return {
+      ...capabilityStatus,
+      phase: "Checking",
+      reason: "SidecarRequirementChecking",
+      message: `Worker attempt ${runtimeLifecycleEventAttemptId(event)} is validating SidecarRequirement/${resourceName(sidecar)}.`,
+      required_capability: stringField(event.payload.required_capability),
+      ...runtimeLifecycleEventStatusFields(event),
+    };
+  }
+  return {
+    ...capabilityStatus,
+    phase: "Available",
+    reason: "SidecarRequirementAvailable",
+    message: `Worker attempt ${runtimeLifecycleEventAttemptId(event)} validated SidecarRequirement/${resourceName(sidecar)}.`,
+    required_capability: stringField(event.payload.required_capability),
+    ...runtimeLifecycleEventStatusFields(event),
+  };
+}
+
+function runtimeAcceleratorRequirementStatus(
+  accelerator: string,
+  activeAttempts: RuntimeRunAttemptRecord[],
+  events: RuntimeEventRecord[],
+): JsonObject {
+  const capabilityStatus = runtimeCapabilityBackedRequirementStatus(`accelerator:${accelerator}`, activeAttempts, {
+    pendingMessage: `No active runner attempt has reported whether accelerator ${accelerator} is available.`,
+    satisfiedReason: "AcceleratorCapabilityAvailable",
+    missingReason: "AcceleratorCapabilityMissing",
+    satisfiedMessage: (attemptId) => `Active runner attempt ${attemptId} advertises accelerator:${accelerator}.`,
+    missingMessage: `No active runner attempt advertises accelerator:${accelerator}.`,
+  });
+  const event = latestRuntimeResourceLifecycleEvent(events, "AcceleratorRequirement", resourceName(accelerator), [
+    "worker.runtime.accelerator_requirement.available",
+    "worker.runtime.accelerator_requirement.failed",
+    "worker.runtime.accelerator_requirement.checking",
+  ]);
+  if (!event) {
+    return capabilityStatus;
+  }
+  if (event.event_type === "worker.runtime.accelerator_requirement.failed") {
+    return {
+      ...capabilityStatus,
+      phase: "Failed",
+      reason: "AcceleratorRequirementFailed",
+      message: stringField(event.payload.error) ?? `Worker failed to validate AcceleratorRequirement/${resourceName(accelerator)}.`,
+      error_message: stringField(event.payload.error),
+      required_capability: stringField(event.payload.required_capability),
+      ...runtimeLifecycleEventStatusFields(event),
+    };
+  }
+  if (event.event_type === "worker.runtime.accelerator_requirement.checking") {
+    return {
+      ...capabilityStatus,
+      phase: "Checking",
+      reason: "AcceleratorRequirementChecking",
+      message: `Worker attempt ${runtimeLifecycleEventAttemptId(event)} is validating AcceleratorRequirement/${resourceName(accelerator)}.`,
+      required_capability: stringField(event.payload.required_capability),
+      ...runtimeLifecycleEventStatusFields(event),
+    };
+  }
+  return {
+    ...capabilityStatus,
+    phase: "Available",
+    reason: "AcceleratorRequirementAvailable",
+    message: `Worker attempt ${runtimeLifecycleEventAttemptId(event)} validated AcceleratorRequirement/${resourceName(accelerator)}.`,
+    required_capability: stringField(event.payload.required_capability),
+    ...runtimeLifecycleEventStatusFields(event),
+  };
+}
+
+function runtimeNetworkPerimeterStatus(
+  activeAttempts: RuntimeRunAttemptRecord[],
+  events: RuntimeEventRecord[],
+): JsonObject {
+  const capabilityStatus = runtimeCapabilityBackedRequirementStatus("network_perimeter", activeAttempts, {
+    pendingMessage: "No active runner attempt has reported whether network perimeter enforcement is available.",
+    satisfiedReason: "NetworkPerimeterAvailable",
+    missingReason: "NetworkPerimeterMissing",
+    satisfiedMessage: (attemptId) => `Active runner attempt ${attemptId} advertises network_perimeter.`,
+    missingMessage: "No active runner attempt advertises network_perimeter.",
+  });
+  const event = latestRuntimeResourceLifecycleEvent(events, "NetworkPerimeter", "declared", [
+    "worker.runtime.network_perimeter.applied",
+    "worker.runtime.network_perimeter.failed",
+    "worker.runtime.network_perimeter.applying",
+  ]);
+  if (!event) {
+    return capabilityStatus;
+  }
+  if (event.event_type === "worker.runtime.network_perimeter.failed") {
+    return {
+      ...capabilityStatus,
+      phase: "Failed",
+      reason: "NetworkPerimeterApplyFailed",
+      message: stringField(event.payload.error) ?? "Worker failed to apply NetworkPerimeter/declared.",
+      error_message: stringField(event.payload.error),
+      ...runtimeLifecycleEventStatusFields(event),
+    };
+  }
+  if (event.event_type === "worker.runtime.network_perimeter.applying") {
+    return {
+      ...capabilityStatus,
+      phase: "Applying",
+      reason: "NetworkPerimeterApplying",
+      message: `Worker attempt ${runtimeLifecycleEventAttemptId(event)} is applying NetworkPerimeter/declared.`,
+      ...runtimeLifecycleEventStatusFields(event),
+    };
+  }
+  return {
+    ...capabilityStatus,
+    phase: "Applied",
+    reason: "NetworkPerimeterApplied",
+    message: `Worker attempt ${runtimeLifecycleEventAttemptId(event)} applied NetworkPerimeter/declared.`,
+    ...runtimeLifecycleEventStatusFields(event),
+  };
+}
+
+function latestRuntimeResourceLifecycleEvent(
+  events: RuntimeEventRecord[],
+  kind: string,
+  name: string,
+  eventTypes: string[],
+): RuntimeEventRecord | undefined {
+  const typeSet = new Set(eventTypes);
+  return events
+    .filter((event) => typeSet.has(event.event_type))
+    .filter((event) => runtimeEventResourceRefs(event).some((ref) => {
+      const refKind = ref.kind ? canonicalRuntimeResourceKind(ref.kind) ?? ref.kind : "";
+      return refKind === kind && ref.name === name;
+    }))
+    .sort((left, right) =>
+      eventTime(right) - eventTime(left)
+      || right.row_seq - left.row_seq
+      || right.seq - left.seq
+    )[0];
+}
+
+function runtimeLifecycleEventStatusFields(event: RuntimeEventRecord): JsonObject {
+  return compactObject({
+    event_type: event.event_type,
+    event_row_seq: event.row_seq,
+    event_seq: event.seq,
+    observed_at: event.ts ?? stringField(event.row.created_at),
+    attempt_id: runtimeLifecycleEventAttemptId(event),
+    runner_instance_id: stringField(event.payload.runner_instance_id),
+    worker_id: stringField(event.payload.worker_id),
+  });
+}
+
+function runtimeLifecycleEventAttemptId(event: RuntimeEventRecord): string {
+  return stringField(event.payload.attempt_id) ?? stringField(event.row.attempt_id) ?? "unknown";
 }
 
 function capabilityAtLeast(value: number | null | undefined, required: number): boolean {
@@ -6833,7 +7763,9 @@ function runtimeEventResource(
   event: RuntimeEventRecord,
 ): RuntimeResourceRecord {
   const refs = runtimeEventResourceRefs(event);
-  const primaryRef = refs.find((ref) => ref.kind && ref.name);
+  const primaryRef = runtimeEventPrimaryResourceRef(event, refs);
+  const involvedObject = runtimeEventInvolvedObject(primaryRef);
+  const involved = runtimeEventInvolvedSummary(primaryRef);
   const eventUid = runtimeEventUid(event);
   return runtimeResource({
     kind: "Event",
@@ -6872,6 +7804,8 @@ function runtimeEventResource(
       variant_id: event.variant_id,
       task_id: event.task_id,
       repl_idx: event.repl_idx,
+      involved_object: involvedObject,
+      involved_resources: runtimeEventResourceRefsForSpec(event),
       resource_refs: runtimeEventResourceRefsForSpec(event),
       payload: event.payload,
       row: event.row,
@@ -6880,6 +7814,12 @@ function runtimeEventResource(
       phase: "recorded",
       reason: runtimeEventReason(event),
       message: runtimeEventMessage(event),
+      involved,
+      involved_object: involvedObject,
+      involved_kind: primaryRef?.kind,
+      involved_name: primaryRef?.name,
+      involved_uid: primaryRef?.uid,
+      involved_count: refs.filter((ref) => ref.kind && ref.name).length,
       event_time: event.ts,
       observed_at: event.ts,
     }),
@@ -6937,12 +7877,52 @@ function runtimeEventOwnerReferences(
 }
 
 function runtimeEventResourceRefsForSpec(event: RuntimeEventRecord): JsonObject[] {
-  return runtimeEventResourceRefs(event).map((ref) => compactObject({
+  return runtimeEventPrimaryFirstResourceRefs(event).map((ref) => compactObject({
     apiVersion: RUNTIME_API_VERSION,
     kind: ref.kind,
     name: ref.name,
     uid: ref.uid,
   }));
+}
+
+function runtimeEventPrimaryFirstResourceRefs(event: RuntimeEventRecord): Array<{ kind: string | null; name: string | null; uid: string | null }> {
+  const refs = runtimeEventResourceRefs(event);
+  const primaryRef = runtimeEventPrimaryResourceRef(event, refs);
+  return primaryRef ? uniqueRuntimeEventResourceRefs([primaryRef, ...refs]) : refs;
+}
+
+function runtimeEventPrimaryResourceRef(
+  event: RuntimeEventRecord,
+  refs: Array<{ kind: string | null; name: string | null; uid: string | null }>,
+): { kind: string | null; name: string | null; uid: string | null } | undefined {
+  const payload = isRecord(event.payload) ? event.payload : {};
+  const explicitRefs = [
+    runtimeEventResourceRefFromObject(isRecord(payload.resource_ref) ? payload.resource_ref : null),
+    runtimeEventResourceRefFromObject(isRecord(payload.access_resource_ref) ? payload.access_resource_ref : null),
+    runtimeEventResourceRefFromObject(isRecord(payload.resolved_target) ? payload.resolved_target : null),
+    runtimeEventResourceRefFromObject(isRecord(payload.target_ref) ? payload.target_ref : null),
+  ];
+  return uniqueRuntimeEventResourceRefs(explicitRefs).find((ref) => ref.kind && ref.name)
+    ?? refs.find((ref) => ref.kind && ref.name);
+}
+
+function runtimeEventInvolvedObject(ref: { kind: string | null; name: string | null; uid: string | null } | undefined): JsonObject | undefined {
+  if (!ref?.kind || !ref.name) {
+    return undefined;
+  }
+  return compactObject({
+    apiVersion: RUNTIME_API_VERSION,
+    kind: ref.kind,
+    name: ref.name,
+    uid: ref.uid,
+  });
+}
+
+function runtimeEventInvolvedSummary(ref: { kind: string | null; name: string | null; uid: string | null } | undefined): string | undefined {
+  if (!ref?.kind || !ref.name) {
+    return undefined;
+  }
+  return `${ref.kind}/${ref.name}`;
 }
 
 function runtimeEventReason(event: RuntimeEventRecord): string {
@@ -7152,11 +8132,13 @@ function runtimeResourceStatusView(
     apiVersion: RUNTIME_API_VERSION,
     kind: "RuntimeResourceStatus",
     cloud_run_id: cloudRunId,
+    generated_at: new Date().toISOString(),
     core_run_ids: coreRunIds,
     resource_ref: runtimeResourceWatchRef(resource),
-    generation: numberField(resource.metadata.generation),
-    observedGeneration: numberField(resource.status.observedGeneration),
-    resourceVersion: stringField(resource.metadata.resourceVersion),
+    generation: resource.metadata.generation,
+    observedGeneration: numberField(resource.status.observedGeneration) ?? resource.metadata.generation,
+    resourceVersion: resource.metadata.resourceVersion,
+    deletionTimestamp: stringField(resource.metadata.deletionTimestamp),
     phase: stringField(resource.status.phase),
     reason: stringField(resource.status.reason),
     message: stringField(resource.status.message) ?? stringField(resource.status.error_message),
@@ -7318,6 +8300,7 @@ function runtimeResourceMetricsListView(
 function runtimeInspectBundleFilter(input: RuntimeInspectBundleInput): RuntimeResourceFilter {
   return {
     kinds: input.kinds?.map((kind) => kind.trim()).filter(Boolean) ?? [],
+    categories: input.categories?.map((category) => category.trim()).filter(Boolean) ?? [],
     labelSelector: input.labelSelector?.trim() || null,
     fieldSelector: input.fieldSelector?.trim() || null,
   };
@@ -7579,15 +8562,18 @@ function runtimeResource(input: {
   status: JsonObject;
   audit: JsonObject;
 }): RuntimeResourceRecord {
-  const resource: RuntimeResourceRecord = {
+  const deletionTimestamp = runtimeResourceDeletionTimestamp(input.kind, input.status, input.updated_at);
+  const resource: RuntimeResourceDraft = {
     apiVersion: RUNTIME_API_VERSION,
     kind: input.kind,
     metadata: {
       name: input.name,
-      ...(input.uid ? { uid: input.uid } : {}),
+      uid: normalizeOptionalString(input.uid) ?? runtimeResourceGeneratedUid(input),
       labels: input.labels,
       annotations: input.annotations ?? {},
       ownerReferences: input.ownerReferences,
+      ...(input.created_at ? { creationTimestamp: input.created_at } : {}),
+      ...(deletionTimestamp ? { deletionTimestamp } : {}),
       ...(input.created_at ? { created_at: input.created_at } : {}),
       ...(input.updated_at ? { updated_at: input.updated_at } : {}),
     },
@@ -7640,10 +8626,26 @@ function runtimeResource(input: {
     ...resource.metadata,
     resourceVersion: runtimeResourceVersion(resource),
   };
-  return resource;
+  return resource as RuntimeResourceRecord;
 }
 
-function runtimeResourceAccessSummary(resource: RuntimeResourceRecord): JsonObject | undefined {
+function runtimeResourceGeneratedUid(input: { kind: string; name: string; ownerReferences: RuntimeResourceRecord["metadata"]["ownerReferences"] }): string {
+  return sha256Digest(canonicalJsonStringify({
+    apiVersion: RUNTIME_API_VERSION,
+    kind: input.kind,
+    name: input.name,
+    ownerReferences: input.ownerReferences,
+  } as JsonObject));
+}
+
+function runtimeResourceDeletionTimestamp(kind: string, status: JsonObject, updatedAt: string | null | undefined): string | null {
+  const phase = stringField(status.phase)?.toLowerCase();
+  return (kind === "PortForward" || kind === "Exec") && phase === "cancelled" && updatedAt
+    ? updatedAt
+    : null;
+}
+
+function runtimeResourceAccessSummary(resource: RuntimeResourceReadable): JsonObject | undefined {
   if (!isRuntimeAccessTargetKind(resource.kind)) {
     return undefined;
   }
@@ -7658,6 +8660,7 @@ function runtimeResourceAccessSummary(resource: RuntimeResourceRecord): JsonObje
     port_forward: booleanField(existing.port_forward) ?? booleanField(bindingAccess.port_forward),
     exec: booleanField(existing.exec) ?? booleanField(bindingAccess.exec),
     runner_instance_id: stringField(existing.runner_instance_id) ?? stringField(runnerBinding.runner_instance_id) ?? resourceRunnerInstanceId(resource),
+    runner_instance_status: stringField(existing.runner_instance_status) ?? resourceRunnerInstanceStatus(resource),
     attempt_id: stringField(existing.attempt_id) ?? stringField(runnerBinding.attempt_id) ?? resourceAttemptId(resource),
     worker_id: stringField(existing.worker_id) ?? stringField(runnerBinding.worker_id) ?? resourceWorkerId(resource),
   });
@@ -7672,7 +8675,7 @@ function objectField(value: unknown): JsonObject | undefined {
   return value as JsonObject;
 }
 
-function runtimeResourceAnnotations(resource: RuntimeResourceRecord): Record<string, string> {
+function runtimeResourceAnnotations(resource: RuntimeResourceReadable): Record<string, string> {
   const annotations: Record<string, string> = { ...resource.metadata.annotations };
   setAnnotation(annotations, "bucephalus.dev/audit-source", stringField(resource.audit.source));
   setAnnotation(annotations, "bucephalus.dev/phase", stringField(resource.status.phase));
@@ -7708,7 +8711,7 @@ function setAnnotation(annotations: Record<string, string>, key: string, value: 
   }
 }
 
-function runtimeResourceVersion(resource: RuntimeResourceRecord): string {
+function runtimeResourceVersion(resource: RuntimeResourceReadable): string {
   const { resourceVersion: _resourceVersion, ...metadata } = resource.metadata;
   return sha256Digest(canonicalJsonStringify({
     apiVersion: resource.apiVersion,
@@ -7723,12 +8726,29 @@ function runtimeResourceVersion(resource: RuntimeResourceRecord): string {
 function assertRuntimeResourceVersionPrecondition(
   resource: RuntimeResourceRecord,
   expectedVersion: string | null | undefined,
+  options: { required?: boolean; operation?: string } = {},
 ): void {
   const expected = normalizeOptionalString(expectedVersion);
+  const current = resource.metadata.resourceVersion ?? runtimeResourceVersion(resource);
   if (!expected) {
+    if (options.required) {
+      throw new HttpError(
+        428,
+        "runtime_resource_version_required",
+        `${resource.kind}/${resource.metadata.name} requires resource_version from operation review; refresh the runtime resource and retry`,
+        {
+          resource_kind: resource.kind,
+          resource_name: resource.metadata.name,
+          resource_version: current,
+          resource_generation: numberField(resource.metadata.generation),
+          observed_generation: numberField(resource.status.observedGeneration),
+          operation: normalizeOptionalString(options.operation),
+          required: ["resource_version"],
+        },
+      );
+    }
     return;
   }
-  const current = resource.metadata.resourceVersion ?? runtimeResourceVersion(resource);
   if (expected === current) {
     return;
   }
@@ -7846,10 +8866,12 @@ function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function runtimeResourceGeneration(resource: RuntimeResourceRecord): number {
+function runtimeResourceGeneration(resource: RuntimeResourceReadable): number {
   const {
     annotations: _annotations,
+    creationTimestamp: _creationTimestamp,
     created_at: _createdAt,
+    deletionTimestamp: _deletionTimestamp,
     generation: _generation,
     resourceVersion: _resourceVersion,
     updated_at: _updatedAt,
@@ -7866,7 +8888,7 @@ function runtimeResourceGeneration(resource: RuntimeResourceRecord): number {
   return Number.isSafeInteger(value) && value >= 0 ? value + 1 : 1;
 }
 
-function runtimeResourceStatusSummary(resource: RuntimeResourceRecord): { reason: string; message: string } {
+function runtimeResourceStatusSummary(resource: RuntimeResourceReadable): { reason: string; message: string } {
   const condition = runtimeResourceSummaryCondition(resource);
   const phase = stringField(resource.status.phase) ?? "Unknown";
   const reason = stringField(resource.status.reason)
@@ -7879,7 +8901,7 @@ function runtimeResourceStatusSummary(resource: RuntimeResourceRecord): { reason
   return { reason, message };
 }
 
-function runtimeResourceSummaryCondition(resource: RuntimeResourceRecord): RuntimeResourceCondition | null {
+function runtimeResourceSummaryCondition(resource: RuntimeResourceReadable): RuntimeResourceCondition | null {
   const conditions = Array.isArray(resource.status.conditions)
     ? resource.status.conditions.filter(runtimeResourceConditionRecord)
     : [];
@@ -7918,7 +8940,7 @@ function runtimeResourceAdvertisedActions(resource: RuntimeResourceRecord): stri
     : [];
 }
 
-function runtimeResourceActions(resource: RuntimeResourceRecord): string[] {
+function runtimeResourceActions(resource: RuntimeResourceReadable): string[] {
   const phase = (stringField(resource.status.phase) ?? "").toLowerCase();
   switch (resource.kind) {
     case "RunnerInstance":
@@ -7927,14 +8949,16 @@ function runtimeResourceActions(resource: RuntimeResourceRecord): string[] {
       if (phase === "draining") return ["uncordon"];
       return [];
     case "PortForward":
+      if (phase === "active") return ["cancel", "complete"];
+      return phase === "requested" || phase === "accepted" ? ["cancel"] : [];
     case "Exec":
-      return /requested|accepted|active/.test(phase) ? ["cancel"] : [];
+      return phase === "requested" || phase === "accepted" || phase === "active" ? ["cancel"] : [];
     default:
       return [];
   }
 }
 
-function runtimeResourceConditions(resource: RuntimeResourceRecord): RuntimeResourceCondition[] {
+function runtimeResourceConditions(resource: RuntimeResourceReadable): RuntimeResourceCondition[] {
   const conditions = [runtimeReadyCondition(resource)];
   const observed = runtimeObservedCondition(resource);
   if (observed) {
@@ -7956,7 +8980,7 @@ function runtimeResourceConditions(resource: RuntimeResourceRecord): RuntimeReso
   return conditions;
 }
 
-function runtimeObservedCondition(resource: RuntimeResourceRecord): RuntimeResourceCondition | null {
+function runtimeObservedCondition(resource: RuntimeResourceReadable): RuntimeResourceCondition | null {
   const observed = runtimeResourceObservedState(resource);
   if (observed === null) {
     return null;
@@ -7974,7 +8998,7 @@ function runtimeObservedCondition(resource: RuntimeResourceRecord): RuntimeResou
   );
 }
 
-function runtimeResourceObservedState(resource: RuntimeResourceRecord): boolean | null {
+function runtimeResourceObservedState(resource: RuntimeResourceReadable): boolean | null {
   const generation = numberField(resource.metadata.generation);
   const observedGeneration = numberField(resource.status.observedGeneration);
   if (generation === null || observedGeneration === null) {
@@ -7983,7 +9007,7 @@ function runtimeResourceObservedState(resource: RuntimeResourceRecord): boolean 
   return observedGeneration >= generation;
 }
 
-function runtimeReadyCondition(resource: RuntimeResourceRecord): RuntimeResourceCondition {
+function runtimeReadyCondition(resource: RuntimeResourceReadable): RuntimeResourceCondition {
   const phase = stringField(resource.status.phase) ?? "Unknown";
   const normalized = phase.toLowerCase();
   const error = stringField(resource.status.error_message);
@@ -7996,19 +9020,19 @@ function runtimeReadyCondition(resource: RuntimeResourceRecord): RuntimeResource
   if (error || /fail|error|lost|dead|offline|unhealthy|timeout|cancel|disabled/.test(normalized)) {
     return runtimeCondition(resource, "Ready", "False", conditionReason(phase || "Error"), error ?? `Resource phase is ${phase}`);
   }
-  if (/running|active|bound|reported|accepted|online|cordoned|draining|recorded/.test(normalized)) {
+  if (/running|active|bound|reported|accepted|online|cordoned|draining|recorded|available|applied|materialized|pulled/.test(normalized)) {
     return runtimeCondition(resource, "Ready", "True", conditionReason(phase), `Resource phase is ${phase}`);
   }
   if (/complete|succeed/.test(normalized)) {
     return runtimeCondition(resource, "Ready", "False", "Terminal", `Resource reached terminal phase ${phase}`);
   }
-  if (/declared|queued|pending|provisioning|starting|requested/.test(normalized)) {
+  if (/declared|queued|pending|provisioning|starting|requested|checking|applying|pulling/.test(normalized)) {
     return runtimeCondition(resource, "Ready", "False", conditionReason(phase || "Pending"), `Resource is waiting in phase ${phase}`);
   }
   return runtimeCondition(resource, "Ready", "Unknown", "UnknownPhase", `Resource phase is ${phase}`);
 }
 
-function runtimeReachableCondition(resource: RuntimeResourceRecord): RuntimeResourceCondition {
+function runtimeReachableCondition(resource: RuntimeResourceReadable): RuntimeResourceCondition {
   const unreachableReason = runtimeAccessTargetUnreachableReason(resource);
   return runtimeCondition(
     resource,
@@ -8021,7 +9045,7 @@ function runtimeReachableCondition(resource: RuntimeResourceRecord): RuntimeReso
   );
 }
 
-function runtimeRunnerBoundCondition(resource: RuntimeResourceRecord): RuntimeResourceCondition {
+function runtimeRunnerBoundCondition(resource: RuntimeResourceReadable): RuntimeResourceCondition {
   const runnerBinding = isRecord(resource.status.runner_binding) ? resource.status.runner_binding : {};
   const workerId = stringField(runnerBinding.worker_id) ?? resourceWorkerId(resource);
   const attemptId = stringField(runnerBinding.attempt_id);
@@ -8055,7 +9079,7 @@ function runtimeRunnerBoundCondition(resource: RuntimeResourceRecord): RuntimeRe
 }
 
 function runtimeAccessCapabilityCondition(
-  resource: RuntimeResourceRecord,
+  resource: RuntimeResourceReadable,
   type: "PortForwardReady" | "ExecReady",
   accessKey: "port_forward" | "exec",
   capability: "runtime_port_forward" | "runtime_exec",
@@ -8077,7 +9101,7 @@ function runtimeAccessCapabilityCondition(
   );
 }
 
-function runtimeAccessRequestConditions(resource: RuntimeResourceRecord): RuntimeResourceCondition[] {
+function runtimeAccessRequestConditions(resource: RuntimeResourceReadable): RuntimeResourceCondition[] {
   const phase = (stringField(resource.status.phase) ?? "unknown").toLowerCase();
   const error = stringField(resource.status.error_message);
   const accepted = phase === "accepted" || phase === "active" || phase === "completed";
@@ -8115,7 +9139,7 @@ function runtimeAccessRequestConditions(resource: RuntimeResourceRecord): Runtim
 }
 
 function runtimePortForwardClientReachableCondition(
-  resource: RuntimeResourceRecord,
+  resource: RuntimeResourceReadable,
   phase: string,
 ): RuntimeResourceCondition {
   if (phase !== "active") {
@@ -8149,12 +9173,11 @@ function runtimePortForwardClientReachableCondition(
 function runtimePortForwardConnectionClientReachable(connection: JsonObject): boolean {
   return connection.client_reachable === true
     || Boolean(stringField(connection.client_endpoint))
-    || Boolean(stringField(connection.client_url))
     || Boolean(stringField(connection.client_listen));
 }
 
 function runtimeCondition(
-  resource: RuntimeResourceRecord,
+  resource: RuntimeResourceReadable,
   type: string,
   status: RuntimeResourceCondition["status"],
   reason: string,
@@ -8169,7 +9192,7 @@ function runtimeCondition(
   }) as RuntimeResourceCondition;
 }
 
-function runtimeConditionTime(resource: RuntimeResourceRecord): string | undefined {
+function runtimeConditionTime(resource: RuntimeResourceReadable): string | undefined {
   return resource.metadata.updated_at
     ?? resource.metadata.created_at
     ?? stringField(resource.audit.observed_at)
@@ -8191,6 +9214,9 @@ export function filterRuntimeResources(
   const kinds = new Set((filter.kinds ?? [])
     .map((kind) => canonicalRuntimeResourceKind(kind) ?? kind.trim())
     .filter(Boolean));
+  const categories = new Set((filter.categories ?? [])
+    .map((category) => runtimeApiResourceAliasKey(category.trim()))
+    .filter(Boolean));
   const labelRequirements = parseResourceSelector(filter.labelSelector, "label_selector", true);
   const fieldRequirements = normalizeRuntimeKindSelectorRequirements(
     parseResourceSelector(filter.fieldSelector, "field_selector", false),
@@ -8199,14 +9225,24 @@ export function filterRuntimeResources(
     if (kinds.size > 0 && !kinds.has(resource.kind)) {
       return false;
     }
+    if (categories.size > 0 && !runtimeResourceMatchesAnyCategory(resource, categories)) {
+      return false;
+    }
     return labelRequirements.every((requirement) => resourceSelectorMatches(requirement, labelValue(resource, requirement.key)))
       && fieldRequirements.every((requirement) => resourceSelectorMatches(requirement, fieldValue(resource, requirement.key)));
   });
 }
 
+function runtimeResourceMatchesAnyCategory(resource: RuntimeResourceRecord, categories: Set<string>): boolean {
+  const kind = canonicalRuntimeResourceKind(resource.kind) ?? resource.kind;
+  const definition = RUNTIME_API_RESOURCE_DEFINITIONS.find((candidate) => candidate.kind === kind);
+  return (definition?.categories ?? []).some((category) => categories.has(runtimeApiResourceAliasKey(category)));
+}
+
 export function runtimeAccessTargetFromInventory(
   resources: RuntimeResourceRecord[],
   input: { resourceKind?: string | null | undefined; resourceName?: string | null | undefined; resourceVersion?: string | null | undefined },
+  options: { required?: boolean; operation?: string } = {},
 ): RuntimeAccessTarget {
   const resourceKind = normalizeOptionalString(input.resourceKind);
   const resourceName = normalizeOptionalString(input.resourceName);
@@ -8230,7 +9266,7 @@ export function runtimeAccessTargetFromInventory(
       name: resourceName,
     });
   }
-  assertRuntimeResourceVersionPrecondition(resource, input.resourceVersion);
+  assertRuntimeResourceVersionPrecondition(resource, input.resourceVersion, options);
   if (!isRuntimeAccessTargetKind(resource.kind)) {
     throw new HttpError(
       409,
@@ -8399,7 +9435,7 @@ function runtimeScheduleSlotForContainer(
   });
 }
 
-function resourceRunnerInstanceId(resource: RuntimeResourceRecord): string | undefined {
+function resourceRunnerInstanceId(resource: RuntimeResourceReadable): string | undefined {
   const runnerBinding = isRecord(resource.status.runner_binding) ? resource.status.runner_binding : {};
   return stringField(resource.spec.runner_instance_id)
     ?? stringField(resource.status.runner_instance_id)
@@ -8408,7 +9444,17 @@ function resourceRunnerInstanceId(resource: RuntimeResourceRecord): string | und
     ?? undefined;
 }
 
-function resourceAttemptId(resource: RuntimeResourceRecord): string | undefined {
+function resourceRunnerInstanceStatus(resource: RuntimeResourceReadable): string | undefined {
+  const access = isRecord(resource.status.access) ? resource.status.access : {};
+  const runnerBinding = isRecord(resource.status.runner_binding) ? resource.status.runner_binding : {};
+  return stringField(access.runner_instance_status)
+    ?? stringField(resource.status.runner_instance_status)
+    ?? stringField(runnerBinding.runner_instance_status)
+    ?? (resource.kind === "RunnerInstance" ? stringField(resource.status.phase) : undefined)
+    ?? undefined;
+}
+
+function resourceAttemptId(resource: RuntimeResourceReadable): string | undefined {
   const runnerBinding = isRecord(resource.status.runner_binding) ? resource.status.runner_binding : {};
   return resource.kind === "RunnerAttempt"
     ? resource.metadata.uid ?? resource.metadata.name
@@ -8421,7 +9467,7 @@ function resourceAttemptId(resource: RuntimeResourceRecord): string | undefined 
       ?? undefined;
 }
 
-function resourceWorkerId(resource: RuntimeResourceRecord): string | undefined {
+function resourceWorkerId(resource: RuntimeResourceReadable): string | undefined {
   const runnerBinding = isRecord(resource.status.runner_binding) ? resource.status.runner_binding : {};
   return stringField(resource.spec.worker_id)
     ?? stringField(resource.status.worker_id)
@@ -8609,16 +9655,15 @@ function isRuntimeAccessTargetKind(kind: string): boolean {
   return RUNTIME_ACCESS_TARGET_KINDS.has(kind);
 }
 
-function runtimeAccessTargetUnreachableReason(resource: RuntimeResourceRecord): string | null {
+function runtimeAccessTargetUnreachableReason(resource: RuntimeResourceReadable): string | null {
   const phase = stringField(resource.status.phase)?.toLowerCase() ?? "";
   switch (resource.kind) {
     case "Run":
-      if (phase !== "running" && phase !== "active") {
+      if (phase !== "running") {
         return `phase is ${phase || "unknown"}`;
       }
       {
-        const access = isRecord(resource.status.access) ? resource.status.access : {};
-        const runnerStatus = stringField(access.runner_instance_status)?.toLowerCase() ?? null;
+        const runnerStatus = resourceRunnerInstanceStatus(resource)?.toLowerCase() ?? null;
         if (runtimeResourceHasAccessBinding(resource) && !runtimeRunnerStatusAllowsAccess(runnerStatus)) {
           return `runner status is ${runnerStatus ?? "unknown"}`;
         }
@@ -8708,7 +9753,7 @@ function runtimeAccessTargetUnreachableReason(resource: RuntimeResourceRecord): 
   }
 }
 
-function runtimeBoundRunnerUnreachableReason(resource: RuntimeResourceRecord): string | null {
+function runtimeBoundRunnerUnreachableReason(resource: RuntimeResourceReadable): string | null {
   const binding = isRecord(resource.status.runner_binding) ? resource.status.runner_binding : {};
   const runnerStatus = stringField(binding.runner_instance_status)?.toLowerCase() ?? null;
   if (runtimeResourceHasRunnerBinding(resource) && !runtimeRunnerStatusAllowsAccess(runnerStatus)) {
@@ -8717,12 +9762,12 @@ function runtimeBoundRunnerUnreachableReason(resource: RuntimeResourceRecord): s
   return null;
 }
 
-function runtimeResourceHasRunnerBinding(resource: RuntimeResourceRecord): boolean {
+function runtimeResourceHasRunnerBinding(resource: RuntimeResourceReadable): boolean {
   const binding = isRecord(resource.status.runner_binding) ? resource.status.runner_binding : {};
   return Boolean(stringField(binding.attempt_id) && stringField(binding.runner_instance_id));
 }
 
-function runtimeResourceHasAccessBinding(resource: RuntimeResourceRecord): boolean {
+function runtimeResourceHasAccessBinding(resource: RuntimeResourceReadable): boolean {
   const access = isRecord(resource.status.access) ? resource.status.access : {};
   return Boolean(stringField(access.attempt_id) && stringField(access.runner_instance_id));
 }
@@ -8746,6 +9791,12 @@ function fieldValue(resource: RuntimeResourceRecord, path: string): RuntimeSelec
   }
   if (path === "metadata.resourceVersion") {
     return resource.metadata.resourceVersion;
+  }
+  if (path === "metadata.creationTimestamp") {
+    return resource.metadata.creationTimestamp;
+  }
+  if (path === "metadata.deletionTimestamp") {
+    return resource.metadata.deletionTimestamp;
   }
   if (path.startsWith("metadata.labels.")) {
     return resource.metadata.labels[path.slice("metadata.labels.".length)];
@@ -8780,7 +9831,7 @@ function fieldValue(resource: RuntimeResourceRecord, path: string): RuntimeSelec
   throw new HttpError(
     400,
     "invalid_runtime_resource_selector",
-    `field_selector path '${path}' is not supported; use kind, metadata.name, metadata.uid, metadata.generation, metadata.resourceVersion, metadata.labels.<key>, metadata.ownerReferences, metadata.ownerReferences.apiVersion, metadata.ownerReferences.kind, metadata.ownerReferences.name, metadata.ownerReferences.uid, spec.<path>, status.conditions.<type>, status.conditions.<type>.status, status.conditions.<type>.reason, status.conditions.<type>.message, status.<path>, or audit.<path>`,
+    `field_selector path '${path}' is not supported; use kind, metadata.name, metadata.uid, metadata.generation, metadata.resourceVersion, metadata.creationTimestamp, metadata.deletionTimestamp, metadata.labels.<key>, metadata.ownerReferences, metadata.ownerReferences.apiVersion, metadata.ownerReferences.kind, metadata.ownerReferences.name, metadata.ownerReferences.uid, spec.<path>, status.conditions.<type>, status.conditions.<type>.status, status.conditions.<type>.reason, status.conditions.<type>.message, status.<path>, or audit.<path>`,
   );
 }
 
@@ -8840,6 +9891,41 @@ function runtimeEventListView(
     metadata: page.metadata,
     events: page.events,
   };
+}
+
+function runtimeEventRowsInputWithContinue(input: RuntimeEventRowsInput = {}): RuntimeEventRowsInput {
+  const afterRowSeq = runtimeEventAfterRowSeq(input);
+  const normalized: RuntimeEventRowsInput = { ...input };
+  delete normalized.continueToken;
+  if (afterRowSeq === undefined) {
+    delete normalized.afterRowSeq;
+  } else {
+    normalized.afterRowSeq = afterRowSeq;
+  }
+  return normalized;
+}
+
+function runtimeEventAfterRowSeq(input: Pick<RuntimeEventRowsInput, "afterRowSeq" | "continueToken">): number | undefined {
+  const continueToken = input.continueToken?.trim() || null;
+  if (input.afterRowSeq !== undefined && continueToken !== null) {
+    throw new HttpError(400, "invalid_runtime_event_cursor", "Runtime event queries accept either afterRowSeq or continueToken, not both");
+  }
+  if (continueToken !== null) {
+    return runtimeEventContinueRowSeq(continueToken);
+  }
+  return input.afterRowSeq;
+}
+
+function runtimeEventContinueRowSeq(token: string): number {
+  const match = /^event-row-seq:(\d+)$/.exec(token.trim());
+  if (!match) {
+    throw new HttpError(400, "invalid_runtime_event_continue", "Runtime event continueToken must be formatted as event-row-seq:<row_seq>");
+  }
+  const rowSeq = Number.parseInt(match[1] ?? "", 10);
+  if (!Number.isSafeInteger(rowSeq) || rowSeq < 0) {
+    throw new HttpError(400, "invalid_runtime_event_continue", "Runtime event continueToken must be formatted as event-row-seq:<row_seq>");
+  }
+  return rowSeq;
 }
 
 function runtimeResourceEventListView(
@@ -9021,7 +10107,7 @@ function runtimeEventRecordWithResourceRefs(event: RuntimeEventRecord): RuntimeE
 }
 
 function runtimeEventResourceRefsForWire(event: RuntimeEventRecord): RuntimeResourceWatchRef[] {
-  return runtimeEventResourceRefs(event).flatMap((ref) => {
+  return runtimeEventPrimaryFirstResourceRefs(event).flatMap((ref) => {
     const kind = normalizeOptionalString(ref.kind);
     const name = normalizeOptionalString(ref.name);
     if (!kind || !name) {
@@ -9047,6 +10133,7 @@ function runtimeEventResourceRefs(event: RuntimeEventRecord): Array<{ kind: stri
     runtimeEventResourceRefFromObject(event.row),
     runtimeEventResourceRefFromObject(isRecord(event.payload.resource_ref) ? event.payload.resource_ref : null),
     runtimeEventResourceRefFromObject(isRecord(event.payload.access_resource_ref) ? event.payload.access_resource_ref : null),
+    runtimeEventResourceRefFromObject(isRecord(event.payload.resolved_target) ? event.payload.resolved_target : null),
     runtimeEventResourceRefFromObject(isRecord(event.payload.target_ref) ? event.payload.target_ref : null),
   ];
   return uniqueRuntimeEventResourceRefs(refs);
@@ -9251,7 +10338,8 @@ function execResourceLogs(
   const connection = isRecord(resource.status.connection) ? resource.status.connection : {};
   const runnerBinding = isRecord(resource.status.runner_binding) ? resource.status.runner_binding : {};
   const tailKey = stream === "stdout" ? "stdout_tail" : "stderr_tail";
-  const text = stringField(connection[tailKey]) ?? "";
+  const streamKey = stream === "stdout" ? "stdout" : "stderr";
+  const text = stringField(connection[tailKey]) ?? stringField(connection[streamKey]) ?? "";
   const allBytes = new TextEncoder().encode(text);
   const bytes = tailLines === undefined ? allBytes : tailTextBytes(allBytes, tailLines);
   const mediaType = "text/plain; charset=utf-8";
@@ -10104,7 +11192,7 @@ function validateRuntimeAccessTtlSeconds(value: number | null | undefined): numb
 }
 
 function validatePortForwardStatusConnection(
-  status: "accepted" | "active" | "failed" | "expired",
+  status: "accepted" | "active" | "completed" | "failed" | "expired",
   connection: JsonObject | null,
 ): void {
   if (status !== "active") {
@@ -10136,15 +11224,19 @@ function portForwardConnectionHasConnectHandle(connection: JsonObject): boolean 
     "client_endpoint",
     "client_url",
     "client_listen",
+    "provider_tunnel_url",
+    "tunnel",
   ].some((key) => Boolean(stringField(connection[key])));
 }
 
-function portForwardWorkerTransitionPreviousStatuses(status: "accepted" | "active" | "failed" | "expired"): string[] {
+function portForwardWorkerTransitionPreviousStatuses(status: "accepted" | "active" | "completed" | "failed" | "expired"): string[] {
   switch (status) {
     case "accepted":
       return ["requested", "accepted"];
     case "active":
       return ["accepted", "active"];
+    case "completed":
+      return ["active"];
     case "failed":
     case "expired":
       return ["requested", "accepted", "active"];
@@ -10264,6 +11356,560 @@ function validateCommand(value: string[], pointer: string): string[] {
 function normalizeOptionalString(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
+}
+
+async function appendRuntimeApiResourcesReadAuditEvent(
+  sql: Sql | undefined,
+  input: {
+    runId: string;
+    operation: "api-resources" | "api-resource";
+    requester?: string | null | undefined;
+    selectedKind?: string | null | undefined;
+    apiResources?: RuntimeApiResourceList | undefined;
+    apiResource?: RuntimeApiResourceRecord | undefined;
+    error?: unknown;
+  },
+): Promise<void> {
+  if (!isRuntimeSql(sql)) {
+    return;
+  }
+  const error = runtimeReadAuditError(input.error);
+  const payload = compactObject({
+    operation: input.operation,
+    status: error ? "failed" : undefined,
+    requester: normalizeOptionalString(input.requester),
+    resource_ref: runtimeInspectBundleRunResourceRef(input.runId),
+    resource_kind: "Run",
+    resource_name: input.runId,
+    resource_uid: input.runId,
+    selected_kind: normalizeOptionalString(input.selectedKind),
+    api_resources_returned: input.apiResources?.resources.length,
+    api_resource_kind: input.apiResource?.kind,
+    api_resource_name: input.apiResource?.name,
+    api_resource_singular: input.apiResource?.singularName,
+    api_resource_categories: input.apiResource?.categories,
+    api_resource_verbs: input.apiResource?.verbs,
+    api_resource_subresources: input.apiResource?.subresources,
+    api_resource_actions: input.apiResource?.actions,
+    api_resource_access: input.apiResource?.access,
+    api_resource_count: input.apiResource?.count,
+    core_run_ids: input.apiResources?.core_run_ids ?? input.apiResource?.core_run_ids,
+    error_code: error?.code,
+    error_status: error?.status,
+    error_message: error?.message,
+  });
+  try {
+    await appendAccessRequestEvent(sql, sql, {
+      runId: input.runId,
+      attemptId: null,
+      eventType: error ? "runtime.api_resources.read.failed" : "runtime.api_resources.read",
+      payload,
+    });
+  } catch (insertError) {
+    if (isMissingRuntimeStore(insertError)) {
+      return;
+    }
+    throw insertError;
+  }
+}
+
+type RuntimeResourceQueryReadEventType =
+  | "runtime.resource.list.read"
+  | "runtime.resource.list.read.failed"
+  | "runtime.resource.watch.read"
+  | "runtime.resource.watch.read.failed"
+  | "runtime.resource.health.read"
+  | "runtime.resource.health.read.failed"
+  | "runtime.resource.describe.read"
+  | "runtime.resource.describe.read.failed"
+  | "runtime.resource.get.read"
+  | "runtime.resource.get.read.failed"
+  | "runtime.resource.events.read"
+  | "runtime.resource.events.read.failed"
+  | "runtime.resource.status.read"
+  | "runtime.resource.status.read.failed"
+  | "runtime.resource.metrics.read"
+  | "runtime.resource.metrics.read.failed"
+  | "runtime.resource.metrics.list.read"
+  | "runtime.resource.metrics.list.read.failed";
+
+async function appendRuntimeResourceQueryReadAuditEvent(
+  sql: Sql | undefined,
+  input: {
+    runId: string;
+    eventType: RuntimeResourceQueryReadEventType;
+    operation: string;
+    requester?: string | null | undefined;
+    input?: unknown;
+    list?: RuntimeResourceList | undefined;
+    watch?: RuntimeResourceWatchList | undefined;
+    health?: RuntimeResourceHealth | undefined;
+    resource?: RuntimeResourceRecord | undefined;
+    eventList?: RuntimeResourceEventList | undefined;
+    status?: RuntimeResourceStatus | undefined;
+    metrics?: RuntimeResourceMetrics | undefined;
+    metricsList?: RuntimeResourceMetricsList | undefined;
+    relatedResources?: number | undefined;
+    error?: unknown;
+  },
+): Promise<void> {
+  if (!isRuntimeSql(sql) || !runtimeReadAuditRequested(input.input)) {
+    return;
+  }
+  const error = runtimeReadAuditError(input.error);
+  const requested = runtimeReadAuditRequestedResource(input.input);
+  const resourceKind = input.resource?.kind
+    ?? requested.kind
+    ?? (input.list || input.watch || input.health || input.metricsList ? "Run" : null);
+  const resourceName = input.resource?.metadata.name
+    ?? requested.name
+    ?? (input.list || input.watch || input.health || input.metricsList ? input.runId : null);
+  const payload = compactObject({
+    operation: input.operation,
+    status: error ? "failed" : undefined,
+    requester: normalizeOptionalString(input.requester),
+    resource_ref: input.resource
+      ? runtimeResourceEventRef(input.resource)
+      : runtimeRequestedResourceEventRef(resourceKind, resourceName),
+    resource_kind: resourceKind,
+    resource_name: resourceName,
+    resource_uid: input.resource?.metadata.uid ?? (resourceKind === "Run" ? input.runId : undefined),
+    resource_version: runtimeResourceReadAuditResourceVersion(input),
+    resource_generation: input.resource?.metadata.generation,
+    resource_filter: runtimeResourceReadAuditFilter(input.input),
+    event_filter: runtimeResourceReadAuditEventFilter(input.input),
+    limit: runtimeReadAuditNumber(input.input, "limit"),
+    event_limit: runtimeReadAuditNumber(input.input, "eventLimit"),
+    continue: runtimeReadAuditString(input.input, "continueToken")
+      ?? input.list?.metadata.continue
+      ?? input.watch?.resource_inventory.metadata.continue
+      ?? input.eventList?.metadata.continue
+      ?? input.metricsList?.metadata.continue,
+    resource_version_cursor: runtimeReadAuditString(input.input, "resourceVersion"),
+    known_resources: runtimeReadAuditKnownResourceCount(input.input),
+    allow_bookmarks: runtimeReadAuditBoolean(input.input, "allowBookmarks"),
+    total: input.list?.metadata.total
+      ?? input.watch?.resource_inventory.metadata.total
+      ?? input.metricsList?.metadata.total
+      ?? input.health?.summary.total,
+    returned: input.list?.metadata.returned
+      ?? input.watch?.resource_inventory.metadata.returned
+      ?? input.eventList?.metadata.returned
+      ?? input.metricsList?.metadata.returned,
+    remaining: input.list?.metadata.remainingItemCount
+      ?? input.watch?.resource_inventory.metadata.remainingItemCount
+      ?? input.eventList?.metadata.remainingItemCount
+      ?? input.metricsList?.metadata.remainingItemCount,
+    watch_events_returned: input.watch?.events.length,
+    event_resource_version: input.eventList?.metadata.resourceVersion,
+    event_returned: input.eventList?.metadata.returned,
+    event_next_after_row_seq: input.eventList?.metadata.next_after_row_seq ?? undefined,
+    metrics_total: input.metrics?.summary.metrics_total ?? input.metricsList?.summary.metrics_total,
+    metrics_resources_returned: input.metricsList?.summary.resources_returned,
+    health_ready: input.health?.summary.ready,
+    health_degraded: input.health?.summary.degraded,
+    health_problem: input.health?.summary.problem,
+    health_unknown: input.health?.summary.unknown,
+    phase: typeof input.status?.phase === "string" ? input.status.phase : undefined,
+    reason: typeof input.status?.reason === "string" ? input.status.reason : undefined,
+    related_resources: input.relatedResources,
+    error_code: error?.code,
+    error_status: error?.status,
+    error_message: error?.message,
+  });
+  try {
+    await appendAccessRequestEvent(sql, sql, {
+      runId: input.runId,
+      attemptId: input.resource ? runtimeResourceReadAttemptId(input.resource) : null,
+      eventType: input.eventType,
+      payload,
+    });
+  } catch (insertError) {
+    if (isMissingRuntimeStore(insertError)) {
+      return;
+    }
+    throw insertError;
+  }
+}
+
+function runtimeReadAuditRequested(input: unknown): boolean {
+  return isRecord(input) && Object.prototype.hasOwnProperty.call(input, "requester");
+}
+
+function runtimeReadAuditRequestedResource(input: unknown): { kind: string | null; name: string | null } {
+  const record = isRecord(input) ? input : {};
+  return {
+    kind: canonicalRuntimeResourceKind(stringField(record.kind)) ?? stringField(record.kind),
+    name: stringField(record.name),
+  };
+}
+
+function runtimeResourceReadAuditResourceVersion(input: Parameters<typeof appendRuntimeResourceQueryReadAuditEvent>[1]): string | undefined {
+  return input.resource?.metadata.resourceVersion
+    ?? input.list?.metadata.resourceVersion
+    ?? input.watch?.resource_inventory.metadata.resourceVersion
+    ?? input.eventList?.resource.metadata.resourceVersion
+    ?? input.status?.resourceVersion
+    ?? input.metrics?.resource_version
+    ?? input.metricsList?.metadata.resourceVersion
+    ?? undefined;
+}
+
+function runtimeResourceReadAuditFilter(input: unknown): JsonObject | undefined {
+  const record = isRecord(input) ? input : {};
+  const filter = isRecord(record.filter) && !record.kind ? record.filter : record;
+  const payload = compactObject({
+    kinds: runtimeReadAuditStringArray(filter.kinds),
+    categories: runtimeReadAuditStringArray(filter.categories),
+    label_selector: stringField(filter.labelSelector),
+    field_selector: stringField(filter.fieldSelector),
+  });
+  return Object.keys(payload).length > 0 ? payload : undefined;
+}
+
+function runtimeResourceReadAuditEventFilter(input: unknown): JsonObject | undefined {
+  const record = isRecord(input) ? input : {};
+  const filter = isRecord(record.filter) ? record.filter : {};
+  const payload = compactObject({
+    event_types: runtimeReadAuditStringArray(filter.eventTypes),
+    sources: runtimeReadAuditStringArray(filter.sources),
+    trial_id: stringField(filter.trialId),
+    task_id: stringField(filter.taskId),
+    after_row_seq: numberField(record.afterRowSeq),
+  });
+  return Object.keys(payload).length > 0 ? payload : undefined;
+}
+
+function runtimeReadAuditStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const items = value.map((item) => typeof item === "string" ? item.trim() : "").filter(Boolean);
+  return items.length > 0 ? items : undefined;
+}
+
+function runtimeReadAuditString(input: unknown, key: string): string | undefined {
+  const record = isRecord(input) ? input : {};
+  return stringField(record[key]) ?? undefined;
+}
+
+function runtimeReadAuditNumber(input: unknown, key: string): number | undefined {
+  const record = isRecord(input) ? input : {};
+  return numberField(record[key]) ?? undefined;
+}
+
+function runtimeReadAuditBoolean(input: unknown, key: string): boolean | undefined {
+  const record = isRecord(input) ? input : {};
+  return typeof record[key] === "boolean" ? record[key] : undefined;
+}
+
+function runtimeReadAuditKnownResourceCount(input: unknown): number | undefined {
+  const record = isRecord(input) ? input : {};
+  return record.knownResourceVersions instanceof Map ? record.knownResourceVersions.size : undefined;
+}
+
+function runtimeResourceFilterOnly(filter: RuntimeResourceFilter): RuntimeResourceFilter {
+  return {
+    kinds: filter.kinds,
+    categories: filter.categories,
+    labelSelector: filter.labelSelector,
+    fieldSelector: filter.fieldSelector,
+  };
+}
+
+async function appendRuntimeOperationReviewAuditEvent(
+  sql: Sql | undefined,
+  input: {
+    runId: string;
+    requester?: string | null | undefined;
+    review?: RuntimeResourceOperationReview | undefined;
+    requestedKind?: string | null | undefined;
+    requestedName?: string | null | undefined;
+    operation?: string | null | undefined;
+    error?: unknown;
+  },
+): Promise<void> {
+  if (!isRuntimeSql(sql)) {
+    return;
+  }
+  const error = runtimeReadAuditError(input.error);
+  const review = input.review;
+  const resourceKind = review?.resource_ref.kind
+    ?? canonicalRuntimeResourceKind(input.requestedKind)
+    ?? normalizeOptionalString(input.requestedKind);
+  const resourceName = review?.resource_ref.name
+    ?? normalizeOptionalString(input.requestedName);
+  const payload = compactObject({
+    operation: review?.operation ?? normalizeOptionalString(input.operation),
+    matched_operation: review?.matched_operation ?? undefined,
+    supported: review?.supported,
+    status: error ? "failed" : review ? (review.supported ? "supported" : "unsupported") : undefined,
+    requester: normalizeOptionalString(input.requester),
+    resource_ref: review ? runtimeOperationReviewResourceRef(review) : runtimeRequestedResourceEventRef(resourceKind, resourceName),
+    resource_kind: resourceKind,
+    resource_name: resourceName,
+    resource_uid: review?.resource_ref.uid,
+    resource_version: review?.resource_version ?? undefined,
+    resource_generation: review?.resource_generation ?? undefined,
+    observed_generation: review?.observed_generation ?? undefined,
+    reason: review?.reason ?? undefined,
+    message: review?.message ?? undefined,
+    command: review?.command ?? undefined,
+    verb: review?.verb ?? undefined,
+    subresource: review?.subresource ?? undefined,
+    action: review?.action ?? undefined,
+    requires_running_run: review?.requires_running_run ?? undefined,
+    error_code: error?.code,
+    error_status: error?.status,
+    error_message: error?.message,
+  });
+  try {
+    await appendAccessRequestEvent(sql, sql, {
+      runId: input.runId,
+      attemptId: null,
+      eventType: error ? "runtime.resource.operation.review.failed" : "runtime.resource.operation.reviewed",
+      payload,
+    });
+  } catch (insertError) {
+    if (isMissingRuntimeStore(insertError)) {
+      return;
+    }
+    throw insertError;
+  }
+}
+
+function runtimeOperationReviewResourceRef(review: RuntimeResourceOperationReview): JsonObject {
+  return compactObject({
+    apiVersion: review.resource_ref.apiVersion,
+    kind: review.resource_ref.kind,
+    name: review.resource_ref.name,
+    uid: review.resource_ref.uid,
+  });
+}
+
+async function appendRuntimeInspectBundleAuditEvent(
+  sql: Sql | undefined,
+  input: {
+    runId: string;
+    requester?: string | null | undefined;
+    eventLimit: number;
+    resourceFilter: RuntimeInspectBundleFilter;
+    bundle?: RuntimeInspectBundle | undefined;
+    error?: unknown;
+  },
+): Promise<void> {
+  if (!isRuntimeSql(sql)) {
+    return;
+  }
+  const error = runtimeReadAuditError(input.error);
+  const payload = compactObject({
+    operation: "inspect",
+    status: error ? "failed" : undefined,
+    requester: normalizeOptionalString(input.requester),
+    resource_ref: runtimeInspectBundleRunResourceRef(input.runId),
+    resource_filter: runtimeInspectBundleAuditFilter(input.bundle?.resource_filter ?? input.resourceFilter),
+    event_limit: input.eventLimit,
+    inventory_resource_version: input.bundle?.resource_inventory.metadata.resourceVersion,
+    inventory_continue: input.bundle?.resource_inventory.metadata.continue,
+    inventory_total: input.bundle?.resource_inventory.metadata.total,
+    inventory_returned: input.bundle?.resource_inventory.metadata.returned,
+    event_resource_version: input.bundle?.event_list.metadata.resourceVersion,
+    event_continue: input.bundle?.event_list.metadata.continue,
+    event_returned: input.bundle?.event_list.metadata.returned,
+    event_next_after_row_seq: input.bundle?.event_list.metadata.next_after_row_seq ?? undefined,
+    api_resources_returned: input.bundle?.api_resources.resources.length,
+    health_summary: input.bundle ? runtimeInspectBundleAuditHealthSummary(input.bundle.resource_health.summary) : undefined,
+    metrics_summary: input.bundle ? runtimeInspectBundleAuditMetricsSummary(input.bundle.resource_metrics.summary) : undefined,
+    log_refs: input.bundle?.log_refs.length,
+    error_code: error?.code,
+    error_status: error?.status,
+    error_message: error?.message,
+  });
+  try {
+    await appendAccessRequestEvent(sql, sql, {
+      runId: input.runId,
+      attemptId: null,
+      eventType: error ? "runtime.inspect.bundle.read.failed" : "runtime.inspect.bundle.read",
+      payload,
+    });
+  } catch (error) {
+    if (isMissingRuntimeStore(error)) {
+      return;
+    }
+    throw error;
+  }
+}
+
+function runtimeInspectBundleRunResourceRef(runId: string): JsonObject {
+  return {
+    apiVersion: RUNTIME_API_VERSION,
+    kind: "Run",
+    name: runId,
+    uid: runId,
+  };
+}
+
+function runtimeInspectBundleFilterView(filter: RuntimeResourceFilter): RuntimeInspectBundleFilter {
+  return {
+    kinds: filter.kinds ?? [],
+    categories: filter.categories ?? [],
+    label_selector: filter.labelSelector ?? null,
+    field_selector: filter.fieldSelector ?? null,
+  };
+}
+
+function runtimeInspectBundleAuditFilter(filter: RuntimeInspectBundleFilter): JsonObject {
+  return compactObject({
+    kinds: filter.kinds,
+    categories: filter.categories,
+    label_selector: filter.label_selector ?? undefined,
+    field_selector: filter.field_selector ?? undefined,
+  });
+}
+
+function runtimeInspectBundleAuditHealthSummary(summary: RuntimeResourceHealthSummary): JsonObject {
+  return compactObject({
+    total: summary.total,
+    ready: summary.ready,
+    degraded: summary.degraded,
+    problem: summary.problem,
+    unknown: summary.unknown,
+    access_targets: summary.access_targets,
+    reachable_access_targets: summary.reachable_access_targets,
+    port_forward_ready: summary.port_forward_ready,
+    exec_ready: summary.exec_ready,
+    actions_available: summary.actions_available,
+    observed_resources: summary.observed_resources,
+    observed_current: summary.observed_current,
+    observed_stale: summary.observed_stale,
+    observed_unknown: summary.observed_unknown,
+  });
+}
+
+function runtimeInspectBundleAuditMetricsSummary(summary: RuntimeResourceMetricsListSummary): JsonObject {
+  return compactObject({
+    resources_total: summary.resources_total,
+    resources_returned: summary.resources_returned,
+    metrics_total: summary.metrics_total,
+    lifecycle_metrics: summary.lifecycle_metrics,
+    condition_metrics: summary.condition_metrics,
+    access_metrics: summary.access_metrics,
+    event_metrics: summary.event_metrics,
+    numeric_spec_metrics: summary.numeric_spec_metrics,
+    numeric_status_metrics: summary.numeric_status_metrics,
+    events_total: summary.events_total,
+  });
+}
+
+async function appendRuntimeResourceReadAuditEvent(
+  sql: Sql | undefined,
+  input: {
+    runId: string;
+    eventType:
+      | "runtime.resource.logs.read"
+      | "runtime.resource.logs.read.failed"
+      | "runtime.resource.content.read"
+      | "runtime.resource.content.read.failed";
+    operation: "logs" | "content";
+    requester?: string | null | undefined;
+    requestedKind?: string | null | undefined;
+    requestedName?: string | null | undefined;
+    resource?: RuntimeResourceRecord | undefined;
+    object?: RuntimeAttemptObjectRecord | undefined;
+    mediaType?: string | null | undefined;
+    byteSize?: number | undefined;
+    stream?: string | null | undefined;
+    tailLines?: number | undefined;
+    error?: unknown;
+  },
+): Promise<void> {
+  if (!isRuntimeSql(sql)) {
+    return;
+  }
+  const resourceKind = input.resource?.kind
+    ?? canonicalRuntimeResourceKind(input.requestedKind)
+    ?? normalizeOptionalString(input.requestedKind);
+  const resourceName = input.resource?.metadata.name
+    ?? normalizeOptionalString(input.requestedName);
+  const error = runtimeReadAuditError(input.error);
+  const payload = compactObject({
+    operation: input.operation,
+    status: error ? "failed" : undefined,
+    requester: normalizeOptionalString(input.requester),
+    resource_ref: input.resource ? runtimeResourceEventRef(input.resource) : runtimeRequestedResourceEventRef(resourceKind, resourceName),
+    resource_kind: resourceKind,
+    resource_name: resourceName,
+    resource_uid: input.resource?.metadata.uid,
+    resource_version: input.resource?.metadata.resourceVersion,
+    resource_generation: input.resource?.metadata.generation,
+    stream: input.stream ?? undefined,
+    tail_lines: input.tailLines,
+    core_run_id: input.object?.core_run_id,
+    trial_id: input.object?.trial_id,
+    trial_attempt: input.object?.attempt,
+    artifact_role: input.object?.role,
+    object_ref: input.object?.object_ref,
+    sha256: input.object?.sha256,
+    media_type: input.mediaType ?? undefined,
+    byte_size: input.byteSize,
+    error_code: error?.code,
+    error_status: error?.status,
+    error_message: error?.message,
+  });
+  try {
+    await appendAccessRequestEvent(sql, sql, {
+      runId: input.runId,
+      attemptId: input.resource ? runtimeResourceReadAttemptId(input.resource) : null,
+      eventType: input.eventType,
+      payload,
+    });
+  } catch (error) {
+    if (isMissingRuntimeStore(error)) {
+      return;
+    }
+    throw error;
+  }
+}
+
+function runtimeRequestedResourceEventRef(kind: string | null | undefined, name: string | null | undefined): JsonObject | undefined {
+  if (!kind || !name) {
+    return undefined;
+  }
+  return compactObject({
+    apiVersion: RUNTIME_API_VERSION,
+    kind,
+    name,
+  });
+}
+
+function runtimeReadAuditError(error: unknown): { status: number | null; code: string; message: string } | null {
+  if (error instanceof HttpError) {
+    return {
+      status: error.status,
+      code: error.code,
+      message: error.message,
+    };
+  }
+  if (error instanceof Error) {
+    return {
+      status: null,
+      code: error.name || "runtime_read_failed",
+      message: error.message,
+    };
+  }
+  return null;
+}
+
+function isRuntimeSql(value: unknown): value is Sql {
+  return typeof value === "function" && typeof (value as { json?: unknown }).json === "function";
+}
+
+function runtimeResourceReadAttemptId(resource: RuntimeResourceRecord): string | null {
+  const runnerBinding = isRecord(resource.status.runner_binding) ? resource.status.runner_binding : {};
+  return stringField(resource.status.attempt_id)
+    ?? stringField(resource.status.current_attempt_id)
+    ?? stringField(resource.spec.attempt_id)
+    ?? stringField(runnerBinding.attempt_id);
 }
 
 async function appendAccessRequestEvent(
@@ -10397,6 +12043,21 @@ function accessRequestCancelEventPayload(
       action: "cancel",
       previous_status: previousStatus,
       cancelled_at: request.updated_at,
+    }),
+  };
+}
+
+function accessRequestCompleteEventPayload(
+  request: RuntimeAccessRequestRecord,
+  previousStatus: string | null,
+  resourceVersionPrecondition?: string | null,
+): JsonObject {
+  return {
+    ...accessRequestEventPayload(request, null, resourceVersionPrecondition),
+    ...compactObject({
+      action: "complete",
+      previous_status: previousStatus,
+      completed_at: request.updated_at,
     }),
   };
 }

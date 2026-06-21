@@ -39,9 +39,10 @@ prove your agent ran. On hosted Cloud, confirm `Trial` and `TrialArtifact`
 runtime resources are ready and content-backed before trusting a run:
 
 ```bash
-bucephalus-cloud run resources <cloud_run_id> --kind Trial
-bucephalus-cloud run resources <cloud_run_id> --kind TrialArtifact --field-selector status.content_available=true
-bucephalus-cloud run audit <cloud_run_id> --limit 50
+buc runs resources <cloud_run_id> --kind Trial
+buc runs resources <cloud_run_id> --kind TrialArtifact --field-selector status.content_available=true
+buc runs audit <cloud_run_id> --limit 50
+buc runs events <cloud_run_id> --limit 50
 ```
 
 For a local-only smoke run, query the account database directly for the same
@@ -160,11 +161,13 @@ For hosted Cloud runs, use the runtime resource API instead of local analysis
 views:
 
 ```bash
-bucephalus-cloud run resources <cloud_run_id> --kind Trial
-bucephalus-cloud run resources <cloud_run_id> --kind MetricObservation
-bucephalus-cloud run top <cloud_run_id> --category trial --limit 25
-bucephalus-cloud run audit <cloud_run_id> --limit 100
-bucephalus-cloud run inspect <cloud_run_id> --json --out runtime-inspect.json
+buc runs resources <cloud_run_id> --kind Trial
+buc runs resources <cloud_run_id> --kind MetricObservation
+buc runs top <cloud_run_id> --kind Trial --limit 25
+buc runs metrics <cloud_run_id> --kind Trial --limit 25
+buc runs audit <cloud_run_id> --limit 100
+buc runs events <cloud_run_id> --limit 100
+buc runs inspect <cloud_run_id> --json
 ```
 
 You can also pass the local run directory to direct SQL queries:

@@ -481,7 +481,7 @@ enum Commands {
     },
     #[command(about = "Show standardized scriptable views for a run")]
     Views {
-        run: Option<String>,
+        run: String,
         view: Option<String>,
         #[arg(long)]
         all: bool,
@@ -495,19 +495,6 @@ enum Commands {
         md: bool,
         #[arg(long)]
         html: bool,
-    },
-    #[command(about = "Live-refresh a scriptable view for a run")]
-    ViewsLive {
-        run: Option<String>,
-        view: Option<String>,
-        #[arg(long, default_value_t = 2)]
-        interval_seconds: u64,
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-        #[arg(long)]
-        once: bool,
-        #[arg(long)]
-        no_clear: bool,
     },
     Query {
         run: String,
@@ -3371,7 +3358,6 @@ fn refresh_dispatch(dispatch_id: &str) -> Result<Value> {
             internal.insert("last_daemon_status".to_string(), daemon);
         }
     }
-    write_dispatch_live_view(&record)?;
     write_dispatch_record(&record)?;
     Ok(public_dispatch_record(&record))
 }
@@ -3611,7 +3597,6 @@ fn redact_local_path_fields(value: &mut Value) {
                 "log_path",
                 "record_path",
                 "dispatch_dir",
-                "live_view",
                 "resolution_path",
                 "seed_dir",
             ] {
@@ -4172,7 +4157,6 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
     fs::create_dir_all(&dir)?;
     let resolution_dir = dir.join("resolution");
     let run_root = dir.join("runs");
-    let live_view_path = dir.join("live.html");
     let record_path = dir.join("dispatch.json");
     let resolution = resolve_dispatch_benchmark(&resolution_dir, benchmark, cases, argv.clone())?;
     let manifest_path = resolution["manifest_path"]
@@ -4216,7 +4200,7 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
         },
         "paths": {
             "dispatch_dir": dir,
-            "live_view": live_view_path,
+            "status": record_path,
             "resolution": resolution["resolution_path"].clone(),
             "manifest": manifest_path,
             "run_root": run_root
@@ -4251,93 +4235,8 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
             "daemon_job": daemon_job
         }
     });
-    write_dispatch_live_view(&record)?;
     write_dispatch_record(&record)?;
     Ok(public_dispatch_record(&record))
-}
-
-fn write_dispatch_live_view(record: &Value) -> Result<()> {
-    let path = record
-        .pointer("/paths/live_view")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("dispatch record missing live view path"))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let dispatch_id = record
-        .get("dispatch_id")
-        .and_then(Value::as_str)
-        .unwrap_or("dispatch");
-    let status = record
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let label = record.get("label").and_then(Value::as_str).unwrap_or("");
-    let benchmark = record
-        .pointer("/benchmark/id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let summary = record.get("summary").cloned().unwrap_or_else(|| json!({}));
-    let mut public_summary = summary.clone();
-    if let Some(summary) = public_summary.as_object_mut() {
-        summary.remove("run_dir");
-    }
-    let lifecycle = record
-        .get("lifecycle")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let updated_at = record
-        .get("updated_at")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let html = format!(
-        r#"<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="5">
-  <title>Bucephalus Dispatch {}</title>
-  <style>
-    body {{ margin: 0; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f7f7f4; color: #171717; }}
-    main {{ max-width: 880px; margin: 0 auto; padding: 32px 20px; }}
-    h1 {{ font-size: 24px; margin: 0 0 8px; }}
-    .status {{ display: inline-block; padding: 4px 8px; border-radius: 6px; background: #111; color: #fff; text-transform: uppercase; font-size: 12px; letter-spacing: .04em; }}
-    dl {{ display: grid; grid-template-columns: 160px 1fr; gap: 10px 16px; margin-top: 24px; }}
-    dt {{ color: #666; }}
-    dd {{ margin: 0; word-break: break-word; }}
-    pre {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 14px; overflow: auto; }}
-  </style>
-</head>
-<body>
-<main>
-  <p class="status">{}</p>
-  <h1>{}</h1>
-  <dl>
-    <dt>Dispatch</dt><dd>{}</dd>
-    <dt>Benchmark</dt><dd>{}</dd>
-    <dt>Updated</dt><dd>{}</dd>
-  </dl>
-  <h2>Lifecycle</h2>
-  <pre>{}</pre>
-  <h2>Summary</h2>
-  <pre>{}</pre>
-</main>
-</body>
-</html>
-"#,
-        html_escape(dispatch_id),
-        html_escape(status),
-        html_escape(if label.is_empty() { dispatch_id } else { label }),
-        html_escape(dispatch_id),
-        html_escape(benchmark),
-        html_escape(updated_at),
-        html_escape(&serde_json::to_string_pretty(&lifecycle)?),
-        html_escape(&serde_json::to_string_pretty(&public_summary)?)
-    );
-    fs::write(path, html)?;
-    Ok(())
 }
 
 fn unregister_mcp_clients(
@@ -5052,7 +4951,7 @@ fn handle_mcp_message(message: Value) -> Option<Value> {
                 },
                 {
                     "name": "dispatch_benchmark",
-                    "description": "Dispatch a Tier-1 benchmark on this host and return a live viewing surface. The local runtime is managed internally; provide the agent command as headless_command.argv.",
+                    "description": "Dispatch a Tier-1 benchmark on this host and return a scriptable dispatch status record. The local runtime is managed internally; provide the agent command as headless_command.argv.",
                     "inputSchema": {
                         "type": "object",
                         "additionalProperties": false,
@@ -5081,7 +4980,7 @@ fn handle_mcp_message(message: Value) -> Option<Value> {
                 },
                 {
                     "name": "dispatch_status",
-                    "description": "Refresh a benchmark dispatch and its live viewing surface.",
+                    "description": "Refresh a benchmark dispatch status record.",
                     "inputSchema": {
                         "type": "object",
                         "additionalProperties": false,
@@ -6861,13 +6760,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 ));
             }
 
-            let (run_dir, view) = if let Some(run_str) = run {
-                (resolve_run_dir_arg(&run_str)?, view)
-            } else {
-                return Err(anyhow::anyhow!(
-                    "run is required; the interactive TUI view browser has been removed. Use `bucephalus runs` to list local runs, then `bucephalus views <run>` or `bucephalus views <run> <view>`."
-                ));
-            };
+            let run_dir = resolve_run_dir_arg(&run)?;
 
             let run_view_set = analysis::run_view_set(&run_dir)?;
             let view_set = run_view_set.as_str().to_string();
@@ -7024,67 +6917,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!(
                 "tip: use `bucephalus query <run> \"SELECT * FROM <raw_view>\"` for raw internals"
             );
-        }
-        Commands::ViewsLive {
-            run,
-            view,
-            interval_seconds,
-            limit,
-            once,
-            no_clear,
-        } => {
-            let sleep_interval = Duration::from_secs(interval_seconds.max(1));
-            let resolved_limit = limit.max(1);
-            let run_dir = run
-                .as_deref()
-                .map(resolve_run_dir_arg)
-                .transpose()?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "run is required; the interactive TUI view browser has been removed. Use `bucephalus runs` to list local runs, then pass a run id/path."
-                    )
-                })?;
-            let run_view_set = analysis::run_view_set(&run_dir)?;
-            let raw_view_names = list_available_analysis_views(&run_dir);
-            let resolved_view = match view.as_deref() {
-                Some(requested) => {
-                    resolve_requested_view(run_view_set, &raw_view_names, requested)?
-                }
-                None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
-            };
-            loop {
-                let table = query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
-                if !no_clear {
-                    print!("\x1B[2J\x1B[H");
-                    if let Err(err) = std::io::stdout().flush() {
-                        eprintln!("warning: failed to flush live view clear: {}", err);
-                    }
-                }
-                println!("run_dir: {}", run_dir.display());
-                println!("status: {}", read_run_status(&run_dir));
-                println!("updated_unix_s: {}", unix_now_seconds());
-                println!("view: {}", resolved_view.name);
-                if let Some(source) = resolved_view.source.as_deref() {
-                    if source != resolved_view.name {
-                        println!("source_view: {}", source);
-                    }
-                }
-                println!("limit: {}", resolved_limit);
-                println!(
-                    "refresh_interval_seconds: {} (Ctrl-C to stop)",
-                    sleep_interval.as_secs()
-                );
-                println!();
-                if !print_special_split_view(&run_dir, &resolved_view.name, &table) {
-                    let display = present_display_table(&resolved_view, &table);
-                    print_query_table(&display);
-                }
-
-                if once {
-                    break;
-                }
-                std::thread::sleep(sleep_interval);
-            }
         }
         Commands::Query {
             run,
@@ -7731,7 +7563,7 @@ fn query_state_backed_source_view(
         "contract_health" => Ok(build_state_contract_health_table(run_dir)),
         "latest_agent_output" => Ok(build_latest_agent_output_table(run_dir)),
         other => Err(anyhow!(
-            "view '{}' requires the analysis query engine; live state views are available for run_progress, health, latest_agent_output, and scoreboard",
+            "view '{}' requires the analysis query engine; state-backed fallback views are available for run_progress, health, latest_agent_output, and scoreboard",
             other
         )),
     }
@@ -7834,7 +7666,7 @@ fn standardize_ab_column_name(name: &str) -> String {
     }
 }
 
-fn build_live_scoreboard_table(
+fn build_scoreboard_metrics_table(
     run_dir: &Path,
     metric_limit: usize,
 ) -> Result<analysis::QueryTable> {
@@ -7911,7 +7743,7 @@ fn build_inflight_scoreboard_table(run_dir: &Path) -> Option<analysis::QueryTabl
 }
 
 fn query_scoreboard(run_dir: &Path) -> Result<analysis::QueryTable> {
-    if let Ok(table) = build_live_scoreboard_table(run_dir, 8) {
+    if let Ok(table) = build_scoreboard_metrics_table(run_dir, 8) {
         if !table.rows.is_empty() {
             return Ok(table);
         }
@@ -10148,7 +9980,7 @@ fn try_print_post_run_stats(run_dir: &Path, run_id: &str) {
     }
     println!();
     println!("inspect:");
-    println!("  live:      bucephalus views-live {} run_progress", run_id);
+    println!("  progress:  bucephalus views {} run_progress", run_id);
     println!("  scores:    bucephalus scores {}", run_id);
     println!("  metrics:   bucephalus explain-metrics {}", run_id);
     println!("  proof:     bucephalus views {} observability", run_id);
@@ -11062,6 +10894,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scriptable_view_commands_require_run_positionals_without_tui_fallback() {
+        let err = match Cli::try_parse_from(["bucephalus", "views"]) {
+            Ok(_) => panic!("views command must require a run id/path"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("<RUN>"),
+            "unexpected clap error: {message}"
+        );
+        assert!(
+            !message.contains("TUI") && !message.contains("view browser"),
+            "missing run errors must not advertise the retired TUI browser: {message}"
+        );
+
+        let parsed = Cli::try_parse_from(["bucephalus", "views", "run-1", "observability"])
+            .expect("views command should parse run and view");
+        let Commands::Views { run, view, .. } = parsed.command else {
+            panic!("expected views command");
+        };
+        assert_eq!(run, "run-1");
+        assert_eq!(view.as_deref(), Some("observability"));
+
+        let err = match Cli::try_parse_from(["bucephalus", "views-live", "run-1", "run_progress"]) {
+            Ok(_) => panic!("views-live command must stay removed"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("unrecognized subcommand") || message.contains("unexpected argument"),
+            "unexpected clap error: {message}"
+        );
+    }
+
+    #[test]
+    fn global_help_does_not_advertise_retired_tui_surfaces() {
+        let mut command = Cli::command();
+        let rendered = command.render_long_help().to_string();
+
+        assert!(rendered.contains("views"));
+        assert!(!rendered.contains("views-live"));
+        assert!(!rendered.contains("TUI"));
+        assert!(!rendered.contains("view browser"));
+        assert!(!rendered.contains(&format!("{}{}", "live", "_view")));
+        assert!(!rendered.contains(&format!("{}{}", "live", ".html")));
+    }
+
+    #[test]
+    fn mcp_dispatch_tools_do_not_advertise_browser_or_tui_surfaces() {
+        let response = handle_mcp_message(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        }))
+        .expect("tools/list response");
+        let rendered = serde_json::to_string(&response).unwrap();
+
+        assert!(rendered.contains("scriptable dispatch status record"));
+        assert!(rendered.contains("Refresh a benchmark dispatch status record"));
+        assert!(!rendered.contains("live viewing surface"));
+        assert!(!rendered.contains(&format!("{}{}", "live", "_view")));
+        assert!(!rendered.contains(&format!("{}{}", "live", ".html")));
+        assert!(!rendered.contains("TUI"));
+        assert!(!rendered.contains("view browser"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn cli_ux_update_installed_version_is_read_from_installed_binary() {
@@ -11226,7 +11125,7 @@ mod tests {
             "status": "local_completed",
             "paths": {
                 "dispatch_dir": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1",
-                "live_view": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/live.html"
+                "status": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/dispatch.json"
             },
             "summary": {
                 "run_dir": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/runs/run_1",
