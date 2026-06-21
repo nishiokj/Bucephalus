@@ -100,6 +100,10 @@ on:
       - "scripts/install.sh"
   workflow_dispatch:
 
+env:
+  CARGO_HTTP_VERSION: "HTTP/1.1"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 jobs:
   cloud-candidate-source:
     name: Cloud candidate source

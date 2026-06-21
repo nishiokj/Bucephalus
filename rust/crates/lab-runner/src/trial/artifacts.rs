@@ -60,8 +60,12 @@ pub(crate) fn normalize_agent_result_adapter(
     if result_kind != "structured_json" || !result_path.exists() {
         return Ok(());
     }
-    let raw: Value = serde_json::from_slice(&fs::read(result_path)?)
-        .with_context(|| format!("failed to parse adapter result at {}", result_path.display()))?;
+    let raw: Value = serde_json::from_slice(&fs::read(result_path)?).with_context(|| {
+        format!(
+            "failed to parse adapter result at {}",
+            result_path.display()
+        )
+    })?;
     if raw.get("schema_version").and_then(Value::as_str) == Some("artifact_envelope_v1") {
         return Ok(());
     }
@@ -104,7 +108,9 @@ fn parse_response_artifact(response: &Value) -> Result<Map<String, Value>> {
         return Ok(object.clone());
     }
     let Some(text) = response.as_str() else {
-        return Err(anyhow!("adapter /response must be an object or JSON string"));
+        return Err(anyhow!(
+            "adapter /response must be an object or JSON string"
+        ));
     };
     let mut candidates = vec![text.trim().to_string(), strip_code_fence(text)];
     if let Some(embedded) = first_json_object(text) {

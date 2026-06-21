@@ -24,6 +24,10 @@ permissions:
   contents: read
   id-token: none
 
+env:
+  CARGO_HTTP_VERSION: "HTTP/1.1"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 jobs:
   rust-lints:
     name: Rust fmt and Clippy
