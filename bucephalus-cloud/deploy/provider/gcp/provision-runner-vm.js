@@ -433,6 +433,8 @@ BUCEPHALUS_WORKER_RESOURCES=\${worker_resources}
 BUCEPHALUS_WORKER_EXECUTORS=\${worker_executors}
 BUCEPHALUS_WORKER_ISOLATION=\${RUNNER_ISOLATION}
 BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON=["bucephalus-cloud-secret-resolver"]
+BUCEPHALUS_WORKER_PORT_FORWARD_CMD_JSON=["bun","runtime-dist/worker.js","runtime-gce-iap-port-forward"]
+BUCEPHALUS_WORKER_EXEC_CMD_JSON=["bun","runtime-dist/worker.js","runtime-docker-exec"]
 BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH=metadata
 EOF
 if [[ "\${MODAL_ENABLED}" == "true" ]]; then

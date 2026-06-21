@@ -424,6 +424,87 @@ describe("Cloud run routes", () => {
       runnersWithDockerPool() as any,
       "worker-token",
     )).rejects.toThrow("/after_row_seq must be an integer");
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/events?continue=not-a-cursor"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/events?continue=not-a-cursor"),
+      {} as PackageRepository,
+      { async getRun() { return runRecord(); } } as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    )).rejects.toThrow("/continue must be formatted as event-row-seq:<row_seq>");
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/events?after_row_seq=1&continue=event-row-seq:1"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/events?after_row_seq=1&continue=event-row-seq:1"),
+      {} as PackageRepository,
+      { async getRun() { return runRecord(); } } as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    )).rejects.toThrow("Runtime event queries accept either after_row_seq or continue, not both");
+  });
+
+  test("runtime event route follows event-row-seq continue cursors", async () => {
+    const observed: { eventInput?: unknown; workerInput?: unknown } = {};
+    const runtime = {
+      async eventRows(_runId: string, input: unknown) {
+        observed.eventInput = input;
+        return [{
+          source: "runtime.event_rows",
+          core_run_id: "core-run-1",
+          trial_id: "trial-1",
+          schedule_idx: 0,
+          attempt: 0,
+          row_seq: 8,
+          slot_commit_id: "slot-1",
+          variant_id: "variant-1",
+          task_id: "task-1",
+          repl_idx: 0,
+          seq: 80,
+          event_type: "trial.started",
+          ts: "2026-06-11T00:00:01Z",
+          resource_refs: [],
+          payload: {},
+          row: {},
+        }];
+      },
+      async workerLifecycleEvents(_runId: string, input: unknown) {
+        observed.workerInput = input;
+        return [{
+          event_id: "evt-9",
+          seq: 9,
+          event_type: "worker.ready",
+          payload: {},
+          created_at: "2026-06-11T00:00:02Z",
+        }];
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/events?limit=1&continue=event-row-seq:7"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/events?limit=1&continue=event-row-seq:7"),
+      {} as PackageRepository,
+      { async getRun() { return runRecord(); } } as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(observed.eventInput).toMatchObject({ limit: 1, afterRowSeq: 7 });
+    expect(observed.workerInput).toMatchObject({ limit: 1, afterRowSeq: 7 });
+    expect(body.metadata).toMatchObject({
+      resourceVersion: "event-row-seq:8",
+      continue: "event-row-seq:8",
+      remainingItemCount: null,
+      limit: 1,
+      returned: 1,
+      after_row_seq: 7,
+      next_after_row_seq: 8,
+    });
+    expect(body.events.map((event: { row_seq: number }) => event.row_seq)).toEqual([8]);
   });
 
   test("keeps env values and secret refs in worker claim responses", async () => {
@@ -522,6 +603,44 @@ describe("Cloud run routes", () => {
     expect(expireCalls).toBe(0);
   });
 
+  test("worker lease expiration also expires runtime access resources", async () => {
+    const observed: { expiredRuns?: boolean; expiredAccess?: boolean } = {};
+    const runs = {
+      async expireLeases() {
+        observed.expiredRuns = true;
+        return [];
+      },
+    };
+    const runtime = {
+      async expireRuntimeAccessRequests() {
+        observed.expiredAccess = true;
+        return [runtimeAccessRequestRecord("pf-1", "port_forward")];
+      },
+      runtimeAccessRequestResourceForRunId(runId: string, request: { access_request_id: string; kind: string }) {
+        return runtimeAccessResource(runId, request);
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/worker/runs/expire-leases", {
+        method: "POST",
+        headers: { authorization: "Bearer worker-token" },
+      }),
+      new URL("https://cloud.example/v1/worker/runs/expire-leases"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(observed).toEqual({ expiredRuns: true, expiredAccess: true });
+    expect(body.expired_access_resources).toEqual([
+      expect.objectContaining({ kind: "PortForward" }),
+    ]);
+  });
+
   test("worker attempt heartbeat requires the attempt token", async () => {
     const observed: { token?: string; attemptId?: string; runnerInstanceId?: string | null | undefined } = {};
     const runs = {
@@ -560,6 +679,158 @@ describe("Cloud run routes", () => {
       attemptId: "attempt-1",
       runnerInstanceId: "runner-instance-1",
     });
+  });
+
+  test("worker runtime resource endpoints list pending port-forwards for an attempt", async () => {
+    const observed: { token?: string; attemptId?: string; runnerInstanceId?: string | null | undefined } = {};
+    const runs = {
+      async verifyAttemptToken(input: { token: string; attemptId: string; runnerInstanceId?: string | null }) {
+        observed.token = input.token;
+        observed.attemptId = input.attemptId;
+        observed.runnerInstanceId = input.runnerInstanceId;
+      },
+    };
+    const runtime = {
+      async portForwardRequestsForAttempt(input: { attemptId: string; runnerInstanceId: string }) {
+        expect(input).toEqual({ attemptId: "attempt-1", runnerInstanceId: "runner-instance-1" });
+        return [runtimeAccessRequestRecord("pf-1", "port_forward")];
+      },
+      runtimeAccessRequestResourceForRunId(runId: string, request: { access_request_id: string; kind: string }) {
+        return runtimeAccessResource(runId, request);
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward?runner_instance_id=runner-instance-1", {
+        headers: { authorization: "Bearer attempt-token" },
+      }),
+      new URL("https://cloud.example/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward?runner_instance_id=runner-instance-1"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(observed).toEqual({
+      token: "attempt-token",
+      attemptId: "attempt-1",
+      runnerInstanceId: "runner-instance-1",
+    });
+    expect(body.resources).toEqual([
+      expect.objectContaining({ kind: "PortForward", metadata: expect.objectContaining({ name: "pf-1" }) }),
+    ]);
+  });
+
+  test("worker runtime resource endpoints update exec lifecycle", async () => {
+    const observed: { token?: string; update?: unknown } = {};
+    const runs = {
+      async verifyAttemptToken(input: { token: string }) {
+        observed.token = input.token;
+      },
+    };
+    const runtime = {
+      async updateExecRequest(input: unknown) {
+        observed.update = input;
+        return runtimeAccessRequestRecord("exec-1", "exec");
+      },
+      runtimeAccessRequestResourceForRunId(runId: string, request: { access_request_id: string; kind: string }) {
+        return runtimeAccessResource(runId, request);
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/complete", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer attempt-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          runner_instance_id: "runner-instance-1",
+          connection: {
+            exit_code: 0,
+            stdout: "ok",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/complete"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(observed.token).toBe("attempt-token");
+    expect(observed.update).toEqual({
+      attemptId: "attempt-1",
+      runnerInstanceId: "runner-instance-1",
+      accessRequestId: "exec-1",
+      status: "completed",
+      connection: {
+        exit_code: 0,
+        stdout: "ok",
+      },
+      errorMessage: null,
+    });
+    expect(body.resource.kind).toBe("Exec");
+  });
+
+  test("worker runtime resource endpoints complete port-forward lifecycle", async () => {
+    const observed: { token?: string; update?: unknown } = {};
+    const runs = {
+      async verifyAttemptToken(input: { token: string }) {
+        observed.token = input.token;
+      },
+    };
+    const runtime = {
+      async updatePortForwardRequest(input: unknown) {
+        observed.update = input;
+        return runtimeAccessRequestRecord("pf-1", "port_forward");
+      },
+      runtimeAccessRequestResourceForRunId(runId: string, request: { access_request_id: string; kind: string }) {
+        return runtimeAccessResource(runId, request);
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward/pf-1/completed", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer attempt-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          runner_instance_id: "runner-instance-1",
+          connection: {
+            client_endpoint: "tcp://127.0.0.1:18080",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward/pf-1/completed"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    const body = await response!.json();
+    expect(observed.token).toBe("attempt-token");
+    expect(observed.update).toEqual({
+      attemptId: "attempt-1",
+      runnerInstanceId: "runner-instance-1",
+      accessRequestId: "pf-1",
+      status: "completed",
+      connection: {
+        client_endpoint: "tcp://127.0.0.1:18080",
+      },
+      errorMessage: null,
+    });
+    expect(body.resource.kind).toBe("PortForward");
   });
 
   test("package content download requires an attempt token for that package", async () => {
@@ -944,67 +1215,944 @@ describe("Cloud run routes", () => {
     }
   });
 
-  test("runtime artifact content download streams persisted worker bytes", async () => {
-    const root = await mkdtemp(join(tmpdir(), "buc-runtime-artifact-download-"));
-    try {
-      const storagePath = join(root, "agent-result.json");
-      await writeFile(storagePath, JSON.stringify({ final: "generated answer" }));
-      const observed: Record<string, unknown> = {};
-      const runs = {
-        async getRun(runId: string, ownerKey?: string) {
-          observed.runId = runId;
-          observed.ownerKey = ownerKey;
-          return runRecord();
-        },
-      };
-      const runtime = {
-        async attemptObjectContent(runId: string, input: Record<string, unknown>) {
-          observed.contentRunId = runId;
-          observed.contentInput = input;
-          return {
-            core_run_id: "run_20260614_051159_561175_000001",
-            trial_id: "trial_1",
-            schedule_idx: 0,
-            attempt: 0,
-            role: "agent_result",
-            object_ref: "runtime://run/trial/0/agent_result/sha256",
-            storage_path: storagePath,
-            media_type: "application/json; charset=utf-8",
-            byte_size: 28,
-            sha256: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            relative_path: "agent/result.json",
-            metadata: null,
-            recorded_at_ms: 1,
-          };
-        },
-      };
+  test("deprecated run-scoped runtime compatibility routes are not handled", async () => {
+    const runs = {
+      async getRun() {
+        throw new Error("deprecated runtime routes should not fetch runs");
+      },
+    };
+    const deprecatedPaths = [
+      "/v1/runs/run-1/runtime",
+      "/v1/runs/run-1/runtime/results",
+      "/v1/runs/run-1/runtime/kv/run_control_v2",
+      "/v1/runs/run-1/runtime/artifacts/trial_1/agent_result",
+      "/v1/runs/run-1/runtime/port-forwards",
+      "/v1/runs/run-1/runtime/port-forwards/pf-1",
+      "/v1/runs/run-1/runtime/execs",
+      "/v1/runs/run-1/runtime/execs/exec-1",
+    ];
 
+    for (const path of deprecatedPaths) {
       const response = await handleRunRoute(
-        new Request("https://cloud.example/v1/runs/run-1/runtime/artifacts/trial_1/agent_result?attempt=0"),
-        new URL("https://cloud.example/v1/runs/run-1/runtime/artifacts/trial_1/agent_result?attempt=0"),
+        new Request(`https://cloud.example${path}`),
+        new URL(`https://cloud.example${path}`),
+        {} as PackageRepository,
+        runs as unknown as RunRepository,
+        {} as RuntimeRepository,
+        runnersWithDockerPool() as any,
+        "worker-token",
+        authContext("user-a"),
+      );
+      expect(response).toBeNull();
+    }
+  });
+
+  test("runtime resource API lists repository-backed runner and access resources", async () => {
+    const observed: { input?: unknown; runId?: string; ownerKey: string | undefined } = { ownerKey: undefined };
+    const runner = runtimeRouteResource("RunnerInstance", "runner-1", {
+      labels: { "bucephalus.dev/run-id": "run-1" },
+      status: {
+        phase: "online",
+        access: { reachable: true, port_forward: true, exec: true },
+      },
+    });
+    const runs = {
+      async getRun(runId: string, ownerKey?: string) {
+        observed.runId = runId;
+        observed.ownerKey = ownerKey;
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async resources(runId: string, _run: unknown, input: unknown) {
+        observed.runId = runId;
+        observed.input = input;
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceList",
+          metadata: {
+            resourceVersion: "sha256:list",
+            continue: null,
+            remainingItemCount: 0,
+            total: 1,
+            returned: 1,
+          },
+          cloud_run_id: "run-1",
+          core_run_ids: ["core-run-1"],
+          resources: [runner],
+        };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources?kind=RunnerInstance,Trial&category=runner,access-target&field_selector=status.access.exec=true&label_selector=bucephalus.dev/run-id=run-1&limit=2&continue=opaque-cursor"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources?kind=RunnerInstance,Trial&category=runner,access-target&field_selector=status.access.exec=true&label_selector=bucephalus.dev/run-id=run-1&limit=2&continue=opaque-cursor"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    const body = await response!.json();
+    expect(observed.ownerKey).toBe("issuer:user-a");
+    expect(observed.input).toEqual({
+      kinds: ["RunnerInstance", "Trial"],
+      categories: ["runner", "access-target"],
+      labelSelector: "bucephalus.dev/run-id=run-1",
+      fieldSelector: "status.access.exec=true",
+      limit: 2,
+      continueToken: "opaque-cursor",
+      requester: "issuer:user-a",
+    });
+    expect(body.resources).toEqual([runner]);
+  });
+
+  test("runtime inspect route forwards filters, event limit, and requester", async () => {
+    const observed: { input?: unknown; runId?: string; ownerKey?: string | null | undefined } = {};
+    const runs = {
+      async getRun(_runId: string, ownerKey?: string | null) {
+        observed.ownerKey = ownerKey;
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async inspectBundle(runId: string, _run: unknown, input: unknown) {
+        observed.runId = runId;
+        observed.input = input;
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeInspectBundle",
+          cloud_run_id: runId,
+          generated_at: "2026-06-19T00:00:00Z",
+          resource_filter: {
+            kinds: ["RunnerInstance", "Trial"],
+            categories: ["runner", "access-target"],
+            label_selector: "bucephalus.dev/run-id=run-1",
+            field_selector: "status.access.exec=true",
+          },
+          api_resources: { resources: [] },
+          resource_inventory: { resources: [], metadata: {} },
+          resource_health: { summary: {}, resources: [] },
+          resource_metrics: { summary: {}, resources: [] },
+          event_list: { metadata: {}, events: [] },
+          log_refs: [],
+        };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/inspect?kind=RunnerInstance,Trial&category=runner,access-target&field_selector=status.access.exec=true&label_selector=bucephalus.dev/run-id=run-1&event_limit=33"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/inspect?kind=RunnerInstance,Trial&category=runner,access-target&field_selector=status.access.exec=true&label_selector=bucephalus.dev/run-id=run-1&event_limit=33"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    const body = await response!.json();
+    expect(observed.ownerKey).toBe("issuer:user-a");
+    expect(observed.runId).toBe("run-1");
+    expect(observed.input).toEqual({
+      kinds: ["RunnerInstance", "Trial"],
+      categories: ["runner", "access-target"],
+      labelSelector: "bucephalus.dev/run-id=run-1",
+      fieldSelector: "status.access.exec=true",
+      eventLimit: 33,
+      requester: "issuer:user-a",
+    });
+    expect(body.kind).toBe("RuntimeInspectBundle");
+  });
+
+  test("runtime resource watch route forwards cursors and bookmark opt-in", async () => {
+    const observed: { input?: unknown; runId?: string } = {};
+    const runs = {
+      async getRun() {
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async watchResources(runId: string, _run: unknown, input: unknown) {
+        observed.runId = runId;
+        observed.input = input;
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceWatchList",
+          cloud_run_id: "run-1",
+          generated_at: "2026-06-19T00:00:00Z",
+          core_run_ids: ["core-run-1"],
+          resource_versions: {},
+          events: [{
+            type: "BOOKMARK",
+            resource_ref: { apiVersion: "bucephalus.dev/v1alpha1", kind: "RuntimeResourceList", name: "run-1" },
+            resource_version: "sha256:list",
+          }],
+          resource_inventory: {
+            apiVersion: "bucephalus.dev/v1alpha1",
+            kind: "RuntimeResourceList",
+            metadata: {
+              resourceVersion: "sha256:list",
+              continue: null,
+              remainingItemCount: 0,
+              total: 0,
+              returned: 0,
+            },
+            cloud_run_id: "run-1",
+            core_run_ids: ["core-run-1"],
+            resources: [],
+          },
+        };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/watch?kind=RunnerInstance&category=runner&field_selector=status.access.exec=true&resource_version=sha256%3Alist&known_resource=RunnerInstance%2Frunner-1%3Dsha256%3Aold&allow_bookmarks=true"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/watch?kind=RunnerInstance&category=runner&field_selector=status.access.exec=true&resource_version=sha256%3Alist&known_resource=RunnerInstance%2Frunner-1%3Dsha256%3Aold&allow_bookmarks=true"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    const input = observed.input as {
+      filter: { kinds: string[]; categories: string[]; labelSelector: string | null; fieldSelector: string | null };
+      resourceVersion: string;
+      knownResourceVersions: Map<string, string>;
+      allowBookmarks: boolean;
+      requester: string;
+    };
+    expect(observed.runId).toBe("run-1");
+    expect(input.filter).toEqual({
+      kinds: ["RunnerInstance"],
+      categories: ["runner"],
+      labelSelector: null,
+      fieldSelector: "status.access.exec=true",
+    });
+    expect(input.resourceVersion).toBe("sha256:list");
+    expect(Array.from(input.knownResourceVersions.entries())).toEqual([["RunnerInstance/runner-1", "sha256:old"]]);
+    expect(input.allowBookmarks).toBe(true);
+    expect(input.requester).toBe("issuer:user-a");
+    const body = await response!.json();
+    expect(body.events).toEqual([{
+      type: "BOOKMARK",
+      resource_ref: { apiVersion: "bucephalus.dev/v1alpha1", kind: "RuntimeResourceList", name: "run-1" },
+      resource_version: "sha256:list",
+    }]);
+  });
+
+  test("runtime resource event routes forward continue cursors and filters to repository", async () => {
+    const observed: { input?: unknown } = {};
+    const runs = {
+      async getRun() {
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async resourceEvents(_runId: string, _run: unknown, input: unknown) {
+        observed.input = input;
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceEventList",
+          cloud_run_id: "run-1",
+          metadata: {
+            resourceVersion: "event-row-seq:6",
+            continue: null,
+            remainingItemCount: 0,
+            limit: 3,
+            returned: 0,
+            after_row_seq: 5,
+            next_after_row_seq: 5,
+          },
+          events: [],
+        };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/Trial/trial-1/events?limit=3&continue=event-row-seq:5&event_type=runtime.access.exec.requested&source=cloud.run_events&trial_id=trial-1&task_id=task-1"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/Trial/trial-1/events?limit=3&continue=event-row-seq:5&event_type=runtime.access.exec.requested&source=cloud.run_events&trial_id=trial-1&task_id=task-1"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    await expect(response!.json()).resolves.toMatchObject({
+      kind: "RuntimeResourceEventList",
+      cloud_run_id: "run-1",
+    });
+    expect(observed.input).toEqual({
+      kind: "Trial",
+      name: "trial-1",
+      limit: 3,
+      afterRowSeq: undefined,
+      continueToken: "event-row-seq:5",
+      filter: {
+        eventTypes: ["runtime.access.exec.requested"],
+        sources: ["cloud.run_events"],
+        trialId: "trial-1",
+        taskId: "task-1",
+      },
+      requester: "issuer:user-a",
+    });
+  });
+
+  test("runtime resource operation reviews use repository access support instead of stale route defaults", async () => {
+    const observed: { input?: unknown } = {};
+    const runs = {
+      async getRun() {
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async reviewResourceOperation(_runId: string, _run: unknown, input: unknown) {
+        observed.input = input;
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceOperationReview",
+          cloud_run_id: "run-1",
+          generated_at: "2026-01-01T00:00:00.000Z",
+          core_run_ids: ["core-run-1"],
+          resource_ref: {
+            apiVersion: "bucephalus.dev/v1alpha1",
+            kind: "TrialContainer",
+            name: "trial-1.agent.container-1",
+          },
+          resource_version: "sha256:target",
+          resource_generation: 2,
+          observed_generation: 2,
+          operation: "port-forward",
+          matched_operation: "port-forward",
+          supported: true,
+          reason: null,
+          message: null,
+          command: "buc runs port-forward run-1 TrialContainer/trial-1.agent.container-1 --target-port PORT",
+          verb: "create",
+          subresource: "port-forward",
+          action: null,
+          requires_running_run: true,
+        };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/TrialContainer/trial-1.agent.container-1/operations/port-forward"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/TrialContainer/trial-1.agent.container-1/operations/port-forward"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    const body = await response!.json();
+    expect(observed.input).toEqual({
+      kind: "TrialContainer",
+      name: "trial-1.agent.container-1",
+      operation: "port-forward",
+      requester: "issuer:user-a",
+    });
+    expect(body).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      generated_at: "2026-01-01T00:00:00.000Z",
+      core_run_ids: ["core-run-1"],
+      supported: true,
+      reason: null,
+      message: null,
+      subresource: "port-forward",
+    });
+  });
+
+  test("decodes slash-qualified runtime operation review names as one path segment", async () => {
+    const observed: {
+      ownerKey?: string | undefined;
+      runtimeRunId?: string;
+      runtimeStatus?: string;
+      kind?: string;
+      name?: string;
+      operation?: string;
+      requester?: string | null | undefined;
+    } = {};
+    const runs = {
+      async getRun(runId: string, ownerKey?: string) {
+        observed.ownerKey = ownerKey;
+        expect(runId).toBe("run-1");
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async reviewResourceOperation(runId: string, run: ReturnType<typeof runRecord>, input: { kind: string; name: string; operation: string; requester?: string | null | undefined }) {
+        observed.runtimeRunId = runId;
+        observed.runtimeStatus = run.status;
+        observed.kind = input.kind;
+        observed.name = input.name;
+        observed.operation = input.operation;
+        observed.requester = input.requester;
+        return {
+          apiVersion: "bucephalus.dev/v1alpha1",
+          kind: "RuntimeResourceOperationReview",
+          cloud_run_id: runId,
+          generated_at: "2026-01-01T00:00:00.000Z",
+          core_run_ids: ["core-run-1"],
+          resource_ref: {
+            apiVersion: "bucephalus.dev/v1alpha1",
+            kind: input.kind,
+            name: input.name,
+          },
+          resource_version: "sha256:review",
+          resource_generation: 4,
+          observed_generation: 4,
+          operation: input.operation,
+          matched_operation: input.operation,
+          supported: true,
+          reason: null,
+          message: null,
+          command: "buc runs logs run-1 Trial/trial-1 --stream stdout --follow",
+          verb: "get",
+          subresource: "logs",
+          action: null,
+        };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/Trial/trial-1/operations/logs%2Fstdout"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/Trial/trial-1/operations/logs%2Fstdout"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(response).not.toBeNull();
+    expect(await response!.json()).toMatchObject({
+      kind: "RuntimeResourceOperationReview",
+      cloud_run_id: "run-1",
+      generated_at: "2026-01-01T00:00:00.000Z",
+      core_run_ids: ["core-run-1"],
+      resource_ref: {
+        kind: "Trial",
+        name: "trial-1",
+      },
+      operation: "logs/stdout",
+      resource_version: "sha256:review",
+      resource_generation: 4,
+      observed_generation: 4,
+      matched_operation: "logs/stdout",
+      supported: true,
+      subresource: "logs",
+    });
+    expect(observed).toEqual({
+      ownerKey: "issuer:user-a",
+      runtimeRunId: "run-1",
+      runtimeStatus: "created",
+      kind: "Trial",
+      name: "trial-1",
+      operation: "logs/stdout",
+      requester: "issuer:user-a",
+    });
+  });
+
+  test("runtime resource byte subresources expose cloud run identity headers", async () => {
+    const observed: {
+      ownerKeys: Array<string | undefined>;
+      logs?: { runId: string; input: unknown };
+      content?: { runId: string; input: unknown };
+    } = { ownerKeys: [] };
+    const runs = {
+      async getRun(runId: string, ownerKey?: string) {
+        expect(runId).toBe("run-1");
+        observed.ownerKeys.push(ownerKey);
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async resourceLogs(runId: string, _run: ReturnType<typeof runRecord>, input: unknown) {
+        observed.logs = { runId, input };
+        return {
+          stream: "stderr",
+          resource: {
+            kind: "Trial",
+            metadata: { name: "trial-1", resourceVersion: "sha256:trial-rv" },
+          },
+          bytes: new TextEncoder().encode("log line\n"),
+          media_type: "text/plain; charset=utf-8",
+          object: {
+            core_run_id: "core-run-1",
+            trial_id: "trial-1",
+            role: "stderr",
+            object_ref: "runtime://cloud-run/run-1/trial/trial-1/stderr",
+            media_type: "text/plain; charset=utf-8",
+            sha256: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          },
+        };
+      },
+      async resourceArtifactContent(runId: string, _run: ReturnType<typeof runRecord>, input: unknown) {
+        observed.content = { runId, input };
+        return {
+          resource: {
+            kind: "TrialArtifact",
+            metadata: { name: "artifact-1", resourceVersion: "sha256:artifact-rv" },
+          },
+          bytes: new TextEncoder().encode("{\"ok\":true}"),
+          media_type: "application/json; charset=utf-8",
+          object: {
+            core_run_id: "core-run-1",
+            trial_id: "trial-1",
+            role: "agent_result",
+            object_ref: "artifact://sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            media_type: "application/json; charset=utf-8",
+            sha256: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          },
+        };
+      },
+    };
+
+    const logsResponse = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/Trial/trial-1/logs?stream=stderr"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/Trial/trial-1/logs?stream=stderr"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(logsResponse).not.toBeNull();
+    expect(await logsResponse!.text()).toBe("log line\n");
+    expect(logsResponse!.headers.get("x-bucephalus-run-id")).toBe("run-1");
+    expect(logsResponse!.headers.get("x-bucephalus-log-stream")).toBe("stderr");
+    expect(logsResponse!.headers.get("x-bucephalus-resource-kind")).toBe("Trial");
+    expect(logsResponse!.headers.get("x-bucephalus-resource-name")).toBe("trial-1");
+    expect(logsResponse!.headers.get("x-bucephalus-resource-version")).toBe("sha256:trial-rv");
+    expect(logsResponse!.headers.get("x-bucephalus-core-run-id")).toBe("core-run-1");
+    expect(logsResponse!.headers.get("x-bucephalus-trial-id")).toBe("trial-1");
+    expect(logsResponse!.headers.get("x-bucephalus-artifact-role")).toBe("stderr");
+    expect(logsResponse!.headers.get("x-bucephalus-object-ref")).toBe("runtime://cloud-run/run-1/trial/trial-1/stderr");
+    expect(logsResponse!.headers.get("x-bucephalus-artifact-sha256")).toBe("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    const contentResponse = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/TrialArtifact/artifact-1/content"),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/TrialArtifact/artifact-1/content"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(contentResponse).not.toBeNull();
+    expect(await contentResponse!.text()).toBe("{\"ok\":true}");
+    expect(contentResponse!.headers.get("x-bucephalus-run-id")).toBe("run-1");
+    expect(contentResponse!.headers.get("x-bucephalus-resource-kind")).toBe("TrialArtifact");
+    expect(contentResponse!.headers.get("x-bucephalus-resource-name")).toBe("artifact-1");
+    expect(contentResponse!.headers.get("x-bucephalus-resource-version")).toBe("sha256:artifact-rv");
+    expect(contentResponse!.headers.get("x-bucephalus-core-run-id")).toBe("core-run-1");
+    expect(contentResponse!.headers.get("x-bucephalus-trial-id")).toBe("trial-1");
+    expect(contentResponse!.headers.get("x-bucephalus-artifact-role")).toBe("agent_result");
+    expect(contentResponse!.headers.get("x-bucephalus-object-ref")).toBe("artifact://sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    expect(contentResponse!.headers.get("x-bucephalus-artifact-sha256")).toBe("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    expect(observed).toEqual({
+      ownerKeys: ["issuer:user-a", "issuer:user-a"],
+      logs: {
+        runId: "run-1",
+        input: {
+          kind: "Trial",
+          name: "trial-1",
+          stream: "stderr",
+          tailLines: undefined,
+          requester: "issuer:user-a",
+        },
+      },
+      content: {
+        runId: "run-1",
+        input: {
+          kind: "TrialArtifact",
+          name: "artifact-1",
+          requester: "issuer:user-a",
+        },
+      },
+    });
+  });
+
+  test("runtime resource API creates port-forward requests from the selected resource path", async () => {
+    const observed: { ownerKey?: string | undefined; input?: unknown } = {};
+    const runs = {
+      async getRun(runId: string, ownerKey?: string) {
+        observed.ownerKey = ownerKey;
+        expect(runId).toBe("run-1");
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async createPortForwardRequest(input: unknown) {
+        observed.input = input;
+        return runtimeAccessRequestRecord("pf-1", "port_forward");
+      },
+      runtimeAccessRequestResource(run: { run_id: string }, request: { access_request_id: string; kind: string }) {
+        return runtimeAccessResource(run.run_id, request);
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/Trial/trial-1.0/port-forward", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          target_port: "8080",
+          local_port: 18080,
+          resource_version: "rv-1",
+          reason: "debug failing service",
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/Trial/trial-1.0/port-forward"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    const body = await response!.json();
+    expect(response!.status).toBe(201);
+    expect(observed.ownerKey).toBe("issuer:user-a");
+    expect(observed.input).toMatchObject({
+      run: expect.objectContaining({ run_id: "run-1" }),
+      targetPort: 8080,
+      localPort: 18080,
+      resourceKind: "Trial",
+      resourceName: "trial-1.0",
+      resourceVersion: "rv-1",
+      requester: "issuer:user-a",
+      reason: "debug failing service",
+    });
+    expect(body.resource.kind).toBe("PortForward");
+  });
+
+  test("runtime resource API creates exec requests from the selected resource path", async () => {
+    const observed: { input?: unknown } = {};
+    const runs = {
+      async getRun() {
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async createExecRequest(input: unknown) {
+        observed.input = input;
+        return runtimeAccessRequestRecord("exec-1", "exec");
+      },
+      runtimeAccessRequestResource(run: { run_id: string }, request: { access_request_id: string; kind: string }) {
+        return runtimeAccessResource(run.run_id, request);
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/RunnerInstance/runner-1/exec", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          command: ["bash", "-lc", "id"],
+          ttl_seconds: 60,
+          resource_version: "rv-runner-1",
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/RunnerInstance/runner-1/exec"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    const body = await response!.json();
+    expect(response!.status).toBe(201);
+    expect(observed.input).toMatchObject({
+      run: expect.objectContaining({ run_id: "run-1" }),
+      command: ["bash", "-lc", "id"],
+      resourceKind: "RunnerInstance",
+      resourceName: "runner-1",
+      resourceVersion: "rv-runner-1",
+      ttlSeconds: 60,
+      requester: "issuer:user-a",
+    });
+    expect(body.resource.kind).toBe("Exec");
+  });
+
+  test("runtime resource API performs lifecycle actions through action subresources", async () => {
+    const observed: { input?: unknown } = {};
+    const runs = {
+      async getRun() {
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async cordonRunnerInstanceResource(input: unknown) {
+        observed.input = input;
+        return { resource: { kind: "RunnerInstance", metadata: { name: "runner-1" } } };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/RunnerInstance/runner-1/actions/cordon", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          resource_version: "rv-2",
+          reason: "drain for inspection",
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/RunnerInstance/runner-1/actions/cordon"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(await response!.json()).toEqual({ resource: { kind: "RunnerInstance", metadata: { name: "runner-1" } } });
+    expect(observed.input).toMatchObject({
+      run: expect.objectContaining({ run_id: "run-1" }),
+      resourceKind: "RunnerInstance",
+      resourceName: "runner-1",
+      resourceVersion: "rv-2",
+      requester: "issuer:user-a",
+      reason: "drain for inspection",
+    });
+  });
+
+  test("runtime resource API deletes access resources through the selected resource", async () => {
+    const observed: { input?: unknown } = {};
+    const runs = {
+      async getRun() {
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async cancelRuntimeAccessResource(input: unknown) {
+        observed.input = input;
+        return { resource: { kind: "PortForward", metadata: { name: "pf-1" } } };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/PortForward/pf-1", {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          resource_version: "rv-pf-1",
+          reason: "done debugging",
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/PortForward/pf-1"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(await response!.json()).toEqual({ resource: { kind: "PortForward", metadata: { name: "pf-1" } } });
+    expect(observed.input).toMatchObject({
+      run: expect.objectContaining({ run_id: "run-1" }),
+      resourceKind: "PortForward",
+      resourceName: "pf-1",
+      resourceVersion: "rv-pf-1",
+      requester: "issuer:user-a",
+      reason: "done debugging",
+    });
+  });
+
+  test("runtime resource API cancels access resources through the cancel action subresource", async () => {
+    const observed: { input?: unknown } = {};
+    const runs = {
+      async getRun() {
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async cancelRuntimeAccessResource(input: unknown) {
+        observed.input = input;
+        return { resource: { kind: "Exec", metadata: { name: "exec-1" } } };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/Exec/exec-1/actions/cancel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          resource_version: "rv-exec-1",
+          reason: "stop debug command",
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/Exec/exec-1/actions/cancel"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(await response!.json()).toEqual({ resource: { kind: "Exec", metadata: { name: "exec-1" } } });
+    expect(observed.input).toMatchObject({
+      run: expect.objectContaining({ run_id: "run-1" }),
+      resourceKind: "Exec",
+      resourceName: "exec-1",
+      resourceVersion: "rv-exec-1",
+      requester: "issuer:user-a",
+      reason: "stop debug command",
+    });
+  });
+
+  test("runtime resource API completes port-forwards through the complete action subresource", async () => {
+    const observed: { input?: unknown } = {};
+    const runs = {
+      async getRun() {
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async completeRuntimeAccessResource(input: unknown) {
+        observed.input = input;
+        return { resource: { kind: "PortForward", metadata: { name: "pf-1" } } };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/PortForward/pf-1/actions/complete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          resource_version: "rv-pf-1",
+          reason: "local tunnel ended",
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/PortForward/pf-1/actions/complete"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(await response!.json()).toEqual({ resource: { kind: "PortForward", metadata: { name: "pf-1" } } });
+    expect(observed.input).toMatchObject({
+      run: expect.objectContaining({ run_id: "run-1" }),
+      resourceKind: "PortForward",
+      resourceName: "pf-1",
+      resourceVersion: "rv-pf-1",
+      requester: "issuer:user-a",
+      reason: "local tunnel ended",
+    });
+  });
+
+  test("runtime resource API requires reviewed resource versions before mutations", async () => {
+    const runs = {
+      async getRun() {
+        return runRecord();
+      },
+    };
+    const runtime = {
+      async createPortForwardRequest() {
+        throw new Error("port-forward should not be created without a reviewed resource version");
+      },
+      async createExecRequest() {
+        throw new Error("exec should not be created without a reviewed resource version");
+      },
+      async cordonRunnerInstanceResource() {
+        throw new Error("cordon should not be performed without a reviewed resource version");
+      },
+      async cancelRuntimeAccessResource() {
+        throw new Error("delete should not be performed without a reviewed resource version");
+      },
+      async completeRuntimeAccessResource() {
+        throw new Error("complete should not be performed without a reviewed resource version");
+      },
+    };
+    const cases = [
+      {
+        operation: "port-forward",
+        request: new Request("https://cloud.example/v1/runs/run-1/runtime/resources/Trial/trial-1.0/port-forward", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ target_port: 8080 }),
+        }),
+        url: new URL("https://cloud.example/v1/runs/run-1/runtime/resources/Trial/trial-1.0/port-forward"),
+      },
+      {
+        operation: "exec",
+        request: new Request("https://cloud.example/v1/runs/run-1/runtime/resources/RunnerInstance/runner-1/exec", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ command: ["bash", "-lc", "id"] }),
+        }),
+        url: new URL("https://cloud.example/v1/runs/run-1/runtime/resources/RunnerInstance/runner-1/exec"),
+      },
+      {
+        operation: "cordon",
+        request: new Request("https://cloud.example/v1/runs/run-1/runtime/resources/RunnerInstance/runner-1/actions/cordon", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ reason: "drain for inspection" }),
+        }),
+        url: new URL("https://cloud.example/v1/runs/run-1/runtime/resources/RunnerInstance/runner-1/actions/cordon"),
+      },
+      {
+        operation: "delete",
+        request: new Request("https://cloud.example/v1/runs/run-1/runtime/resources/PortForward/pf-1", {
+          method: "DELETE",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ reason: "done debugging" }),
+        }),
+        url: new URL("https://cloud.example/v1/runs/run-1/runtime/resources/PortForward/pf-1"),
+      },
+      {
+        operation: "complete",
+        request: new Request("https://cloud.example/v1/runs/run-1/runtime/resources/PortForward/pf-1/actions/complete", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ reason: "local tunnel ended" }),
+        }),
+        url: new URL("https://cloud.example/v1/runs/run-1/runtime/resources/PortForward/pf-1/actions/complete"),
+      },
+    ];
+
+    for (const testCase of cases) {
+      await expect(handleRunRoute(
+        testCase.request,
+        testCase.url,
         {} as PackageRepository,
         runs as unknown as RunRepository,
         runtime as unknown as RuntimeRepository,
         runnersWithDockerPool() as any,
         "worker-token",
         authContext("user-a"),
-      );
-
-      expect(await response!.text()).toBe(JSON.stringify({ final: "generated answer" }));
-      expect(response!.headers.get("content-type")).toBe("application/json; charset=utf-8");
-      expect(response!.headers.get("x-bucephalus-artifact-role")).toBe("agent_result");
-      expect(observed).toMatchObject({
-        runId: "run-1",
-        ownerKey: "issuer:user-a",
-        contentRunId: "run-1",
-        contentInput: {
-          trialId: "trial_1",
-          role: "agent_result",
-          attempt: 0,
+      )).rejects.toMatchObject({
+        status: 428,
+        code: "runtime_resource_version_required",
+        detail: {
+          operation: testCase.operation,
+          required: ["resource_version"],
         },
       });
-    } finally {
-      await rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1592,6 +2740,47 @@ describe("Cloud run routes", () => {
     )).rejects.toThrow("/runtime_options/region is not supported for hosted Cloud runs");
   });
 
+  test("run creation rejects runtime compatibility aliases before queueing", async () => {
+    for (const [key, value] of [
+      ["executor", "modal"],
+      ["cpu", 2],
+    ] as const) {
+      const packages = {
+        async getArtifact() {
+          return packageRecordWithSecrets();
+        },
+      };
+      const runs = {
+        async createRun() {
+          throw new Error("createRun should not be called");
+        },
+      };
+
+      await expect(handleRunRoute(
+        new Request("https://cloud.example/v1/runs", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            runtime_options: {
+              [key]: value,
+            },
+            secret_refs: {
+              OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/latest",
+            },
+          }),
+        }),
+        new URL("https://cloud.example/v1/runs"),
+        packages as unknown as PackageRepository,
+        runs as unknown as RunRepository,
+        {} as RuntimeRepository,
+        runnersWithDockerPool() as any,
+        "worker-token",
+        authContext("user-a"),
+      )).rejects.toThrow(`/runtime_options/${key} is not supported for hosted Cloud runs`);
+    }
+  });
+
   test("run creation persists validated plain env separately from secret refs", async () => {
     const packages = {
       async getArtifact() {
@@ -1882,6 +3071,77 @@ function attemptRecord(attemptToken?: string): RunAttemptRecord {
     created_at: "2026-06-04T00:00:00Z",
     updated_at: "2026-06-04T00:00:00Z",
     ...(attemptToken ? { attempt_token: attemptToken } : {}),
+  };
+}
+
+function runtimeAccessRequestRecord(accessRequestId: string, kind: "port_forward" | "exec") {
+  return {
+    access_request_id: accessRequestId,
+    run_id: "run-1",
+    kind,
+    status: "requested",
+    resource_kind: kind === "exec" ? "RunnerInstance" : "Trial",
+    resource_name: kind === "exec" ? "runner-1" : "trial-1.0",
+    target_uid: null,
+    target_resource_version: null,
+    protocol: kind === "exec" ? "exec" : "tcp",
+    target_port: kind === "exec" ? null : 8080,
+    local_port: null,
+    command: kind === "exec" ? ["bash", "-lc", "id"] : null,
+    runner_instance_id: "runner-instance-1",
+    attempt_id: "attempt-1",
+    worker_id: "worker-1",
+    requester: "issuer:user-a",
+    reason: "debug",
+    connection: {},
+    error_message: null,
+    expires_at: null,
+    created_at: "2026-06-04T00:00:00Z",
+    updated_at: "2026-06-04T00:00:00Z",
+  };
+}
+
+function runtimeAccessResource(runId: string, request: { access_request_id: string; kind: string }) {
+  const kind = request.kind === "exec" ? "Exec" : "PortForward";
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind,
+    metadata: {
+      name: request.access_request_id,
+      labels: {
+        "bucephalus.dev/cloud-run-id": runId,
+      },
+    },
+    spec: {},
+    status: {},
+  };
+}
+
+function runtimeRouteResource(
+  kind: string,
+  name: string,
+  overrides: {
+    labels?: Record<string, string>;
+    annotations?: Record<string, string>;
+    spec?: Record<string, unknown>;
+    status?: Record<string, unknown>;
+  } = {},
+) {
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind,
+    metadata: {
+      name,
+      uid: `${kind.toLowerCase()}-${name}`,
+      generation: 1,
+      resourceVersion: "sha256:resource",
+      labels: overrides.labels ?? {},
+      annotations: overrides.annotations ?? {},
+      ownerReferences: [],
+    },
+    spec: overrides.spec ?? {},
+    status: overrides.status ?? {},
+    audit: {},
   };
 }
 

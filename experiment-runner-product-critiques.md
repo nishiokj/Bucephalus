@@ -1,7 +1,7 @@
 # Experiment Runner Product Critiques
 
 Perspective: user of Bucephalus/Experiments as both a product surface and a
-developer tool, based on the AgentBench and lm-evaluation-harness Nova runs.
+developer tool, based on the AgentBench and lm-evaluation-harness runs.
 
 ## High-Level Take
 
@@ -97,7 +97,7 @@ Displaying a payload object as the metric should be avoided.
 
 ### 5. Candidate Artifact Status Is Confusing
 
-`latest_agent_output` showed `candidate=invalid` even though Nova's result JSON
+`latest_agent_output` showed `candidate=invalid` even though the agent's result JSON
 was captured and the grader succeeded. If "candidate artifact" means a patch or
 file artifact, that should be separate from answer-mode agent result validity.
 

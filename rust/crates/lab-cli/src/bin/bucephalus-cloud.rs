@@ -718,6 +718,7 @@ fn package_secrets(context: CliContext) -> Result<()> {
 }
 
 fn run_create(context: CliContext) -> Result<()> {
+    validate_run_create_args(&context.args)?;
     let package_digest = required_option(&context.args, "--package-digest")?;
     let secret_refs = secret_refs_from_options(&context.args)?;
     if !context
@@ -796,6 +797,65 @@ fn run_create(context: CliContext) -> Result<()> {
         None,
         AuthMode::User,
     )?)
+}
+
+fn validate_run_create_args(args: &[String]) -> Result<()> {
+    const ALLOWED_OPTIONS: &[&str] = &[
+        "--arch",
+        "--backend",
+        "--cpu-count",
+        "--disk-mb",
+        "--env",
+        "--isolation",
+        "--label",
+        "--materialize",
+        "--max-parallel-trials",
+        "--memory-mb",
+        "--no-secret-preflight",
+        "--package-digest",
+        "--secret",
+        "--secret-ref",
+        "--secret-ref-file",
+        "--secrets-file",
+        "--smoke-test",
+        "--timeout-ms",
+    ];
+    const REMOVED_OPTIONS: &[(&str, &str)] = &[
+        ("--region", "Hosted Cloud does not support user-selected regions yet; runner placement is controlled by the Cloud runner pool."),
+        ("--executor", "Use --backend for supported Cloud runtime backend selection, or declare runtime.compute.backend in the sealed package."),
+        ("--cpu", "Use --cpu-count for the supported Cloud runner shape override, or declare runtime.compute.cpu_count in the sealed package."),
+    ];
+
+    let allowed = ALLOWED_OPTIONS.iter().copied().collect::<BTreeSet<_>>();
+    let removed = REMOVED_OPTIONS.iter().copied().collect::<BTreeMap<_, _>>();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if !arg.starts_with('-') {
+            bail!(
+                "run create does not accept positional arguments; use --package-digest sha256:..."
+            );
+        }
+        let (option, has_inline_value) = arg
+            .split_once('=')
+            .map(|(name, _)| (name, true))
+            .unwrap_or((arg.as_str(), false));
+        if let Some(message) = removed.get(option) {
+            bail!("run create option {option} is not supported. {message}");
+        }
+        if !allowed.contains(option) {
+            bail!("unknown run create option {option}");
+        }
+        if option_takes_value(option) && !has_inline_value {
+            if args.get(index + 1).is_none() {
+                bail!("{option} requires a value");
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
 }
 
 fn run_get(context: CliContext) -> Result<()> {
@@ -1162,6 +1222,11 @@ fn option_value(args: &[String], name: &str) -> Result<Option<String>> {
             .get(index + 1)
             .ok_or_else(|| anyhow!("{name} requires a value"))?;
         Ok(Some(value.clone()))
+    } else if let Some(value) = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix(&format!("{name}=")))
+    {
+        Ok(Some(value.to_string()))
     } else {
         Ok(None)
     }
@@ -1171,13 +1236,16 @@ fn key_value_options(args: &[String], name: &str) -> Result<BTreeMap<String, Str
     let mut out = BTreeMap::new();
     let mut index = 0;
     while index < args.len() {
-        if args[index] != name {
+        let value = if args[index] == name {
+            args.get(index + 1)
+                .ok_or_else(|| anyhow!("{name} requires KEY=VALUE"))?
+                .clone()
+        } else if let Some(value) = args[index].strip_prefix(&format!("{name}=")) {
+            value.to_string()
+        } else {
             index += 1;
             continue;
-        }
-        let value = args
-            .get(index + 1)
-            .ok_or_else(|| anyhow!("{name} requires KEY=VALUE"))?;
+        };
         let Some((key, value)) = value.split_once('=') else {
             bail!("{name} requires KEY=VALUE");
         };
@@ -1185,9 +1253,31 @@ fn key_value_options(args: &[String], name: &str) -> Result<BTreeMap<String, Str
             bail!("{name} requires KEY=VALUE");
         }
         out.insert(key.to_string(), value.to_string());
-        index += 2;
+        index += if args[index] == name { 2 } else { 1 };
     }
     Ok(out)
+}
+
+fn option_takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "--arch"
+            | "--backend"
+            | "--cpu-count"
+            | "--disk-mb"
+            | "--env"
+            | "--isolation"
+            | "--label"
+            | "--materialize"
+            | "--max-parallel-trials"
+            | "--memory-mb"
+            | "--package-digest"
+            | "--secret"
+            | "--secret-ref"
+            | "--secret-ref-file"
+            | "--secrets-file"
+            | "--timeout-ms"
+    )
 }
 
 fn csv_option(args: &[String], name: &str, fallback: &[String]) -> Result<Vec<String>> {
@@ -1376,7 +1466,7 @@ fn print_secret_requirements(
     lines.extend([
         String::new(),
         "Queue with:".to_string(),
-        format!("  bucephalus-cloud run create --package-digest {package_digest} --secret-ref-file secrets.yaml"),
+        format!("  buc run {package_digest} --secret-ref-file secrets.yaml"),
     ]);
     println!("{}", lines.join("\n"));
     Ok(())
@@ -1507,6 +1597,108 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    #[test]
+    fn key_value_options_accept_equals_form() {
+        let args = vec![
+            "--env=OPENAI_BASE_URL=https://api.example.com".to_string(),
+            "--secret-ref".to_string(),
+            "OPENAI_API_KEY=gcp-secret-manager://projects/p/secrets/openai/versions/latest"
+                .to_string(),
+        ];
+
+        assert_eq!(
+            key_value_options(&args, "--env").expect("env"),
+            BTreeMap::from([(
+                "OPENAI_BASE_URL".to_string(),
+                "https://api.example.com".to_string()
+            )])
+        );
+        assert_eq!(
+            key_value_options(&args, "--secret-ref").expect("secret"),
+            BTreeMap::from([(
+                "OPENAI_API_KEY".to_string(),
+                "gcp-secret-manager://projects/p/secrets/openai/versions/latest".to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn run_create_rejects_unsupported_runtime_placement_flags() {
+        for (flag, expected) in [
+            ("--region", "does not support user-selected regions"),
+            ("--executor", "Use --backend"),
+            ("--cpu", "Use --cpu-count"),
+        ] {
+            let err = validate_run_create_args(&[
+                "--package-digest".to_string(),
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                flag.to_string(),
+                "ignored".to_string(),
+            ])
+            .expect_err("unsupported placement flag");
+            assert!(err.to_string().contains(expected), "{flag}: {err}");
+        }
+    }
+
+    #[test]
+    fn run_create_rejects_unknown_options_and_positionals() {
+        let unknown = validate_run_create_args(&[
+            "--package-digest".to_string(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "--flavor".to_string(),
+            "large".to_string(),
+        ])
+        .expect_err("unknown option");
+        assert!(unknown
+            .to_string()
+            .contains("unknown run create option --flavor"));
+
+        let positional = validate_run_create_args(&[
+            "--package-digest".to_string(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "us-east-1".to_string(),
+        ])
+        .expect_err("positional");
+        assert!(positional
+            .to_string()
+            .contains("run create does not accept positional arguments"));
+    }
+
+    #[test]
+    fn run_create_allows_explicit_supported_options() {
+        validate_run_create_args(&[
+            "--package-digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            "--label".to_string(),
+            "trial-debug".to_string(),
+            "--secret-ref=OPENAI_API_KEY=gcp-secret-manager://projects/p/secrets/openai/versions/latest"
+                .to_string(),
+            "--env=OPENAI_BASE_URL=https://api.example.com".to_string(),
+            "--backend".to_string(),
+            "runner-docker".to_string(),
+            "--arch".to_string(),
+            "x86_64".to_string(),
+            "--cpu-count".to_string(),
+            "4".to_string(),
+            "--memory-mb".to_string(),
+            "4096".to_string(),
+            "--disk-mb".to_string(),
+            "20480".to_string(),
+            "--isolation".to_string(),
+            "reusable_vm".to_string(),
+            "--materialize".to_string(),
+            "metadata_only".to_string(),
+            "--timeout-ms".to_string(),
+            "60000".to_string(),
+            "--max-parallel-trials".to_string(),
+            "8".to_string(),
+            "--smoke-test".to_string(),
+            "--no-secret-preflight".to_string(),
+        ])
+        .expect("supported run create options");
     }
 
     #[test]

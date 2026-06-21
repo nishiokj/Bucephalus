@@ -74,6 +74,12 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    PreconditionRequired:
+      description: The request is missing a required optimistic-concurrency precondition.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
     Unauthorized:
       description: The request is missing a valid bearer credential.
       content:

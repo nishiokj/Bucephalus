@@ -35,7 +35,7 @@ use crate::persistence::store::is_sqlite_busy_error;
 use crate::persistence::writer::RunStoreWriter;
 use crate::trial::artifacts::{
     artifact_type_from_trial_input_path, extract_candidate_artifact_record,
-    load_agent_response_resilient,
+    load_agent_response_resilient, normalize_agent_result_adapter,
 };
 use crate::trial::env::{
     build_exec_env, resolve_grader_command, resolve_grading_phase, resolve_runtime_agent_command,
@@ -1308,6 +1308,7 @@ fn execute_host_agent_runtime(
     fs::write(trial_agent_stdout_path(trial_dir), &output.stdout)?;
     fs::write(trial_agent_stderr_path(trial_dir), &output.stderr)?;
 
+    normalize_agent_result_adapter(request.runtime_experiment, &request.io_paths.result_host)?;
     let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
     let trial_output = agent_response.response;
     let result_present = agent_response.result_present;

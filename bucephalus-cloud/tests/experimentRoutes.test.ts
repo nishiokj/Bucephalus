@@ -1212,7 +1212,7 @@ describe("Hosted experiment routes", () => {
         new URL("https://cloud.example/v1/experiments/builds"),
         importsAcceptingCompletedUpload(archivePath, packageDigest) as unknown as ImportRepository,
         packagesRecordingArtifact(packageDigest, {
-          image_refs: ["peter-gregory-v2-nova:local"],
+          image_refs: ["peter-gregory-v2:local"],
         }) as unknown as PackageRepository,
         {} as RunRepository,
         runnersWithDockerPool() as unknown as RunnerRepository,
@@ -1397,7 +1397,7 @@ describe("Hosted experiment routes", () => {
       {} as ImportRepository,
       packagesReturning({
         ...cloudReadyPackage(),
-        image_refs: ["peter-gregory-v2-nova:local"],
+        image_refs: ["peter-gregory-v2:local"],
       }) as unknown as PackageRepository,
       {} as RunRepository,
       runnersWithDockerPool() as unknown as RunnerRepository,
@@ -1908,7 +1908,7 @@ function cloudReadyPackage() {
       platforms: ["linux/amd64"],
     },
     image_refs: [
-      "us-central1-docker.pkg.dev/acme/buc/peter-gregory-v2-nova@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "us-central1-docker.pkg.dev/acme/buc/peter-gregory-v2@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     ],
     diagnostics: [],
     package_provenance: {

@@ -1702,6 +1702,7 @@ where
         let agent_ended_at = Utc::now().to_rfc3339();
 
         let agent_output_parse_started_at = Instant::now();
+        normalize_agent_result_adapter(request.runtime_experiment, &request.io_paths.result_host)?;
         let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
         let trial_output = agent_response.response;
         let result_present = agent_response.result_present;

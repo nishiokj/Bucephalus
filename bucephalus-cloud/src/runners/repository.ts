@@ -43,7 +43,11 @@ export interface RunnerInstanceRecord {
   updated_at: string;
 }
 
-export type RunnerInstanceStatus = "online" | "draining" | "offline" | "unhealthy";
+export type RunnerInstanceStatus = "online" | "cordoned" | "draining" | "offline" | "unhealthy";
+
+interface RunnerInstanceLifecycleRow extends RunnerInstanceRecord {
+  previous_status: RunnerInstanceStatus | null;
+}
 
 export interface RunnerProvisionRequestRecord {
   provision_request_id: string;
@@ -331,33 +335,77 @@ export class RunnerRepository {
     capabilities?: WorkerCapabilities;
     metadata?: JsonObject;
   }): Promise<RunnerInstanceRecord> {
-    const rows = input.capabilities || input.metadata
-      ? await this.sql`
-          update cloud.runner_instances
-          set status = case when status = 'offline' then 'online'::cloud.runner_instance_status else status end,
-              capabilities = coalesce(${input.capabilities ? this.sql.json(input.capabilities as unknown as JsonObject) : null}, capabilities),
-              metadata = case
-                when ${input.metadata ? this.sql.json(input.metadata) : null} is null then metadata
-                else metadata || ${input.metadata ? this.sql.json(input.metadata) : null}::jsonb
-              end,
-              last_heartbeat_at = now(),
-              updated_at = now()
-          where runner_instance_id = ${input.runnerInstanceId}
-          returning *
-        `
-      : await this.sql`
-          update cloud.runner_instances
-          set status = case when status = 'offline' then 'online'::cloud.runner_instance_status else status end,
-              last_heartbeat_at = now(),
-              updated_at = now()
-          where runner_instance_id = ${input.runnerInstanceId}
-          returning *
-        `;
-    const instance = rows[0] as RunnerInstanceRecord | undefined;
-    if (!instance) {
-      throw new HttpError(404, "runner_instance_not_found", "Runner instance not found");
-    }
-    return instance;
+    return await this.sql.begin(async (tx) => {
+      const rows = input.capabilities || input.metadata
+        ? await tx`
+            with selected as (
+              select runner_instance_id, status as previous_status
+              from cloud.runner_instances
+              where runner_instance_id = ${input.runnerInstanceId}
+              for update
+            ),
+            updated as (
+              update cloud.runner_instances instance
+              set status = case
+                    when selected.previous_status = 'offline'
+                      and instance.metadata #>> '{last_offline,previous_status}' in ('cordoned', 'draining')
+                      then (instance.metadata #>> '{last_offline,previous_status}')::cloud.runner_instance_status
+                    when selected.previous_status = 'offline' then 'online'::cloud.runner_instance_status
+                    else instance.status
+                  end,
+                  capabilities = coalesce(${input.capabilities ? this.sql.json(input.capabilities as unknown as JsonObject) : null}, instance.capabilities),
+                  metadata = case
+                    when ${input.metadata ? this.sql.json(input.metadata) : null} is null then instance.metadata
+                    else instance.metadata || ${input.metadata ? this.sql.json(input.metadata) : null}::jsonb
+                  end,
+                  last_heartbeat_at = now(),
+                  updated_at = now()
+              from selected
+              where instance.runner_instance_id = selected.runner_instance_id
+              returning instance.*, selected.previous_status
+            )
+            select * from updated
+          `
+        : await tx`
+            with selected as (
+              select runner_instance_id, status as previous_status
+              from cloud.runner_instances
+              where runner_instance_id = ${input.runnerInstanceId}
+              for update
+            ),
+            updated as (
+              update cloud.runner_instances instance
+              set status = case
+                    when selected.previous_status = 'offline'
+                      and instance.metadata #>> '{last_offline,previous_status}' in ('cordoned', 'draining')
+                      then (instance.metadata #>> '{last_offline,previous_status}')::cloud.runner_instance_status
+                    when selected.previous_status = 'offline' then 'online'::cloud.runner_instance_status
+                    else instance.status
+                  end,
+                  last_heartbeat_at = now(),
+                  updated_at = now()
+              from selected
+              where instance.runner_instance_id = selected.runner_instance_id
+              returning instance.*, selected.previous_status
+            )
+            select * from updated
+          `;
+      const instance = rows[0] as RunnerInstanceLifecycleRow | undefined;
+      if (!instance) {
+        throw new HttpError(404, "runner_instance_not_found", "Runner instance not found");
+      }
+      if (instance.previous_status === "offline" && instance.status !== "offline") {
+        await appendRunnerInstanceLifecycleEvent(tx, this.sql, {
+          eventType: "runtime.resource.runner_instance.heartbeat_restored",
+          instance,
+          previousStatus: instance.previous_status,
+          status: instance.status,
+          reason: "heartbeat_restored",
+          message: "Runner instance heartbeat restored runtime availability",
+        });
+      }
+      return runnerInstanceRecordWithoutPreviousStatus(instance);
+    });
   }
 
   async setInstanceStatus(input: {
@@ -365,49 +413,113 @@ export class RunnerRepository {
     status: RunnerInstanceStatus;
     metadataPatch?: JsonObject;
   }): Promise<RunnerInstanceRecord> {
-    const rows = input.metadataPatch
-      ? await this.sql`
-          update cloud.runner_instances
-          set status = ${input.status},
-              metadata = metadata || ${this.sql.json(input.metadataPatch)}::jsonb,
-              updated_at = now()
-          where runner_instance_id = ${input.runnerInstanceId}
-          returning *
-        `
-      : await this.sql`
-          update cloud.runner_instances
-          set status = ${input.status},
-              updated_at = now()
-          where runner_instance_id = ${input.runnerInstanceId}
-          returning *
-        `;
-    const instance = rows[0] as RunnerInstanceRecord | undefined;
-    if (!instance) {
-      throw new HttpError(404, "runner_instance_not_found", "Runner instance not found");
-    }
-    return instance;
+    return await this.sql.begin(async (tx) => {
+      const rows = input.metadataPatch
+        ? await tx`
+            with selected as (
+              select runner_instance_id, status as previous_status
+              from cloud.runner_instances
+              where runner_instance_id = ${input.runnerInstanceId}
+              for update
+            ),
+            updated as (
+              update cloud.runner_instances instance
+              set status = ${input.status},
+                  metadata = instance.metadata || ${this.sql.json(input.metadataPatch)}::jsonb,
+                  updated_at = now()
+              from selected
+              where instance.runner_instance_id = selected.runner_instance_id
+              returning instance.*, selected.previous_status
+            )
+            select * from updated
+          `
+        : await tx`
+            with selected as (
+              select runner_instance_id, status as previous_status
+              from cloud.runner_instances
+              where runner_instance_id = ${input.runnerInstanceId}
+              for update
+            ),
+            updated as (
+              update cloud.runner_instances instance
+              set status = ${input.status},
+                  updated_at = now()
+              from selected
+              where instance.runner_instance_id = selected.runner_instance_id
+              returning instance.*, selected.previous_status
+            )
+            select * from updated
+          `;
+      const instance = rows[0] as RunnerInstanceLifecycleRow | undefined;
+      if (!instance) {
+        throw new HttpError(404, "runner_instance_not_found", "Runner instance not found");
+      }
+      if (instance.previous_status !== input.status) {
+        await appendRunnerInstanceLifecycleEvent(tx, this.sql, {
+          eventType: runnerInstanceStatusEventType(input.status),
+          instance,
+          previousStatus: instance.previous_status,
+          status: input.status,
+          reason: runnerInstanceStatusEventReason(input.status, input.metadataPatch),
+          message: `Runner instance status changed to ${input.status}`,
+          extra: {
+            action: "set_status",
+          },
+        });
+      }
+      return runnerInstanceRecordWithoutPreviousStatus(instance);
+    });
   }
 
   async markStaleInstancesOffline(input: {
     runnerPoolId?: string;
     staleAfterSeconds: number;
   }): Promise<RunnerInstanceRecord[]> {
-    const rows = await this.sql`
-      update cloud.runner_instances
-      set status = 'offline',
-          metadata = metadata || ${this.sql.json({
-            last_offline: {
-              reason: "heartbeat_stale",
-              recorded_at: new Date().toISOString(),
-            },
-          })}::jsonb,
-          updated_at = now()
-      where status in ('online', 'draining')
-        and (${input.runnerPoolId ?? null}::uuid is null or runner_pool_id = ${input.runnerPoolId ?? null})
-        and last_heartbeat_at < now() - (${input.staleAfterSeconds.toString()} || ' seconds')::interval
-      returning *
-    `;
-    return rows as unknown as RunnerInstanceRecord[];
+    return await this.sql.begin(async (tx) => {
+      const recordedAt = new Date().toISOString();
+      const rows = await tx`
+        with candidates as (
+          select runner_instance_id, status as previous_status
+          from cloud.runner_instances
+          where status in ('online', 'cordoned', 'draining')
+            and (${input.runnerPoolId ?? null}::uuid is null or runner_pool_id = ${input.runnerPoolId ?? null})
+            and last_heartbeat_at < now() - (${input.staleAfterSeconds.toString()} || ' seconds')::interval
+          for update
+        ),
+        updated as (
+          update cloud.runner_instances instance
+          set status = 'offline',
+              metadata = instance.metadata || jsonb_build_object(
+                'last_offline',
+                jsonb_build_object(
+                  'reason', 'heartbeat_stale',
+                  'previous_status', candidates.previous_status::text,
+                  'recorded_at', ${recordedAt}
+                )
+              ),
+              updated_at = now()
+          from candidates
+          where instance.runner_instance_id = candidates.runner_instance_id
+          returning instance.*, candidates.previous_status
+        )
+        select * from updated
+      `;
+      const instances = rows as unknown as RunnerInstanceLifecycleRow[];
+      for (const instance of instances) {
+        await appendRunnerInstanceLifecycleEvent(tx, this.sql, {
+          eventType: "runtime.resource.runner_instance.offline",
+          instance,
+          previousStatus: instance.previous_status,
+          status: "offline",
+          reason: "heartbeat_stale",
+          message: "Runner instance heartbeat became stale",
+          extra: {
+            stale_after_seconds: input.staleAfterSeconds,
+          },
+        });
+      }
+      return instances.map(runnerInstanceRecordWithoutPreviousStatus);
+    });
   }
 
   async listQueuedDemand(input: {
@@ -671,4 +783,109 @@ export class RunnerRepository {
     }
     return request;
   }
+}
+
+async function appendRunnerInstanceLifecycleEvent(
+  tx: any,
+  sql: Sql,
+  input: {
+    eventType: string;
+    instance: RunnerInstanceRecord;
+    previousStatus: RunnerInstanceStatus | null;
+    status: RunnerInstanceStatus;
+    reason: string;
+    message: string;
+    extra?: JsonObject;
+  },
+): Promise<void> {
+  const payload = compactObject({
+    ...(input.extra ?? {}),
+    resource_ref: {
+      apiVersion: "bucephalus.dev/v1alpha1",
+      kind: "RunnerInstance",
+      name: input.instance.runner_instance_id,
+      uid: input.instance.runner_instance_id,
+    },
+    resource_kind: "RunnerInstance",
+    resource_name: input.instance.runner_instance_id,
+    resource_uid: input.instance.runner_instance_id,
+    runner_instance_id: input.instance.runner_instance_id,
+    runner_pool_id: input.instance.runner_pool_id,
+    instance_name: input.instance.instance_name,
+    previous_status: input.previousStatus,
+    status: input.status,
+    reason: input.reason,
+    message: input.message,
+  });
+  await tx`
+    with involved_attempts as (
+      select run_id, attempt_id,
+             row_number() over (partition by run_id order by started_at desc, attempt_id) as seq_offset
+      from cloud.run_attempts
+      where runner_instance_id = ${input.instance.runner_instance_id}
+        and status = 'running'
+    )
+    insert into cloud.run_events (
+      run_id,
+      attempt_id,
+      seq,
+      event_type,
+      payload
+    )
+    select
+      involved_attempts.run_id,
+      involved_attempts.attempt_id,
+      coalesce((select max(seq) from cloud.run_events where run_id = involved_attempts.run_id), 0) + involved_attempts.seq_offset,
+      ${input.eventType},
+      ${sql.json(payload)}::jsonb || jsonb_build_object('attempt_id', involved_attempts.attempt_id::text)
+    from involved_attempts
+  `;
+}
+
+function runnerInstanceRecordWithoutPreviousStatus(row: RunnerInstanceLifecycleRow): RunnerInstanceRecord {
+  const { previous_status: _previousStatus, ...record } = row;
+  return record;
+}
+
+function runnerInstanceStatusEventType(status: RunnerInstanceStatus): string {
+  switch (status) {
+    case "cordoned":
+      return "runtime.resource.runner_instance.cordoned";
+    case "draining":
+      return "runtime.resource.runner_instance.drained";
+    case "offline":
+      return "runtime.resource.runner_instance.offline";
+    case "unhealthy":
+      return "runtime.resource.runner_instance.unhealthy";
+    case "online":
+      return "runtime.resource.runner_instance.online";
+  }
+}
+
+function runnerInstanceStatusEventReason(status: RunnerInstanceStatus, metadataPatch?: JsonObject): string {
+  return stringPath(metadataPatch, ["last_offline", "reason"])
+    ?? stringPath(metadataPatch, ["health", "reason"])
+    ?? stringPath(metadataPatch, ["last_runtime_action", "reason"])
+    ?? status;
+}
+
+function stringPath(value: unknown, path: string[]): string | null {
+  let current = value;
+  for (const segment of path) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) {
+      return null;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return typeof current === "string" && current.trim().length > 0 ? current : null;
+}
+
+function compactObject(value: Record<string, unknown>): JsonObject {
+  const out: JsonObject = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (item !== undefined && item !== null) {
+      out[key] = item as JsonObject[string];
+    }
+  }
+  return out;
 }

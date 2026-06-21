@@ -1,6 +1,6 @@
 # Experiment YAML Reference
 
-This is the canonical authoring reference for v1 `experiment.yaml`. Authoring uses `matrix.cases`, `stages`, `ephemerals`, and `externals`; packaging normalizes those names to the current internal runtime shape. Mapping keys must be unique at every level; duplicate YAML keys are rejected instead of silently taking the last value.
+This is the canonical authoring reference for v1 `experiment.yaml`. Authoring uses `matrix.cases`, `stages`, `services`, and `externals`; packaging normalizes those names to the current internal runtime shape. Mapping keys must be unique at every level; duplicate YAML keys are rejected instead of silently taking the last value.
 
 The editor-facing schema is
 [`schemas/experiment_authoring_v1.jsonschema`](../../schemas/experiment_authoring_v1.jsonschema).
@@ -58,10 +58,33 @@ outputs, metrics, and grading contracts.
 Optional `experiment.description`, `experiment.owner`, and `experiment.tags`
 must be non-empty when present; tags must be unique.
 
-`stages.agent.command` is how Bucephalus invokes the agent today. The runner
-launches that argv, injects runner-owned input/output paths, and can ingest
-command-agent event streams. Do not declare `stages.agent.protocol`; command
-invocation is implied by `stages.agent.command`.
+`stages.agent.command` is the direct command-agent launch contract. For an
+agent CLI that natively speaks the runner's trial contract, `stages.agent.adapter`
+can own the runner argv and result normalization instead. Declare exactly one of
+`command` or `adapter`.
+
+The runner launches the resolved argv, injects runner-owned input/output paths,
+and can ingest command-agent event streams. Do not declare
+`stages.agent.protocol`; command invocation is implied by the command contract.
+
+```yaml
+stages:
+  agent:
+    adapter:
+      executable: /usr/local/bin/myagent
+      config: /opt/agent/config.json
+      timeout_ms: 540000
+      provider_env:
+        gemini: GOOGLE_API_KEY
+```
+
+The adapter lowers to a sealed command that invokes `executable` as
+`<executable> run --input-file … --output …`, reading the trial input,
+writing the canonical result, and normalizing the agent's native
+`structured_json` result into the artifact envelope contract after execution.
+When the agent has a declared event sink, the adapter also passes the trajectory
+path; set `adapter.events: false` to suppress that argv, or `adapter.events: true`
+to require a declared sink.
 
 The canonical agent `result` output is added by default. Use
 `stages.agent.outputs` only for additional captures such as patches, stdout
@@ -87,9 +110,9 @@ events only. Set `source: protocol` when you want Buc to use the command-agent
 trace channel. That creates a runner-owned JSONL event path and injects
 `BUCEPHALUS_TRAJECTORY_PATH`. Your agent must append JSONL there; Buc does not
 guess or scrape arbitrary trace files.
-Command arguments that need the path use the declared event sink placeholder
-`__BUCEPHALUS_EVENT_PATH_<id>__`; the generic
-`__BUCEPHALUS_TRAJECTORY_PATH__` command placeholder is rejected.
+Command arguments that need the path may use the declared event sink placeholder
+`__BUCEPHALUS_EVENT_PATH_<id>__`, or `__BUCEPHALUS_TRAJECTORY_PATH__` when an
+agent event sink is declared.
 Top-level `traces` is authoring-only; the build lowers it into
 `trial_runtime.agent.events` and the sealed package does not keep `/traces`.
 
@@ -227,7 +250,7 @@ values. Active graders must carry an explicit `inputs` map, even when empty,
 and at least one declared `outputs` entry; direct resolved configs cannot rely
 on runner-side fallbacks for those fields.
 
-If `stages.grader` declares any command, outputs, inputs, ephemerals, or
+If `stages.grader` declares any command, outputs, inputs, services, or
 strategy-specific config, it must also declare `strategy`; only an omitted
 grader defaults to `none`. An explicit empty `stages.grader: {}` is rejected.
 
@@ -240,32 +263,37 @@ These defaults do not grant external access. Declare `runtime.network.agent`,
 `runtime.network.task_sandbox`, `runtime.secrets`, or `externals` when an
 experiment needs credentials or egress.
 
-## Ephemerals
+## Services
 
-`ephemerals` is optional. Each top-level ephemeral defines a per-trial resource whose lifecycle the runner owns, but which is not a link in the stage chain. A stage attaches an ephemeral by listing its id under `stages.agent.ephemerals` or `stages.grader.ephemerals`.
+`services` is optional. Each top-level service defines a per-trial resource whose lifecycle the runner owns, but which is not a link in the stage chain. A stage attaches a service by listing its id under `stages.agent.services` or `stages.grader.services`. The older `ephemerals` field remains accepted as a compatibility alias.
 
 ```yaml
-ephemerals:
+services:
   service-id:
     image: ghcr.io/acme/service:latest
-    lifecycle: per-trial
+    lifecycle: trial
     command: ["service", "--port", "8080"] # optional
     workdir: /srv/service                  # optional
     env: { LOG_LEVEL: info }               # optional, for the service
     expose: { SERVICE_URL: "http://service-id:8080" } # optional, for attached stages
+    readiness:
+      timeout_ms: 10000
+      http:
+        url: http://service-id:8080/health
+        expect_status: 200
 
 stages:
   agent:
-    ephemerals: [service-id]
+    services: [service-id]
 ```
 
-Ids use portable DNS-label syntax because the id is also the runtime hostname alias: lowercase letters, numbers, and `-`, starting and ending with a letter or number. Only `lifecycle: per-trial` is supported. Local Docker supports ephemerals; Modal currently rejects them.
-Each stage-level `ephemerals` list must be duplicate-free, and attached
-ephemerals must expose unique env names within that stage.
+Ids use portable DNS-label syntax because the id is also the runtime hostname alias: lowercase letters, numbers, and `-`, starting and ending with a letter or number. Authoring uses `lifecycle: trial`; sealed packages write `per-trial`. Local Docker supports service containers on a per-trial network. Modal supports `placement: same_sandbox` services and structured HTTP readiness inside the sandbox.
+Each stage-level `services` list must be duplicate-free, and attached services
+must expose unique env names within that stage.
 
 ## Legacy Files
 
-Authoring files should not use resolved package internals such as `matrix.tasks`, `trial_runtime`, or `sidecars`. Use `matrix.cases`, `stages`, `ephemerals`, and `externals`; the build step lowers them into the sealed package contract.
+Authoring files should not use resolved package internals such as `matrix.tasks`, `trial_runtime`, or `sidecars`. Use `matrix.cases`, `stages`, `services`, and `externals`; the build step lowers them into the sealed package contract.
 Inline `knobs` are not part of `experiment.yaml`; use an external
 `knob_manifest_v1` file with `experiment_overrides_v1` when applying
 `--overrides`. The default manifest location is `.lab/knobs/manifest.json`;

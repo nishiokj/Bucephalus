@@ -4,35 +4,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 type ColumnAliases = BTreeMap<usize, BTreeMap<String, String>>;
-type AliasLegend = Vec<(String, String)>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Category {
-    Overview,
-    Results,
-    Compare,
-    Debug,
-}
-
-impl Category {
-    pub fn label(self) -> &'static str {
-        match self {
-            Category::Overview => "Overview",
-            Category::Results => "Results",
-            Category::Compare => "Compare",
-            Category::Debug => "Debug",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ViewRenderer {
-    Overview,
-    Table,
-    Scoreboard,
-    Timeline,
-    Comparison,
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ViewLayout {
@@ -50,8 +21,6 @@ pub enum ViewQueryPlan {
 pub struct ViewSpec {
     pub name: &'static str,
     pub purpose: &'static str,
-    pub category: Category,
-    pub renderer: ViewRenderer,
     pub plan: ViewQueryPlan,
     pub aliases: &'static [&'static str],
     pub layout: ViewLayout,
@@ -87,7 +56,6 @@ enum FieldRole {
 #[derive(Clone, Debug)]
 pub struct PresentedTable {
     pub table: lab_analysis::QueryTable,
-    pub legend: Vec<(String, String)>,
 }
 
 const EVENTS_LAYOUT: ViewLayout = ViewLayout {
@@ -372,15 +340,11 @@ const fn source_spec(
     purpose: &'static str,
     source: &'static str,
     aliases: &'static [&'static str],
-    category: Category,
-    renderer: ViewRenderer,
     layout: ViewLayout,
 ) -> ViewSpec {
     ViewSpec {
         name,
         purpose,
-        category,
-        renderer,
         plan: ViewQueryPlan::Source(source),
         aliases,
         layout,
@@ -392,8 +356,6 @@ const RUN_PROGRESS: ViewSpec = source_spec(
     "Run completion + pass-rate snapshot.",
     "run_progress",
     &["status", "progress", "overview"],
-    Category::Overview,
-    ViewRenderer::Overview,
     RUN_PROGRESS_LAYOUT,
 );
 
@@ -409,8 +371,6 @@ const HEALTH: ViewSpec = source_spec(
         "trial_contract_health",
         "score_trust",
     ],
-    Category::Overview,
-    ViewRenderer::Overview,
     HEALTH_LAYOUT,
 );
 
@@ -419,8 +379,6 @@ const OBSERVABILITY: ViewSpec = source_spec(
     "Proof summary: results, events, agent exits, grader, and extraction coverage.",
     "observability_summary",
     &["trust", "proof", "trust_report", "observability_summary"],
-    Category::Overview,
-    ViewRenderer::Overview,
     OBSERVABILITY_LAYOUT,
 );
 
@@ -429,16 +387,12 @@ const VARIANT_SUMMARY: ViewSpec = source_spec(
     "Per-variant pass rate + primary metric.",
     "variant_summary",
     &["variants", "summary_by_variant"],
-    Category::Results,
-    ViewRenderer::Table,
     VARIANT_SUMMARY_LAYOUT,
 );
 
 const SCOREBOARD: ViewSpec = ViewSpec {
     name: "scoreboard",
     purpose: "Per-task scoreboard grouped by variant.",
-    category: Category::Results,
-    renderer: ViewRenderer::Scoreboard,
     plan: ViewQueryPlan::Scoreboard,
     aliases: &[
         "board",
@@ -455,8 +409,6 @@ const SCOREBOARD: ViewSpec = ViewSpec {
 const COMPARISON_SUMMARY: ViewSpec = ViewSpec {
     name: "comparison_summary",
     purpose: "Headline AB stats: rates, delta, McNemar, effect.",
-    category: Category::Results,
-    renderer: ViewRenderer::Comparison,
     plan: ViewQueryPlan::AbComparisonSummary,
     aliases: &[
         "summary",
@@ -490,8 +442,6 @@ const TASK_METRICS: ViewSpec = source_spec(
         "ab_task_table",
         "scoreboard",
     ],
-    Category::Results,
-    ViewRenderer::Comparison,
     TASK_METRICS_LAYOUT,
 );
 
@@ -506,8 +456,6 @@ const TURN_COMPARE: ViewSpec = source_spec(
         "trace_turns",
         "ab_turn_side_by_side",
     ],
-    Category::Compare,
-    ViewRenderer::Comparison,
     TURN_COMPARE_LAYOUT,
 );
 
@@ -521,8 +469,6 @@ const TRACE: ViewSpec = source_spec(
         "trace_side_by_side",
         "ab_trace_row_side_by_side",
     ],
-    Category::Debug,
-    ViewRenderer::Comparison,
     TRACE_LAYOUT,
 );
 
@@ -531,8 +477,6 @@ const VARIANT_RANKING: ViewSpec = source_spec(
     "Variant leaderboard vs reference.",
     "variant_ranking",
     &["ranking", "leaderboard", "variants", "variant_summary"],
-    Category::Results,
-    ViewRenderer::Table,
     VARIANT_RANKING_LAYOUT,
 );
 
@@ -541,8 +485,6 @@ const PAIRWISE_COMPARE: ViewSpec = source_spec(
     "Pairwise win/loss/tie counts.",
     "pairwise_comparisons",
     &["pairwise", "pairwise_comparisons"],
-    Category::Compare,
-    ViewRenderer::Comparison,
     PAIRWISE_LAYOUT,
 );
 
@@ -558,8 +500,6 @@ const CONFIG_RANKING: ViewSpec = source_spec(
         "variant_summary",
         "variants",
     ],
-    Category::Results,
-    ViewRenderer::Table,
     CONFIGS_LAYOUT,
 );
 
@@ -568,8 +508,6 @@ const PARAMETER_EFFECTS: ViewSpec = source_spec(
     "Average metric per parameter value.",
     "parameter_metric",
     &["parameter_metric", "parameter_impact", "effects"],
-    Category::Compare,
-    ViewRenderer::Table,
     PARAM_EFFECTS_LAYOUT,
 );
 
@@ -578,8 +516,6 @@ const PARAMETER_SENSITIVITY: ViewSpec = source_spec(
     "Variance + range sensitivity by parameter.",
     "sensitivity",
     &["sensitivity"],
-    Category::Compare,
-    ViewRenderer::Table,
     PARAM_SENSITIVITY_LAYOUT,
 );
 
@@ -588,8 +524,6 @@ const RUN_TREND: ViewSpec = source_spec(
     "Pass-rate trend per run + variant.",
     "pass_rate_trend",
     &["trend", "pass_rate_trend", "variants", "variant_summary"],
-    Category::Results,
-    ViewRenderer::Table,
     RUN_TREND_LAYOUT,
 );
 
@@ -598,8 +532,6 @@ const FLAKY_TASKS: ViewSpec = source_spec(
     "Tasks with unstable outcomes across reps.",
     "flaky_tasks",
     &["flaky"],
-    Category::Compare,
-    ViewRenderer::Table,
     FLAKY_TASKS_LAYOUT,
 );
 
@@ -608,8 +540,6 @@ const FAILURE_CLUSTERS: ViewSpec = source_spec(
     "Failure concentration by task-group prefix.",
     "failure_clusters",
     &["clusters"],
-    Category::Compare,
-    ViewRenderer::Table,
     FAILURE_CLUSTERS_LAYOUT,
 );
 
@@ -618,8 +548,6 @@ const TOKEN_USAGE: ViewSpec = source_spec(
     "Per-variant token totals from event streams.",
     "token_usage_by_variant",
     &["tokens", "usage", "token_usage_by_variant"],
-    Category::Debug,
-    ViewRenderer::Table,
     TOKEN_USAGE_LAYOUT,
 );
 
@@ -628,8 +556,6 @@ const TOOL_USAGE: ViewSpec = source_spec(
     "Per-variant tool calls from event streams.",
     "tool_usage_by_variant",
     &["tools", "tool_calls", "tool_usage_by_variant"],
-    Category::Debug,
-    ViewRenderer::Table,
     TOOL_USAGE_LAYOUT,
 );
 
@@ -638,8 +564,6 @@ const RUN_ERRORS: ViewSpec = source_spec(
     "Event-stream error and failure counts.",
     "run_errors",
     &["errors", "failures", "event_errors"],
-    Category::Debug,
-    ViewRenderer::Table,
     RUN_ERRORS_LAYOUT,
 );
 
@@ -648,8 +572,6 @@ const EVENTS: ViewSpec = source_spec(
     "Raw event stream written to stdout; no count summaries.",
     "raw_events",
     &["event_stream", "timeline", "raw_events"],
-    Category::Debug,
-    ViewRenderer::Timeline,
     EVENTS_LAYOUT,
 );
 
@@ -658,8 +580,6 @@ const TRIAL_DIAGNOSTICS: ViewSpec = source_spec(
     "Raw per-trial facts: phase, result state, events, grader stages, sandbox, and log paths.",
     "trial_diagnostics",
     &["diagnostics", "proof_by_trial", "trial_proof", "attempts"],
-    Category::Debug,
-    ViewRenderer::Table,
     TRIAL_DIAGNOSTICS_LAYOUT,
 );
 
@@ -676,8 +596,6 @@ const LATEST_AGENT_OUTPUT: ViewSpec = source_spec(
         "prediction",
         "predictions",
     ],
-    Category::Debug,
-    ViewRenderer::Table,
     LATEST_AGENT_OUTPUT_LAYOUT,
 );
 
@@ -868,16 +786,9 @@ pub fn resolve_requested_view(
     );
 }
 
-pub fn renderer_for_resolved(resolved: &ResolvedView) -> ViewRenderer {
-    resolved
-        .spec
-        .map(|spec| spec.renderer)
-        .unwrap_or(ViewRenderer::Table)
-}
-
 pub fn present_table(spec: Option<&ViewSpec>, table: &lab_analysis::QueryTable) -> PresentedTable {
     let selected_indices = select_display_indices(spec, table);
-    let (aliases, legend) = build_aliases(table, &selected_indices);
+    let aliases = build_aliases(table, &selected_indices);
     let columns = selected_indices
         .iter()
         .map(|&idx| {
@@ -903,16 +814,11 @@ pub fn present_table(spec: Option<&ViewSpec>, table: &lab_analysis::QueryTable) 
 
     PresentedTable {
         table: lab_analysis::QueryTable { columns, rows },
-        legend,
     }
 }
 
-fn build_aliases(
-    table: &lab_analysis::QueryTable,
-    selected_indices: &[usize],
-) -> (ColumnAliases, AliasLegend) {
+fn build_aliases(table: &lab_analysis::QueryTable, selected_indices: &[usize]) -> ColumnAliases {
     let mut aliases_by_column = BTreeMap::new();
-    let mut legend = Vec::new();
     let mut values_by_prefix: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     let mut columns_by_prefix: BTreeMap<&'static str, Vec<usize>> = BTreeMap::new();
 
@@ -939,7 +845,6 @@ fn build_aliases(
         let mut map = BTreeMap::new();
         for (alias_idx, value) in values.into_iter().enumerate() {
             let alias = format!("{prefix}{}", alias_idx + 1);
-            legend.push((alias.clone(), value.clone()));
             map.insert(value, alias);
         }
         for idx in columns_by_prefix.get(prefix).into_iter().flatten() {
@@ -947,7 +852,7 @@ fn build_aliases(
         }
     }
 
-    (aliases_by_column, legend)
+    aliases_by_column
 }
 
 fn alias_prefix_for_column(column: &str) -> Option<&'static str> {
@@ -1368,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn presentation_aliases_variants_with_legend() {
+    fn presentation_aliases_variants() {
         let raw = lab_analysis::QueryTable {
             columns: vec![
                 "variant_id".to_string(),
@@ -1395,19 +1300,6 @@ mod tests {
         let presented = present_table(Some(&SCOREBOARD), &raw);
         assert_eq!(presented.table.rows[0][0], Value::String("V1".to_string()));
         assert_eq!(presented.table.rows[1][0], Value::String("V2".to_string()));
-        assert_eq!(
-            presented.legend,
-            vec![
-                (
-                    "V1".to_string(),
-                    "codex_spark_really_long_variant_name".to_string()
-                ),
-                (
-                    "V2".to_string(),
-                    "glm_5_really_long_variant_name".to_string()
-                )
-            ]
-        );
     }
 
     #[test]
@@ -1456,13 +1348,5 @@ mod tests {
         assert_eq!(presented.table.rows[1][1], Value::String("V3".to_string()));
         assert_eq!(presented.table.rows[2][0], Value::String("V2".to_string()));
         assert_eq!(presented.table.rows[2][1], Value::String("V3".to_string()));
-        assert_eq!(
-            presented.legend,
-            vec![
-                ("V1".to_string(), "alpha".to_string()),
-                ("V2".to_string(), "beta".to_string()),
-                ("V3".to_string(), "gamma".to_string())
-            ]
-        );
     }
 }

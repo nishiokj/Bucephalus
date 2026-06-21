@@ -292,7 +292,7 @@ pub(crate) fn resolve_runtime_agent_command(request: &TrialRunRequest<'_>) -> Re
         .iter()
         .map(|token| {
             replace_event_path_placeholders(
-                &replace_task_workdir_placeholder(token, request.task_workdir),
+                &replace_runtime_contract_placeholders(token, request),
                 request,
             )
         })
@@ -303,7 +303,7 @@ pub(crate) fn resolve_runtime_agent_command(request: &TrialRunRequest<'_>) -> Re
             .iter()
             .map(|token| {
                 replace_event_path_placeholders(
-                    &replace_task_workdir_placeholder(token, request.task_workdir),
+                    &replace_runtime_contract_placeholders(token, request),
                     request,
                 )
             })
@@ -312,13 +312,35 @@ pub(crate) fn resolve_runtime_agent_command(request: &TrialRunRequest<'_>) -> Re
     Ok(command)
 }
 
+fn replace_runtime_contract_placeholders(raw: &str, request: &TrialRunRequest<'_>) -> String {
+    replace_task_workdir_placeholder(raw, request.task_workdir)
+        .replace(
+            "__BUCEPHALUS_TRIAL_INPUT_PATH__",
+            request.io_paths.trial_input_path.as_str(),
+        )
+        .replace(
+            "__BUCEPHALUS_RESULT_PATH__",
+            request.io_paths.result_path.as_str(),
+        )
+        .replace(
+            "__BUCEPHALUS_MAPPED_GRADER_OUTPUT_PATH__",
+            request.io_paths.mapped_grader_output_path.as_str(),
+        )
+}
+
 fn replace_event_path_placeholders(raw: &str, request: &TrialRunRequest<'_>) -> Result<String> {
-    if raw.contains("__BUCEPHALUS_TRAJECTORY_PATH__") {
-        return Err(anyhow!(
-            "trial_runtime.agent.command uses removed __BUCEPHALUS_TRAJECTORY_PATH__ placeholder; declare an event sink and use __BUCEPHALUS_EVENT_PATH_<id>__"
-        ));
-    }
     let mut rendered = raw.to_string();
+    if rendered.contains("__BUCEPHALUS_TRAJECTORY_PATH__") {
+        if request.runtime.event_sinks.is_empty() {
+            return Err(anyhow!(
+                "trial_runtime.agent.command uses __BUCEPHALUS_TRAJECTORY_PATH__ but no agent events are declared"
+            ));
+        }
+        rendered = rendered.replace(
+            "__BUCEPHALUS_TRAJECTORY_PATH__",
+            request.io_paths.trajectory_path.as_str(),
+        );
+    }
     for sink in &request.runtime.event_sinks {
         let placeholder = format!("__BUCEPHALUS_EVENT_PATH_{}__", sink.id);
         rendered = rendered.replace(&placeholder, sink.path.as_str());

@@ -77,7 +77,7 @@ The MCP adapter presents the host workflow as a dispatch surface:
 | --- | --- |
 | `status` | Check install/auth/runtime readiness. |
 | `dispatch_benchmark` | Resolve the requested benchmark into local cases and start a dispatch. |
-| `dispatch_status` | Refresh dispatch state and the live viewing surface. |
+| `dispatch_status` | Refresh dispatch state and the scriptable status record. |
 
 `dispatch_benchmark` is where the caller supplies the agent process:
 
@@ -92,7 +92,7 @@ The MCP adapter presents the host workflow as a dispatch surface:
 }
 ```
 
-The MCP response returns a `dispatch_id` and `paths.live_view`. It does not
+The MCP response returns a `dispatch_id` and `paths.status`. It does not
 return daemon job ids, socket paths, manifest paths, or run roots. Those are
 internal local runtime details.
 

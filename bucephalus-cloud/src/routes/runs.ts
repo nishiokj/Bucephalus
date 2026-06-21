@@ -5,9 +5,15 @@ import { putRuntimeObject, readStoredObject } from "../objectStorage";
 import { sha256Digest, type JsonObject, type JsonValue } from "../primitives";
 import {
   RuntimeRepository,
+  type RuntimeEventFilter,
   type RuntimeEventRecord,
   type RuntimeEventRowInsert,
   type RuntimeAttemptObjectContentRecord,
+  type RuntimeAttemptObjectRecord,
+  type RuntimeResourceFilter,
+  type RuntimeResourceListInput,
+  type RuntimeResourceMetricsListInput,
+  type RuntimeResourceWatchInput,
   type WorkerLifecycleEventRecord,
 } from "../runtime/repository";
 import { RunnerRepository, type RunnerInstanceRecord, type RunnerPoolRecord } from "../runners/repository";
@@ -51,6 +57,32 @@ interface RunWireEnrichment {
   pending_reason: PendingReason | null;
 }
 
+interface RuntimeResourceRef {
+  apiVersion: "bucephalus.dev/v1alpha1";
+  kind: string;
+  name: string;
+  uid?: string;
+}
+
+type RuntimeResourceRoute =
+  | { kind: "resource-list"; runId: string }
+  | { kind: "resource-health"; runId: string }
+  | { kind: "resource-watch"; runId: string }
+  | { kind: "resource-metrics-list"; runId: string }
+  | { kind: "resource-item"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-status"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-events"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-logs"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-metrics"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-content"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-operation"; runId: string; resourceKind: string; resourceName: string; operation: string }
+  | { kind: "resource-action"; runId: string; resourceKind: string; resourceName: string; action: string }
+  | { kind: "resource-port-forward"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "resource-exec"; runId: string; resourceKind: string; resourceName: string }
+  | { kind: "api-resources"; runId: string }
+  | { kind: "api-resource"; runId: string; resourceKind: string }
+  | { kind: "inspect"; runId: string };
+
 export async function handleRunRoute(
   request: Request,
   url: URL,
@@ -92,9 +124,47 @@ export async function handleRunRoute(
     return failAttempt(request, url, runs);
   }
 
+  const workerPortForwardRoute = workerPortForwardPath(url.pathname);
+  if (workerPortForwardRoute) {
+    if (request.method === "GET" && workerPortForwardRoute.kind === "list") {
+      return workerListPortForwards(request, workerPortForwardRoute, runs, runtime);
+    }
+    if (request.method === "POST" && workerPortForwardRoute.kind === "update") {
+      return workerUpdatePortForward(request, workerPortForwardRoute, runs, runtime);
+    }
+    throw new HttpError(405, "worker_runtime_method_not_allowed", "Worker runtime endpoint does not support this method", {
+      method: request.method,
+      path: url.pathname,
+    });
+  }
+
+  const workerExecRoute = workerExecPath(url.pathname);
+  if (workerExecRoute) {
+    if (request.method === "GET" && workerExecRoute.kind === "list") {
+      return workerListExecRequests(request, workerExecRoute, runs, runtime);
+    }
+    if (request.method === "POST" && workerExecRoute.kind === "update") {
+      return workerUpdateExecRequest(request, workerExecRoute, runs, runtime);
+    }
+    throw new HttpError(405, "worker_runtime_method_not_allowed", "Worker runtime endpoint does not support this method", {
+      method: request.method,
+      path: url.pathname,
+    });
+  }
+
+  if (isWorkerRuntimeSubpath(url.pathname)) {
+    throw new HttpError(404, "worker_runtime_endpoint_not_found", "Worker runtime endpoint not found; use resource-native worker runtime paths", {
+      path: url.pathname,
+      resource_apis: [
+        "/v1/worker/run-attempts/{attempt_id}/runtime/resources/PortForward",
+        "/v1/worker/run-attempts/{attempt_id}/runtime/resources/Exec",
+      ],
+    });
+  }
+
   if (request.method === "POST" && url.pathname === "/v1/worker/runs/expire-leases") {
     requireBearerToken(request, workerToken, "worker lease expiration");
-    return expireLeases(runs);
+    return expireLeases(runs, runtime);
   }
 
   if (request.method === "GET" && packageContentPath(url.pathname)) {
@@ -153,46 +223,117 @@ export async function handleRunRoute(
     return jsonResponse({ runs: records.map((run) => runToWire(run, enrichment.get(run.run_id), { includeConfig, includeRuntime })) });
   }
 
+  const runtimeResourceRoute = runtimeResourcePath(url.pathname);
+  if (runtimeResourceRoute) {
+    const run = await runs.getRun(runtimeResourceRoute.runId, ownerKey);
+    if (!run) {
+      throw new HttpError(404, "run_not_found", "Run not found");
+    }
+    if (request.method === "GET") {
+      return runtimeResourceResponse(url, runtimeResourceRoute, run, runtime, ownerKey ?? null);
+    }
+    if (request.method === "DELETE" && runtimeResourceRoute.kind === "resource-item") {
+      const body = await optionalJsonBody(request);
+      const resourceVersion = requireRuntimeResourceVersionPrecondition(body, "delete");
+      return jsonResponse(await runtime.cancelRuntimeAccessResource({
+        run,
+        resourceKind: runtimeResourceRoute.resourceKind,
+        resourceName: runtimeResourceRoute.resourceName,
+        resourceVersion,
+        requester: ownerKey ?? null,
+        reason: body ? optionalString(body.reason, "/reason") : null,
+      }));
+    }
+    if (request.method === "POST" && runtimeResourceRoute.kind === "resource-action") {
+      const body = await optionalJsonBody(request);
+      const resourceVersion = requireRuntimeResourceVersionPrecondition(body, runtimeResourceRoute.action);
+      const input = {
+        run,
+        resourceKind: runtimeResourceRoute.resourceKind,
+        resourceName: runtimeResourceRoute.resourceName,
+        resourceVersion,
+        requester: ownerKey ?? null,
+        reason: body ? optionalString(body.reason, "/reason") : null,
+      };
+      switch (runtimeResourceRoute.action) {
+        case "cordon":
+          return jsonResponse(await runtime.cordonRunnerInstanceResource(input));
+        case "drain":
+          return jsonResponse(await runtime.drainRunnerInstanceResource(input));
+        case "uncordon":
+          return jsonResponse(await runtime.uncordonRunnerInstanceResource(input));
+        case "cancel":
+          return jsonResponse(await runtime.cancelRuntimeAccessResource(input));
+        case "complete":
+          return jsonResponse(await runtime.completeRuntimeAccessResource(input));
+        default:
+          throw new HttpError(404, "runtime_resource_action_not_found", "Runtime resource action not found", {
+            action: runtimeResourceRoute.action,
+          });
+      }
+    }
+    if (request.method === "POST" && runtimeResourceRoute.kind === "resource-port-forward") {
+      const body = await readJsonObject(request);
+      assertRuntimeAccessBodyHasNoTarget(body);
+      const portForward = await runtime.createPortForwardRequest({
+        run,
+        targetPort: requirePort(body.target_port, "/target_port"),
+        localPort: optionalPort(body.local_port, "/local_port"),
+        resourceKind: runtimeResourceRoute.resourceKind,
+        resourceName: runtimeResourceRoute.resourceName,
+        resourceVersion: requireRuntimeResourceVersionPrecondition(body, "port-forward"),
+        protocol: optionalString(body.protocol, "/protocol"),
+        ttlSeconds: optionalPositiveInt(body.ttl_seconds, "/ttl_seconds"),
+        requester: ownerKey ?? null,
+        reason: optionalString(body.reason, "/reason"),
+      });
+      return jsonResponse({ resource: runtime.runtimeAccessRequestResource(run, portForward) }, { status: 201 });
+    }
+    if (request.method === "POST" && runtimeResourceRoute.kind === "resource-exec") {
+      const body = await readJsonObject(request);
+      assertRuntimeAccessBodyHasNoTarget(body);
+      const exec = await runtime.createExecRequest({
+        run,
+        command: requireStringArray(body.command, "/command"),
+        resourceKind: runtimeResourceRoute.resourceKind,
+        resourceName: runtimeResourceRoute.resourceName,
+        resourceVersion: requireRuntimeResourceVersionPrecondition(body, "exec"),
+        ttlSeconds: optionalPositiveInt(body.ttl_seconds, "/ttl_seconds"),
+        requester: ownerKey ?? null,
+        reason: optionalString(body.reason, "/reason"),
+      });
+      return jsonResponse({ resource: runtime.runtimeAccessRequestResource(run, exec) }, { status: 201 });
+    }
+    throw new HttpError(405, "runtime_method_not_allowed", "Runtime resource endpoint does not support this method", {
+      method: request.method,
+      path: url.pathname,
+    });
+  }
+
   const runtimeRoute = runtimePath(url.pathname);
   if (request.method === "GET" && runtimeRoute) {
     const run = await runs.getRun(runtimeRoute.runId, ownerKey);
     if (!run) {
       throw new HttpError(404, "run_not_found", "Run not found");
     }
-    if (runtimeRoute.kind === "summary") {
-      return jsonResponse(await runtime.getSummary(runtimeRoute.runId));
-    }
-    if (runtimeRoute.kind === "events") {
-      const limit = limitFromUrl(url);
-      const [trialRows, workerEvents] = await Promise.all([
-        runtime.eventRows(runtimeRoute.runId, {
-          limit,
-          afterRowSeq: optionalIntFromUrl(url, "after_row_seq"),
-        }),
-        runtime.workerLifecycleEvents(runtimeRoute.runId, { limit }),
-      ]);
-      return jsonResponse({
-        cloud_run_id: runtimeRoute.runId,
-        events: runtimeEventStreamToWire(trialRows, workerEvents, limit),
-      });
-    }
-    if (runtimeRoute.kind === "results") {
-      return jsonResponse(await runtime.results(runtimeRoute.runId, {
-        limit: limitFromUrl(url),
-      }));
-    }
-    if (runtimeRoute.kind === "artifact") {
-      return runtimeArtifactContent(url, runtimeRoute, runtime);
-    }
-    return jsonResponse({
-      cloud_run_id: runtimeRoute.runId,
-      key: runtimeRoute.key,
-      values: await runtime.runtimeValue(runtimeRoute.runId, runtimeRoute.key),
-    });
+    const limit = limitFromUrl(url);
+    const afterRowSeq = runtimeEventAfterRowSeqFromUrl(url);
+    const [trialRows, workerEvents] = await Promise.all([
+      runtime.eventRows(runtimeRoute.runId, {
+        limit,
+        afterRowSeq: afterRowSeq ?? undefined,
+      }),
+      runtime.workerLifecycleEvents(runtimeRoute.runId, { limit, afterRowSeq: afterRowSeq ?? undefined }),
+    ]);
+    return jsonResponse(runtimeEventListToWire(runtimeRoute.runId, [], trialRows, workerEvents, url, limit, afterRowSeq));
   }
 
   if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
-    const runId = decodeURIComponent(url.pathname.slice("/v1/runs/".length));
+    const runIdPath = url.pathname.slice("/v1/runs/".length);
+    if (!runIdPath || runIdPath.includes("/")) {
+      return null;
+    }
+    const runId = decodeURIComponent(runIdPath);
     const run = await runs.getRun(runId, ownerKey);
     if (!run) {
       throw new HttpError(404, "run_not_found", "Run not found");
@@ -243,31 +384,86 @@ function optionalBooleanFromUrl(url: URL, key: string, defaultValue: boolean): b
 }
 
 function runtimePath(pathname: string):
-  | { kind: "summary"; runId: string }
   | { kind: "events"; runId: string }
-  | { kind: "results"; runId: string }
-  | { kind: "artifact"; runId: string; trialId: string; role: string }
-  | { kind: "kv"; runId: string; key: string }
   | null {
   const prefix = "/v1/runs/";
   if (!pathname.startsWith(prefix)) {
     return null;
   }
   const parts = pathname.slice(prefix.length).split("/").map(decodeURIComponent);
-  if (parts.length === 2 && parts[1] === "runtime") {
-    return { kind: "summary", runId: parts[0] ?? "" };
-  }
   if (parts.length === 3 && parts[1] === "runtime" && parts[2] === "events") {
     return { kind: "events", runId: parts[0] ?? "" };
   }
-  if (parts.length === 3 && parts[1] === "runtime" && parts[2] === "results") {
-    return { kind: "results", runId: parts[0] ?? "" };
+  return null;
+}
+
+function runtimeResourcePath(pathname: string): RuntimeResourceRoute | null {
+  const prefix = "/v1/runs/";
+  if (!pathname.startsWith(prefix)) {
+    return null;
   }
-  if (parts.length === 5 && parts[1] === "runtime" && parts[2] === "artifacts") {
-    return { kind: "artifact", runId: parts[0] ?? "", trialId: parts[3] ?? "", role: parts[4] ?? "" };
+  const parts = pathname.slice(prefix.length).split("/").map(decodeURIComponent);
+  const runId = parts[0] ?? "";
+  if (parts[1] !== "runtime") {
+    return null;
   }
-  if (parts.length === 4 && parts[1] === "runtime" && parts[2] === "kv") {
-    return { kind: "kv", runId: parts[0] ?? "", key: parts[3] ?? "" };
+  if (parts.length === 3 && parts[2] === "inspect") {
+    return { kind: "inspect", runId };
+  }
+  if (parts.length === 3 && parts[2] === "api-resources") {
+    return { kind: "api-resources", runId };
+  }
+  if (parts.length === 4 && parts[2] === "api-resources") {
+    return { kind: "api-resource", runId, resourceKind: parts[3] ?? "" };
+  }
+  if (parts[2] !== "resources") {
+    return null;
+  }
+  if (parts.length === 3) {
+    return { kind: "resource-list", runId };
+  }
+  if (parts.length === 4 && parts[3] === "health") {
+    return { kind: "resource-health", runId };
+  }
+  if (parts.length === 4 && parts[3] === "watch") {
+    return { kind: "resource-watch", runId };
+  }
+  if (parts.length === 4 && parts[3] === "metrics") {
+    return { kind: "resource-metrics-list", runId };
+  }
+  const resourceKind = parts[3] ?? "";
+  const resourceName = parts[4] ?? "";
+  if (!resourceKind || !resourceName) {
+    return null;
+  }
+  if (parts.length === 5) {
+    return { kind: "resource-item", runId, resourceKind, resourceName };
+  }
+  if (parts.length === 7 && parts[5] === "actions") {
+    return { kind: "resource-action", runId, resourceKind, resourceName, action: parts[6] ?? "" };
+  }
+  if (parts.length === 6) {
+    switch (parts[5]) {
+      case "status":
+        return { kind: "resource-status", runId, resourceKind, resourceName };
+      case "events":
+        return { kind: "resource-events", runId, resourceKind, resourceName };
+      case "logs":
+        return { kind: "resource-logs", runId, resourceKind, resourceName };
+      case "metrics":
+        return { kind: "resource-metrics", runId, resourceKind, resourceName };
+      case "content":
+        return { kind: "resource-content", runId, resourceKind, resourceName };
+      case "port-forward":
+        return { kind: "resource-port-forward", runId, resourceKind, resourceName };
+      case "exec":
+        return { kind: "resource-exec", runId, resourceKind, resourceName };
+      default:
+        return null;
+    }
+  }
+  if (parts.length === 7 && parts[5] === "operations") {
+    return { kind: "resource-operation", runId, resourceKind, resourceName, operation: parts[6] ?? "" };
   }
   return null;
 }
@@ -411,41 +607,6 @@ async function uploadRuntimeArtifact(
   return jsonResponse({ artifact: runtimeArtifactToWire(record) }, { status: 201 });
 }
 
-async function runtimeArtifactContent(
-  url: URL,
-  route: { runId: string; trialId: string; role: string },
-  runtime: RuntimeRepository,
-): Promise<Response> {
-  const trialId = requireArtifactToken(route.trialId, "/trial_id");
-  const role = requireArtifactRole(route.role, "/role");
-  const attempt = optionalQueryInteger(url, "attempt", { min: 0 });
-  const coreRunId = optionalString(url.searchParams.get("core_run_id"), "/core_run_id");
-  if (coreRunId !== null) {
-    requireCoreRunId(coreRunId, "/core_run_id");
-  }
-  const artifact = await runtime.attemptObjectContent(route.runId, {
-    trialId,
-    role,
-    ...(attempt !== undefined ? { attempt } : {}),
-    ...(coreRunId !== null ? { coreRunId } : {}),
-  });
-  if (!artifact) {
-    throw new HttpError(404, "runtime_artifact_not_found", "Runtime artifact content not found");
-  }
-  const bytes = await readStoredObject(artifact.storage_path);
-  return new Response(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer, {
-    headers: {
-      "content-type": artifact.media_type || "application/octet-stream",
-      "content-length": String(bytes.byteLength),
-      "x-bucephalus-core-run-id": artifact.core_run_id,
-      "x-bucephalus-trial-id": artifact.trial_id,
-      "x-bucephalus-artifact-role": artifact.role,
-      "x-bucephalus-object-ref": artifact.object_ref,
-      "x-bucephalus-sha256": artifact.sha256,
-    },
-  });
-}
-
 function runtimeArtifactToWire(record: RuntimeAttemptObjectContentRecord): JsonObject {
   return {
     core_run_id: record.core_run_id,
@@ -461,6 +622,416 @@ function runtimeArtifactToWire(record: RuntimeAttemptObjectContentRecord): JsonO
     relative_path: record.relative_path,
     recorded_at_ms: record.recorded_at_ms,
   };
+}
+
+async function runtimeResourceResponse(
+  url: URL,
+  route: RuntimeResourceRoute,
+  run: CloudRunRecord,
+  runtime: RuntimeRepository,
+  requester?: string | null,
+): Promise<Response> {
+  switch (route.kind) {
+    case "resource-list":
+      return jsonResponse(await runtime.resources(route.runId, run, {
+        ...runtimeResourceListInputFromUrl(url),
+        requester,
+      }));
+    case "resource-health":
+      return jsonResponse(await runtime.resourceHealth(route.runId, run, {
+        ...runtimeResourceFilterFromUrl(url),
+        requester,
+      }));
+    case "resource-watch":
+      return jsonResponse(await runtime.watchResources(route.runId, run, {
+        ...runtimeResourceWatchInputFromUrl(url),
+        requester,
+      }));
+    case "resource-metrics-list":
+      return jsonResponse(await runtime.resourceMetricsList(route.runId, run, {
+        ...runtimeResourceMetricsListInputFromUrl(url),
+        requester,
+      }));
+    case "api-resources":
+      return jsonResponse(await runtime.apiResources(route.runId, run, { requester }));
+    case "api-resource":
+      return jsonResponse(await runtime.apiResource(route.runId, run, route.resourceKind, { requester }));
+    case "inspect":
+      return jsonResponse(await runtime.inspectBundle(route.runId, run, {
+        ...runtimeInspectBundleInputFromUrl(url),
+        requester,
+      }));
+    case "resource-item": {
+      if (url.searchParams.get("view") === "resource") {
+        return jsonResponse(await runtime.getResource(route.runId, run, {
+          kind: route.resourceKind,
+          name: route.resourceName,
+          requester,
+        }));
+      }
+      return jsonResponse(await runtime.describeResource(route.runId, run, {
+        kind: route.resourceKind,
+        name: route.resourceName,
+        eventLimit: limitFromUrl(url),
+        requester,
+      }));
+    }
+    case "resource-status":
+      return jsonResponse(await runtime.resourceStatus(route.runId, run, {
+        kind: route.resourceKind,
+        name: route.resourceName,
+        requester,
+      }));
+    case "resource-events":
+      return jsonResponse(await runtime.resourceEvents(route.runId, run, {
+        kind: route.resourceKind,
+        name: route.resourceName,
+        limit: limitFromUrl(url),
+        afterRowSeq: optionalIntFromUrl(url, "after_row_seq"),
+        continueToken: optionalString(url.searchParams.get("continue"), "/continue"),
+        filter: runtimeEventFilterFromUrl(url),
+        requester,
+      }));
+    case "resource-logs":
+      return runtimeResourceLogsResponse(route.runId, run, runtime, route, url, requester);
+    case "resource-content":
+      return runtimeResourceContentResponse(route.runId, run, runtime, route, requester);
+    case "resource-metrics":
+      return jsonResponse(await runtime.resourceMetrics(route.runId, run, {
+        kind: route.resourceKind,
+        name: route.resourceName,
+        requester,
+      }));
+    case "resource-operation":
+      return jsonResponse(await runtime.reviewResourceOperation(route.runId, run, {
+        kind: route.resourceKind,
+        name: route.resourceName,
+        operation: route.operation,
+        requester,
+      }));
+    case "resource-action":
+    case "resource-port-forward":
+    case "resource-exec":
+      throw new HttpError(405, "runtime_method_not_allowed", "Runtime resource endpoint does not support this method", {
+        method: "GET",
+        resource_kind: route.resourceKind,
+        resource_name: route.resourceName,
+      });
+  }
+}
+
+function runtimeResourceFilterFromUrl(url: URL): RuntimeResourceFilter {
+  return {
+    kinds: url.searchParams.getAll("kind").flatMap(splitCsv),
+    categories: url.searchParams.getAll("category").flatMap(splitCsv),
+    labelSelector: optionalString(url.searchParams.get("label_selector"), "/label_selector"),
+    fieldSelector: optionalString(url.searchParams.get("field_selector"), "/field_selector"),
+  };
+}
+
+function runtimeResourceListInputFromUrl(url: URL): RuntimeResourceListInput {
+  return {
+    ...runtimeResourceFilterFromUrl(url),
+    limit: limitFromUrl(url),
+    continueToken: optionalString(url.searchParams.get("continue"), "/continue"),
+  };
+}
+
+function runtimeResourceMetricsListInputFromUrl(url: URL): RuntimeResourceMetricsListInput {
+  return {
+    ...runtimeResourceFilterFromUrl(url),
+    limit: limitFromUrl(url),
+    continueToken: optionalString(url.searchParams.get("continue"), "/continue"),
+  };
+}
+
+function runtimeResourceWatchInputFromUrl(url: URL): RuntimeResourceWatchInput {
+  return {
+    filter: runtimeResourceFilterFromUrl(url),
+    resourceVersion: optionalString(url.searchParams.get("resource_version"), "/resource_version"),
+    knownResourceVersions: runtimeKnownResourceVersionsFromUrl(url),
+    allowBookmarks: optionalBooleanFromUrl(url, "allow_bookmarks", false),
+  };
+}
+
+function runtimeInspectBundleInputFromUrl(url: URL): RuntimeResourceFilter & { eventLimit: number } {
+  return {
+    ...runtimeResourceFilterFromUrl(url),
+    eventLimit: queryInteger(url, "event_limit", { defaultValue: 100, min: 1, max: 1000 }),
+  };
+}
+
+function runtimeEventFilterFromUrl(url: URL): RuntimeEventFilter {
+  return {
+    eventTypes: url.searchParams.getAll("event_type").flatMap(splitCsv),
+    sources: url.searchParams.getAll("source").flatMap(splitCsv),
+    trialId: optionalString(url.searchParams.get("trial_id"), "/trial_id"),
+    taskId: optionalString(url.searchParams.get("task_id"), "/task_id"),
+  };
+}
+
+function runtimeEventAfterRowSeqFromUrl(url: URL): number | null {
+  const afterRowSeq = optionalIntFromUrl(url, "after_row_seq");
+  const continueToken = optionalString(url.searchParams.get("continue"), "/continue");
+  if (afterRowSeq !== undefined && continueToken !== null) {
+    throw new HttpError(400, "invalid_runtime_event_cursor", "Runtime event queries accept either after_row_seq or continue, not both");
+  }
+  if (continueToken !== null) {
+    return runtimeEventContinueRowSeq(continueToken, "/continue");
+  }
+  return afterRowSeq ?? null;
+}
+
+function runtimeEventContinueRowSeq(token: string, pointer: string): number {
+  const match = /^event-row-seq:(\d+)$/.exec(token.trim());
+  if (!match) {
+    throw new HttpError(400, "invalid_runtime_event_continue", `${pointer} must be formatted as event-row-seq:<row_seq>`);
+  }
+  const rowSeq = Number.parseInt(match[1] ?? "", 10);
+  if (!Number.isSafeInteger(rowSeq) || rowSeq < 0) {
+    throw new HttpError(400, "invalid_runtime_event_continue", `${pointer} must be formatted as event-row-seq:<row_seq>`);
+  }
+  return rowSeq;
+}
+
+function runtimeKnownResourceVersionsFromUrl(url: URL): Map<string, string> {
+  const versions = new Map<string, string>();
+  for (const raw of url.searchParams.getAll("known_resource").flatMap(splitCsv)) {
+    const separator = raw.indexOf("=");
+    if (separator <= 0 || separator === raw.length - 1) {
+      throw new HttpError(400, "invalid_known_resource", "/known_resource must be formatted as Kind/name=resourceVersion");
+    }
+    const key = raw.slice(0, separator).trim();
+    const version = raw.slice(separator + 1).trim();
+    if (!key || !version) {
+      throw new HttpError(400, "invalid_known_resource", "/known_resource must be formatted as Kind/name=resourceVersion");
+    }
+    versions.set(key, version);
+  }
+  return versions;
+}
+
+function runtimeEventListToWire(
+  cloudRunId: string,
+  coreRunIds: string[],
+  trialRows: RuntimeEventRecord[],
+  workerEvents: WorkerLifecycleEventRecord[],
+  url: URL,
+  limit: number,
+  afterRowSeq: number | null,
+): Record<string, unknown> {
+  const filteredEvents = runtimeEventStreamToWire(trialRows, workerEvents, afterRowSeq)
+    .filter((event) => runtimeEventMatchesFilters(event, url));
+  const events = filteredEvents.slice(0, limit);
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind: "RuntimeEventList",
+    cloud_run_id: cloudRunId,
+    generated_at: new Date().toISOString(),
+    event_filter: runtimeEventFilterToWire(url),
+    metadata: runtimeEventMetadata(events, limit, afterRowSeq, filteredEvents.length > limit),
+    core_run_ids: coreRunIds,
+    events,
+  };
+}
+
+function runtimeEventMetadata(events: JsonObject[], limit: number, afterRowSeq: number | null, hasMore: boolean): Record<string, unknown> {
+  const next = runtimeEventNextAfterRowSeq(afterRowSeq, events);
+  return {
+    resourceVersion: runtimeEventContinueToken(next ?? afterRowSeq ?? 0),
+    continue: hasMore && next !== null ? runtimeEventContinueToken(next) : null,
+    remainingItemCount: hasMore ? null : 0,
+    limit,
+    returned: events.length,
+    after_row_seq: afterRowSeq,
+    next_after_row_seq: next,
+  };
+}
+
+function runtimeEventNextAfterRowSeq(afterRowSeq: number | null, events: JsonObject[]): number | null {
+  const observed = events
+    .map((event) => numberField(event.row_seq) ?? numberField(event.seq))
+    .filter((value): value is number => value !== null)
+    .reduce<number | null>((max, value) => max === null ? value : Math.max(max, value), null);
+  if (observed !== null) return Math.max(afterRowSeq ?? observed, observed);
+  return afterRowSeq;
+}
+
+function runtimeEventContinueToken(rowSeq: number): string {
+  return `event-row-seq:${rowSeq}`;
+}
+
+function runtimeEventFilterToWire(url: URL): Record<string, unknown> {
+  return {
+    event_types: url.searchParams.getAll("event_type").flatMap(splitCsv).sort(),
+    sources: url.searchParams.getAll("source").flatMap(splitCsv).sort(),
+    resource_kind: optionalString(url.searchParams.get("resource_kind"), "/resource_kind"),
+    resource_name: optionalString(url.searchParams.get("resource_name"), "/resource_name"),
+    trial_id: optionalString(url.searchParams.get("trial_id"), "/trial_id"),
+    task_id: optionalString(url.searchParams.get("task_id"), "/task_id"),
+  };
+}
+
+function runtimeEventMatchesFilters(event: JsonObject, url: URL): boolean {
+  const types = url.searchParams.getAll("event_type").flatMap(splitCsv);
+  const sources = url.searchParams.getAll("source").flatMap(splitCsv);
+  if (types.length > 0 && !types.includes(String(event.event_type))) return false;
+  if (sources.length > 0 && !sources.includes(String(event.source))) return false;
+  const trialId = optionalString(url.searchParams.get("trial_id"), "/trial_id");
+  if (trialId !== null && event.trial_id !== trialId) return false;
+  const taskId = optionalString(url.searchParams.get("task_id"), "/task_id");
+  if (taskId !== null && event.task_id !== taskId) return false;
+  const resourceKind = optionalString(url.searchParams.get("resource_kind"), "/resource_kind");
+  const resourceName = optionalString(url.searchParams.get("resource_name"), "/resource_name");
+  if (resourceKind === null && resourceName === null) return true;
+  return (Array.isArray(event.resource_refs) ? event.resource_refs : []).some((ref) =>
+    isRecord(ref)
+    && (resourceKind === null || ref.kind === resourceKind)
+    && (resourceName === null || ref.name === resourceName)
+  );
+}
+
+async function runtimeResourceLogsResponse(
+  cloudRunId: string,
+  run: CloudRunRecord,
+  runtime: RuntimeRepository,
+  route: Extract<RuntimeResourceRoute, { kind: "resource-logs" }>,
+  url: URL,
+  requester?: string | null,
+): Promise<Response> {
+  const logs = await runtime.resourceLogs(cloudRunId, run, {
+    kind: route.resourceKind,
+    name: route.resourceName,
+    stream: url.searchParams.get("stream"),
+    tailLines: optionalIntFromUrl(url, "tail_lines"),
+    requester,
+  });
+  return runtimeArtifactBytesResponse(logs.object, logs.bytes, {
+    ...runtimeResourceByteHeaders(cloudRunId, logs.resource),
+    "x-bucephalus-log-stream": logs.stream,
+  });
+}
+
+async function runtimeResourceContentResponse(
+  cloudRunId: string,
+  run: CloudRunRecord,
+  runtime: RuntimeRepository,
+  route: Extract<RuntimeResourceRoute, { kind: "resource-content" }>,
+  requester?: string | null,
+): Promise<Response> {
+  const content = await runtime.resourceArtifactContent(cloudRunId, run, {
+    kind: route.resourceKind,
+    name: route.resourceName,
+    requester,
+  });
+  return runtimeArtifactBytesResponse(content.object, content.bytes, {
+    ...runtimeResourceByteHeaders(cloudRunId, content.resource),
+  });
+}
+
+function runtimeResourceByteHeaders(cloudRunId: string, resource: { kind: string; metadata: { name: string; resourceVersion?: unknown } }): Record<string, string> {
+  const headers: Record<string, string> = {
+    "x-bucephalus-run-id": cloudRunId,
+    "x-bucephalus-resource-kind": resource.kind,
+    "x-bucephalus-resource-name": resource.metadata.name,
+  };
+  const resourceVersion = typeof resource.metadata.resourceVersion === "string"
+    ? resource.metadata.resourceVersion.trim()
+    : "";
+  if (resourceVersion) {
+    headers["x-bucephalus-resource-version"] = resourceVersion;
+  }
+  return headers;
+}
+
+async function runtimeArtifactContentResponse(
+  artifact: RuntimeAttemptObjectContentRecord,
+  headers: Record<string, string> = {},
+): Promise<Response> {
+  const bytes = await readStoredObject(artifact.storage_path);
+  return runtimeArtifactBytesResponse(artifact, bytes, headers);
+}
+
+function runtimeArtifactBytesResponse(
+  artifact: Pick<RuntimeAttemptObjectRecord, "core_run_id" | "trial_id" | "role" | "object_ref" | "media_type" | "sha256">,
+  bytes: Uint8Array,
+  headers: Record<string, string> = {},
+): Response {
+  return new Response(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer, {
+    headers: {
+      "content-type": artifact.media_type || "application/octet-stream",
+      "content-length": String(bytes.byteLength),
+      "x-bucephalus-core-run-id": artifact.core_run_id,
+      "x-bucephalus-trial-id": artifact.trial_id,
+      "x-bucephalus-artifact-role": artifact.role,
+      "x-bucephalus-object-ref": artifact.object_ref,
+      "x-bucephalus-sha256": artifact.sha256,
+      "x-bucephalus-artifact-sha256": artifact.sha256,
+      ...headers,
+    },
+  });
+}
+
+function splitCsv(value: string): string[] {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function runtimeCollectionResourceVersion(values: unknown[]): string {
+  return sha256Digest(JSON.stringify(values)).slice("sha256:".length, "sha256:".length + 16);
+}
+
+function runtimeTrialResourceName(trialId: string, attempt: number): string {
+  const base = runtimeResourceName(trialId);
+  return attempt > 0 ? runtimeResourceName(`${base}-attempt-${attempt}`) : base;
+}
+
+function runtimeResourceName(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/^sha256:/, "sha256-")
+    .replace(/[^a-z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 96) || "resource";
+}
+
+function runtimeResourceUid(...parts: string[]): string {
+  return sha256Digest(parts.join("\0"));
+}
+
+function runtimeOwnerRef(kind: string, name: string, uid: string): RuntimeResourceRef {
+  return {
+    apiVersion: "bucephalus.dev/v1alpha1",
+    kind,
+    name,
+    uid,
+  };
+}
+
+function runtimeRowTimestamp(row: JsonObject): string | undefined {
+  for (const candidate of [
+    row.recorded_at,
+    row.ts,
+    row.timestamp,
+    row.created_at,
+    row.updated_at,
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return undefined;
+}
+
+function jsonObjectOrEmpty(value: unknown): JsonObject {
+  return isRecord(value) ? value : {};
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function numberField(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && /^-?\d+(\.\d+)?$/.test(value)) return Number(value);
+  return null;
 }
 
 function runtimeEventRowFromWire(
@@ -582,13 +1153,18 @@ function maxRuntimeArtifactBytes(): number {
 function runtimeEventStreamToWire(
   trialRows: RuntimeEventRecord[],
   workerEvents: WorkerLifecycleEventRecord[],
-  limit: number,
+  afterRowSeq: number | null,
 ): JsonObject[] {
   const trialWire = trialRows.map((row) => ({
     ...row,
     source: "trial",
     event_id: `trial:${row.core_run_id}:${row.trial_id}:${row.schedule_idx}:${row.attempt}:${row.row_seq}`,
     recorded_at: row.ts,
+    resource_refs: [runtimeOwnerRef(
+      "Trial",
+      runtimeTrialResourceName(row.trial_id, row.attempt),
+      runtimeResourceUid("Trial", "", row.core_run_id, row.trial_id, String(row.attempt)),
+    )],
   }));
   const workerWire = workerEvents.map((event) => ({
     source: "worker",
@@ -606,15 +1182,16 @@ function runtimeEventStreamToWire(
     event_type: event.event_type,
     ts: event.created_at,
     recorded_at: event.created_at,
+    resource_refs: [],
     payload: event.payload,
     row: { source: "worker_lifecycle" },
   }));
   // Rows without a timestamp sort to the end rather than masquerading as the
   // oldest events in the stream.
   const sortKey = (row: { recorded_at: string | null }) => row.recorded_at ?? "￿";
-  return [...workerWire, ...trialWire]
-    .sort((a, b) => sortKey(a).localeCompare(sortKey(b)))
-    .slice(0, limit) as JsonObject[];
+  return ([...workerWire, ...trialWire]
+    .filter((row) => row.row_seq > (afterRowSeq ?? -1))
+    .sort((a, b) => sortKey(a).localeCompare(sortKey(b))) as JsonObject[]);
 }
 
 async function completeAttempt(
@@ -659,10 +1236,100 @@ async function failAttempt(
   return jsonResponse(claimToWire(result));
 }
 
-async function expireLeases(runs: RunRepository): Promise<Response> {
-  const expired = await runs.expireLeases();
+async function workerListPortForwards(
+  request: Request,
+  route: { attemptId: string },
+  runs: RunRepository,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const runnerInstanceId = requireString(new URL(request.url).searchParams.get("runner_instance_id"), "/runner_instance_id");
+  await requireAttemptToken(request, runs, {
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  const requests = await runtime.portForwardRequestsForAttempt({
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  return jsonResponse({
+    resources: requests.map((item) => runtime.runtimeAccessRequestResourceForRunId(item.run_id, item)),
+  });
+}
+
+async function workerUpdatePortForward(
+  request: Request,
+  route: { attemptId: string; accessRequestId: string; action: string },
+  runs: RunRepository,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const body = await readJsonObject(request);
+  const runnerInstanceId = requireString(body.runner_instance_id, "/runner_instance_id");
+  await requireAttemptToken(request, runs, {
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  const portForward = await runtime.updatePortForwardRequest({
+    attemptId: route.attemptId,
+    runnerInstanceId,
+    accessRequestId: route.accessRequestId,
+    status: portForwardStatusForWorkerAction(route.action),
+    connection: body.connection === undefined ? null : optionalJsonObject(body.connection as JsonValue | undefined, "/connection"),
+    errorMessage: optionalString(body.error_message, "/error_message"),
+  });
+  return jsonResponse({ resource: runtime.runtimeAccessRequestResourceForRunId(portForward.run_id, portForward) });
+}
+
+async function workerListExecRequests(
+  request: Request,
+  route: { attemptId: string },
+  runs: RunRepository,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const runnerInstanceId = requireString(new URL(request.url).searchParams.get("runner_instance_id"), "/runner_instance_id");
+  await requireAttemptToken(request, runs, {
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  const requests = await runtime.execRequestsForAttempt({
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  return jsonResponse({
+    resources: requests.map((item) => runtime.runtimeAccessRequestResourceForRunId(item.run_id, item)),
+  });
+}
+
+async function workerUpdateExecRequest(
+  request: Request,
+  route: { attemptId: string; accessRequestId: string; action: string },
+  runs: RunRepository,
+  runtime: RuntimeRepository,
+): Promise<Response> {
+  const body = await readJsonObject(request);
+  const runnerInstanceId = requireString(body.runner_instance_id, "/runner_instance_id");
+  await requireAttemptToken(request, runs, {
+    attemptId: route.attemptId,
+    runnerInstanceId,
+  });
+  const exec = await runtime.updateExecRequest({
+    attemptId: route.attemptId,
+    runnerInstanceId,
+    accessRequestId: route.accessRequestId,
+    status: execStatusForWorkerAction(route.action),
+    connection: body.connection === undefined ? null : optionalJsonObject(body.connection as JsonValue | undefined, "/connection"),
+    errorMessage: optionalString(body.error_message, "/error_message"),
+  });
+  return jsonResponse({ resource: runtime.runtimeAccessRequestResourceForRunId(exec.run_id, exec) });
+}
+
+async function expireLeases(runs: RunRepository, runtime: RuntimeRepository): Promise<Response> {
+  const [expired, expiredAccessRequests] = await Promise.all([
+    runs.expireLeases(),
+    runtime.expireRuntimeAccessRequests(),
+  ]);
   return jsonResponse({
     expired: expired.map((item) => claimToWire(item)),
+    expired_access_resources: expiredAccessRequests.map((item) => runtime.runtimeAccessRequestResourceForRunId(item.run_id, item)),
   });
 }
 
@@ -896,7 +1563,6 @@ export function runRequirementsForArtifact(
 ): RunRequirements {
   validateCloudRuntimeOptions(runtimeOptions);
   const requestedBackend = optionalString(runtimeOptions.backend, "/runtime_options/backend")
-    ?? optionalString(runtimeOptions.executor, "/runtime_options/executor")
     ?? packageComputeBackend(artifact);
   const executor = cloudExecutorForBackend(requestedBackend);
   rejectUnsupportedCloudTrialRuntime(artifact, runtimeOptions);
@@ -965,7 +1631,7 @@ export function runRequirementsForArtifact(
     sidecars,
     accelerators,
     arch: resolvedArch,
-    cpu_count: positiveInt(runtimeOptions.cpu_count) ?? positiveInt(runtimeOptions.cpu) ?? positiveInt(packageRuntimeValue(artifact, "cpu_count")) ?? 1,
+    cpu_count: positiveInt(runtimeOptions.cpu_count) ?? positiveInt(packageRuntimeValue(artifact, "cpu_count")) ?? 1,
     memory_mb: positiveInt(runtimeOptions.memory_mb) ?? positiveInt(packageRuntimeValue(artifact, "memory_mb")) ?? 1024,
     disk_mb: positiveInt(runtimeOptions.disk_mb) ?? positiveInt(packageRuntimeValue(artifact, "disk_mb")) ?? 20480,
     isolation: networkPerimeter.egress_hosts.length > 0
@@ -980,10 +1646,8 @@ export function runRequirementsForArtifact(
 
 const CLOUD_RUNTIME_OPTION_KEYS = new Set([
   "backend",
-  "executor",
   "arch",
   "cpu_count",
-  "cpu",
   "memory_mb",
   "disk_mb",
   "isolation",
@@ -1016,41 +1680,17 @@ function validateCloudRuntimeOptions(runtimeOptions: JsonObject): void {
     }
     validateCloudRuntimeOptionValue(key, value);
   }
-  rejectAmbiguousCloudRuntimeOptions(runtimeOptions);
-}
-
-function rejectAmbiguousCloudRuntimeOptions(runtimeOptions: JsonObject): void {
-  if (
-    Object.prototype.hasOwnProperty.call(runtimeOptions, "backend")
-    && Object.prototype.hasOwnProperty.call(runtimeOptions, "executor")
-  ) {
-    throw new HttpError(
-      400,
-      "ambiguous_cloud_runtime_option",
-      "/runtime_options/backend and /runtime_options/executor cannot both be provided; use /runtime_options/backend",
-    );
-  }
-  if (
-    Object.prototype.hasOwnProperty.call(runtimeOptions, "cpu_count")
-    && Object.prototype.hasOwnProperty.call(runtimeOptions, "cpu")
-  ) {
-    throw new HttpError(
-      400,
-      "ambiguous_cloud_runtime_option",
-      "/runtime_options/cpu_count and /runtime_options/cpu cannot both be provided; use /runtime_options/cpu_count",
-    );
-  }
 }
 
 function validateCloudRuntimeOptionValue(key: string, value: unknown): void {
   const pointer = `/runtime_options/${escapeJsonPointer(key)}`;
-  if (["backend", "executor", "arch", "isolation"].includes(key)) {
+  if (["backend", "arch", "isolation"].includes(key)) {
     if (typeof value !== "string" || value.trim().length === 0) {
       throw new HttpError(400, "invalid_cloud_runtime_option", `${pointer} must be a non-empty string`);
     }
     return;
   }
-  if (["cpu_count", "cpu", "memory_mb", "disk_mb", "timeout_ms", "max_parallel_trials"].includes(key)) {
+  if (["cpu_count", "memory_mb", "disk_mb", "timeout_ms", "max_parallel_trials"].includes(key)) {
     if (positiveInt(value) === null) {
       throw new HttpError(400, "invalid_cloud_runtime_option", `${pointer} must be a positive integer`);
     }
@@ -1737,7 +2377,6 @@ function runRuntime(run: CloudRunRecord): string | null {
   for (const candidate of [
     jsonPointerValue(run.run_requirements as unknown as JsonObject, "/executor"),
     jsonPointerValue(run.runtime_options, "/backend"),
-    jsonPointerValue(run.runtime_options, "/executor"),
   ]) {
     if (typeof candidate === "string" && candidate.trim()) {
       return candidate.trim();
@@ -1837,12 +2476,205 @@ function leaseSecondsFromBody(value: unknown): number {
   return Math.min(Math.max(Math.floor(value), 5), 3600);
 }
 
+async function optionalJsonBody(request: Request): Promise<JsonObject | null> {
+  const raw = await request.text();
+  if (!raw.trim()) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new HttpError(400, "invalid_json", "Request body must be valid JSON");
+  }
+  return optionalJsonObject(parsed as JsonValue, "/");
+}
+
+function requireRuntimeResourceVersionPrecondition(body: Record<string, unknown> | null, operation: string): string {
+  const resourceVersion = body ? optionalString(body.resource_version, "/resource_version")?.trim() : "";
+  if (!resourceVersion) {
+    throw new HttpError(428, "runtime_resource_version_required", `Runtime ${operation} requires resource_version from operation review`, {
+      operation,
+      required: ["resource_version"],
+    });
+  }
+  return resourceVersion;
+}
+
+function requirePort(value: unknown, pointer: string): number {
+  const parsed = parsePort(value);
+  if (parsed === null) {
+    throw new HttpError(400, "invalid_port", `${pointer} must be an integer from 1 to 65535`);
+  }
+  return parsed;
+}
+
+function optionalPort(value: unknown, pointer: string): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const parsed = parsePort(value);
+  if (parsed === null) {
+    throw new HttpError(400, "invalid_port", `${pointer} must be an integer from 1 to 65535`);
+  }
+  return parsed;
+}
+
+function optionalPositiveInt(value: unknown, pointer: string): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const parsed = typeof value === "number"
+    ? value
+    : typeof value === "string" && /^\d+$/.test(value)
+      ? Number.parseInt(value, 10)
+      : NaN;
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new HttpError(400, "invalid_positive_integer", `${pointer} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function parsePort(value: unknown): number | null {
+  const parsed = typeof value === "number"
+    ? value
+    : typeof value === "string" && /^\d+$/.test(value)
+      ? Number.parseInt(value, 10)
+      : NaN;
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : null;
+}
+
+function requireStringArray(value: unknown, pointer: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new HttpError(400, "invalid_string_array", `${pointer} must be a non-empty string array`);
+  }
+  const strings = value.map((item) => typeof item === "string" ? item.trim() : "");
+  if (strings.length === 0 || strings.some((item) => item.length === 0)) {
+    throw new HttpError(400, "invalid_string_array", `${pointer} must be a non-empty string array`);
+  }
+  return strings;
+}
+
+function portForwardStatusForWorkerAction(action: string): "accepted" | "active" | "completed" | "failed" | "expired" {
+  switch (action) {
+    case "accept":
+    case "accepted":
+      return "accepted";
+    case "active":
+      return "active";
+    case "complete":
+    case "completed":
+      return "completed";
+    case "fail":
+    case "failed":
+      return "failed";
+    case "expire":
+    case "expired":
+      return "expired";
+    default:
+      throw new HttpError(404, "unknown_port_forward_action", "Unknown port-forward worker action");
+  }
+}
+
+function execStatusForWorkerAction(action: string): "accepted" | "active" | "completed" | "failed" | "expired" {
+  switch (action) {
+    case "accept":
+    case "accepted":
+      return "accepted";
+    case "active":
+      return "active";
+    case "complete":
+    case "completed":
+      return "completed";
+    case "fail":
+    case "failed":
+      return "failed";
+    case "expire":
+    case "expired":
+      return "expired";
+    default:
+      throw new HttpError(404, "unknown_exec_action", "Unknown exec worker action");
+  }
+}
+
 function workerAttemptPath(pathname: string, suffix: string): boolean {
-  return pathname.startsWith("/v1/worker/run-attempts/") && pathname.endsWith(suffix);
+  if (!pathname.startsWith("/v1/worker/run-attempts/") || !pathname.endsWith(suffix)) {
+    return false;
+  }
+  return !pathname.slice("/v1/worker/run-attempts/".length, -suffix.length).includes("/");
 }
 
 function attemptIdFromWorkerPath(pathname: string, suffix: string): string {
   return decodeURIComponent(pathname.slice("/v1/worker/run-attempts/".length, -suffix.length));
+}
+
+function workerPortForwardPath(pathname: string):
+  | { kind: "list"; attemptId: string }
+  | { kind: "update"; attemptId: string; accessRequestId: string; action: string }
+  | null {
+  const prefix = "/v1/worker/run-attempts/";
+  if (!pathname.startsWith(prefix)) {
+    return null;
+  }
+  const parts = pathname.slice(prefix.length).split("/").map(decodeURIComponent);
+  if (parts.length === 4 && parts[1] === "runtime" && parts[2] === "resources" && parts[3] === "PortForward") {
+    return { kind: "list", attemptId: parts[0] ?? "" };
+  }
+  if (parts.length === 6 && parts[1] === "runtime" && parts[2] === "resources" && parts[3] === "PortForward") {
+    return {
+      kind: "update",
+      attemptId: parts[0] ?? "",
+      accessRequestId: parts[4] ?? "",
+      action: parts[5] ?? "",
+    };
+  }
+  return null;
+}
+
+function workerExecPath(pathname: string):
+  | { kind: "list"; attemptId: string }
+  | { kind: "update"; attemptId: string; accessRequestId: string; action: string }
+  | null {
+  const prefix = "/v1/worker/run-attempts/";
+  if (!pathname.startsWith(prefix)) {
+    return null;
+  }
+  const parts = pathname.slice(prefix.length).split("/").map(decodeURIComponent);
+  if (parts.length === 4 && parts[1] === "runtime" && parts[2] === "resources" && parts[3] === "Exec") {
+    return { kind: "list", attemptId: parts[0] ?? "" };
+  }
+  if (parts.length === 6 && parts[1] === "runtime" && parts[2] === "resources" && parts[3] === "Exec") {
+    return {
+      kind: "update",
+      attemptId: parts[0] ?? "",
+      accessRequestId: parts[4] ?? "",
+      action: parts[5] ?? "",
+    };
+  }
+  return null;
+}
+
+function isWorkerRuntimeSubpath(pathname: string): boolean {
+  const prefix = "/v1/worker/run-attempts/";
+  if (!pathname.startsWith(prefix)) {
+    return false;
+  }
+  const parts = pathname.slice(prefix.length).split("/").map(decodeURIComponent);
+  return parts.length >= 3 && parts[1] === "runtime";
+}
+
+function assertRuntimeAccessBodyHasNoTarget(body: Record<string, unknown>): void {
+  const fields = ["/resource_kind", "/resource_name"].filter((field) =>
+    Object.prototype.hasOwnProperty.call(body, field.slice(1))
+  );
+  if (fields.length > 0) {
+    throw new HttpError(
+      400,
+      "runtime_access_body_target_removed",
+      "Runtime access targets are selected by the resource path; remove resource_kind/resource_name from the request body",
+      { fields },
+    );
+  }
 }
 
 function packageContentPath(pathname: string): boolean {

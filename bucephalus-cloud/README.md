@@ -108,13 +108,26 @@ supported. Runner pool and worker management commands intentionally use
 Upload and inspect an already-built sealed package artifact:
 
 ```bash
-bucephalus-cloud import sealed-package /tmp/package.tgz --label smoke
-bucephalus-cloud import inspect <import-id>
-bucephalus-cloud import inspect <import-id> --json
-bucephalus-cloud package get sha256:...
-bucephalus-cloud run create --package-digest sha256:... --backend runner-docker --env OPENAI_BASE_URL=https://api.openai.com
-bucephalus-cloud run get <run-id>
+buc packages upload /tmp/package.tgz
+buc packages inspect sha256:...
+buc runs create sha256:... --env OPENAI_BASE_URL=https://api.openai.com
+buc runs get <run-id>
+buc runs get <run-id> Trial
+buc runs get <run-id> Trial/<trial-name>
 ```
+
+`buc runs create` rejects unknown runtime-placement flags before queueing. Hosted
+Cloud does not support `--region`, `--executor`, or `--cpu` aliases; declare
+compute intent in the sealed package or use the supported Cloud runtime option
+names shown by `buc runs create --help`.
+
+Hosted Cloud runs do not accept runtime placement selectors such as `region`,
+`runtime_region`, `placement`, or `zone`. Runner placement is controlled by
+runner pools and the Cloud scheduler; clients must not expose those fields until
+Cloud has a supported placement contract. The API rejects unsupported placement
+fields with pointers such as `/runtime_options/region`.
+Hosted Cloud runtime options also reject compatibility alias spellings such as
+`executor` and `cpu`; use canonical `backend` and `cpu_count` instead.
 
 ## Cloud Worker Runtime
 
@@ -127,7 +140,9 @@ BUCEPHALUS_WORKER_ID=worker-1 \
 BUCEPHALUS_RUNNER_POOL_ID=<runner-pool-id> \
 BUCEPHALUS_CLOUD_WORKER_TOKEN=<worker-token> \
 BUCEPHALUS_WORKER_EXECUTORS=runner-docker \
-BUCEPHALUS_WORKER_RESOURCES=core_runner,docker_daemon,registry_pull \
+BUCEPHALUS_WORKER_RESOURCES=core_runner,docker_daemon,registry_pull,runtime_port_forward,runtime_exec \
+BUCEPHALUS_WORKER_PORT_FORWARD_CMD_JSON='["bun","runtime-dist/worker.js","runtime-gce-iap-port-forward"]' \
+BUCEPHALUS_WORKER_EXEC_CMD_JSON='["bun","runtime-dist/worker.js","runtime-docker-exec"]' \
 BUCEPHALUS_CORE_RUNNER_CMD=bucephalus \
 bun run worker
 ```
@@ -136,6 +151,12 @@ The worker polls the Cloud API, claims runs, heartbeats its attempt lease,
 downloads the sealed package through the API, and invokes Core. The production
 shape is a long-running daemon on cloud-managed runner capacity, not a container
 that happens to mount the host Docker socket.
+Low-level runtime access is command-backed: workers only advertise
+`runtime_port_forward` or `runtime_exec` when
+`BUCEPHALUS_WORKER_PORT_FORWARD_CMD_JSON` or
+`BUCEPHALUS_WORKER_EXEC_CMD_JSON` is configured. The GCE runner provisioning
+uses the bundled worker helper modes above to report auditable GCE IAP tunnel
+handles and Docker-backed exec results.
 
 Runs with `secret_refs` require an attempt-scoped resolver. Provider runner
 images can use the bundled resolver entrypoint:
@@ -238,9 +259,39 @@ And the first Cloud run-record slice:
 - `GET /v1/packages/:package_digest/content`
 - `POST /v1/runs`
 - `GET /v1/runs/:run_id`
-- `GET /v1/runs/:run_id/runtime`
 - `GET /v1/runs/:run_id/runtime/events`
-- `GET /v1/runs/:run_id/runtime/kv/:key`
+- `GET /v1/runs/:run_id/runtime/resources`
+- `GET /v1/runs/:run_id/runtime/resources/health`
+- `GET /v1/runs/:run_id/runtime/resources/metrics`
+- `GET /v1/runs/:run_id/runtime/resources/watch`
+- `GET /v1/runs/:run_id/runtime/api-resources`
+- `GET /v1/runs/:run_id/runtime/api-resources/:kind`
+- `GET /v1/runs/:run_id/runtime/inspect`
+- `GET /v1/runs/:run_id/runtime/resources/:kind/:name`
+- `GET /v1/runs/:run_id/runtime/resources/:kind/:name?view=resource`
+- `DELETE /v1/runs/:run_id/runtime/resources/:kind/:name`
+- `GET /v1/runs/:run_id/runtime/resources/:kind/:name/status`
+- `GET /v1/runs/:run_id/runtime/resources/:kind/:name/operations/:operation`
+- `GET /v1/runs/:run_id/runtime/resources/:kind/:name/events`
+- `GET /v1/runs/:run_id/runtime/resources/:kind/:name/metrics`
+- `GET /v1/runs/:run_id/runtime/resources/:kind/:name/content`
+- `GET /v1/runs/:run_id/runtime/resources/:kind/:name/logs`
+- `POST /v1/runs/:run_id/runtime/resources/:kind/:name/port-forward`
+- `POST /v1/runs/:run_id/runtime/resources/:kind/:name/exec`
+- `POST /v1/runs/:run_id/runtime/resources/:kind/:name/actions/cordon`
+- `POST /v1/runs/:run_id/runtime/resources/:kind/:name/actions/drain`
+- `POST /v1/runs/:run_id/runtime/resources/:kind/:name/actions/uncordon`
+- `POST /v1/runs/:run_id/runtime/resources/:kind/:name/actions/cancel`
+- `POST /v1/runs/:run_id/runtime/resources/:kind/:name/actions/complete`
+
+The old run-scoped `runtime/port-forwards`, `runtime/execs`,
+`runtime/results`, `runtime/artifacts/:trial_id/:role`, and `runtime/kv/:key`
+compatibility routes are removed. Clients must use the resource list, resource
+DELETE, subresources, and action paths above so every low-level operation is tied
+to a visible runtime object. Trial results, metrics, stages, artifacts, runtime
+values, port-forwards, and execs are all modeled as runtime resources; artifact
+bytes are downloaded through
+`/v1/runs/:run_id/runtime/resources/TrialArtifact/:name/content`.
 
 And the first runner pool slice:
 
@@ -259,4 +310,13 @@ And the first durable worker queue slice:
 - `POST /v1/worker/run-attempts/:attempt_id/events`
 - `POST /v1/worker/run-attempts/:attempt_id/complete`
 - `POST /v1/worker/run-attempts/:attempt_id/fail`
+- `GET /v1/worker/run-attempts/:attempt_id/runtime/resources/PortForward`
+- `POST /v1/worker/run-attempts/:attempt_id/runtime/resources/PortForward/:access_request_id/:action`
+- `GET /v1/worker/run-attempts/:attempt_id/runtime/resources/Exec`
+- `POST /v1/worker/run-attempts/:attempt_id/runtime/resources/Exec/:access_request_id/:action`
 - `POST /v1/worker/runs/expire-leases`
+
+Worker runtime access list, lifecycle update, and expiry responses use generic
+`resources`/`resource`/`expired_access_resources` envelopes containing
+`RuntimeResource` PortForward and Exec objects, not storage-row access request
+records.

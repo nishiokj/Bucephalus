@@ -21,7 +21,6 @@ base64 = "0.21.7"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.29"
 ctrlc = "3"
 flate2 = "1"
 futures-util = "0.3"
@@ -37,7 +36,6 @@ lab-schemas = { path = "rust/crates/lab-schemas", version = "0.3.0" }
 libc = "0.2"
 percent-encoding = "2"
 postgres = "0.19"
-ratatui = "0.30"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 rusqlite = { version = "0.33", features = ["bundled", "functions"] }

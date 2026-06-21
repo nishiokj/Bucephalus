@@ -304,7 +304,8 @@
                 "not": {
                   "anyOf": [
                     { "required": ["image"] },
-                    { "required": ["ephemerals"] }
+                    { "required": ["ephemerals"] },
+                    { "required": ["services"] }
                   ]
                 }
               }
@@ -425,6 +426,11 @@
       }
     },
     "ephemerals": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/sidecar_id" },
+      "additionalProperties": { "$ref": "#/$defs/ephemeral" }
+    },
+    "services": {
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/sidecar_id" },
       "additionalProperties": { "$ref": "#/$defs/ephemeral" }
@@ -720,7 +726,8 @@
                 "not": {
                   "anyOf": [
                     { "required": ["image"] },
-                    { "required": ["ephemerals"] }
+                    { "required": ["ephemerals"] },
+                    { "required": ["services"] }
                   ]
                 }
               }
@@ -985,9 +992,13 @@
     "agent_stage": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["command"],
+      "oneOf": [
+        { "required": ["command"], "not": { "required": ["adapter"] } },
+        { "required": ["adapter"], "not": { "required": ["command"] } }
+      ],
       "properties": {
         "command": { "$ref": "#/$defs/argv" },
+        "adapter": { "$ref": "#/$defs/agent_adapter" },
         "image": { "type": "string", "minLength": 1 },
         "mount": { "$ref": "#/$defs/mount" },
         "env": {
@@ -995,6 +1006,10 @@
           "additionalProperties": { "type": "string" }
         },
         "ephemerals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sidecar_id" }
+        },
+        "services": {
           "type": "array",
           "items": { "$ref": "#/$defs/sidecar_id" }
         },
@@ -1021,6 +1036,7 @@
       "additionalProperties": false,
       "properties": {
         "command": { "$ref": "#/$defs/argv" },
+        "adapter": { "$ref": "#/$defs/agent_adapter" },
         "image": { "type": "string", "minLength": 1 },
         "mount": { "$ref": "#/$defs/mount" },
         "env": {
@@ -1028,6 +1044,10 @@
           "additionalProperties": { "type": "string" }
         },
         "ephemerals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sidecar_id" }
+        },
+        "services": {
           "type": "array",
           "items": { "$ref": "#/$defs/sidecar_id" }
         },
@@ -1047,6 +1067,28 @@
           "type": "array",
           "items": { "$ref": "#/$defs/output_mount" }
         }
+      }
+    },
+    "agent_adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executable"],
+      "properties": {
+        "executable": { "type": "string", "minLength": 1 },
+        "config": { "type": "string", "minLength": 1 },
+        "mcp_config": { "type": "string", "minLength": 1 },
+        "working_dir": { "type": "string", "minLength": 1 },
+        "timeout_ms": { "type": "integer", "minimum": 1 },
+        "dangerous": { "type": "boolean" },
+        "events": { "type": "boolean" },
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "provider_env": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/env_name" }
+        },
+        "result": { "type": "string", "enum": ["structured_json"] },
+        "args": { "$ref": "#/$defs/argv" }
       }
     },
     "execution_stage": {
@@ -1074,6 +1116,7 @@
               "anyOf": [
                 { "required": ["command"] },
                 { "required": ["ephemerals"] },
+                { "required": ["services"] },
                 { "required": ["max_concurrency"] },
                 { "required": ["inputs"] },
                 { "required": ["outputs"] },
@@ -1117,7 +1160,12 @@
           },
           "then": {
             "required": ["host"],
-            "not": { "required": ["ephemerals"] }
+            "not": {
+              "anyOf": [
+                { "required": ["ephemerals"] },
+                { "required": ["services"] }
+              ]
+            }
           }
         }
       ],
@@ -1128,6 +1176,10 @@
         },
         "command": { "$ref": "#/$defs/argv" },
         "ephemerals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sidecar_id" }
+        },
+        "services": {
           "type": "array",
           "items": { "$ref": "#/$defs/sidecar_id" }
         },
@@ -1442,7 +1494,7 @@
       "required": ["image", "lifecycle"],
       "properties": {
         "image": { "type": "string", "minLength": 1 },
-        "lifecycle": { "type": "string", "enum": ["per-trial"] },
+        "lifecycle": { "type": "string", "enum": ["trial", "per-trial"] },
         "placement": {
           "type": "string",
           "enum": ["separate_container", "same_sandbox"]
@@ -1460,12 +1512,36 @@
         "readiness": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["command"],
+          "oneOf": [
+            { "required": ["command"], "not": { "required": ["http"] } },
+            { "required": ["http"], "not": { "required": ["command"] } }
+          ],
           "properties": {
             "command": { "$ref": "#/$defs/argv" },
+            "http": { "$ref": "#/$defs/http_readiness" },
             "timeout_ms": { "type": "integer", "minimum": 1 }
           }
         }
+      }
+    },
+    "http_readiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url"],
+      "properties": {
+        "url": { "type": "string", "minLength": 1 },
+        "method": { "type": "string", "minLength": 1 },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "body": { "type": "string" },
+        "json": true,
+        "expect_status": { "type": "integer", "minimum": 100, "maximum": 599 },
+        "interval_ms": { "type": "integer", "minimum": 1 }
+      },
+      "not": {
+        "required": ["body", "json"]
       }
     },
     "metric": {

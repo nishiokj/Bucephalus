@@ -76,6 +76,9 @@ const rustQualityWorkflowText = read(rustQualityWorkflowPath);
 const rustQualityWorkflow = YAML.parse(rustQualityWorkflowText);
 const cloudGatesPath = "scripts/ci/cloud-gates.sh";
 const cloudGatesText = read(cloudGatesPath);
+const migrationPaths = listFiles("bucephalus-cloud/db/migrations");
+const migrationRunnerPath = "bucephalus-cloud/src/db/migrate.ts";
+const migrationRunnerText = read(migrationRunnerPath);
 const candidateClassifierPath = "scripts/ci/classify-cloud-candidate-change.sh";
 const candidateClassifierText = read(candidateClassifierPath);
 const modalLauncherGoModPath = "modal-launcher/go.mod";
@@ -93,6 +96,50 @@ const gcpInfraPath = "bucephalus-cloud/infra/gcp/main.tf";
 const gcpInfraText = read(gcpInfraPath);
 const gcpVariablesPath = "bucephalus-cloud/infra/gcp/variables.tf";
 const gcpVariablesText = read(gcpVariablesPath);
+const cloudCliBinPath = "rust/crates/lab-cli/src/bin/bucephalus-cloud.rs";
+const cloudCliBinText = read(cloudCliBinPath);
+const hostedCliPath = "rust/crates/lab-cli/src/bin/buc.rs";
+const hostedCliText = read(hostedCliPath);
+const cloudReadmePath = "bucephalus-cloud/README.md";
+const cloudReadmeText = read(cloudReadmePath);
+const runsRoutePath = "bucephalus-cloud/src/routes/runs.ts";
+const runsRouteText = read(runsRoutePath);
+const runtimeRepositoryPath = "bucephalus-cloud/src/runtime/repository.ts";
+const runtimeRepositoryText = read(runtimeRepositoryPath);
+const runsOpenApiPath = "bucephalus-cloud/api/openapi/runs.yaml";
+const runsOpenApiText = read(runsOpenApiPath);
+const validateOpenApiPath = "bucephalus-cloud/scripts/validate-openapi.ts";
+const validateOpenApiText = read(validateOpenApiPath);
+const cloudCliDocPath = "docs/user/cloud-cli.md";
+const cloudCliDocText = read(cloudCliDocPath);
+const publicRuntimeDocTexts = [
+  ["README.md", read("README.md")],
+  [cloudReadmePath, cloudReadmeText],
+  [cloudCliDocPath, cloudCliDocText],
+  ["docs/user/agent-runtime-contract.md", read("docs/user/agent-runtime-contract.md")],
+  ["docs/user/inspecting-results.md", read("docs/user/inspecting-results.md")],
+  ["docs/user/latch.md", read("docs/user/latch.md")],
+  ["docs/user/quickstart.md", read("docs/user/quickstart.md")],
+  ["docs/distribution.md", read("docs/distribution.md")],
+];
+const runRequirementsTestText = read("bucephalus-cloud/tests/runRequirements.test.ts");
+const runRoutesTestPath = "bucephalus-cloud/tests/runRoutes.test.ts";
+const runRoutesTestText = read(runRoutesTestPath);
+const runtimeRepositoryTestPath = "bucephalus-cloud/tests/runtimeRepository.test.ts";
+const runtimeRepositoryTestText = read(runtimeRepositoryTestPath);
+const workerLifecycleTestText = read("bucephalus-cloud/tests/workerLifecycle.test.ts");
+const rootCargoTomlText = read("Cargo.toml");
+const cargoLockText = read("Cargo.lock");
+const labCliCargoTomlText = read("rust/crates/lab-cli/Cargo.toml");
+const coreCliText = read("rust/crates/lab-cli/src/main.rs");
+const coreCliRuntimeText = coreCliText.split("\nmod tests {", 1)[0];
+const labCliSrcFiles = listFiles("rust/crates/lab-cli/src");
+const labCliRuntimeSourceTexts = labCliSrcFiles
+  .filter((path) => path.endsWith(".rs"))
+  .map((path) => [
+    path,
+    path === "rust/crates/lab-cli/src/main.rs" ? coreCliRuntimeText : read(path),
+  ]);
 
 for (const forbidden of [
   /\bscp\b/,
@@ -367,6 +414,1277 @@ for (const inputName of [
     fail(`${deployWorkflowPath} must not ask operators for ${inputName}; deploy config belongs in the GitHub environment`);
   }
 }
+for (const forbiddenRunCreateUsage of [
+  /run create[^\n]*\[--region\b/,
+  /run create[^\n]*\[--executor\b/,
+  /run create[^\n]*\[--cpu\s/,
+  /run create[^\n]*--backend runner-docker/,
+]) {
+  if (cloudReadmeText.match(forbiddenRunCreateUsage) || cloudCliBinText.match(forbiddenRunCreateUsage)) {
+    fail(`Cloud run create docs/help must not expose unsupported hosted runtime placement flag ${forbiddenRunCreateUsage}`);
+  }
+}
+for (const requiredCloudCreateGuard of [
+  "fn validate_run_create_args",
+  "run create option {option} is not supported",
+  "Hosted Cloud does not support user-selected regions",
+  "run_create_rejects_unsupported_runtime_placement_flags",
+  "run_create_rejects_unknown_options_and_positionals",
+]) {
+  if (!cloudCliBinText.includes(requiredCloudCreateGuard)) {
+    fail(`${cloudCliBinPath} must reject unsupported hosted runtime placement before queueing runs: ${requiredCloudCreateGuard}`);
+  }
+}
+for (const requiredCloudCreateDoc of [
+  "Hosted",
+  "Cloud does not support `--region`, `--executor`, or `--cpu` aliases",
+  "/runtime_options/region",
+]) {
+  if (!cloudReadmeText.includes(requiredCloudCreateDoc)) {
+    fail(`${cloudReadmePath} must document unsupported hosted runtime placement contract: ${requiredCloudCreateDoc}`);
+  }
+}
+for (const requiredCloudCliRuntimePlacementDoc of [
+  "Hosted Cloud does not accept runtime placement selectors such as `region`,",
+  "`runtime_region`, `placement`, or `zone`",
+  "runner placement is controlled by",
+  "/runtime_options/region",
+]) {
+  if (!cloudCliDocText.includes(requiredCloudCliRuntimePlacementDoc)) {
+    fail(`${cloudCliDocPath} must document unsupported hosted runtime placement contract: ${requiredCloudCliRuntimePlacementDoc}`);
+  }
+}
+for (const forbiddenRuntimeAliasImplementation of [
+  /optionalString\(runtimeOptions\.executor/,
+  /positiveInt\(runtimeOptions\.cpu\)/,
+  /jsonPointerValue\(run\.runtime_options,\s*"\/executor"\)/,
+  /"executor",\s*\n\s*"arch"/,
+  /"cpu",\s*\n\s*"memory_mb"/,
+]) {
+  if (forbiddenRuntimeAliasImplementation.test(runsRouteText)) {
+    fail(`${runsRoutePath} must not implement hosted runtime compatibility alias ${forbiddenRuntimeAliasImplementation}`);
+  }
+}
+for (const forbiddenHostedCliRuntimeAliasImplementation of [
+  /"executor",\s*\n\s*"arch"/,
+  /"cpu",\s*\n\s*"memory_mb"/,
+  /"backend"\s*\|\s*"executor"/,
+  /"cpu_count"\s*\|\s*"cpu"/,
+  /backend` and `executor/,
+  /cpu_count` and `cpu/,
+]) {
+  if (forbiddenHostedCliRuntimeAliasImplementation.test(hostedCliText)) {
+    fail(`${hostedCliPath} must reject hosted runtime compatibility alias ${forbiddenHostedCliRuntimeAliasImplementation}`);
+  }
+}
+const cloudRuntimeOptionsSchemaText = runsOpenApiText
+  .split("    CloudRuntimeOptions:")[1]
+  ?.split("\n    ")[0] ?? "";
+for (const forbiddenRuntimeAliasSchema of [
+  /\n        executor:\n          type: string\n/,
+  /\n        cpu:\n          \$ref: '#\/components\/schemas\/PositiveIntegerLike'\n/,
+]) {
+  if (forbiddenRuntimeAliasSchema.test(cloudRuntimeOptionsSchemaText)) {
+    fail(`${runsOpenApiPath} must not advertise hosted runtime compatibility alias ${forbiddenRuntimeAliasSchema}`);
+  }
+}
+for (const requiredAliasRejectionEvidence of [
+  "/runtime_options/executor is not supported",
+  "/runtime_options/cpu is not supported",
+  "unsupported hosted Cloud runtime option `region`",
+  "Hosted Cloud does not accept the compatibility aliases `executor` or `cpu`",
+]) {
+  if (!runsRouteText.includes(requiredAliasRejectionEvidence)
+    && !cloudCliDocText.includes(requiredAliasRejectionEvidence)
+    && !cloudReadmeText.includes(requiredAliasRejectionEvidence)
+    && !cloudCliBinText.includes(requiredAliasRejectionEvidence)
+    && !hostedCliText.includes(requiredAliasRejectionEvidence)
+    && !runRequirementsTestText.includes(requiredAliasRejectionEvidence)
+    && !runRoutesTestText.includes(requiredAliasRejectionEvidence)) {
+    fail(`hosted runtime alias rejection evidence is missing: ${requiredAliasRejectionEvidence}`);
+  }
+}
+for (const forbiddenRunScopedRuntimeCompatibilityRoute of [
+  "/v1/runs/{run_id}/runtime/results",
+  "/v1/runs/{run_id}/runtime/kv",
+  "/v1/runs/{run_id}/runtime/artifacts",
+  "/v1/runs/{run_id}/runtime/port-forwards",
+  "/v1/runs/{run_id}/runtime/execs",
+]) {
+  if (runsOpenApiText.includes(forbiddenRunScopedRuntimeCompatibilityRoute)) {
+    fail(`${runsOpenApiPath} must not advertise deprecated run-scoped runtime compatibility route ${forbiddenRunScopedRuntimeCompatibilityRoute}; use runtime resources and subresources`);
+  }
+}
+for (const forbiddenRunScopedLiveContractWording of [
+  "run-scoped runtime control plane",
+  "run-scoped runtime API",
+  "run-scoped runtime inspect bundle",
+  "run-scoped RunnerInstance",
+  "run-scoped PortForward",
+  "run-scoped PortForward or Exec",
+  "active run-scoped PortForward",
+]) {
+  if (runsOpenApiText.includes(forbiddenRunScopedLiveContractWording)) {
+    fail(`${runsOpenApiPath} must reserve run-scoped wording for retired compatibility routes, not live runtime resource contracts: ${forbiddenRunScopedLiveContractWording}`);
+  }
+}
+if (hostedCliText.includes("List run-scoped or resource-scoped runtime audit/events.")) {
+  fail(`${hostedCliPath} must describe runtime events as run-wide or resource-scoped, not run-scoped compatibility wording`);
+}
+for (const forbiddenRunScopedRuntimeImplementation of [
+  "/runtime/results",
+  "/runtime/kv",
+  "/runtime/port-forwards",
+  "/runtime/execs",
+]) {
+  if (runsRouteText.includes(forbiddenRunScopedRuntimeImplementation)) {
+    fail(`${runsRoutePath} must not implement deprecated run-scoped runtime compatibility route ${forbiddenRunScopedRuntimeImplementation}; use runtime resources and subresources`);
+  }
+}
+for (const requiredRetiredRuntimeCompatibilityEvidence of [
+  "deprecated run-scoped runtime compatibility routes are not handled",
+  "/v1/runs/run-1/runtime",
+  "/v1/runs/run-1/runtime/results",
+  "/v1/runs/run-1/runtime/kv/run_control_v2",
+  "/v1/runs/run-1/runtime/artifacts/trial_1/agent_result",
+  "/v1/runs/run-1/runtime/port-forwards",
+  "/v1/runs/run-1/runtime/port-forwards/pf-1",
+  "/v1/runs/run-1/runtime/execs",
+  "/v1/runs/run-1/runtime/execs/exec-1",
+]) {
+  if (!runRoutesTestText.includes(requiredRetiredRuntimeCompatibilityEvidence)) {
+    fail(`${runRoutesTestPath} must prove deprecated public run-scoped runtime compatibility routes stay retired: ${requiredRetiredRuntimeCompatibilityEvidence}`);
+  }
+}
+for (const requiredRuntimeOperatorDoc of [
+  "## Runtime Resources and Low-Level Operations",
+  "buc runs api-resources <run-id>",
+  "buc runs explain <run-id> TrialContainer",
+  "buc runs tree <run-id> --kind RunnerInstance,RunnerAttempt,Trial,TrialContainer",
+  "buc runs get <run-id> RunnerInstance,RunnerAttempt,Trial,TrialContainer --wide",
+  "buc runs get <run-id> Trial -o name",
+  "buc runs get <run-id> --category runner --wide",
+  "buc runs get <run-id> Event --field-selector status.involved=PortForward/<port-forward-name> --wide",
+  "buc runs get <run-id> Event --field-selector spec.involved_object.kind=PortForward,spec.involved_object.name=<port-forward-name> --wide",
+  "buc runs get <run-id> RunnerInstance/<runner-name>",
+  "buc runs get` mirrors the useful part of `kubectl get`",
+  "Describe output includes\nthe generated snapshot timestamp and represented Core run ids",
+  "resources, available operations, and recent related event rows with\n`event_resource_version`/cursor metadata",
+  "Each advertised operation is printed\nwith its support decision, verb/subresource/action metadata",
+  "whether it requires\na running Cloud run, and command template",
+  "Use `--category <name>` to send the same server-owned selector exposed by",
+  "`buc runs api-resources` prints the generated catalog timestamp, represented\nCore run ids",
+  "advertises concrete Event selectors such as",
+  "`spec.involved_object.kind`, `spec.involved_object.name`, `status.involved`,",
+  "Add `--wide` on resource lists to render the server-advertised printer columns",
+  "Use `--output name` or `-o name` when scripts\nneed one concrete `Kind/name` ref per line",
+  "`buc runs status <run-id> Kind/name` reads the status subresource and prints the\ngenerated status timestamp",
+  "buc runs can-i <run-id> port-forward RunnerInstance/<runner-name>",
+  "Use `can-i` before a mutating, low-level access, or observability operation",
+  "returns the generated review timestamp, represented Core run ids, and\nresource version",
+  "Human output prints a\nreviewed command with the current `--resource-version` materialized",
+  "buc runs can-i <run-id> top TrialContainer/<container-name>",
+  "buc runs can-i <run-id> audit RunnerInstance/<runner-name>",
+  "buc runs can-i <run-id> logs/stdout TrialContainer/<container-name>",
+  "buc runs can-i <run-id> logs/stderr TrialContainer/<container-name>",
+  "buc runs can-i <run-id> content TrialArtifact/<artifact-name>",
+  "buc runs can-i <run-id> cancel Exec/<exec-name>",
+  "buc runs can-i <run-id> complete PortForward/<port-forward-name>",
+  "can-i` exits zero when the operation is currently supported and nonzero when",
+  "Reviewed\nmutating and low-level access commands include `--resource-version`",
+  "`ImagePull` resources move past capability-level `Satisfied` to `Pulling`,\n`Pulled`, or `Failed`",
+  "`SecretBinding` resources move past capability-level `Satisfied` to\n`Materialized`",
+  "`SidecarRequirement/<sidecar>` moves past capability-level `Satisfied` to\n`Checking`, `Available`, or `Failed`",
+  "`AcceleratorRequirement/<accelerator>` follows the same worker-observed lifecycle",
+  "`NetworkPerimeter/declared` reports `Applying`, `Applied`, or `Failed`",
+  "buc runs logs <run-id> Trial/<trial-name> --stream stdout",
+  "buc runs port-forward <run-id> Trial/<trial-name> --target-port 8080 --local-port 18080 --attach --resource-version <reviewed-version>",
+  "When the CLI-owned local attach process exits,\nthe CLI marks the `PortForward` resource `completed` with an audited closeout",
+  "If the worker reports a client-reachable endpoint instead, `--attach`\nprints the endpoint and leaves the worker-managed `PortForward` active for\nexplicit cleanup or TTL expiry",
+  "`buc runs port-forward` exits nonzero",
+  "buc runs exec <run-id> Trial/<trial-name> --resource-version <reviewed-version> -- python -V",
+  "`buc runs exec` exits nonzero",
+  "buc runs get <run-id> PortForward,Exec",
+  "buc runs complete <run-id> PortForward/<port-forward-name> --reason \"local tunnel ended\" --resource-version <reviewed-version>",
+  "buc runs delete <run-id> Exec/<exec-name> --reason",
+  "buc runs wait <run-id> Exec/<exec-name> --for delete --timeout-seconds 60",
+  "the error includes the latest\nobserved phase, reason, waited condition status, resourceVersion, and\ngeneration freshness",
+  "buc runs cordon <run-id> RunnerInstance/<runner-name>",
+  "buc runs drain <run-id> RunnerInstance/<runner-name>",
+  "buc runs uncordon <run-id> RunnerInstance/<runner-name>",
+  "runtime audit stream",
+  "repeatable `--event-type` and `--source` filters",
+  "`--resource-kind`, `--resource-name`, `--trial-id`, `--task-id`, and\n`--continue` cursors",
+  "Add `--follow` to `buc runs events`, `buc runs audit`,\n`buc runs watch`, or `buc runs logs` to keep polling",
+  "`--interval-seconds`\ncontrols the poll delay, and `--max-polls` captures a bounded stream",
+  "Followed logs print only appended bytes",
+  "Human event output\nincludes the event `resource_version`, `continue`, and row-sequence cursor\nmetadata",
+  "`buc runs watch --follow` carries\nforward the returned collection and per-resource versions",
+  "Watch follow requests opt into server BOOKMARK events",
+  "kind/name/resourceVersion",
+]) {
+  if (!cloudCliDocText.includes(requiredRuntimeOperatorDoc)) {
+    fail(`${cloudCliDocPath} must document hosted runtime operator operation: ${requiredRuntimeOperatorDoc}`);
+  }
+}
+for (const forbiddenRuntimeOperatorDoc of [
+  "active-run\nrequirement",
+]) {
+  if (cloudCliDocText.includes(forbiddenRuntimeOperatorDoc)) {
+    fail(`${cloudCliDocPath} must describe runtime operation preconditions as running Cloud run requirements, not stale active-run requirements: ${forbiddenRuntimeOperatorDoc}`);
+  }
+}
+for (const requiredRuntimeGetAliasEvidence of [
+  "enum RunGetTarget",
+  "canonical_run_get_resource_list_args",
+  "canonical_run_get_resource_item_args",
+  "runs_get_can_list_runtime_resources_by_kind",
+  "runs_get_can_fetch_raw_runtime_resource_by_identity",
+  "buc runs explain <run-id> <kind> [--json]",
+  "runs_explain_fetches_runtime_api_resource_contract",
+  "print_runtime_api_resource_explain",
+  "buc runs tree <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--json]",
+  "runs_tree_fetches_bounded_owner_reference_inventory",
+  "print_runtime_resource_tree_summary",
+  "runs_resources_wide_fetches_discovery_and_renders_printer_columns",
+  "runs_resources_output_name_lists_refs_without_discovery",
+  "runtime_resources_name_lines_render_pipeline_refs",
+  "option_value_alias(args, \"--output\", \"-o\")",
+  "runs get <kind> -o name should render resource refs",
+  "runs_resources_category_forwards_server_owned_category_selector",
+  "runtime_selector_query_params",
+  "category=runner",
+  "runtime_resources_wide_lines",
+  "STDOUT BYTES",
+  "STDOUT TAIL BYTES",
+  "STDOUT TRUNCATED",
+  "STDERR BYTES",
+  "STDERR TAIL BYTES",
+  "STDERR TRUNCATED",
+  "RunnerInstance,Trial",
+  "RunnerInstance%2CTrial",
+  "buc runs get <run-id> [kind|--kind KIND|--category CATEGORY]",
+  "buc runs resources <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--wide|--output name|-o name] [--json]",
+  "buc runs get <run-id> <Kind/name|KIND NAME>",
+]) {
+  if (!hostedCliText.includes(requiredRuntimeGetAliasEvidence)) {
+    fail(`${hostedCliPath} must preserve Kubernetes-style runtime resource get aliases: ${requiredRuntimeGetAliasEvidence}`);
+  }
+}
+for (const requiredRuntimeWideDocEvidence of [
+  [cloudCliDocPath, cloudCliDocText, "Exec --wide` columns also expose"],
+  [cloudCliDocPath, cloudCliDocText, "stdout/stderr byte totals"],
+  [cloudCliDocPath, cloudCliDocText, "Runtime audit summaries for completed Exec resources"],
+  ["docs/user/inspecting-results.md", read("docs/user/inspecting-results.md"), "buc runs resources <cloud_run_id> --kind Exec --wide"],
+  ["docs/user/inspecting-results.md", read("docs/user/inspecting-results.md"), "buc runs audit <cloud_run_id> Exec/<exec_name>"],
+  ["docs/user/inspecting-results.md", read("docs/user/inspecting-results.md"), "retained tail byte counts"],
+]) {
+  const [path, text, required] = requiredRuntimeWideDocEvidence;
+  if (!text.includes(required)) {
+    fail(`${path} must document runtime Exec --wide output evidence columns: ${required}`);
+  }
+}
+for (const requiredRuntimeCategoryApiEvidence of [
+  [runsRoutePath, runsRouteText, "categories: url.searchParams.getAll(\"category\").flatMap(splitCsv)"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "categories?: string[] | undefined"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "runtimeResourceMatchesAnyCategory"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "runtimeApiResourceAliasKey(category.trim())"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "categories: filter.categories ?? []"],
+  [runsOpenApiPath, runsOpenApiText, "- name: category"],
+  [runsOpenApiPath, runsOpenApiText, "`runtime/api-resources[].categories`"],
+  [runsOpenApiPath, runsOpenApiText, "RuntimeInspectBundleFilter:"],
+  ["bucephalus-cloud/tests/runRoutes.test.ts", runRoutesTestText, "category=runner,access-target"],
+  ["bucephalus-cloud/tests/runRoutes.test.ts", runRoutesTestText, "categories: [\"runner\"]"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, "categories: [\"trial\", \"access\"]"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, "categories: [\"access-target\"]"],
+  [cloudCliDocPath, cloudCliDocText, "category=runner` on runtime resource list"],
+  ["docs/user/inspecting-results.md", read("docs/user/inspecting-results.md"), "forwards that selector to the hosted runtime API as `category=runner`"],
+]) {
+  const [path, text, needle] = requiredRuntimeCategoryApiEvidence;
+  if (!text.includes(needle)) {
+    fail(`${path} must keep runtime category selectors as a first-class API contract: ${needle}`);
+  }
+}
+for (const requiredRuntimeMetadataEvidence of [
+  [runtimeRepositoryPath, runtimeRepositoryText, "uid: normalizeOptionalString(input.uid) ?? runtimeResourceGeneratedUid(input)"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "function runtimeResourceGeneratedUid"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "runner_instance_status: stringField(existing.runner_instance_status) ?? resourceRunnerInstanceStatus(resource)"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "function resourceRunnerInstanceStatus"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "export interface RuntimeResourceAccessStatus"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "access: RuntimeResourceAccessStatus"],
+  [runsOpenApiPath, runsOpenApiText, "RuntimeResourceAccessStatus:"],
+  [runsOpenApiPath, runsOpenApiText, "$ref: '#/components/schemas/RuntimeResourceAccessStatus'"],
+  [validateOpenApiPath, validateOpenApiText, "RuntimeResourceHealthRow.access must use RuntimeResourceAccessStatus"],
+  [runsOpenApiPath, runsOpenApiText, "- uid"],
+  [runsOpenApiPath, runsOpenApiText, "RuntimeResource.metadata.uid"],
+  [validateOpenApiPath, validateOpenApiText, "RuntimeResource.metadata.uid must be a non-empty string"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, "expect(resource.metadata.uid).toMatch(/\\S/)"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, 'runner_instance_status: "online"'],
+  [runtimeRepositoryPath, runtimeRepositoryText, '"metadata.creationTimestamp"'],
+  [runtimeRepositoryPath, runtimeRepositoryText, '"metadata.deletionTimestamp"'],
+  [runtimeRepositoryPath, runtimeRepositoryText, "creationTimestamp?: string"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "deletionTimestamp?: string"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "creationTimestamp: input.created_at"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "deletionTimestamp: stringField(resource.metadata.deletionTimestamp)"],
+  [runsOpenApiPath, runsOpenApiText, "creationTimestamp:"],
+  [runsOpenApiPath, runsOpenApiText, "deletionTimestamp:"],
+  [runsOpenApiPath, runsOpenApiText, "`metadata.creationTimestamp`"],
+  [runsOpenApiPath, runsOpenApiText, "`metadata.deletionTimestamp`"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, "metadata.creationTimestamp=2027-02-06T23:59:50.000Z"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, "metadata.deletionTimestamp=${cancelledAt}"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, 'creationTimestamp: "2027-02-06T23:59:50.000Z"'],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, "deletionTimestamp: cancelledAt"],
+]) {
+  const [path, text, needle] = requiredRuntimeMetadataEvidence;
+  if (!text.includes(needle)) {
+    fail(`${path} must preserve Kubernetes-style runtime resource lifecycle metadata: ${needle}`);
+  }
+}
+for (const requiredRuntimeActionAliasHelp of [
+  "buc runs port-forward <run-id> <Kind/name> --target-port PORT [--local-port PORT] [--attach] [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json]",
+  "buc runs exec <run-id> <Kind/name> [--ttl-seconds N] [--wait-seconds N|--no-wait] [--reason TEXT] --resource-version VERSION [--json] -- COMMAND [ARG...]",
+  "buc runs delete <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]",
+  "buc runs cordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]",
+  "buc runs drain <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]",
+  "buc runs uncordon <run-id> <RunnerInstance/name> [--reason TEXT] --resource-version VERSION [--json]",
+  "buc runs cancel <run-id> <PortForward/name|Exec/name> [--reason TEXT] --resource-version VERSION [--json]",
+  "buc runs complete <run-id> <PortForward/name> [--reason TEXT] --resource-version VERSION [--json]",
+  "runtime_action_help_exposes_reviewed_precondition_flags_on_aliases",
+  "\"cordon\" | \"drain\" | \"uncordon\" | \"cancel\" | \"complete\"",
+  "runs action should send complete compatibility command with optimistic concurrency",
+]) {
+  if (!hostedCliText.includes(requiredRuntimeActionAliasHelp)) {
+    fail(`${hostedCliPath} must document reviewed runtime action aliases with audit reason and resource-version preconditions: ${requiredRuntimeActionAliasHelp}`);
+  }
+}
+for (const requiredRuntimeActionValidatorEvidence of [
+  '"cordon", "drain", "uncordon", "cancel", "complete"',
+]) {
+  if (!validateOpenApiText.includes(requiredRuntimeActionValidatorEvidence)) {
+    fail(`${validateOpenApiPath} must validate every runtime action response contract, including PortForward complete: ${requiredRuntimeActionValidatorEvidence}`);
+  }
+}
+for (const requiredRuntimeActionCatalogEvidence of [
+  "`cordon`, `drain`, `uncordon`, `cancel`, or `complete`",
+  "actions/cancel, or actions/complete",
+  "actions/cancel,actions/complete actions=cancel,complete",
+]) {
+  if (!runsOpenApiText.includes(requiredRuntimeActionCatalogEvidence)
+    && !hostedCliText.includes(requiredRuntimeActionCatalogEvidence)) {
+    fail(`runtime action catalogs must include the PortForward complete lifecycle action: ${requiredRuntimeActionCatalogEvidence}`);
+  }
+}
+for (const requiredRuntimeMutationTestEvidence of [
+  "runs_mutating_resource_commands_require_reviewed_resource_version_before_api_request",
+  "runs_access_commands_can_create_async_resources_without_waiting",
+  'json!("sha256:runner-port-forward")',
+  'json!("sha256:runner-exec")',
+  'body["resource_version"]',
+  'exec_body["resource_version"]',
+]) {
+  if (!hostedCliText.includes(requiredRuntimeMutationTestEvidence)) {
+    fail(`${hostedCliPath} must test every API-reaching runtime mutation with a reviewed resource-version precondition: ${requiredRuntimeMutationTestEvidence}`);
+  }
+}
+for (const requiredRuntimePortForwardAttachEvidence of [
+  "struct RuntimePortForwardAttachSpec",
+  "struct RuntimePortForwardClientEndpointAttachSpec",
+  "enum RuntimePortForwardAttachPlan",
+  "runtime_port_forward_attach_plan",
+  "runtime_port_forward_client_endpoint_attach_spec",
+  "run_gce_iap_port_forward_attach",
+  "run_client_endpoint_port_forward_attach",
+  "complete_attached_runtime_port_forward",
+  "cleanup_attached_runtime_port_forward",
+  "runtime_access_cleanup_command_line",
+  "runtime_access_summaries_surface_connection_and_exec_output",
+  'runtime_connection_string(resource, "stdout_tail")',
+  'runtime_connection_string(resource, "stdout")',
+  'runtime_connection_string(resource, "stderr_tail")',
+  'runtime_connection_string(resource, "stderr")',
+  "runtime_exec_stream_evidence_line",
+  "stdout_evidence: bytes=14 tail_bytes=14 truncated=false",
+  "stderr_evidence: bytes=7 tail_bytes=7 truncated=false",
+  "cleanup_command: buc runs complete run-1 PortForward/pf-1 --reason cleanup --resource-version sha256:pf-rv",
+  "cleanup_command: buc runs delete run-1 Exec/exec-2 --reason cleanup --resource-version sha256:exec-rv",
+  '"stdout": "v22.0.0\\n"',
+  '"stderr": "node warning\\n"',
+  "gcloud_iap_port_forward_args",
+  'Command::new("gcloud")',
+  '"--tunnel-through-iap"',
+  '"-N"',
+  '"-L"',
+  '"127.0.0.1:{}:{}:{}"',
+  "--attach requires an active PortForward resource",
+  "--attach requires a GCE IAP provider tunnel or a client-reachable PortForward endpoint",
+  "worker reports client-reachable endpoint",
+  "leaving the PortForward resource active for explicit cleanup or TTL expiry",
+  "local port-forward attach ended",
+  "port-forward attach ended but cleanup failed",
+  "runs_port_forward_attach_completes_active_resource_after_local_tunnel_exits",
+  "runs_port_forward_attach_reports_worker_client_endpoint_without_cleanup",
+  "port_forward_attach_uses_gce_iap_connection_handle",
+  "port_forward_attach_accepts_client_reachable_handles",
+  '"127.0.0.1:18080:10.0.0.2:8080"',
+]) {
+  if (!hostedCliText.includes(requiredRuntimePortForwardAttachEvidence)) {
+    fail(`${hostedCliPath} must keep real GCE IAP local PortForward attach behavior: ${requiredRuntimePortForwardAttachEvidence}`);
+  }
+}
+if (!hostedCliText.includes("#[test]\n    fn runtime_access_summaries_surface_connection_and_exec_output()")) {
+  fail(`${hostedCliPath} must keep runtime access summary coverage live as a Rust test`);
+}
+for (const requiredRuntimeWatchCliEvidence of [
+  "buc runs watch <run-id> [--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--resource-version VERSION] [--known-resource Kind/name=VERSION] [--follow] [--interval-seconds N] [--max-polls N] [--json]",
+  'option_values(&context.args, "--known-resource")',
+  "runtime_watch_follow_cursors",
+  'query_params.push(("allow_bookmarks", Some("true".to_string())))',
+  "runs_watch_forwards_selectors_and_repeated_known_resources",
+  "runs_watch_follow_polls_with_returned_resource_cursors",
+]) {
+  if (!hostedCliText.includes(requiredRuntimeWatchCliEvidence)) {
+    fail(`${hostedCliPath} must expose runtime watch selectors and repeated known-resource deltas: ${requiredRuntimeWatchCliEvidence}`);
+  }
+}
+for (const requiredRuntimeWatchOpenApiValidatorEvidence of [
+  'assertOperationParameter(document, "/v1/runs/{run_id}/runtime/resources/watch", "get", "allow_bookmarks")',
+  'assertOperationParameterDescriptionIncludes(document, "/v1/runs/{run_id}/runtime/resources/watch", "get", "allow_bookmarks", "BOOKMARK")',
+  'assertSchemaRequired(document, "RuntimeResourceWatchList", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids", "resource_versions", "events", "resource_inventory"])',
+  'assertSchemaPropertyRef(runtimeResourceWatchList, "cloud_run_id", "RuntimeResourceWatchList", "#/components/schemas/CloudRunId")',
+  "RuntimeResourceWatchList.generated_at must be a date-time string",
+  "RuntimeResourceWatchList.core_run_ids must be an array",
+  "RuntimeResourceWatchList.core_run_ids items must be strings",
+  "RuntimeResourceWatchList.events.items must use RuntimeResourceWatchEvent",
+  'assertSchemaPropertyRef(runtimeResourceWatchList, "resource_inventory", "RuntimeResourceWatchList", "#/components/schemas/RuntimeResourceList")',
+  "RuntimeResourceWatchEvent.type must enumerate ADDED, MODIFIED, DELETED, and BOOKMARK",
+  'for (const propertyName of ["resource_version", "previous_resource_version"])',
+  'assertSchemaPropertyRef(runtimeResourceWatchEvent, "resource_ref", "RuntimeResourceWatchEvent", "#/components/schemas/RuntimeResourceWatchRef")',
+  'assertSchemaRequired(document, "RuntimeResourceWatchRef", ["apiVersion", "kind", "name"])',
+]) {
+  if (!validateOpenApiText.includes(requiredRuntimeWatchOpenApiValidatorEvidence)) {
+    fail(`${validateOpenApiPath} must validate runtime watch bookmark OpenAPI contract: ${requiredRuntimeWatchOpenApiValidatorEvidence}`);
+  }
+}
+for (const requiredRuntimeApiDiscoveryValidatorEvidence of [
+  'assertSchemaRequired(document, "RuntimeApiResourceList", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids", "resources"])',
+  'assertSchemaPropertyRef(runtimeApiResourceList, "cloud_run_id", "RuntimeApiResourceList", "#/components/schemas/CloudRunId")',
+  "RuntimeApiResourceList.generated_at must be a date-time string",
+  "RuntimeApiResourceList.core_run_ids must be an array",
+  "RuntimeApiResourceList.core_run_ids items must be strings",
+  'assertSchemaRequired(document, "RuntimeApiResource", ["cloud_run_id", "generated_at", "core_run_ids"',
+  'assertSchemaPropertyRef(runtimeApiResource, "cloud_run_id", "RuntimeApiResource", "#/components/schemas/CloudRunId")',
+  "RuntimeApiResource.generated_at must be a date-time string",
+  "RuntimeApiResource.core_run_ids must be an array",
+  "RuntimeApiResource.core_run_ids items must be strings",
+]) {
+  if (!validateOpenApiText.includes(requiredRuntimeApiDiscoveryValidatorEvidence)) {
+    fail(`${validateOpenApiPath} must validate runtime API discovery snapshot identity: ${requiredRuntimeApiDiscoveryValidatorEvidence}`);
+  }
+}
+for (const requiredRuntimeLogCliEvidence of [
+  "buc runs logs <run-id> <Kind/name> [--stream stdout|stderr] [--tail-lines N] [--out FILE] [--metadata-out FILE] [--follow] [--interval-seconds N] [--max-polls N]",
+  "buc runs content <run-id> <TrialArtifact/name> [--out FILE] [--metadata-out FILE]",
+  "let bytes = appended_raw_log_bytes(&previous, &response.bytes)",
+  "write_raw_bytes(bytes, out.as_deref(), polls > 1)",
+  "write_runtime_raw_metadata(&response, metadata_out.as_deref())",
+  "fn runtime_raw_response_metadata",
+  '"x-bucephalus-resource-version"',
+  "Use --metadata-out FILE to write the response provenance from Cloud headers",
+  "fn appended_raw_log_bytes",
+  "runs_raw_resource_commands_fetch_logs_and_content",
+  "runs_logs_follow_prints_only_appended_tail_bytes",
+  "appended_raw_log_bytes_uses_suffix_prefix_overlap",
+]) {
+  if (!hostedCliText.includes(requiredRuntimeLogCliEvidence)) {
+    fail(`${hostedCliPath} must expose bounded runtime log follow without duplicating sliding tail windows: ${requiredRuntimeLogCliEvidence}`);
+  }
+}
+for (const requiredRuntimeByteSubresourceRouteEvidence of [
+  "function runtimeResourceByteHeaders",
+  '"x-bucephalus-run-id": cloudRunId',
+  '"x-bucephalus-resource-kind": resource.kind',
+  '"x-bucephalus-resource-name": resource.metadata.name',
+  '"x-bucephalus-resource-version"',
+]) {
+  if (!runsRouteText.includes(requiredRuntimeByteSubresourceRouteEvidence)) {
+    fail(`${runsRoutePath} must emit resource identity/version headers on runtime resource logs and content byte subresources: ${requiredRuntimeByteSubresourceRouteEvidence}`);
+  }
+}
+for (const requiredRuntimeByteSubresourceEvidence of [
+  "runtime resource byte subresources expose cloud run identity headers",
+  'headers.get("x-bucephalus-run-id")).toBe("run-1")',
+  'headers.get("x-bucephalus-resource-version")).toBe("sha256:',
+  'headers.get("x-bucephalus-log-stream")).toBe("stderr")',
+  'headers.get("x-bucephalus-artifact-sha256")).toBe("sha256:',
+  'requester: "issuer:user-a"',
+]) {
+  if (!runRoutesTestText.includes(requiredRuntimeByteSubresourceEvidence)) {
+    fail(`${runRoutesTestPath} must cover runtime resource byte subresource identity headers: ${requiredRuntimeByteSubresourceEvidence}`);
+  }
+}
+for (const requiredRuntimeByteReadAuditEvidence of [
+  "appendRuntimeResourceReadAuditEvent",
+  '"runtime.resource.logs.read"',
+  '"runtime.resource.logs.read.failed"',
+  '"runtime.resource.content.read"',
+  '"runtime.resource.content.read.failed"',
+  "runtimeReadAuditError",
+  "error_code: error?.code",
+  "error_status: error?.status",
+  "runtimeResourceReadAttemptId",
+  "runtimeRequestedResourceEventRef",
+  "requester: normalizeOptionalString(input.requester)",
+]) {
+  if (!runtimeRepositoryText.includes(requiredRuntimeByteReadAuditEvidence)) {
+    fail(`${runtimeRepositoryPath} must audit runtime resource log/content reads with requester and object provenance: ${requiredRuntimeByteReadAuditEvidence}`);
+  }
+}
+for (const requiredRuntimeByteReadAuditTestEvidence of [
+  "audits runtime log reads with requester and object provenance",
+  "audits failed runtime log reads with requester and error provenance",
+  "audits runtime artifact content reads with requester and object provenance",
+  "audits failed runtime artifact content reads with requester and error provenance",
+  'eventType: "runtime.resource.logs.read"',
+  'eventType: "runtime.resource.logs.read.failed"',
+  'eventType: "runtime.resource.content.read"',
+  'eventType: "runtime.resource.content.read.failed"',
+  'error_code: "runtime_logs_unavailable"',
+  'error_code: "runtime_resource_content_not_found"',
+  'object_ref: "artifact://sha256/',
+]) {
+  if (!runtimeRepositoryTestText.includes(requiredRuntimeByteReadAuditTestEvidence)) {
+    fail(`${runtimeRepositoryTestPath} must prove runtime resource log/content reads write audit events: ${requiredRuntimeByteReadAuditTestEvidence}`);
+  }
+}
+for (const requiredRuntimeByteReadAuditDocEvidence of [
+  "`runtime.resource.logs.read`",
+  "`runtime.resource.content.read`",
+  "`runtime.resource.logs.read.failed`",
+  "`runtime.resource.content.read.failed`",
+  "requester and object metadata",
+  "error code",
+  "HTTP status",
+]) {
+  if (!cloudCliDocText.includes(requiredRuntimeByteReadAuditDocEvidence)
+    && !publicRuntimeDocTexts.some(([_path, text]) => text.includes(requiredRuntimeByteReadAuditDocEvidence))) {
+    fail(`public runtime docs must describe audited runtime resource byte reads: ${requiredRuntimeByteReadAuditDocEvidence}`);
+  }
+}
+for (const requiredRuntimeQueryReadAuditEvidence of [
+  "appendRuntimeApiResourcesReadAuditEvent",
+  '"runtime.api_resources.read"',
+  '"runtime.api_resources.read.failed"',
+  "api_resources_returned: input.apiResources?.resources.length",
+  "api_resource_kind: input.apiResource?.kind",
+  "selected_kind: normalizeOptionalString(input.selectedKind)",
+  "appendRuntimeResourceQueryReadAuditEvent",
+  '"runtime.resource.list.read"',
+  '"runtime.resource.list.read.failed"',
+  '"runtime.resource.watch.read"',
+  '"runtime.resource.watch.read.failed"',
+  '"runtime.resource.describe.read"',
+  '"runtime.resource.describe.read.failed"',
+  '"runtime.resource.get.read"',
+  '"runtime.resource.status.read"',
+  '"runtime.resource.events.read"',
+  '"runtime.resource.metrics.read"',
+  '"runtime.resource.metrics.list.read"',
+  "resource_filter: runtimeResourceReadAuditFilter(input.input)",
+  "known_resources: runtimeReadAuditKnownResourceCount(input.input)",
+  "watch_events_returned: input.watch?.events.length",
+  "event_resource_version: input.eventList?.metadata.resourceVersion",
+  "metrics_resources_returned: input.metricsList?.summary.resources_returned",
+  "health_ready: input.health?.summary.ready",
+  "function runtimeReadAuditRequested",
+]) {
+  if (!runtimeRepositoryText.includes(requiredRuntimeQueryReadAuditEvidence)) {
+    fail(`${runtimeRepositoryPath} must audit runtime resource query reads with requester, selector, cursor, and returned-version provenance: ${requiredRuntimeQueryReadAuditEvidence}`);
+  }
+}
+for (const requiredRuntimeQueryReadRouteEvidence of [
+  "runtime.apiResources(route.runId, run, { requester })",
+  "runtime.apiResource(route.runId, run, route.resourceKind, { requester })",
+  "...runtimeResourceListInputFromUrl(url),\n        requester,",
+  "...runtimeResourceWatchInputFromUrl(url),\n        requester,",
+  "...runtimeResourceMetricsListInputFromUrl(url),\n        requester,",
+  "runtime.resourceEvents(route.runId, run, {",
+  "runtime.resourceMetrics(route.runId, run, {",
+]) {
+  if (!runsRouteText.includes(requiredRuntimeQueryReadRouteEvidence)) {
+    fail(`${runsRoutePath} must propagate authenticated requester into audited runtime resource reads: ${requiredRuntimeQueryReadRouteEvidence}`);
+  }
+}
+for (const requiredRuntimeQueryReadAuditTestEvidence of [
+  "audits runtime API discovery reads with requester and catalog provenance",
+  "audits failed runtime API discovery reads with requested kind and error provenance",
+  'eventType: "runtime.api_resources.read"',
+  'eventType: "runtime.api_resources.read.failed"',
+  'api_resource_kind: "RunnerInstance"',
+  'selected_kind: "missing-kind"',
+  "audits runtime resource list reads with requester and selector provenance",
+  "audits runtime resource watch reads with cursor provenance",
+  "audits failed runtime resource describe reads with requester and target identity",
+  'eventType: "runtime.resource.list.read"',
+  'eventType: "runtime.resource.watch.read"',
+  'eventType: "runtime.resource.describe.read.failed"',
+  'resource_version_cursor: "sha256:inventory"',
+  'known_resources: 1',
+  'resource_filter: {',
+  'error_code: "runtime_resource_not_found"',
+]) {
+  if (!runtimeRepositoryTestText.includes(requiredRuntimeQueryReadAuditTestEvidence)) {
+    fail(`${runtimeRepositoryTestPath} must prove runtime resource query reads write audit events: ${requiredRuntimeQueryReadAuditTestEvidence}`);
+  }
+}
+for (const requiredRuntimeQueryReadRouteTestEvidence of [
+  "runtime resource API lists repository-backed runner and access resources",
+  "runtime resource watch route forwards cursors and bookmark opt-in",
+  "runtime resource event routes forward continue cursors and filters to repository",
+  'requester: "issuer:user-a"',
+]) {
+  if (!runRoutesTestText.includes(requiredRuntimeQueryReadRouteTestEvidence)) {
+    fail(`${runRoutesTestPath} must prove HTTP runtime resource reads propagate requester into repository calls: ${requiredRuntimeQueryReadRouteTestEvidence}`);
+  }
+}
+for (const requiredRuntimeQueryReadAuditDocEvidence of [
+  "`runtime.api_resources.read`",
+  "`runtime.api_resources.read.failed`",
+  "`runtime.resource.list.read`",
+  "`runtime.resource.watch.read`",
+  "`runtime.resource.describe.read`",
+  "`runtime.resource.metrics.list.read`",
+  "selector and cursor provenance",
+  "resourceVersion, returned counts",
+  "Failure variants keep the same event name plus `.failed`",
+]) {
+  if (!cloudCliDocText.includes(requiredRuntimeQueryReadAuditDocEvidence)
+    && !publicRuntimeDocTexts.some(([_path, text]) => text.includes(requiredRuntimeQueryReadAuditDocEvidence))) {
+    fail(`public runtime docs must describe audited runtime resource query reads: ${requiredRuntimeQueryReadAuditDocEvidence}`);
+  }
+}
+for (const requiredRuntimeInspectAuditEvidence of [
+  "appendRuntimeInspectBundleAuditEvent",
+  '"runtime.inspect.bundle.read"',
+  '"runtime.inspect.bundle.read.failed"',
+  "status: error ? \"failed\" : undefined",
+  "requester: normalizeOptionalString(input.requester)",
+  "resource_ref: runtimeInspectBundleRunResourceRef(input.runId)",
+  "function runtimeInspectBundleRunResourceRef",
+  "inventory_resource_version",
+  "event_resource_version",
+  "log_refs: input.bundle?.log_refs.length",
+  "error_code: error?.code",
+  "error_status: error?.status",
+]) {
+  if (!runtimeRepositoryText.includes(requiredRuntimeInspectAuditEvidence)) {
+    fail(`${runtimeRepositoryPath} must audit runtime inspect bundle reads with requester and cursor provenance: ${requiredRuntimeInspectAuditEvidence}`);
+  }
+}
+for (const requiredRuntimeInspectRouteEvidence of [
+  "runtime.inspectBundle(route.runId, run, {",
+  "...runtimeInspectBundleInputFromUrl(url)",
+  "requester,",
+]) {
+  if (!runsRouteText.includes(requiredRuntimeInspectRouteEvidence)) {
+    fail(`${runsRoutePath} must pass authenticated requester into runtime inspect bundle reads: ${requiredRuntimeInspectRouteEvidence}`);
+  }
+}
+for (const requiredRuntimeInspectAuditTestEvidence of [
+  "runtime inspect route forwards filters, event limit, and requester",
+  "builds runtime inspect bundles with inventory, events, discovery, and log refs",
+  "audits failed runtime inspect bundle reads with requester, filters, and error provenance",
+  "projects inspect bundle audit events onto the run resource",
+  'eventInsertValues).toContain("runtime.inspect.bundle.read")',
+  'eventInsertValues).toContain("runtime.inspect.bundle.read.failed")',
+  'requester: "issuer:user-a"',
+  'kind: "Run"',
+  'name: "run-1"',
+  "inventory_resource_version",
+  "event_resource_version",
+  'error_code: "runtime_inventory_unavailable"',
+  "log_refs: 4",
+]) {
+  if (!runRoutesTestText.includes(requiredRuntimeInspectAuditTestEvidence)
+    && !runtimeRepositoryTestText.includes(requiredRuntimeInspectAuditTestEvidence)) {
+    fail(`runtime inspect bundle tests must prove requester propagation and audit payload provenance: ${requiredRuntimeInspectAuditTestEvidence}`);
+  }
+}
+for (const requiredRuntimeInspectAuditDocEvidence of [
+  "`runtime.inspect.bundle.read`",
+  "`runtime.inspect.bundle.read.failed`",
+  "`Run/<run-id>` resource ref",
+  "resource versions, returned counts",
+  "log-reference count",
+  "error code",
+  "HTTP status",
+]) {
+  if (!publicRuntimeDocTexts.some(([_path, text]) => text.includes(requiredRuntimeInspectAuditDocEvidence))) {
+    fail(`public runtime docs must describe audited runtime inspect bundle reads: ${requiredRuntimeInspectAuditDocEvidence}`);
+  }
+}
+for (const requiredRuntimeInspectAuditOpenApiEvidence of [
+  "`runtime.api_resources.read` / `runtime.api_resources.read.failed`",
+  "`runtime.inspect.bundle.read` / `runtime.inspect.bundle.read.failed`",
+  "`runtime.api_resources.read` payloads retain the requester",
+  "`runtime.api_resources.read.failed`",
+  "`runtime.inspect.bundle.read` payloads retain the requester",
+  "`runtime.inspect.bundle.read.failed`",
+  "`Run/<run_id>` resource ref",
+  "inventory and event resourceVersion cursors",
+  "health and metrics summaries, and log-reference count",
+]) {
+  if (!runsOpenApiText.includes(requiredRuntimeInspectAuditOpenApiEvidence)) {
+    fail(`${runsOpenApiPath} must document runtime inspect bundle read audit event filters and payload provenance: ${requiredRuntimeInspectAuditOpenApiEvidence}`);
+  }
+}
+for (const requiredRuntimeInspectAuditValidatorEvidence of [
+  'assertOperationParameterDescriptionIncludes(document, path, "get", "event_type", "runtime.api_resources.read")',
+  'assertOperationParameterDescriptionIncludes(document, path, "get", "event_type", "runtime.api_resources.read.failed")',
+  'assertOperationParameterDescriptionIncludes(document, path, "get", "event_type", "runtime.inspect.bundle.read")',
+  'assertOperationParameterDescriptionIncludes(document, path, "get", "event_type", "runtime.inspect.bundle.read.failed")',
+  'assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "runtime.api_resources.read")',
+  'assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "runtime.api_resources.read.failed")',
+  'assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "runtime.inspect.bundle.read")',
+  'assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "runtime.inspect.bundle.read.failed")',
+  'assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "Run/<run_id>")',
+  'assertSchemaPropertyDescriptionIncludes(runtimeEvent, "payload", "RuntimeEvent", "log-reference count")',
+]) {
+  if (!validateOpenApiText.includes(requiredRuntimeInspectAuditValidatorEvidence)) {
+    fail(`${validateOpenApiPath} must validate runtime inspect bundle read audit OpenAPI contract: ${requiredRuntimeInspectAuditValidatorEvidence}`);
+  }
+}
+for (const requiredRuntimeOperationReviewAuditEvidence of [
+  "appendRuntimeOperationReviewAuditEvent",
+  '"runtime.resource.operation.reviewed"',
+  '"runtime.resource.operation.review.failed"',
+  "operation: review?.operation",
+  "matched_operation: review?.matched_operation",
+  "supported: review?.supported",
+  "resource_version: review?.resource_version",
+]) {
+  if (!runtimeRepositoryText.includes(requiredRuntimeOperationReviewAuditEvidence)) {
+    fail(`${runtimeRepositoryPath} must audit runtime operation reviews and failed preflights: ${requiredRuntimeOperationReviewAuditEvidence}`);
+  }
+}
+for (const requiredRuntimeOperationReviewAuditTestEvidence of [
+  "audits runtime operation reviews with requester and decision provenance",
+  "audits failed runtime operation reviews with requester and error provenance",
+  'eventType: "runtime.resource.operation.reviewed"',
+  'eventType: "runtime.resource.operation.review.failed"',
+  'operation: "audit"',
+  'error_code: "runtime_resource_not_found"',
+]) {
+  if (!runtimeRepositoryTestText.includes(requiredRuntimeOperationReviewAuditTestEvidence)) {
+    fail(`${runtimeRepositoryTestPath} must prove operation reviews write audit events: ${requiredRuntimeOperationReviewAuditTestEvidence}`);
+  }
+}
+for (const requiredRuntimeEventRefEvidence of [
+  "runtimeEventResourceRefFromObject(isRecord(event.payload.resolved_target) ? event.payload.resolved_target : null)",
+  "trial-container-uid-1",
+  "resolved_target",
+]) {
+  if (!runtimeRepositoryText.includes(requiredRuntimeEventRefEvidence)
+    && !runtimeRepositoryTestText.includes(requiredRuntimeEventRefEvidence)) {
+    fail(`runtime event resource refs must include resolved access targets for per-resource event views: ${requiredRuntimeEventRefEvidence}`);
+  }
+}
+for (const [path, text, requiredRuntimeEventSelectorDiscoveryEvidence] of [
+  [runtimeRepositoryPath, runtimeRepositoryText, "RUNTIME_RESOURCE_FIELD_SELECTOR_EXTRAS"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "runtimeApiResourceFieldSelectors(kind)"],
+  [runtimeRepositoryPath, runtimeRepositoryText, '"spec.involved_object.kind"'],
+  [runtimeRepositoryPath, runtimeRepositoryText, '"status.involved_uid"'],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, '"status.involved_count"'],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, '"spec.involved_object.kind=PortForward,spec.involved_object.name=pf-1"'],
+]) {
+  if (!text.includes(requiredRuntimeEventSelectorDiscoveryEvidence)) {
+    fail(`${path} must advertise and test Event involved-object field selectors for per-resource audit/event views: ${requiredRuntimeEventSelectorDiscoveryEvidence}`);
+  }
+}
+for (const requiredRuntimeOperationReviewAuditDocEvidence of [
+  "`runtime.resource.operation.reviewed`",
+  "`runtime.resource.operation.review.failed`",
+]) {
+  if (!publicRuntimeDocTexts.some(([_path, text]) => text.includes(requiredRuntimeOperationReviewAuditDocEvidence))) {
+    fail(`public runtime docs must describe audited runtime operation reviews: ${requiredRuntimeOperationReviewAuditDocEvidence}`);
+  }
+}
+for (const requiredRuntimeWaitCliEvidence of [
+  "RuntimeWaitPredicate::Delete",
+  "buc runs wait <run-id> <Kind/name> [--for condition=Ready[=True]|phase=completed|delete]",
+  "runtime_deletion_timestamp",
+  "runtime_wait_latest_status_summary",
+  "runs_wait_for_delete_treats_404_as_success",
+  "runs_wait_for_delete_treats_deletion_timestamp_as_success",
+  "runs_wait_terminal_failure_surfaces_latest_status_evidence",
+  "generation=9/7 freshness=stale",
+]) {
+  if (!hostedCliText.includes(requiredRuntimeWaitCliEvidence)) {
+    fail(`${hostedCliPath} must expose Kubernetes-style runtime wait deletion and failure observability semantics: ${requiredRuntimeWaitCliEvidence}`);
+  }
+}
+for (const requiredRuntimeEventCliEvidence of [
+  "buc runs events <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]",
+  "buc runs audit <run-id> [Kind/name] [--limit N] [--after-row-seq N] [--continue TOKEN] [--event-type TYPE] [--source SOURCE] [--resource-kind KIND] [--resource-name NAME] [--trial-id ID] [--task-id ID] [--follow] [--interval-seconds N] [--max-polls N] [--json]",
+  'for event_type in option_values(args, "--event-type")?',
+  'for source in option_values(args, "--source")?',
+  "runs_events_forwards_repeated_filter_options",
+  "runs_events_follow_uses_event_cursors",
+  "runs_audit_filter_covers_runner_lifecycle_and_access_events",
+  "runtime.resource.operation.reviewed",
+  "runtime.resource.operation.review.failed",
+  "runtime_events_summary_surfaces_operation_review_audit_metadata",
+  "operation=audit",
+  "matched=audit",
+  "runtime.api_resources.read",
+  "runtime.api_resources.read.failed",
+  "runtime_events_summary_surfaces_api_resources_read_audit_metadata",
+  "runtime_event_is_api_resources_read",
+  "api_resources=37",
+  "api_kind=RunnerInstance",
+  "runtime.resource.list.read",
+  "runtime.resource.list.read.failed",
+  "runtime.resource.watch.read",
+  "runtime.resource.watch.read.failed",
+  "runtime.resource.describe.read",
+  "runtime.resource.describe.read.failed",
+  "runtime.resource.metrics.list.read",
+  "runtime.resource.metrics.list.read.failed",
+  "runtime_events_summary_surfaces_resource_query_read_audit_metadata",
+  "runtime_event_is_resource_query_read",
+  "cursor-rv=sha256:previous",
+  "watch_events=1",
+  "runtime.inspect.bundle.read",
+  "runtime.inspect.bundle.read.failed",
+  "runtime_events_summary_surfaces_inspect_bundle_read_audit_metadata",
+  "resource=Run/run-1",
+  "inventory-rv=sha256:inspect-inventory",
+  "event-rv=event-row-seq:42",
+  "metrics_resources=8/10",
+  "log_refs=6",
+  "error=runtime_inventory_unavailable",
+  "catalog read, resource read, inspect-bundle read",
+  "runtime.resource.logs.read",
+  "runtime.resource.logs.read.failed",
+  "runtime.resource.content.read",
+  "runtime.resource.content.read.failed",
+  "runtime_events_summary_surfaces_raw_byte_read_audit_metadata",
+  "object=artifact://sha256/",
+  "bytes=14",
+  "media=text/plain; charset=utf-8",
+  "error=runtime_resource_content_not_found",
+  "http=404",
+  "raw-byte read audit events",
+  "runtime_events_follow_cursor",
+  "--follow cannot be combined with --json",
+  "runtime_events_summary_surfaces_follow_cursors",
+  "runtime_events_summary_lines",
+  "connection.exit_code",
+  "exit=0",
+  "runtime_event_exec_stream_summary",
+  "connection.{stream}_bytes",
+  "connection.{stream}_tail_bytes",
+  "connection.{stream}_tail_truncated",
+  "stdout=bytes=20000,tail=16000,truncated=true",
+  "stderr=bytes=5,tail=5,truncated=false",
+  "resource_version: {resource_version}",
+  "next_after_row_seq",
+]) {
+  if (!hostedCliText.includes(requiredRuntimeEventCliEvidence)) {
+    fail(`${hostedCliPath} must expose runtime event/audit observability filters and repeated event/source values: ${requiredRuntimeEventCliEvidence}`);
+  }
+}
+if (!hostedCliText.includes('"runtime.access.port_forward.completed,"')) {
+  fail(`${hostedCliPath} must include runtime.access.port_forward.completed in default audit filters for clean PortForward closeout`);
+}
+for (const requiredWorkerInfraAuditFilter of [
+  '"worker.runtime.image_pull.pulling,"',
+  '"worker.runtime.image_pull.pulled,"',
+  '"worker.runtime.image_pull.failed,"',
+  '"worker.runtime.secret_binding.materialized,"',
+  '"worker.runtime.sidecar_requirement.checking,"',
+  '"worker.runtime.sidecar_requirement.available,"',
+  '"worker.runtime.sidecar_requirement.failed,"',
+  '"worker.runtime.accelerator_requirement.checking,"',
+  '"worker.runtime.accelerator_requirement.available,"',
+  '"worker.runtime.accelerator_requirement.failed,"',
+  '"worker.runtime.network_perimeter.applying,"',
+  '"worker.runtime.network_perimeter.applied,"',
+  '"worker.runtime.network_perimeter.failed,"',
+]) {
+  if (!hostedCliText.includes(requiredWorkerInfraAuditFilter)) {
+    fail(`${hostedCliPath} must include worker-observed infra lifecycle events in default audit filters: ${requiredWorkerInfraAuditFilter}`);
+  }
+}
+if (hostedCliText.includes('PortForward has no completed API transition; attach cleanup emits cancelled/delete lifecycle instead')) {
+  fail(`${hostedCliPath} must not preserve the old cancelled/delete-only PortForward lifecycle guard`);
+}
+for (const requiredRuntimeCanIObservabilityEvidence of [
+  "runs_can_i_reviews_observability_operations",
+  "can_i_summary_prints_reviewed_command_and_resource_version",
+  "runtime_review_command_with_resource_version",
+  "generated_at: {generated_at}",
+  "core_run_ids: {}",
+  "review: verb=create subresource=exec requires_running_run=true generation=12/12",
+  "--resource-version sha256:reviewed -- COMMAND",
+  "buc runs can-i <run-id> top TrialContainer/<container-name>",
+  "buc runs can-i <run-id> audit RunnerInstance/<runner-name>",
+  "buc runs can-i <run-id> logs/stdout TrialContainer/<container-name>",
+  "buc runs can-i <run-id> logs/stderr TrialContainer/<container-name>",
+  "buc runs can-i <run-id> content TrialArtifact/<artifact-name>",
+  "buc runs can-i <run-id> cancel Exec/<exec-name>",
+  "/v1/runs/run%2D1/runtime/resources/TrialContainer/trial%2D1%2Eagent%2Econtainer%2D1/operations/top",
+  "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/operations/audit",
+  "/v1/runs/run%2D1/runtime/resources/TrialContainer/trial%2D1%2Eagent%2Econtainer%2D1/operations/logs%2Fstdout",
+  "/v1/runs/run%2D1/runtime/resources/TrialContainer/trial%2D1%2Eagent%2Econtainer%2D1/operations/logs%2Fstderr",
+  "/v1/runs/run%2D1/runtime/resources/TrialArtifact/trial%2D1%2Eagent%2Dresult%2Esha256%2Dbbbbbbbb/operations/content",
+  "buc runs logs run-1 TrialContainer/trial-1.agent.container-1 --stream stdout --metadata-out FILE.metadata.json",
+  "buc runs logs run-1 TrialContainer/trial-1.agent.container-1 --stream stderr --metadata-out FILE.metadata.json",
+  "buc runs content run-1 TrialArtifact/trial-1.agent-result.sha256-bbbbbbbb --out FILE --metadata-out FILE.metadata.json",
+  "runs_can_i_reviews_runtime_access_cancel_operation",
+  "/v1/runs/run%2D1/runtime/resources/Exec/exec%2D1/operations/cancel",
+  "buc runs cancel run-1 Exec/exec-1 --resource-version sha256:exec-cancel-review",
+]) {
+  if (!hostedCliText.includes(requiredRuntimeCanIObservabilityEvidence)) {
+    fail(`${hostedCliPath} must prove can-i reviews runtime observability operations through operation review: ${requiredRuntimeCanIObservabilityEvidence}`);
+  }
+}
+for (const requiredRuntimeMultiKindRouteEvidence of [
+  "kind=RunnerInstance,Trial",
+  'kinds: ["RunnerInstance", "Trial"]',
+]) {
+  if (!runRoutesTestText.includes(requiredRuntimeMultiKindRouteEvidence)) {
+    fail(`runtime resource routes must preserve comma-separated kind selectors for get-first CLI usage: ${requiredRuntimeMultiKindRouteEvidence}`);
+  }
+}
+for (const requiredRuntimeDiscoveryGetEvidence of [
+  "command: `buc runs get {run_id} ${kind}`",
+  "command: `buc runs get {run_id} ${kind} --output name`",
+  "command: `buc runs top {run_id} --kind ${kind}`",
+  "command: `buc runs get {run_id} ${target}`",
+  "command: `buc runs wait {run_id} ${target} --for condition=Ready`",
+  "command: `buc runs wait {run_id} ${target} --for delete`",
+  "command: `buc runs audit {run_id} ${target}`",
+  "command: `buc runs logs {run_id} ${target} --stream stdout --metadata-out FILE.metadata.json`",
+  "command: `buc runs logs {run_id} ${target} --stream stderr --metadata-out FILE.metadata.json`",
+  "command: `buc runs content {run_id} ${target} --out FILE --metadata-out FILE.metadata.json`",
+  'if (purpose === "top") return "metrics"',
+  'if (purpose === "audit") return "events"',
+  'if (purpose === "list" || purpose === "list/name") return "list"',
+  'if (purpose === "wait" || purpose === "wait/delete") return "status"',
+]) {
+  if (!runtimeRepositoryText.includes(requiredRuntimeDiscoveryGetEvidence)) {
+    fail(`${runtimeRepositoryPath} runtime API discovery must advertise get-first and wait-first runtime resource commands: ${requiredRuntimeDiscoveryGetEvidence}`);
+  }
+}
+if (!runsOpenApiText.includes("Operation label such as describe, list/name, wait, top, metrics, events, audit, logs") || !runsOpenApiText.includes("status-subresource wait checks")) {
+  fail(`${runsOpenApiPath} runtime operation review must document wait/top/audit observability operation labels`);
+}
+for (const requiredRuntimeOperationRouteEvidence of [
+  "decodes slash-qualified runtime operation review names as one path segment",
+  "logs%2Fstdout",
+  'operation: "logs/stdout"',
+]) {
+  if (!runRoutesTestText.includes(requiredRuntimeOperationRouteEvidence)) {
+    fail(`runtime operation review routes must preserve encoded slash-qualified operation labels: ${requiredRuntimeOperationRouteEvidence}`);
+  }
+}
+const retiredRequiresActiveRunField = "requires_" + "active_run";
+for (const [path, text] of [
+  [runsOpenApiPath, runsOpenApiText],
+  [runtimeRepositoryPath, runtimeRepositoryText],
+  [validateOpenApiPath, validateOpenApiText],
+  [runRoutesTestPath, runRoutesTestText],
+  [runtimeRepositoryTestPath, runtimeRepositoryTestText],
+  [hostedCliPath, hostedCliText],
+]) {
+  if (text.includes(retiredRequiresActiveRunField)) {
+    fail(`${path} must not preserve retired runtime operation field ${retiredRequiresActiveRunField}; use requires_running_run only`);
+  }
+}
+if (runtimeRepositoryText.includes("runtimeResourceOperationRequiresActiveRun")) {
+  fail(`${runtimeRepositoryPath} must name operation running-run predicates after requires_running_run, not active-run compatibility vocabulary`);
+}
+for (const requiredRuntimeOperationReviewValidatorEvidence of [
+  'assertSchemaRequired(document, "RuntimeResourceOperationReview", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids"',
+  '"requires_running_run"])',
+  "RuntimeResourceOperationReview.generated_at must be a date-time string",
+  "RuntimeResourceOperationReview.core_run_ids must be an array",
+  "RuntimeResourceOperationReview.core_run_ids items must be strings",
+  'assertSchemaPropertyRef(runtimeResourceOperationReview, "resource_ref", "RuntimeResourceOperationReview", "#/components/schemas/RuntimeResourceWatchRef")',
+]) {
+  if (!validateOpenApiText.includes(requiredRuntimeOperationReviewValidatorEvidence)) {
+    fail(`${validateOpenApiPath} must validate timestamped runtime operation review identity: ${requiredRuntimeOperationReviewValidatorEvidence}`);
+  }
+}
+for (const requiredRuntimeDescribeValidatorEvidence of [
+  'assertSchemaRequired(document, "RuntimeResourceDescribe", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids"',
+  'assertSchemaPropertyRef(runtimeResourceDescribe, "cloud_run_id", "RuntimeResourceDescribe", "#/components/schemas/CloudRunId")',
+  "RuntimeResourceDescribe.generated_at must be a date-time string",
+  "RuntimeResourceDescribe.core_run_ids must be an array",
+  "RuntimeResourceDescribe.core_run_ids items must be strings",
+  "RuntimeResourceDescribe.event_list must use RuntimeResourceEventList",
+]) {
+  if (!validateOpenApiText.includes(requiredRuntimeDescribeValidatorEvidence)) {
+    fail(`${validateOpenApiPath} must validate timestamped runtime describe identity: ${requiredRuntimeDescribeValidatorEvidence}`);
+  }
+}
+for (const requiredRuntimeStatusValidatorEvidence of [
+  'assertSchemaRequired(document, "RuntimeResourceStatus", ["apiVersion", "kind", "cloud_run_id", "generated_at", "core_run_ids"',
+  "RuntimeResourceStatus.generated_at must be a date-time string",
+  "RuntimeResourceStatus.core_run_ids must be an array",
+  "RuntimeResourceStatus.core_run_ids items must be strings",
+  'assertSchemaPropertyRef(status, "resource_ref", "RuntimeResourceStatus", "#/components/schemas/RuntimeResourceWatchRef")',
+]) {
+  if (!validateOpenApiText.includes(requiredRuntimeStatusValidatorEvidence)) {
+    fail(`${validateOpenApiPath} must validate timestamped runtime status identity: ${requiredRuntimeStatusValidatorEvidence}`);
+  }
+}
+for (const requiredRuntimeStatusCliEvidence of [
+  "runtime_resource_status_summary_surfaces_freshness_conditions_actions_and_audit",
+  "generated_at: {generated_at}",
+  "generated_at: 2026-06-19T12:00:01Z",
+]) {
+  if (!hostedCliText.includes(requiredRuntimeStatusCliEvidence)) {
+    fail(`${hostedCliPath} must render timestamped runtime status snapshots: ${requiredRuntimeStatusCliEvidence}`);
+  }
+}
+for (const requiredRuntimeRunIdentityEvidence of [
+  "runtime_subresource_commands_reject_mismatched_cloud_run_ids",
+  "runtime response run id mismatch: requested run-1, API returned run-2",
+]) {
+  if (!hostedCliText.includes(requiredRuntimeRunIdentityEvidence)) {
+    fail(`${hostedCliPath} must reject mismatched run-scoped runtime subresource responses before rendering operator evidence: ${requiredRuntimeRunIdentityEvidence}`);
+  }
+}
+for (const requiredRuntimeHealthFreshnessField of [
+  "observed_resources",
+  "observed_current",
+  "observed_stale",
+  "observed_unknown",
+]) {
+  if (!runsOpenApiText.includes(requiredRuntimeHealthFreshnessField)) {
+    fail(`${runsOpenApiPath} RuntimeResourceHealthSummary must expose observed-generation freshness field: ${requiredRuntimeHealthFreshnessField}`);
+  }
+  if (!validateOpenApiText.includes(requiredRuntimeHealthFreshnessField)) {
+    fail(`${validateOpenApiPath} must require RuntimeResourceHealthSummary freshness field: ${requiredRuntimeHealthFreshnessField}`);
+  }
+}
+const deleteRuntimeResourceOpenApi = runsOpenApiText.split("operationId: deleteRunRuntimeResource", 2)[1]?.split("\n  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/status:", 1)[0] ?? "";
+const deleteKindParameterOpenApi = deleteRuntimeResourceOpenApi.split("- name: kind", 2)[1]?.split("- name: name", 1)[0] ?? "";
+if (deleteKindParameterOpenApi.includes("enum:")) {
+  fail(`${runsOpenApiPath} runtime DELETE kind parameter must accept runtime API aliases such as pf/execs, not only canonical PortForward/Exec enums`);
+}
+for (const forbiddenRuntimeDiscoveryReadCommand of [
+  "command: `buc runs resources {run_id} --kind ${kind}`",
+  "command: `buc runs describe {run_id} ${target} --view resource`",
+]) {
+  if (runtimeRepositoryText.includes(forbiddenRuntimeDiscoveryReadCommand)) {
+    fail(`${runtimeRepositoryPath} runtime API discovery must not advertise stale resource read command: ${forbiddenRuntimeDiscoveryReadCommand}`);
+  }
+}
+for (const requiredRuntimeDiscoveryGetTestEvidence of [
+  "buc runs get {run_id} Trial",
+  "buc runs top {run_id} --kind Trial",
+  "buc runs get {run_id} Trial/{name}",
+  "buc runs wait {run_id} Trial/{name} --for condition=Ready",
+  "buc runs audit {run_id} Trial/{name}",
+  "matched_operation: \"wait\"",
+  "matched_operation: \"top\"",
+  "matched_operation: \"audit\"",
+  "matched_operation: \"logs/stdout\"",
+  "matched_operation: \"content\"",
+  "buc runs logs run-1 TrialContainer/trial-1.agent.container-1 --stream stdout --metadata-out FILE.metadata.json",
+  "buc runs content run-1 TrialArtifact/trial-1.agent-result.sha256-aaaaaaaa --out FILE --metadata-out FILE.metadata.json",
+]) {
+  if (!runtimeRepositoryTestText.includes(requiredRuntimeDiscoveryGetTestEvidence)) {
+    fail(`${runtimeRepositoryTestPath} must cover get-first runtime API discovery commands: ${requiredRuntimeDiscoveryGetTestEvidence}`);
+  }
+}
+for (const requiredRuntimeReviewPreconditionEvidence of [
+  "runtimeResourceCommandWithVersionPrecondition",
+  "runtimeResourceOperationAcceptsVersionPrecondition",
+  "runtimeResourceOperationReadOnlyPurpose",
+  "requires_running_run: runtimeResourceOperationRequiresRunningRun",
+  "requires_running_run: matched.requires_running_run",
+  "operation_support_unimplemented",
+  "operation: string,",
+  "{ required: true, operation }",
+  "shellQuoteCliToken",
+]) {
+  if (!runtimeRepositoryText.includes(requiredRuntimeReviewPreconditionEvidence)) {
+    fail(`${runtimeRepositoryPath} must explicitly review advertised runtime operations and materialize resource-version preconditions: ${requiredRuntimeReviewPreconditionEvidence}`);
+  }
+}
+if (!runtimeRepositoryText.includes("case \"Run\":\n      if (phase !== \"running\")")) {
+  fail(`${runtimeRepositoryPath} must require Run resources to be running before advertising reachable runtime access, matching operation review`);
+}
+if (runtimeRepositoryText.includes("case \"Run\":\n      if (phase !== \"running\" && phase !== \"active\")")) {
+  fail(`${runtimeRepositoryPath} must not mark active Run resources reachable for runtime access when hosted Cloud operation review requires running`);
+}
+if (!runtimeRepositoryTestText.includes("Run/run-active is not currently reachable for runtime access: phase is active")) {
+  fail(`${runtimeRepositoryTestPath} must prove active Run resources are not reachable runtime access targets`);
+}
+for (const requiredRuntimeAccessCreatePreconditionEvidence of [
+  "}, \"port-forward\");",
+  "}, \"exec\");",
+]) {
+  if (!runtimeRepositoryText.includes(requiredRuntimeAccessCreatePreconditionEvidence)) {
+    fail(`${runtimeRepositoryPath} must pass concrete runtime access create operations into resource-version preconditions: ${requiredRuntimeAccessCreatePreconditionEvidence}`);
+  }
+}
+for (const requiredRuntimeDiscoveryPreconditionEvidence of [
+  "buc runs port-forward {run_id} ${target} --target-port PORT --local-port PORT --attach --resource-version <metadata.resourceVersion>",
+  "buc runs exec {run_id} ${target} --resource-version <metadata.resourceVersion> -- COMMAND [ARG...]",
+  "buc runs delete {run_id} ${target} --resource-version <metadata.resourceVersion>",
+  "buc runs ${action} {run_id} ${target} --resource-version <metadata.resourceVersion>",
+]) {
+  if (!runtimeRepositoryText.includes(requiredRuntimeDiscoveryPreconditionEvidence)) {
+    fail(`${runtimeRepositoryPath} runtime API discovery must not advertise mutating commands without resource-version preconditions: ${requiredRuntimeDiscoveryPreconditionEvidence}`);
+  }
+  if (!runtimeRepositoryTestText.includes(requiredRuntimeDiscoveryPreconditionEvidence.replace("${target}", "RunnerInstance/{name}"))
+    && !runtimeRepositoryTestText.includes(requiredRuntimeDiscoveryPreconditionEvidence.replace("${target}", "Trial/{name}"))
+    && !runtimeRepositoryTestText.includes(requiredRuntimeDiscoveryPreconditionEvidence.replace("${target}", "PortForward/{name}"))
+    && !runtimeRepositoryTestText.includes(requiredRuntimeDiscoveryPreconditionEvidence.replace("${action}", "cordon").replace("${target}", "RunnerInstance/{name}"))) {
+    fail(`${runtimeRepositoryTestPath} must cover runtime API discovery resource-version precondition example: ${requiredRuntimeDiscoveryPreconditionEvidence}`);
+  }
+}
+for (const requiredRuntimeReviewPreconditionTestEvidence of [
+  "reviews runner lifecycle commands with resource version preconditions",
+  "requires reviewed resource versions before mutating runtime resources",
+  "buc runs exec run-1 TrialContainer/trial-1.agent.container-1 --resource-version",
+  "buc runs delete run-1 PortForward/pf-failed --resource-version",
+  "buc runs cancel run-1 Exec/exec-completed --resource-version",
+  "operation: \"port-forward\"",
+  "operation: \"exec\"",
+  "matched_operation: \"cancel\"",
+]) {
+  if (!runtimeRepositoryTestText.includes(requiredRuntimeReviewPreconditionTestEvidence)) {
+    fail("runtime repository tests must cover reviewed runtime operation command resource-version preconditions: " + requiredRuntimeReviewPreconditionTestEvidence);
+  }
+}
+for (const requiredHostedCliExplainEvidence of [
+  "runtime_api_resources_summary_surfaces_operator_catalog_fields",
+  "generated_at",
+  "core_run_ids",
+  "categories=runner,access-target",
+  "subresources=status,events,metrics,logs,actions/cordon",
+  "selectors=label,field",
+  "runtime_api_resource_explain_surfaces_subresource_path_templates",
+  "subresource/actions/cordon",
+  "subresource/logs",
+  "subresource/status",
+  "runtime_inspect_summary_surfaces_bundle_observability",
+  "inventory_resource_version",
+  "health: total=3 ready=1 degraded=1 problem=1",
+  "event_resource_version",
+  "log_ref: RunnerInstance/runner-1 streams=stdout,stderr",
+]) {
+  if (!hostedCliText.includes(requiredHostedCliExplainEvidence)) {
+    fail(`${hostedCliPath} discovery/inspect output must expose runtime catalog, subresource endpoints, and support-bundle evidence: ${requiredHostedCliExplainEvidence}`);
+  }
+}
+for (const requiredHostedCliDescribeEvidence of [
+  "runtime_resource_summary_surfaces_precondition_metadata",
+  "runtime_resource_summary_surfaces_related_event_rows",
+  "generated_at: 2026-06-18T00:00:00Z",
+  "core_run_ids: core-run-1,core-run-2",
+  "event_resource_version: event-row-seq:41",
+  "event: row=40 runtime.resource.operation.reviewed",
+  "event: row=41 runtime.access.port_forward.completed",
+  "runtime_resource_operation_summary_line",
+  "operation: cordon supported=yes verb=update subresource=actions action=cordon requires_running_run=false",
+  "operation: exec supported=no verb=create subresource=exec reason=run_not_running message='exec requires a running Cloud run' requires_running_run=true",
+  "command='buc runs exec run-1 RunnerInstance/runner-1 --resource-version <metadata.resourceVersion> -- COMMAND [ARG...]'",
+]) {
+  if (!hostedCliText.includes(requiredHostedCliDescribeEvidence)) {
+    fail(`${hostedCliPath} describe output must expose timestamped runtime describe identity and related event audit rows: ${requiredHostedCliDescribeEvidence}`);
+  }
+}
+for (const forbiddenHostedCliDescribeEvidence of [
+  `operation: cordon supported=yes verb=update subresource=actions action=cordon ${retiredRequiresActiveRunField}=false`,
+  `operation: exec supported=no verb=create subresource=exec reason=run_not_running message='exec requires a running Cloud run' ${retiredRequiresActiveRunField}=true`,
+  `review: verb=create subresource=exec ${retiredRequiresActiveRunField}=true`,
+]) {
+  if (hostedCliText.includes(forbiddenHostedCliDescribeEvidence)) {
+    fail(`${hostedCliPath} user-facing runtime summaries must say requires_running_run, not ${retiredRequiresActiveRunField}: ${forbiddenHostedCliDescribeEvidence}`);
+  }
+}
+for (const retiredTuiFile of [
+  "rust/crates/lab-cli/src/tui.rs",
+  "rust/crates/lab-cli/src/view_layout.rs",
+]) {
+  if (labCliSrcFiles.includes(retiredTuiFile)) {
+    fail(`${retiredTuiFile} must stay removed; Cloud/runtime inspection must use scriptable resource views, not an alternate-screen TUI`);
+  }
+}
+for (const forbiddenTuiSource of [
+  "mod tui",
+  "mod view_layout",
+  "tui::",
+  "view_layout::",
+  "use crate::tui",
+  "use crate::view_layout",
+  "run_views_browser",
+  "run_interactive_views_browser",
+  "interactive TUI",
+  "TUI view browser",
+]) {
+  for (const [sourcePath, sourceText] of labCliRuntimeSourceTexts) {
+    if (sourceText.includes(forbiddenTuiSource)) {
+      fail(`${sourcePath} must not retain retired TUI source path: ${forbiddenTuiSource}`);
+    }
+  }
+}
+for (const requiredRetiredTuiRegressionEvidence of [
+  "scriptable_view_commands_require_run_positionals_without_tui_fallback",
+  "views-live command must stay removed",
+  "global_help_does_not_advertise_retired_tui_surfaces",
+  "mcp_dispatch_tools_do_not_advertise_browser_or_tui_surfaces",
+]) {
+  if (!coreCliText.includes(requiredRetiredTuiRegressionEvidence)) {
+    fail(`core CLI tests must keep retired TUI/live-view surfaces out of user-facing command paths: ${requiredRetiredTuiRegressionEvidence}`);
+  }
+}
+for (const forbiddenLiveViewSource of [
+  "ViewsLive",
+  "views-live",
+  "write_dispatch_live_view",
+  "paths.live_view",
+  "\"live_view\"",
+  "live.html",
+  "live state views",
+  "build_live_scoreboard_table",
+]) {
+  for (const [sourcePath, sourceText] of labCliRuntimeSourceTexts) {
+    if (sourceText.includes(forbiddenLiveViewSource)) {
+      fail(`${sourcePath} must not retain retired live view command path: ${forbiddenLiveViewSource}`);
+    }
+  }
+}
+for (const forbiddenTuiDependency of ["crossterm", "ratatui"]) {
+  if (rootCargoTomlText.includes(forbiddenTuiDependency) || labCliCargoTomlText.includes(forbiddenTuiDependency)) {
+    fail(`retired TUI dependency must not be declared: ${forbiddenTuiDependency}`);
+  }
+  if (cargoLockText.includes(`name = "${forbiddenTuiDependency}"`)) {
+    fail(`retired TUI dependency must not be locked: ${forbiddenTuiDependency}`);
+  }
+}
+for (const [docPath, docText] of publicRuntimeDocTexts) {
+  for (const forbiddenPublicTuiSurface of [
+    "views-live",
+    "paths.live_view",
+    "live.html",
+    "interactive TUI",
+    "TUI view browser",
+    "alternate-screen TUI",
+    "ratatui",
+    "crossterm",
+  ]) {
+    if (docText.includes(forbiddenPublicTuiSurface)) {
+      fail(`${docPath} must not document retired TUI/live-view runtime inspection surface: ${forbiddenPublicTuiSurface}`);
+    }
+  }
+}
 for (const requiredEnv of [
   "BUCEPHALUS_TERRAFORM_BACKEND_BUCKET",
   "BUCEPHALUS_TERRAFORM_BACKEND_PREFIX",
@@ -410,6 +1728,46 @@ if (
 }
 if (deployWorkflowText.includes("-target=google_cloud_run_v2_job.migrations")) {
   fail(`${deployWorkflowPath} must not use targeted Terraform applies for normal deploy flow`);
+}
+const migrationsByPrefix = new Map();
+for (const migrationPath of migrationPaths) {
+  const migrationName = migrationPath.split("/").pop() ?? migrationPath;
+  const prefix = migrationName.match(/^(\d{4})_/)?.[1];
+  if (!prefix) {
+    fail(`${migrationPath} must start with a four-digit migration sequence prefix`);
+    continue;
+  }
+  migrationsByPrefix.set(prefix, [...(migrationsByPrefix.get(prefix) ?? []), migrationName]);
+}
+for (const [prefix, names] of migrationsByPrefix.entries()) {
+  if (names.length > 1) {
+    fail(`Cloud SQL migrations must not share numeric prefix ${prefix}: ${names.join(", ")}`);
+  }
+}
+for (const requiredRuntimeMigration of [
+  "0023_runtime_access_requests.sql",
+  "0024_runner_instance_cordoned.sql",
+]) {
+  if (!migrationPaths.some((path) => path.endsWith(`/${requiredRuntimeMigration}`))) {
+    fail(`runtime resource migration must be sequenced after existing released migrations: ${requiredRuntimeMigration}`);
+  }
+}
+for (const staleRuntimeMigration of [
+  "0018_runtime_access_requests.sql",
+  "0019_runner_instance_cordoned.sql",
+]) {
+  if (migrationPaths.some((path) => path.endsWith(`/${staleRuntimeMigration}`))) {
+    fail(`runtime resource migration uses a stale duplicate sequence prefix: ${staleRuntimeMigration}`);
+  }
+}
+for (const requiredMigrationAliasEvidence of [
+  '"0023_runtime_access_requests.sql": ["0018_runtime_access_requests.sql"]',
+  '"0024_runner_instance_cordoned.sql": ["0019_runner_instance_cordoned.sql"]',
+  "migration already applied via alias",
+]) {
+  if (!migrationRunnerText.includes(requiredMigrationAliasEvidence)) {
+    fail(`${migrationRunnerPath} must preserve renamed runtime migration aliases: ${requiredMigrationAliasEvidence}`);
+  }
 }
 if (deployWorkflowText.includes("terraform_action") || deployWorkflowText.includes("substrate-plan") || deployWorkflowText.includes("api-apply") || deployWorkflowText.includes("pool-apply")) {
   fail(`${deployWorkflowPath} must use deployment_stage plus apply instead of six plan/apply action names`);
@@ -1286,6 +2644,47 @@ const workerText = read("bucephalus-cloud/src/worker.ts");
 if (!workerText.includes("DOCKER_SOCKET_PATH") || !workerText.includes("node:http")) {
   fail("Cloud worker cleanup must use the Docker Engine API over the mounted socket");
 }
+for (const [path, text, requiredWorkerInfraLifecycleEvidence] of [
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.image_pull.pulling"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.image_pull.pulled"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.image_pull.failed"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "function runtimeImagePullStatus"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "ImagePulled"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.secret_binding.materialized"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.network_perimeter.applying"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.network_perimeter.applied"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.network_perimeter.failed"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "function runtimeSecretBindingStatus"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "SecretBindingMaterialized"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.sidecar_requirement.checking"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.sidecar_requirement.available"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.sidecar_requirement.failed"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "function runtimeSidecarRequirementStatus"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "SidecarRequirementAvailable"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.accelerator_requirement.checking"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.accelerator_requirement.available"],
+  ["bucephalus-cloud/src/worker.ts", workerText, "worker.runtime.accelerator_requirement.failed"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "function runtimeAcceleratorRequirementStatus"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "AcceleratorRequirementAvailable"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "function runtimeNetworkPerimeterStatus"],
+  [runtimeRepositoryPath, runtimeRepositoryText, "NetworkPerimeterApplied"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, "worker.runtime.image_pull.pulled"],
+  ["bucephalus-cloud/tests/workerLifecycle.test.ts", workerLifecycleTestText, "audited image pre-pull emits ImagePull lifecycle events"],
+  ["bucephalus-cloud/tests/workerLifecycle.test.ts", workerLifecycleTestText, "audited image pre-pull records failed ImagePull lifecycle events"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, "worker.runtime.secret_binding.materialized"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, "worker.runtime.sidecar_requirement.available"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, "worker.runtime.accelerator_requirement.available"],
+  ["bucephalus-cloud/tests/workerLifecycle.test.ts", workerLifecycleTestText, "audited sidecar validation emits SidecarRequirement lifecycle events"],
+  ["bucephalus-cloud/tests/workerLifecycle.test.ts", workerLifecycleTestText, "audited sidecar validation records failed SidecarRequirement lifecycle events"],
+  ["bucephalus-cloud/tests/workerLifecycle.test.ts", workerLifecycleTestText, "audited accelerator validation emits AcceleratorRequirement lifecycle events"],
+  ["bucephalus-cloud/tests/workerLifecycle.test.ts", workerLifecycleTestText, "audited accelerator validation records failed AcceleratorRequirement lifecycle events"],
+  ["bucephalus-cloud/tests/runtimeRepository.test.ts", runtimeRepositoryTestText, "worker.runtime.network_perimeter.applied"],
+  ["bucephalus-cloud/tests/workerLifecycle.test.ts", workerLifecycleTestText, "audited network policy emits resource lifecycle events"],
+]) {
+  if (!text.includes(requiredWorkerInfraLifecycleEvidence)) {
+    fail(`${path} must expose worker-observed ImagePull/SecretBinding/SidecarRequirement/AcceleratorRequirement/NetworkPerimeter lifecycle evidence: ${requiredWorkerInfraLifecycleEvidence}`);
+  }
+}
 if (/runCommand\("docker"|spawn\("docker"/.test(workerText)) {
   fail("Cloud worker must not shell out to the Docker CLI");
 }
@@ -1986,11 +3385,9 @@ for (const dockerfile of listFiles("bucephalus-cloud/images")) {
 }
 
 const experimentRouteText = read("bucephalus-cloud/src/routes/experiments.ts");
-const hostedCliText = read("rust/crates/lab-cli/src/bin/buc.rs");
 const packageRepositoryText = read("bucephalus-cloud/src/packages/repository.ts");
 const packageProvenanceMigrationText = read("bucephalus-cloud/db/migrations/0021_package_provenance.sql");
 const readmeText = read("README.md");
-const runsOpenApiText = read("bucephalus-cloud/api/openapi/runs.yaml");
 const cloudConfigText = read("bucephalus-cloud/src/config.ts");
 for (const required of [
   "BUCEPHALUS_RELEASE_GIT_SHA",
@@ -2055,7 +3452,6 @@ for (const required of [
     fail(`package provenance migration must persist owner-scoped provenance: ${required}`);
   }
 }
-const cloudCliDocText = read("docs/user/cloud-cli.md");
 for (const required of [
   "authenticated",
   "knowing another user's upload id is not a",
@@ -2246,6 +3642,83 @@ if (!provisionRunnerVmText.includes("DOCKER_CONFIG=/var/lib/bucephalus/docker-co
 if (!provisionRunnerVmText.includes("BUCEPHALUS_WORKER_IMAGE_REF=\\${WORKER_IMAGE}")) {
   fail("GCE runner workers must report the exact promoted worker image ref they booted from");
 }
+for (const [requiredRuntimeAccessProvisioning, requiredRuntimeAccessReadmeCommand] of [
+  [
+    'BUCEPHALUS_WORKER_PORT_FORWARD_CMD_JSON=["bun","runtime-dist/worker.js","runtime-gce-iap-port-forward"]',
+    'BUCEPHALUS_WORKER_PORT_FORWARD_CMD_JSON=\'["bun","runtime-dist/worker.js","runtime-gce-iap-port-forward"]\'',
+  ],
+  [
+    'BUCEPHALUS_WORKER_EXEC_CMD_JSON=["bun","runtime-dist/worker.js","runtime-docker-exec"]',
+    'BUCEPHALUS_WORKER_EXEC_CMD_JSON=\'["bun","runtime-dist/worker.js","runtime-docker-exec"]\'',
+  ],
+]) {
+  if (!provisionRunnerVmText.includes(requiredRuntimeAccessProvisioning)) {
+    fail(`GCE runner workers must configure bundled runtime access helpers: ${requiredRuntimeAccessProvisioning}`);
+  }
+  if (!cloudReadmeText.includes(requiredRuntimeAccessReadmeCommand)) {
+    fail(`${cloudReadmePath} must document the bundled runtime access helper command: ${requiredRuntimeAccessReadmeCommand}`);
+  }
+}
+for (const requiredRuntimeAccessReadme of [
+  "BUCEPHALUS_WORKER_RESOURCES=core_runner,docker_daemon,registry_pull,runtime_port_forward,runtime_exec",
+  "workers only advertise\n`runtime_port_forward` or `runtime_exec` when",
+  "GCE runner provisioning\nuses the bundled worker helper modes",
+]) {
+  if (!cloudReadmeText.includes(requiredRuntimeAccessReadme)) {
+    fail(`${cloudReadmePath} must document command-backed worker runtime access: ${requiredRuntimeAccessReadme}`);
+  }
+}
+for (const requiredRuntimeAccessWorkerImplementation of [
+  "kind === \"Run\" || kind === \"RunnerInstance\" || kind === \"RunnerAttempt\"",
+  "mode: \"worker_process\"",
+  "provider: \"gce-worker-container\"",
+  "RUNTIME_EXEC_OUTPUT_TAIL_BYTES",
+  "addExecOutputConnectionEvidence",
+  "connection[`${stream}_tail`]",
+  "connection[`${stream}_bytes`]",
+  "connection[`${stream}_tail_bytes`]",
+  "connection[`${stream}_tail_truncated`]",
+]) {
+  if (!workerText.includes(requiredRuntimeAccessWorkerImplementation)) {
+    fail(`worker runtime exec helper must provide auditable runner-process access for RunnerInstance resources: ${requiredRuntimeAccessWorkerImplementation}`);
+  }
+}
+for (const requiredRuntimeExecPrinterColumnEvidence of [
+  'name: "StdoutBytes"',
+  'jsonPath: ".status.connection.stdout_bytes"',
+  'name: "StdoutTailBytes"',
+  'jsonPath: ".status.connection.stdout_tail_bytes"',
+  'name: "StdoutTruncated"',
+  'jsonPath: ".status.connection.stdout_tail_truncated"',
+  'name: "StderrBytes"',
+  'jsonPath: ".status.connection.stderr_bytes"',
+  'name: "StderrTailBytes"',
+  'jsonPath: ".status.connection.stderr_tail_bytes"',
+  'name: "StderrTruncated"',
+  'jsonPath: ".status.connection.stderr_tail_truncated"',
+]) {
+  if (!runtimeRepositoryText.includes(requiredRuntimeExecPrinterColumnEvidence)) {
+    fail(`${runtimeRepositoryPath} must advertise runtime Exec output evidence in printer columns: ${requiredRuntimeExecPrinterColumnEvidence}`);
+  }
+  if (!runtimeRepositoryTestText.includes(requiredRuntimeExecPrinterColumnEvidence)) {
+    fail(`bucephalus-cloud/tests/runtimeRepository.test.ts must lock runtime Exec output evidence printer columns: ${requiredRuntimeExecPrinterColumnEvidence}`);
+  }
+}
+for (const requiredRuntimeAccessWorkerTest of [
+  "built-in runtime exec helper runs commands against the runner worker process",
+  "runWorkerHelper([\"runtime-docker-exec\"]",
+  "resource_kind: \"RunnerInstance\"",
+  "provider: \"gce-worker-container\"",
+  "mode: \"worker_process\"",
+  "worker reports runtime exec output truncation evidence",
+  "runtimeExecLongOutput.ts",
+  "stdout_tail_truncated: true",
+  "stdout_bytes: 20_000",
+]) {
+  if (!workerLifecycleTestText.includes(requiredRuntimeAccessWorkerTest)) {
+    fail(`worker lifecycle tests must directly prove RunnerInstance exec helper behavior: ${requiredRuntimeAccessWorkerTest}`);
+  }
+}
 if (provisionRunnerVmText.includes("BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD") || provisionRunnerVmText.includes("/usr/local/bin/gcloud:ro")) {
   fail("GCE runner workers must not depend on a bind-mounted gcloud executable for secret resolution");
 }
@@ -2283,8 +3756,8 @@ const poolControllerDockerfileText = read("bucephalus-cloud/images/Dockerfile.po
 if (!poolControllerDockerfileText.includes("bucephalus-cloud/deploy/provider/gcp")) {
   fail("pool-controller image must include GCP provider command payloads used by command secrets");
 }
-if (!/await prePullRunImages\(config, claim\);\s*await applyRuntimeNetworkPolicy\(config, claim, materialized\);/.test(workerText)) {
-  fail("Cloud worker must pre-pull package images before applying runtime network policy");
+if (!/await validateSidecarRequirementsWithAudit\(config, claim, runContext\);\s*await validateAcceleratorRequirementsWithAudit\(config, claim, runContext\);\s*await prePullRunImagesWithAudit\(config, claim, runContext\);\s*await applyRuntimeNetworkPolicyWithAudit\(config, claim, materialized, runContext\);/.test(workerText)) {
+  fail("Cloud worker must validate sidecar and accelerator requirements, then pre-pull package images with audit, before applying audited runtime network policy");
 }
 if (!workerText.includes("X-Registry-Auth")) {
   fail("Cloud worker Docker pre-pull must pass registry auth from Docker config");

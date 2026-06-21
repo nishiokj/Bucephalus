@@ -1,19 +1,28 @@
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
 import { describe, expect, test } from "bun:test";
 import * as tar from "tar";
 import {
   applyRuntimeNetworkPolicy,
+  applyRuntimeNetworkPolicyWithAudit,
   collectRuntimeArtifactUploads,
   collectRuntimeSnapshot,
   coreProgressCompleted,
   coreRunnerEnv,
   coreRunnerFailureMessage,
+  demuxDockerExecOutput,
   dockerRegistryAuthHeaders,
   loadWorkerConfig,
   materializeAttemptSecrets,
   materializePackage,
+  prePullRunImagesWithAudit,
+  processPortForwardRequests,
+  processExecRequests,
+  resolveRuntimeExecCommandTarget,
+  validateAcceleratorRequirementsWithAudit,
+  validateSidecarRequirementsWithAudit,
 } from "../src/worker";
 import { discoverCoreRunIdsFromRunRoot } from "../src/workerEvidence";
 import { canonicalJsonStringify, sha256Digest, type JsonObject } from "../src/primitives";
@@ -48,6 +57,87 @@ describe("worker lifecycle cleanup helpers", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  test("runtime Docker exec target resolution uses trial runtime state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-exec-target-"));
+    try {
+      const runRoot = join(root, "run-root");
+      const coreRunId = "run_20260529_000001_000001_000001";
+      const trialDir = join(runRoot, coreRunId, "trials", "trial:1", "runner");
+      await mkdir(trialDir, { recursive: true });
+      await writeFile(join(trialDir, "trial_runtime_state.json"), JSON.stringify({
+        schema_version: "trial_runtime_state_v1",
+        updated_at: "2026-06-18T00:00:00.000Z",
+        state: {
+          key: { schedule_idx: 3, attempt: 0 },
+          slot: { variant_id: "base", task_id: "task-1", repl_idx: 0 },
+          phase: "agent_running",
+          fs: { attempt_dir: "/tmp/trial", in_dir: "/tmp/trial/in", out_dir: "/tmp/trial/out", telemetry_mounts: [], logs_dir: "/tmp/trial/logs" },
+          task_sandbox: {
+            container_id: "abcdef1234567890abcdef1234567890abcdef123456",
+            image: "python:3.11-slim",
+            workdir: "/workspace",
+            materialization: { kind: "copy" },
+          },
+          grading_sandbox: {
+            container_id: "grading-container-1",
+            strategy: "separate",
+            workdir: "/grader",
+          },
+          ephemerals: [],
+          ephemeral_networks: [],
+          cleanup: { containers: [] },
+        },
+      }));
+
+      await expect(resolveRuntimeExecCommandTarget(
+        runRoot,
+        "TrialContainer",
+        "trial-1.task.abcdef1234567890abcdef1234567890",
+      )).resolves.toMatchObject({
+        mode: "docker_container",
+        coreRunId,
+        trialId: "trial:1",
+        scheduleIdx: 3,
+        role: "task",
+        containerId: "abcdef1234567890abcdef1234567890abcdef123456",
+        workdir: "/workspace",
+      });
+      await expect(resolveRuntimeExecCommandTarget(runRoot, "Trial", "trial-1")).resolves.toMatchObject({
+        mode: "docker_container",
+        role: "task",
+        containerId: "abcdef1234567890abcdef1234567890abcdef123456",
+      });
+      await expect(resolveRuntimeExecCommandTarget(runRoot, "ScheduleSlot", `${coreRunId}.3`)).resolves.toMatchObject({
+        mode: "docker_container",
+        role: "task",
+        containerId: "abcdef1234567890abcdef1234567890abcdef123456",
+      });
+      await expect(resolveRuntimeExecCommandTarget(runRoot, "RunnerInstance", "runner-1")).resolves.toEqual({
+        mode: "worker_process",
+        resourceKind: "RunnerInstance",
+        resourceName: "runner-1",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("Docker exec stream demux keeps stdout and stderr separate", () => {
+    const stdout = Buffer.from("hello\n");
+    const stderr = Buffer.from("warn\n");
+    const stdoutHeader = Buffer.alloc(8);
+    stdoutHeader[0] = 1;
+    stdoutHeader.writeUInt32BE(stdout.byteLength, 4);
+    const stderrHeader = Buffer.alloc(8);
+    stderrHeader[0] = 2;
+    stderrHeader.writeUInt32BE(stderr.byteLength, 4);
+
+    expect(demuxDockerExecOutput(Buffer.concat([stdoutHeader, stdout, stderrHeader, stderr]))).toEqual({
+      stdout: "hello\n",
+      stderr: "warn\n",
+    });
   });
 
   test("collects Core runtime mirrors without absolute workspace paths", async () => {
@@ -426,6 +516,344 @@ describe("worker lifecycle cleanup helpers", () => {
     }
   });
 
+  test("audited image pre-pull emits ImagePull lifecycle events", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-image-pull-"));
+    const imageRef = "us-central1-docker.pkg.dev/project/repo/image@sha256:abc123";
+    const events: JsonObject[] = [];
+    const pulled: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v1/worker/run-attempts/attempt-1/events") {
+          expect(request.headers.get("authorization")).toBe("Bearer attempt-token");
+          events.push(await request.json() as JsonObject);
+          return Response.json({ event: { event_type: "accepted" } }, { status: 201 });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await prePullRunImagesWithAudit(
+        runtimeAccessWorkerConfig(root, server.url.href, {
+          capabilities: { executors: ["runner-docker"], resources: ["docker_daemon", "registry_pull"] },
+        }),
+        claim({
+          run_requirements: {
+            image_refs: [imageRef, imageRef],
+          },
+        }),
+        undefined,
+        async (ref) => {
+          pulled.push(ref);
+        },
+      );
+
+      expect(pulled).toEqual([imageRef]);
+      expect(events.map((event) => event.event_type)).toEqual([
+        "worker.runtime.image_pull.pulling",
+        "worker.runtime.image_pull.pulled",
+      ]);
+      expect(events[0]).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        event_type: "worker.runtime.image_pull.pulling",
+        payload: {
+          resource_kind: "ImagePull",
+          resource_name: "us-central1-docker.pkg.dev-project-repo-image-sha256-abc123",
+          image_ref: imageRef,
+          status: "pulling",
+          attempt_id: "attempt-1",
+          run_id: "run-1",
+          runner_instance_id: "runner-instance-1",
+          worker_id: "worker-1",
+        },
+      });
+      expect(events[1]).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        event_type: "worker.runtime.image_pull.pulled",
+        payload: {
+          resource_kind: "ImagePull",
+          resource_name: "us-central1-docker.pkg.dev-project-repo-image-sha256-abc123",
+          image_ref: imageRef,
+          status: "pulled",
+        },
+      });
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("audited image pre-pull records failed ImagePull lifecycle events", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-image-pull-failed-"));
+    const imageRef = "us-central1-docker.pkg.dev/project/repo/image@sha256:bad";
+    const events: JsonObject[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v1/worker/run-attempts/attempt-1/events") {
+          events.push(await request.json() as JsonObject);
+          return Response.json({ event: { event_type: "accepted" } }, { status: 201 });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await expect(prePullRunImagesWithAudit(
+        runtimeAccessWorkerConfig(root, server.url.href, {
+          capabilities: { executors: ["runner-docker"], resources: ["docker_daemon", "registry_pull"] },
+        }),
+        claim({
+          run_requirements: {
+            image_refs: [imageRef],
+          },
+        }),
+        undefined,
+        async () => {
+          throw new Error("registry unavailable");
+        },
+      )).rejects.toThrow("registry unavailable");
+
+      expect(events.map((event) => event.event_type)).toEqual([
+        "worker.runtime.image_pull.pulling",
+        "worker.runtime.image_pull.failed",
+      ]);
+      expect(events[1]).toMatchObject({
+        event_type: "worker.runtime.image_pull.failed",
+        payload: {
+          resource_kind: "ImagePull",
+          resource_name: "us-central1-docker.pkg.dev-project-repo-image-sha256-bad",
+          status: "failed",
+          error: "registry unavailable",
+        },
+      });
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("audited sidecar validation emits SidecarRequirement lifecycle events", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-sidecar-requirement-"));
+    const events: JsonObject[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v1/worker/run-attempts/attempt-1/events") {
+          expect(request.headers.get("authorization")).toBe("Bearer attempt-token");
+          events.push(await request.json() as JsonObject);
+          return Response.json({ event: { event_type: "accepted" } }, { status: 201 });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await validateSidecarRequirementsWithAudit(
+        runtimeAccessWorkerConfig(root, server.url.href, {
+          capabilities: { executors: ["runner-docker"], resources: ["sidecar:redis"] },
+        }),
+        claim({
+          run_requirements: {
+            sidecars: ["redis", "redis"],
+          },
+        }),
+      );
+
+      expect(events.map((event) => event.event_type)).toEqual([
+        "worker.runtime.sidecar_requirement.checking",
+        "worker.runtime.sidecar_requirement.available",
+      ]);
+      expect(events[0]).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        event_type: "worker.runtime.sidecar_requirement.checking",
+        payload: {
+          resource_kind: "SidecarRequirement",
+          resource_name: "redis",
+          sidecar: "redis",
+          required_capability: "sidecar:redis",
+          status: "checking",
+          attempt_id: "attempt-1",
+          run_id: "run-1",
+          runner_instance_id: "runner-instance-1",
+          worker_id: "worker-1",
+        },
+      });
+      expect(events[1]).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        event_type: "worker.runtime.sidecar_requirement.available",
+        payload: {
+          resource_kind: "SidecarRequirement",
+          resource_name: "redis",
+          sidecar: "redis",
+          required_capability: "sidecar:redis",
+          status: "available",
+        },
+      });
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("audited sidecar validation records failed SidecarRequirement lifecycle events", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-sidecar-requirement-failed-"));
+    const events: JsonObject[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v1/worker/run-attempts/attempt-1/events") {
+          events.push(await request.json() as JsonObject);
+          return Response.json({ event: { event_type: "accepted" } }, { status: 201 });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await expect(validateSidecarRequirementsWithAudit(
+        runtimeAccessWorkerConfig(root, server.url.href, {
+          capabilities: { executors: ["runner-docker"], resources: [] },
+        }),
+        claim({
+          run_requirements: {
+            sidecars: ["redis"],
+          },
+        }),
+      )).rejects.toThrow("Runner worker does not advertise required sidecar:redis");
+
+      expect(events.map((event) => event.event_type)).toEqual([
+        "worker.runtime.sidecar_requirement.checking",
+        "worker.runtime.sidecar_requirement.failed",
+      ]);
+      expect(events[1]).toMatchObject({
+        event_type: "worker.runtime.sidecar_requirement.failed",
+        payload: {
+          resource_kind: "SidecarRequirement",
+          resource_name: "redis",
+          sidecar: "redis",
+          required_capability: "sidecar:redis",
+          status: "failed",
+          error: "Runner worker does not advertise required sidecar:redis",
+        },
+      });
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("audited accelerator validation emits AcceleratorRequirement lifecycle events", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-accelerator-requirement-"));
+    const events: JsonObject[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v1/worker/run-attempts/attempt-1/events") {
+          expect(request.headers.get("authorization")).toBe("Bearer attempt-token");
+          events.push(await request.json() as JsonObject);
+          return Response.json({ event: { event_type: "accepted" } }, { status: 201 });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await validateAcceleratorRequirementsWithAudit(
+        runtimeAccessWorkerConfig(root, server.url.href, {
+          capabilities: { executors: ["runner-docker"], resources: ["accelerator:gpu-a10"] },
+        }),
+        claim({
+          run_requirements: {
+            accelerators: ["gpu-a10", "gpu-a10"],
+          },
+        }),
+      );
+
+      expect(events.map((event) => event.event_type)).toEqual([
+        "worker.runtime.accelerator_requirement.checking",
+        "worker.runtime.accelerator_requirement.available",
+      ]);
+      expect(events[0]).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        event_type: "worker.runtime.accelerator_requirement.checking",
+        payload: {
+          resource_kind: "AcceleratorRequirement",
+          resource_name: "gpu-a10",
+          accelerator: "gpu-a10",
+          required_capability: "accelerator:gpu-a10",
+          status: "checking",
+          attempt_id: "attempt-1",
+          run_id: "run-1",
+          runner_instance_id: "runner-instance-1",
+          worker_id: "worker-1",
+        },
+      });
+      expect(events[1]).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        event_type: "worker.runtime.accelerator_requirement.available",
+        payload: {
+          resource_kind: "AcceleratorRequirement",
+          resource_name: "gpu-a10",
+          accelerator: "gpu-a10",
+          required_capability: "accelerator:gpu-a10",
+          status: "available",
+        },
+      });
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("audited accelerator validation records failed AcceleratorRequirement lifecycle events", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-accelerator-requirement-failed-"));
+    const events: JsonObject[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v1/worker/run-attempts/attempt-1/events") {
+          events.push(await request.json() as JsonObject);
+          return Response.json({ event: { event_type: "accepted" } }, { status: 201 });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await expect(validateAcceleratorRequirementsWithAudit(
+        runtimeAccessWorkerConfig(root, server.url.href, {
+          capabilities: { executors: ["runner-docker"], resources: [] },
+        }),
+        claim({
+          run_requirements: {
+            accelerators: ["gpu-a10"],
+          },
+        }),
+      )).rejects.toThrow("Runner worker does not advertise required accelerator:gpu-a10");
+
+      expect(events.map((event) => event.event_type)).toEqual([
+        "worker.runtime.accelerator_requirement.checking",
+        "worker.runtime.accelerator_requirement.failed",
+      ]);
+      expect(events[1]).toMatchObject({
+        event_type: "worker.runtime.accelerator_requirement.failed",
+        payload: {
+          resource_kind: "AcceleratorRequirement",
+          resource_name: "gpu-a10",
+          accelerator: "gpu-a10",
+          required_capability: "accelerator:gpu-a10",
+          status: "failed",
+          error: "Runner worker does not advertise required accelerator:gpu-a10",
+        },
+      });
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("worker verifies downloaded package digest before using extracted content", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-worker-package-"));
     const serverState = {
@@ -467,6 +895,8 @@ describe("worker lifecycle cleanup helpers", () => {
           workerToken: "worker-token",
           secretResolverCommand: null,
           networkPolicyCommand: null,
+          portForwardCommand: null,
+          execCommand: null,
           capabilities: { executors: [], resources: [] },
           minFreeBytes: 0,
           retainAttemptWorkspaces: false,
@@ -517,6 +947,1209 @@ describe("worker lifecycle cleanup helpers", () => {
     });
 
     expect(config.capabilities.resources).toContain("network_perimeter");
+  });
+
+  test("runtime access capabilities require explicit worker commands", () => {
+    const baseEnv = {
+      BUCEPHALUS_CLOUD_API_URL: "https://cloud.example",
+      BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
+      BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
+      BUCEPHALUS_WORKER_MIN_FREE_BYTES: "1",
+    };
+
+    const defaultConfig = loadWorkerConfig(baseEnv);
+    expect(defaultConfig.capabilities.resources).not.toContain("runtime_port_forward");
+    expect(defaultConfig.capabilities.resources).not.toContain("runtime_exec");
+
+    const accessConfig = loadWorkerConfig({
+      ...baseEnv,
+      BUCEPHALUS_WORKER_PORT_FORWARD_CMD_JSON: JSON.stringify(["port-forward-helper"]),
+      BUCEPHALUS_WORKER_EXEC_CMD_JSON: JSON.stringify(["exec-helper"]),
+    });
+    expect(accessConfig.capabilities.resources).toContain("runtime_port_forward");
+    expect(accessConfig.capabilities.resources).toContain("runtime_exec");
+  });
+
+  test("command-backed worker capabilities cannot be declared without matching helper commands", () => {
+    const baseEnv = {
+      BUCEPHALUS_CLOUD_API_URL: "https://cloud.example",
+      BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
+      BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
+      BUCEPHALUS_WORKER_MIN_FREE_BYTES: "1",
+    };
+    const cases: Array<[string, string]> = [
+      ["secret_resolver", "BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON"],
+      ["network_perimeter", "BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON"],
+      ["runtime_port_forward", "BUCEPHALUS_WORKER_PORT_FORWARD_CMD_JSON"],
+      ["runtime_exec", "BUCEPHALUS_WORKER_EXEC_CMD_JSON"],
+    ];
+
+    for (const [resource, commandEnvName] of cases) {
+      expect(() => loadWorkerConfig({
+        ...baseEnv,
+        BUCEPHALUS_WORKER_RESOURCES: `core_runner,${resource}`,
+      })).toThrow(`${resource} requires ${commandEnvName} to be configured`);
+    }
+  });
+
+  test("worker processes pending exec runtime resources through the resource API", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-exec-"));
+    const updates: Array<{ path: string; body: JsonObject }> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec") {
+          expect(request.headers.get("authorization")).toBe("Bearer attempt-token");
+          expect(url.searchParams.get("runner_instance_id")).toBe("runner-instance-1");
+          return Response.json({
+            resources: [
+              {
+                kind: "Exec",
+                metadata: {
+                  name: "exec-1",
+                  uid: "exec-1",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "exec-1",
+                  resource_kind: "RunnerInstance",
+                  resource_name: "runner-1",
+                  protocol: "exec",
+                  command: ["whoami"],
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+                audit: {
+                  requester: "issuer:user-a",
+                },
+              },
+            ],
+          });
+        }
+        if (request.method === "POST" && url.pathname.startsWith("/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/")) {
+          updates.push({
+            path: url.pathname,
+            body: await request.json() as JsonObject,
+          });
+          return Response.json({ resource: { kind: "Exec", metadata: { name: "exec-1" } } });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await processExecRequests(
+        {
+          apiUrl: server.url.href.replace(/\/+$/, ""),
+          workerId: "worker-1",
+          runnerPoolId: "pool-1",
+          runnerInstanceId: "runner-instance-1",
+          leaseSeconds: 30,
+          pollMs: 1000,
+          heartbeatMs: 1000,
+          sweeperMs: 1000,
+          dataDir: root,
+          coreRunnerCommand: "bucephalus",
+          workerToken: "worker-token",
+          secretResolverCommand: null,
+          networkPolicyCommand: null,
+          portForwardCommand: null,
+          execCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/runtimeExec.ts")],
+          capabilities: { executors: ["runner-docker"], resources: ["runtime_exec"] },
+          minFreeBytes: 0,
+          retainAttemptWorkspaces: false,
+          provisionRequestId: null,
+          providerInstanceId: null,
+          workerImageRef: null,
+          liveEvidence: true,
+          evidenceIntervalMs: 2000,
+          coreTimeoutMs: 15 * 60 * 1000,
+          coreCompletionGraceMs: 120_000,
+          apiRequestTimeoutMs: 30_000,
+        },
+        {
+          run: {
+            run_id: "run-1",
+            package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            env: {},
+            secret_refs: {},
+            runtime_options: {},
+            run_requirements: {
+              executor: "runner-docker",
+              requires: [],
+              image_refs: [],
+            },
+          },
+          attempt: {
+            attempt_id: "attempt-1",
+            attempt_token: "attempt-token",
+          },
+        },
+        {
+          workspaceDir: root,
+          extractedDir: join(root, "package"),
+          runRootDir: join(root, "run-root"),
+        },
+      );
+
+      expect(updates.map((item) => item.path)).toEqual([
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/accept",
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/complete",
+      ]);
+      expect(updates[0]?.body).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        connection: {
+          mode: "worker_command",
+          worker_id: "worker-1",
+        },
+      });
+      expect(updates[1]?.body).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        connection: {
+          mode: "worker_command",
+          worker_id: "worker-1",
+          exit_code: 0,
+          stdout_tail: "hello from exec\n",
+          stdout_bytes: 16,
+          stdout_tail_bytes: 16,
+          stdout_tail_truncated: false,
+          stderr_tail: "",
+          stderr_bytes: 0,
+          stderr_tail_bytes: 0,
+          stderr_tail_truncated: false,
+        },
+      });
+      const commandInput = JSON.parse(await readFile(join(root, "exec-input.json"), "utf8"));
+      expect(commandInput.exec).toMatchObject({
+        access_request_id: "exec-1",
+        resource_kind: "RunnerInstance",
+        resource_name: "runner-1",
+        command: ["whoami"],
+      });
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("worker reports runtime exec output truncation evidence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-exec-long-output-"));
+    const updates: Array<{ path: string; body: JsonObject }> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec") {
+          return Response.json({
+            resources: [
+              {
+                kind: "Exec",
+                metadata: {
+                  name: "exec-1",
+                  uid: "exec-1",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "exec-1",
+                  resource_kind: "RunnerInstance",
+                  resource_name: "runner-1",
+                  protocol: "exec",
+                  command: ["long-output"],
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+              },
+            ],
+          });
+        }
+        if (request.method === "POST" && url.pathname.startsWith("/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/")) {
+          updates.push({
+            path: url.pathname,
+            body: await request.json() as JsonObject,
+          });
+          return Response.json({ resource: { kind: "Exec", metadata: { name: "exec-1" } } });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await processExecRequests(
+        runtimeAccessWorkerConfig(root, server.url.href, {
+          execCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/runtimeExecLongOutput.ts")],
+          capabilities: { executors: ["runner-docker"], resources: ["runtime_exec"] },
+        }),
+        claim(),
+        {
+          workspaceDir: root,
+          extractedDir: join(root, "package"),
+          runRootDir: join(root, "run-root"),
+        },
+      );
+
+      expect(updates.map((item) => item.path)).toEqual([
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/accept",
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/complete",
+      ]);
+      expect(updates[1]?.body).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        connection: {
+          mode: "worker_command",
+          worker_id: "worker-1",
+          exit_code: 0,
+          stdout_bytes: 20_000,
+          stdout_tail_bytes: 16_000,
+          stdout_tail_truncated: true,
+          stderr_tail: "warn\n",
+          stderr_bytes: 5,
+          stderr_tail_bytes: 5,
+          stderr_tail_truncated: false,
+        },
+      });
+      expect(String((updates[1]?.body.connection as JsonObject | undefined)?.stdout_tail ?? "").length).toBe(16_000);
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("worker processes pending port-forward runtime resources through the resource API", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-port-forward-"));
+    const updates: Array<{ path: string; body: JsonObject }> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward") {
+          expect(request.headers.get("authorization")).toBe("Bearer attempt-token");
+          expect(url.searchParams.get("runner_instance_id")).toBe("runner-instance-1");
+          return Response.json({
+            resources: [
+              {
+                kind: "PortForward",
+                metadata: {
+                  name: "pf-1",
+                  uid: "pf-1",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "pf-1",
+                  resource_kind: "Trial",
+                  resource_name: "trial-1.0",
+                  protocol: "tcp",
+                  target_port: 8080,
+                  local_port: 18080,
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+                audit: {
+                  requester: "issuer:user-a",
+                },
+              },
+            ],
+          });
+        }
+        if (request.method === "POST" && url.pathname.startsWith("/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward/pf-1/")) {
+          updates.push({
+            path: url.pathname,
+            body: await request.json() as JsonObject,
+          });
+          return Response.json({ resource: { kind: "PortForward", metadata: { name: "pf-1" } } });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await processPortForwardRequests(
+        {
+          apiUrl: server.url.href.replace(/\/+$/, ""),
+          workerId: "worker-1",
+          runnerPoolId: "pool-1",
+          runnerInstanceId: "runner-instance-1",
+          leaseSeconds: 30,
+          pollMs: 1000,
+          heartbeatMs: 1000,
+          sweeperMs: 1000,
+          dataDir: root,
+          coreRunnerCommand: "bucephalus",
+          workerToken: "worker-token",
+          secretResolverCommand: null,
+          networkPolicyCommand: null,
+          portForwardCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/portForward.ts")],
+          execCommand: null,
+          capabilities: { executors: ["runner-docker"], resources: ["runtime_port_forward"] },
+          minFreeBytes: 0,
+          retainAttemptWorkspaces: false,
+          provisionRequestId: null,
+          providerInstanceId: null,
+          workerImageRef: null,
+          liveEvidence: true,
+          evidenceIntervalMs: 2000,
+          coreTimeoutMs: 15 * 60 * 1000,
+          coreCompletionGraceMs: 120_000,
+          apiRequestTimeoutMs: 30_000,
+        },
+        {
+          run: {
+            run_id: "run-1",
+            package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            env: {},
+            secret_refs: {},
+            runtime_options: {},
+            run_requirements: {
+              executor: "runner-docker",
+              requires: [],
+              image_refs: [],
+            },
+          },
+          attempt: {
+            attempt_id: "attempt-1",
+            attempt_token: "attempt-token",
+          },
+        },
+        {
+          workspaceDir: root,
+          extractedDir: join(root, "package"),
+          runRootDir: join(root, "run-root"),
+        },
+      );
+
+      expect(updates.map((item) => item.path)).toEqual([
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward/pf-1/accept",
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward/pf-1/active",
+      ]);
+      expect(updates[0]?.body).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        connection: {
+          mode: "worker_command",
+          worker_id: "worker-1",
+        },
+      });
+      expect(updates[1]?.body).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        connection: {
+          kind: "loopback",
+          target: "tcp:8080",
+          local_port: 18080,
+          client_reachable: true,
+          client_endpoint: "tcp://127.0.0.1:18080",
+        },
+      });
+      const commandInput = JSON.parse(await readFile(join(root, "port-forward-input.json"), "utf8"));
+      expect(commandInput.port_forward).toMatchObject({
+        access_request_id: "pf-1",
+        resource_kind: "Trial",
+        resource_name: "trial-1.0",
+        target_port: 8080,
+        local_port: 18080,
+      });
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("built-in GCE IAP port-forward helper reports an auditable runner VM tunnel handle", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-gce-iap-port-forward-"));
+    try {
+      const result = await runWorkerHelper(["runtime-gce-iap-port-forward"], {
+        schema_version: "runtime_port_forward_command_v1",
+        worker_id: "worker-1",
+        runner_instance_id: "runner-instance-1",
+        provider_instance_id: "gce://projects/project-1/zones/us-central1-a/instances/runner-vm-1",
+        run_id: "run-1",
+        attempt_id: "attempt-1",
+        workspace_dir: root,
+        package_dir: join(root, "package"),
+        run_root_dir: join(root, "run-root"),
+        port_forward: {
+          access_request_id: "pf-1",
+          resource_kind: "RunnerInstance",
+          resource_name: "runner-vm-1",
+          protocol: "tcp",
+          target_port: 8080,
+          local_port: 18080,
+        },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      const output = JSON.parse(result.stdout) as JsonObject;
+      expect(output).toMatchObject({
+        status: "active",
+        connection: {
+          mode: "gcp_iap_ssh",
+          provider: "gce-iap-ssh-local-forward",
+          project_id: "project-1",
+          zone: "us-central1-a",
+          instance_name: "runner-vm-1",
+          target_host: "127.0.0.1",
+          target_port: 8080,
+          requested_target_port: 8080,
+          local_port: 18080,
+          target_mode: "worker_host",
+          client_reachable: false,
+          provider_tunnel_url: "gcp-iap-ssh://projects/project-1/zones/us-central1-a/instances/runner-vm-1?target_host=127.0.0.1&target_port=8080",
+          tunnel: "gcp-iap-ssh runner-vm-1 127.0.0.1:8080",
+          worker_id: "worker-1",
+          resource_kind: "RunnerInstance",
+          resource_name: "runner-vm-1",
+        },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("built-in runtime exec helper runs commands against the runner worker process", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runner-exec-"));
+    try {
+      const result = await runWorkerHelper(["runtime-docker-exec"], {
+        schema_version: "runtime_exec_command_v1",
+        worker_id: "worker-1",
+        runner_instance_id: "runner-instance-1",
+        provider_instance_id: "gce://projects/project-1/zones/us-central1-a/instances/runner-vm-1",
+        run_id: "run-1",
+        attempt_id: "attempt-1",
+        workspace_dir: root,
+        package_dir: join(root, "package"),
+        run_root_dir: join(root, "run-root"),
+        exec: {
+          access_request_id: "exec-1",
+          resource_kind: "RunnerInstance",
+          resource_name: "runner-vm-1",
+          protocol: "exec",
+          command: [process.execPath, "-e", "process.stdout.write('runner-exec-ok')"],
+        },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      const output = JSON.parse(result.stdout) as JsonObject;
+      expect(output).toMatchObject({
+        status: "completed",
+        exit_code: 0,
+        stdout: "runner-exec-ok",
+        stderr: "",
+        error_message: null,
+        connection: {
+          mode: "worker_process",
+          provider: "gce-worker-container",
+          resource_kind: "RunnerInstance",
+          resource_name: "runner-vm-1",
+        },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("worker fails port-forward requests when helper reports no usable connection handle", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-port-forward-empty-"));
+    const updates: Array<{ path: string; body: JsonObject }> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward") {
+          return Response.json({
+            resources: [
+              {
+                kind: "PortForward",
+                metadata: {
+                  name: "pf-1",
+                  uid: "pf-1",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "pf-1",
+                  resource_kind: "Trial",
+                  resource_name: "trial-1.0",
+                  protocol: "tcp",
+                  target_port: 8080,
+                  local_port: 18080,
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+                audit: {},
+              },
+            ],
+          });
+        }
+        if (request.method === "POST" && url.pathname.startsWith("/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward/pf-1/")) {
+          updates.push({
+            path: url.pathname,
+            body: await request.json() as JsonObject,
+          });
+          return Response.json({ resource: { kind: "PortForward", metadata: { name: "pf-1" } } });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await processPortForwardRequests(
+        runtimeAccessWorkerConfig(root, server.url.href, {
+          portForwardCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/portForwardEmptyConnection.ts")],
+          capabilities: { executors: ["runner-docker"], resources: ["runtime_port_forward"] },
+        }),
+        claim(),
+        {
+          workspaceDir: root,
+          extractedDir: join(root, "package"),
+          runRootDir: join(root, "run-root"),
+        },
+      );
+
+      expect(updates.map((item) => item.path)).toEqual([
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward/pf-1/accept",
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward/pf-1/fail",
+      ]);
+      expect(updates[1]?.body).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        connection: {},
+        error_message: "port-forward command did not report a usable connection handle",
+      });
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("worker fails exec requests when helper omits exit code", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-exec-empty-"));
+    const updates: Array<{ path: string; body: JsonObject }> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec") {
+          return Response.json({
+            resources: [
+              {
+                kind: "Exec",
+                metadata: {
+                  name: "exec-1",
+                  uid: "exec-1",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "exec-1",
+                  resource_kind: "RunnerInstance",
+                  resource_name: "runner-1",
+                  protocol: "exec",
+                  command: ["whoami"],
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+                audit: {},
+              },
+            ],
+          });
+        }
+        if (request.method === "POST" && url.pathname.startsWith("/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/")) {
+          updates.push({
+            path: url.pathname,
+            body: await request.json() as JsonObject,
+          });
+          return Response.json({ resource: { kind: "Exec", metadata: { name: "exec-1" } } });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await processExecRequests(
+        runtimeAccessWorkerConfig(root, server.url.href, {
+          execCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/runtimeExecEmptyResult.ts")],
+          capabilities: { executors: ["runner-docker"], resources: ["runtime_exec"] },
+        }),
+        claim(),
+        {
+          workspaceDir: root,
+          extractedDir: join(root, "package"),
+          runRootDir: join(root, "run-root"),
+        },
+      );
+
+      expect(updates.map((item) => item.path)).toEqual([
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/accept",
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/fail",
+      ]);
+      expect(updates[1]?.body).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        connection: {
+          mode: "worker_command",
+          worker_id: "worker-1",
+          stdout_tail: "missing exit code\n",
+          stderr_tail: "",
+        },
+        error_message: "runtime exec command did not report an exit_code",
+      });
+      expect((updates[1]?.body.connection as JsonObject).exit_code).toBeUndefined();
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("worker fails exec requests when helper output exceeds the control-plane JSON budget", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-exec-huge-"));
+    const updates: Array<{ path: string; body: JsonObject }> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec") {
+          return Response.json({
+            resources: [
+              {
+                kind: "Exec",
+                metadata: {
+                  name: "exec-1",
+                  uid: "exec-1",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "exec-1",
+                  resource_kind: "RunnerInstance",
+                  resource_name: "runner-1",
+                  protocol: "exec",
+                  command: ["whoami"],
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+                audit: {},
+              },
+            ],
+          });
+        }
+        if (request.method === "POST" && url.pathname.startsWith("/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/")) {
+          updates.push({
+            path: url.pathname,
+            body: await request.json() as JsonObject,
+          });
+          return Response.json({ resource: { kind: "Exec", metadata: { name: "exec-1" } } });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await processExecRequests(
+        runtimeAccessWorkerConfig(root, server.url.href, {
+          execCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/runtimeExecHugeOutput.ts")],
+          capabilities: { executors: ["runner-docker"], resources: ["runtime_exec"] },
+        }),
+        claim(),
+        {
+          workspaceDir: root,
+          extractedDir: join(root, "package"),
+          runRootDir: join(root, "run-root"),
+        },
+      );
+
+      expect(updates.map((item) => item.path)).toEqual([
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/accept",
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/fail",
+      ]);
+      expect(updates[1]?.body).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        error_message: expect.stringContaining("command stdout exceeded 1048576 bytes"),
+      });
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("worker treats runtime access transition conflicts as stale control-plane state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-exec-stale-"));
+    const updates: Array<{ path: string; body: JsonObject }> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec") {
+          return Response.json({
+            resources: [
+              {
+                kind: "Exec",
+                metadata: {
+                  name: "exec-1",
+                  uid: "exec-1",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "exec-1",
+                  resource_kind: "RunnerInstance",
+                  resource_name: "runner-1",
+                  protocol: "exec",
+                  command: ["whoami"],
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+                audit: {},
+              },
+            ],
+          });
+        }
+        if (request.method === "POST" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/accept") {
+          updates.push({
+            path: url.pathname,
+            body: await request.json() as JsonObject,
+          });
+          return Response.json({
+            code: "runtime_access_transition_invalid",
+            message: "Exec request cannot transition from active to accepted",
+            detail: {
+              access_request_id: "exec-1",
+              kind: "exec",
+              current_status: "active",
+              target_status: "accepted",
+            },
+          }, { status: 409 });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await processExecRequests(
+        {
+          apiUrl: server.url.href.replace(/\/+$/, ""),
+          workerId: "worker-1",
+          runnerPoolId: "pool-1",
+          runnerInstanceId: "runner-instance-1",
+          leaseSeconds: 30,
+          pollMs: 1000,
+          heartbeatMs: 1000,
+          sweeperMs: 1000,
+          dataDir: root,
+          coreRunnerCommand: "bucephalus",
+          workerToken: "worker-token",
+          secretResolverCommand: null,
+          networkPolicyCommand: null,
+          portForwardCommand: null,
+          execCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/runtimeExec.ts")],
+          capabilities: { executors: ["runner-docker"], resources: ["runtime_exec"] },
+          minFreeBytes: 0,
+          retainAttemptWorkspaces: false,
+          provisionRequestId: null,
+          providerInstanceId: null,
+          workerImageRef: null,
+          liveEvidence: true,
+          evidenceIntervalMs: 2000,
+          coreTimeoutMs: 15 * 60 * 1000,
+          coreCompletionGraceMs: 120_000,
+          apiRequestTimeoutMs: 30_000,
+        },
+        {
+          run: {
+            run_id: "run-1",
+            package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            env: {},
+            secret_refs: {},
+            runtime_options: {},
+            run_requirements: {
+              executor: "runner-docker",
+              requires: [],
+              image_refs: [],
+            },
+          },
+          attempt: {
+            attempt_id: "attempt-1",
+            attempt_token: "attempt-token",
+          },
+        },
+        {
+          workspaceDir: root,
+          extractedDir: join(root, "package"),
+          runRootDir: join(root, "run-root"),
+        },
+      );
+
+      expect(updates.map((item) => item.path)).toEqual([
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec/exec-1/accept",
+      ]);
+      await expect(readFile(join(root, "exec-input.json"), "utf8")).rejects.toThrow();
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("worker treats port-forward transition conflicts as stale control-plane state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-port-forward-stale-"));
+    const updates: Array<{ path: string; body: JsonObject }> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward") {
+          return Response.json({
+            resources: [
+              {
+                kind: "PortForward",
+                metadata: {
+                  name: "pf-1",
+                  uid: "pf-1",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "pf-1",
+                  resource_kind: "Trial",
+                  resource_name: "trial-1.0",
+                  protocol: "tcp",
+                  target_port: 8080,
+                  local_port: 18080,
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+                audit: {},
+              },
+            ],
+          });
+        }
+        if (request.method === "POST" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward/pf-1/accept") {
+          updates.push({
+            path: url.pathname,
+            body: await request.json() as JsonObject,
+          });
+          return Response.json({
+            code: "runtime_access_transition_invalid",
+            message: "PortForward request cannot transition from active to accepted",
+            detail: {
+              access_request_id: "pf-1",
+              kind: "port_forward",
+              current_status: "active",
+              target_status: "accepted",
+            },
+          }, { status: 409 });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await processPortForwardRequests(
+        {
+          apiUrl: server.url.href.replace(/\/+$/, ""),
+          workerId: "worker-1",
+          runnerPoolId: "pool-1",
+          runnerInstanceId: "runner-instance-1",
+          leaseSeconds: 30,
+          pollMs: 1000,
+          heartbeatMs: 1000,
+          sweeperMs: 1000,
+          dataDir: root,
+          coreRunnerCommand: "bucephalus",
+          workerToken: "worker-token",
+          secretResolverCommand: null,
+          networkPolicyCommand: null,
+          portForwardCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/portForward.ts")],
+          execCommand: null,
+          capabilities: { executors: ["runner-docker"], resources: ["runtime_port_forward"] },
+          minFreeBytes: 0,
+          retainAttemptWorkspaces: false,
+          provisionRequestId: null,
+          providerInstanceId: null,
+          workerImageRef: null,
+          liveEvidence: true,
+          evidenceIntervalMs: 2000,
+          coreTimeoutMs: 15 * 60 * 1000,
+          coreCompletionGraceMs: 120_000,
+          apiRequestTimeoutMs: 30_000,
+        },
+        {
+          run: {
+            run_id: "run-1",
+            package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            env: {},
+            secret_refs: {},
+            runtime_options: {},
+            run_requirements: {
+              executor: "runner-docker",
+              requires: [],
+              image_refs: [],
+            },
+          },
+          attempt: {
+            attempt_id: "attempt-1",
+            attempt_token: "attempt-token",
+          },
+        },
+        {
+          workspaceDir: root,
+          extractedDir: join(root, "package"),
+          runRootDir: join(root, "run-root"),
+        },
+      );
+
+      expect(updates.map((item) => item.path)).toEqual([
+        "/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward/pf-1/accept",
+      ]);
+      await expect(readFile(join(root, "port-forward-input.json"), "utf8")).rejects.toThrow();
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("worker ignores wrong-kind runtime access resources from worker lists", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-access-kind-"));
+    const updates: Array<{ path: string; body: JsonObject }> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/PortForward") {
+          return Response.json({
+            resources: [
+              {
+                kind: "exec",
+                access_request_id: "exec-in-port-forward-list",
+                run_id: "run-1",
+                status: "requested",
+                resource_kind: "RunnerInstance",
+                resource_name: "runner-1",
+                protocol: "exec",
+                target_port: null,
+                local_port: null,
+                command: ["whoami"],
+                runner_instance_id: "runner-instance-1",
+                attempt_id: "attempt-1",
+                connection: {},
+                created_at: "2026-06-04T00:00:00Z",
+                updated_at: "2026-06-04T00:00:00Z",
+              },
+              {
+                kind: "PortForward",
+                metadata: {
+                  name: "pf-missing-target",
+                  uid: "pf-missing-target",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "pf-missing-target",
+                  protocol: "tcp",
+                  target_port: 8080,
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+              },
+              {
+                kind: "PortForward",
+                metadata: {
+                  name: "pf-invalid-port",
+                  uid: "pf-invalid-port",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "pf-invalid-port",
+                  resource_kind: "Trial",
+                  resource_name: "trial-1.0",
+                  protocol: "tcp",
+                  target_port: 0,
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+              },
+            ],
+          });
+        }
+        if (request.method === "GET" && url.pathname === "/v1/worker/run-attempts/attempt-1/runtime/resources/Exec") {
+          return Response.json({
+            resources: [
+              {
+                kind: "port_forward",
+                access_request_id: "pf-in-exec-list",
+                run_id: "run-1",
+                status: "requested",
+                resource_kind: "Trial",
+                resource_name: "trial-1.0",
+                protocol: "tcp",
+                target_port: 8080,
+                local_port: 18080,
+                runner_instance_id: "runner-instance-1",
+                attempt_id: "attempt-1",
+                connection: {},
+                created_at: "2026-06-04T00:00:00Z",
+                updated_at: "2026-06-04T00:00:00Z",
+              },
+              {
+                kind: "Exec",
+                metadata: {
+                  name: "exec-missing-target",
+                  uid: "exec-missing-target",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "exec-missing-target",
+                  protocol: "exec",
+                  command: ["whoami"],
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+              },
+              {
+                kind: "Exec",
+                metadata: {
+                  name: "exec-empty-command",
+                  uid: "exec-empty-command",
+                  labels: {
+                    "bucephalus.dev/run-id": "run-1",
+                  },
+                },
+                spec: {
+                  access_request_id: "exec-empty-command",
+                  resource_kind: "RunnerInstance",
+                  resource_name: "runner-1",
+                  protocol: "exec",
+                  command: [],
+                },
+                status: {
+                  phase: "requested",
+                  runner_instance_id: "runner-instance-1",
+                  attempt_id: "attempt-1",
+                  connection: {},
+                },
+              },
+            ],
+          });
+        }
+        if (request.method === "POST" && url.pathname.startsWith("/v1/worker/run-attempts/attempt-1/runtime/resources/")) {
+          updates.push({
+            path: url.pathname,
+            body: await request.json() as JsonObject,
+          });
+          return Response.json({ resource: { kind: "RuntimeAccess", metadata: { name: "unexpected" } } });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    const config = {
+      apiUrl: server.url.href.replace(/\/+$/, ""),
+      workerId: "worker-1",
+      runnerPoolId: "pool-1",
+      runnerInstanceId: "runner-instance-1",
+      leaseSeconds: 30,
+      pollMs: 1000,
+      heartbeatMs: 1000,
+      sweeperMs: 1000,
+      dataDir: root,
+      coreRunnerCommand: "bucephalus",
+      workerToken: "worker-token",
+      secretResolverCommand: null,
+      networkPolicyCommand: null,
+      portForwardCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/portForward.ts")],
+      execCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/runtimeExec.ts")],
+      capabilities: { executors: ["runner-docker"], resources: ["runtime_port_forward", "runtime_exec"] },
+      minFreeBytes: 0,
+      retainAttemptWorkspaces: false,
+      provisionRequestId: null,
+      providerInstanceId: null,
+      workerImageRef: null,
+      liveEvidence: true,
+      evidenceIntervalMs: 2000,
+      coreTimeoutMs: 15 * 60 * 1000,
+      coreCompletionGraceMs: 120_000,
+      apiRequestTimeoutMs: 30_000,
+    };
+    const claim = {
+      run: {
+        run_id: "run-1",
+        package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        env: {},
+        secret_refs: {},
+        runtime_options: {},
+        run_requirements: {
+          executor: "runner-docker",
+          requires: [],
+          image_refs: [],
+        },
+      },
+      attempt: {
+        attempt_id: "attempt-1",
+        attempt_token: "attempt-token",
+      },
+    };
+    const materialized = {
+      workspaceDir: root,
+      extractedDir: join(root, "package"),
+      runRootDir: join(root, "run-root"),
+    };
+    try {
+      await processPortForwardRequests(config, claim, materialized);
+      await processExecRequests(config, claim, materialized);
+
+      expect(updates).toEqual([]);
+      await expect(readFile(join(root, "port-forward-input.json"), "utf8")).rejects.toThrow();
+      await expect(readFile(join(root, "exec-input.json"), "utf8")).rejects.toThrow();
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("network egress requirements require a configured policy enforcer", async () => {
@@ -571,6 +2204,70 @@ describe("worker lifecycle cleanup helpers", () => {
       });
       expect(input.workspace_dir).toBe(root);
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("audited network policy emits resource lifecycle events", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-network-audit-"));
+    const events: JsonObject[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v1/worker/run-attempts/attempt-1/events") {
+          expect(request.headers.get("authorization")).toBe("Bearer attempt-token");
+          events.push(await request.json() as JsonObject);
+          return Response.json({ event: { event_type: "accepted" } }, { status: 201 });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      await applyRuntimeNetworkPolicyWithAudit(
+        runtimeAccessWorkerConfig(root, server.url.href, {
+          networkPolicyCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/networkPolicy.ts")],
+          capabilities: { executors: ["runner-docker"], resources: ["network_perimeter"] },
+        }),
+        claimWithNetwork(["api.openai.com", "storage.googleapis.com"]),
+        {
+          workspaceDir: root,
+          runRootDir: join(root, "run-root"),
+        },
+      );
+
+      expect(events.map((event) => event.event_type)).toEqual([
+        "worker.runtime.network_perimeter.applying",
+        "worker.runtime.network_perimeter.applied",
+      ]);
+      expect(events[0]).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        event_type: "worker.runtime.network_perimeter.applying",
+        payload: {
+          resource_kind: "NetworkPerimeter",
+          resource_name: "declared",
+          status: "applying",
+          attempt_id: "attempt-1",
+          run_id: "run-1",
+          runner_instance_id: "runner-instance-1",
+          worker_id: "worker-1",
+          egress_hosts: ["api.openai.com", "storage.googleapis.com"],
+        },
+      });
+      expect(events[1]).toMatchObject({
+        runner_instance_id: "runner-instance-1",
+        event_type: "worker.runtime.network_perimeter.applied",
+        payload: {
+          resource_kind: "NetworkPerimeter",
+          resource_name: "declared",
+          status: "applied",
+        },
+      });
+      expect(JSON.stringify(events)).not.toContain("secret-manager");
+      const input = JSON.parse(await readFile(join(root, "network-policy-input.json"), "utf8"));
+      expect(input.egress_hosts).toEqual(["api.openai.com", "storage.googleapis.com"]);
+    } finally {
+      server.stop(true);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -656,6 +2353,47 @@ describe("worker lifecycle cleanup helpers", () => {
     }
   });
 });
+
+function runtimeAccessWorkerConfig(
+  root: string,
+  apiUrl: string,
+  overrides: {
+    networkPolicyCommand?: string[] | null;
+    portForwardCommand?: string[] | null;
+    execCommand?: string[] | null;
+    capabilities?: { executors: string[]; resources: string[] };
+  } = {},
+) {
+  return {
+    apiUrl: apiUrl.replace(/\/+$/, ""),
+    workerId: "worker-1",
+    runnerPoolId: "pool-1",
+    runnerInstanceId: "runner-instance-1",
+    leaseSeconds: 30,
+    pollMs: 1000,
+    heartbeatMs: 1000,
+    sweeperMs: 1000,
+    dataDir: root,
+    coreRunnerCommand: "bucephalus",
+    workerToken: "worker-token",
+    secretResolverCommand: null,
+    networkPolicyCommand: null,
+    portForwardCommand: null,
+    execCommand: null,
+    capabilities: { executors: ["runner-docker"], resources: [] },
+    minFreeBytes: 0,
+    retainAttemptWorkspaces: false,
+    provisionRequestId: null,
+    providerInstanceId: null,
+    workerImageRef: null,
+    liveEvidence: true,
+    evidenceIntervalMs: 2000,
+    coreTimeoutMs: 15 * 60 * 1000,
+    coreCompletionGraceMs: 120_000,
+    apiRequestTimeoutMs: 30_000,
+    ...overrides,
+  };
+}
 
 function claimWithSecrets(secretRefs: Record<string, string>) {
   return claim({
@@ -786,6 +2524,35 @@ function currentResolvedExperiment(): JsonObject {
     },
     metrics: [{ id: "resolved", direction: "maximize", primary: true }],
   };
+}
+
+async function runWorkerHelper(
+  args: string[],
+  input: JsonObject,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return await new Promise((resolvePromise, reject) => {
+    const child = spawn(process.execPath, [
+      "run",
+      join(import.meta.dir, "../src/worker.ts"),
+      ...args,
+    ], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      resolvePromise({
+        exitCode: code ?? 1,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      });
+    });
+    child.stdin.end(`${JSON.stringify(input)}\n`);
+  });
 }
 
 function restoreEnv(previous: Record<string, string | undefined>): void {

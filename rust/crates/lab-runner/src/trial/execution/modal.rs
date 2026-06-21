@@ -1,4 +1,5 @@
 use super::*;
+use crate::trial::sidecar::RuntimeSidecarReadinessPlan;
 use std::io::{BufRead, BufReader, Write};
 use std::thread;
 
@@ -827,6 +828,7 @@ fn execute_modal_trial_runtime(
     attempt_state.task_sandbox = Some(task_sandbox);
     record_modal_sandbox_cleanup(&mut attempt_state, "task");
 
+    normalize_agent_result_adapter(request.runtime_experiment, &request.io_paths.result_host)?;
     let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
     let trial_output = agent_response.response;
     let result_present = agent_response.result_present;
@@ -1424,14 +1426,34 @@ fn modal_same_sandbox_ephemerals_value(
 ) -> Result<Value> {
     let mut items = Vec::new();
     for plan in sidecar_plans_for_stage(request.runtime_experiment, "agent")? {
-        let readiness = plan.readiness.as_ref().map(|readiness| {
-            json!({
-                "command": readiness.command,
-                "timeout_seconds": readiness
-                    .timeout_ms
-                    .map(|value| value.div_ceil(1000).max(1))
-                    .unwrap_or(30),
-            })
+        let readiness = plan.readiness.as_ref().map(|readiness| match readiness {
+            RuntimeSidecarReadinessPlan::Command {
+                command,
+                timeout_ms,
+            } => {
+                json!({
+                    "command": command,
+                    "timeout_seconds": timeout_ms
+                        .map(|value| value.div_ceil(1000).max(1))
+                        .unwrap_or(30),
+                })
+            }
+            RuntimeSidecarReadinessPlan::Http { http, timeout_ms } => {
+                json!({
+                    "http": {
+                        "url": http.url,
+                        "method": http.method,
+                        "headers": http.headers,
+                        "body": http.body,
+                        "json": http.json,
+                        "expect_status": http.expect_status,
+                        "interval_ms": http.interval_ms,
+                    },
+                    "timeout_seconds": timeout_ms
+                        .map(|value| value.div_ceil(1000).max(1))
+                        .unwrap_or(30),
+                })
+            }
         });
         items.push(json!({
             "id": plan.id,

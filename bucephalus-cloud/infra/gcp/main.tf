@@ -405,6 +405,20 @@ resource "google_compute_router_nat" "runner_egress" {
   }
 }
 
+resource "google_compute_firewall" "runner_iap_ssh" {
+  name          = "${local.name_prefix}-runner-iap-ssh"
+  network       = google_compute_network.control_plane.name
+  direction     = "INGRESS"
+  source_ranges = ["35.235.240.0/20"]
+  target_tags   = ["bucephalus-runner"]
+  description   = "Allow Google IAP TCP forwarding to runner SSH for audited runtime port-forward sessions."
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+}
+
 resource "google_compute_global_address" "private_service_range" {
   name          = "${local.name_prefix}-private-services"
   purpose       = "VPC_PEERING"

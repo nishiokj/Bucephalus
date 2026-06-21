@@ -218,10 +218,11 @@ paths:
                 runtime_options:
                   $ref: '#/components/schemas/CloudRuntimeOptions'
                   description: >
-                    Run-time execution options. Cloud backends use `backend`
-                    values such as `runner-docker` or `modal`; `runner-docker`
-                    is executed by a VM runner daemon and maps to Core's Docker
-                    executor inside that VM.
+                    Hosted Cloud runtime options accepted by the scheduler.
+                    Placement is Cloud-owned: clients must not send region,
+                    runtime_region, placement, or zone. Legacy local/TUI aliases
+                    such as executor and cpu are also rejected; use backend and
+                    cpu_count when those knobs are explicitly supported.
       responses:
         '201':
           description: Run record created.
@@ -241,12 +242,7 @@ paths:
       summary: Fetch a Cloud run record.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
-        - name: run_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: '#/components/parameters/RunId'
       responses:
         '200':
           description: Run record.
@@ -256,47 +252,13 @@ paths:
                 $ref: '#/components/schemas/CloudRun'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
-  /v1/runs/{run_id}/runtime:
-    get:
-      operationId: getRunRuntime
-      summary: Fetch live Core runtime state for a Cloud run.
-      description: >
-        Reads API-owned worker runtime snapshots plus any legacy normalized
-        Core runtime rows. Runner VMs report runtime state through the Cloud API
-        and do not need direct database credentials.
-      parameters:
-        - $ref: './common.yaml#/components/parameters/OrgId'
-        - name: run_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      responses:
-        '200':
-          description: Live runtime summary.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/RuntimeSummary'
-        '404':
-          $ref: './common.yaml#/components/responses/NotFound'
   /v1/runs/{run_id}/runtime/events:
     get:
       operationId: listRunRuntimeEvents
-      summary: List live trace events for a Cloud run.
-      description: >
-        One chronological stream combining trial trajectory rows (live-ingested
-        during the run, repaired from worker runtime snapshots after it) and
-        worker harness lifecycle events, distinguished by source.
+      summary: List runtime lifecycle, audit, and trace events for a Cloud run.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
-        - name: run_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: '#/components/parameters/RunId'
         - name: limit
           in: query
           required: false
@@ -308,48 +270,832 @@ paths:
         - name: after_row_seq
           in: query
           required: false
+          description: >
+            Numeric event row cursor for manual debugging/backfill. Prefer
+            `continue` for paged clients and `metadata.resourceVersion` for
+            follow/watch cursors. The server rejects requests that provide both
+            `after_row_seq` and `continue`.
           schema:
             type: integer
             minimum: 0
+        - name: continue
+          in: query
+          required: false
+          description: >
+            Event-list cursor returned as `metadata.continue` or
+            `metadata.resourceVersion`. Current cursors use
+            `event-row-seq:<row_seq>`; clients should still treat the value as
+            opaque and pass it back unchanged.
+          schema:
+            type: string
+        - name: event_type
+          in: query
+          required: false
+          description: >
+            Filter by event type. May be repeated or comma-separated, for
+            example `event_type=runtime.access.exec.requested,trial.observed`.
+            Runtime audit event types include low-level access lifecycle rows,
+            operation reviews, raw log/content reads, and
+            `runtime.api_resources.read` / `runtime.api_resources.read.failed`
+            catalog discovery reads, plus
+            `runtime.inspect.bundle.read` / `runtime.inspect.bundle.read.failed`
+            support-bundle reads.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: source
+          in: query
+          required: false
+          description: >
+            Filter by normalized event source, such as `cloud.run_events`,
+            `runtime.event_rows`, or `worker_runtime_snapshot`.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: resource_kind
+          in: query
+          required: false
+          description: Filter events by involved runtime resource kind when the event declares one.
+          schema:
+            type: string
+        - name: resource_name
+          in: query
+          required: false
+          description: Filter events by involved runtime resource name when the event declares one.
+          schema:
+            type: string
+        - name: trial_id
+          in: query
+          required: false
+          description: Filter events by trial id across Core, worker snapshot, and Cloud control-plane event rows.
+          schema:
+            type: string
+        - name: task_id
+          in: query
+          required: false
+          description: Filter events by task id across Core, worker snapshot, and Cloud control-plane event rows.
+          schema:
+            type: string
       responses:
         '200':
-          description: Live runtime event rows.
+          description: Runtime event rows from the Cloud control plane, worker snapshots, and Core runtime store.
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: false
-                required:
-                  - cloud_run_id
-                  - events
-                properties:
-                  cloud_run_id:
-                    type: string
-                    format: uuid
-                  events:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/RuntimeEvent'
+                $ref: '#/components/schemas/RuntimeEventList'
         '400':
           $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
-  /v1/runs/{run_id}/runtime/results:
+  /v1/runs/{run_id}/runtime/api-resources:
     get:
-      operationId: getRunRuntimeResults
-      summary: Fetch runtime result rows for a Cloud run.
+      operationId: listRunRuntimeApiResources
+      summary: Discover runtime resource kinds and supported operations for a Cloud run.
       description: >
-        Returns normalized legacy runtime rows plus trial, metric, and contract
-        stage rows derived from API-owned worker runtime snapshots.
-        Snapshot-derived rows include row.source=worker_runtime_snapshot.
+        Returns a Kubernetes-style API resource catalog for the runtime control
+        plane of one Cloud run. Each entry describes the kind, short names,
+        supported verbs, subresources, lifecycle actions, access operations,
+        selector support, and the current number of visible resources of that
+        kind in the run inventory.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
-        - name: run_id
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        '200':
+          description: Runtime API resource discovery catalog.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeApiResourceList'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/api-resources/{kind}:
+    get:
+      operationId: getRunRuntimeApiResource
+      summary: Explain one runtime resource kind and its supported operations.
+      description: >
+        Resolves a canonical Kind, lowercase plural name, singular name, short
+        name, or hyphen/case variant against the runtime API discovery catalog
+        for one Cloud run and returns the authoritative resource-kind contract.
+        This is the server-side equivalent of `kubectl explain` for Cloud
+        runtime resources, including selector contracts, path templates,
+        subresources, lifecycle actions, access operations, printer columns,
+        example commands, and the live visible resource count for the run.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
           in: path
           required: true
           schema:
             type: string
-            format: uuid
+          description: Canonical Kind, plural, singular, short name, or hyphen/case alias to explain.
+      responses:
+        '200':
+          description: Runtime API resource kind contract.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeApiResource'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/inspect:
+    get:
+      operationId: inspectRunRuntime
+      summary: Build a runtime inspect bundle for one Cloud run.
+      description: >
+        Returns a bounded Kubernetes/OpenShift-style inspect bundle containing
+        runtime API resource discovery, the visible resource inventory, resource
+        health, bounded resource metrics, recent lifecycle/audit events, and log
+        subresource references for resources that support logs. The same
+        resource selectors as list/health/top can narrow the exported inventory
+        for support handoff and offline operator inspection without embedding
+        large log payloads.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: event_limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 250
+        - name: kind
+          in: query
+          required: false
+          description: >
+            Filter by resource kind before the inspect bundle is built. May be
+            repeated or comma-separated, and accepts canonical kinds,
+            lowercase singular/plural resource names, or short names from
+            `runtime/api-resources`.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: category
+          in: query
+          required: false
+          description: >
+            Filter by server-advertised runtime API resource category before
+            the inspect bundle is built. May be repeated or comma-separated,
+            and values come from `runtime/api-resources[].categories`, such as
+            `runner`, `trial`, `access`, or `access-target`.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: label_selector
+          in: query
+          required: false
+          description: Kubernetes-style label selector applied before the inspect bundle is built.
+          schema:
+            type: string
+        - name: field_selector
+          in: query
+          required: false
+          description: >
+            Kubernetes-style field selector applied before the inspect bundle is
+            built. Supports the same paths as runtime resource listing.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Runtime inspect bundle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeInspectBundle'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/resources:
+    get:
+      operationId: listRunRuntimeResources
+      summary: List low-level runtime resources for a Cloud run.
+      description: >
+        Returns Kubernetes-shaped runtime resources backed by Cloud control
+        plane rows, declared run requirements, runner pools, worker attempts,
+        runner provision requests, normalized Core schedule/container tables,
+        worker runtime snapshots, and runtime lifecycle/audit events projected as
+        Event resources. Secret refs and environment values are not included;
+        only secret ids and environment key names are exposed.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: query
+          required: false
+          description: >
+            Filter by resource kind. May be repeated or comma-separated, and
+            accepts canonical kinds, lowercase singular/plural resource names,
+            or short names from `runtime/api-resources`; for example
+            `kind=RunnerAttempt,PortForward&kind=Exec`.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: category
+          in: query
+          required: false
+          description: >
+            Filter by server-advertised runtime API resource category. May be
+            repeated or comma-separated, and values come from
+            `runtime/api-resources[].categories`, such as `runner`, `trial`,
+            `access`, or `access-target`.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: label_selector
+          in: query
+          required: false
+          description: >
+            Kubernetes-style label selector. Supports `key`, `!key`,
+            `key=value`, `key==value`, `key!=value`, `key in (a,b)`,
+            and `key notin (a,b)` expressions separated by commas. Commas
+            inside set expressions are parsed as set values.
+          schema:
+            type: string
+        - name: field_selector
+          in: query
+          required: false
+          description: >
+            Kubernetes-style field selector. Supports `path=value` and
+            `path!=value` over `kind`, `metadata.name`, `metadata.uid`,
+            `metadata.generation`, `metadata.resourceVersion`,
+            `metadata.creationTimestamp`, `metadata.deletionTimestamp`,
+            `metadata.labels.<key>`, `metadata.ownerReferences`,
+            `metadata.ownerReferences.apiVersion`,
+            `metadata.ownerReferences.kind`, `metadata.ownerReferences.name`,
+            `metadata.ownerReferences.uid`, `spec.<path>`,
+            operational access paths such as `status.access.reachable`,
+            `status.access.port_forward`, `status.access.exec`,
+            `status.access.runner_instance_id`,
+            `status.access.runner_instance_status`,
+            `status.access.attempt_id`, `status.access.worker_id`,
+            condition paths such as `status.conditions.Ready`,
+            `status.conditions.ClientReachable`,
+            `status.conditions.ClientReachable.reason`, generic `status.<path>`,
+            and `audit.<path>`.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: >
+            Maximum number of resources to return from the filtered collection.
+            When more resources remain, the response metadata includes an opaque
+            `continue` token and `remainingItemCount`.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+        - name: continue
+          in: query
+          required: false
+          description: >
+            Opaque pagination token from a previous RuntimeResourceList
+            `metadata.continue` value. Tokens are tied to the filtered
+            collection resourceVersion; restart the list if the token expires.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Runtime resource inventory.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceList'
+        '410':
+          description: Continue token expired because the filtered resource collection changed.
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/resources/health:
+    get:
+      operationId: getRunRuntimeResourceHealth
+      summary: Summarize runtime resource health for a Cloud run.
+      description: >
+        Returns an operator-oriented health rollup derived from runtime resource
+        conditions, phases, access readiness, and advertised lifecycle actions.
+        Supports the same kind, label, and field selectors as runtime resource
+        listing so CLI and GUI clients can summarize a filtered inventory.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: query
+          required: false
+          description: >
+            Filter by resource kind. May be repeated or comma-separated, and
+            accepts canonical kinds, lowercase singular/plural resource names,
+            or short names from `runtime/api-resources`.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: category
+          in: query
+          required: false
+          description: >
+            Filter by server-advertised runtime API resource category. May be
+            repeated or comma-separated, and values come from
+            `runtime/api-resources[].categories`, such as `runner`, `trial`,
+            `access`, or `access-target`.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: label_selector
+          in: query
+          required: false
+          description: Kubernetes-style label selector applied before health is calculated.
+          schema:
+            type: string
+        - name: field_selector
+          in: query
+          required: false
+          description: >
+            Kubernetes-style field selector applied before health is calculated.
+            Supports the same paths as runtime resource listing, including
+            `status.access.reachable`, `status.access.port_forward`,
+            `status.access.exec`, `status.access.runner_instance_id`,
+            `status.access.runner_instance_status`,
+            `status.access.attempt_id`, `status.access.worker_id`, and
+            condition paths such as `status.conditions.Ready` or
+            `status.conditions.ClientReachable.reason`.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Runtime resource health summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceHealth'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/resources/metrics:
+    get:
+      operationId: listRunRuntimeResourceMetrics
+      summary: List metrics for runtime resources in a Cloud run.
+      description: >
+        Returns a bounded, operator-oriented metrics view across the filtered
+        runtime resource inventory, similar to a Kubernetes `top`-style scan.
+        Supports the same kind, label, and field selectors as runtime resource
+        listing so CLI and GUI clients can inspect infrastructure state without
+        fetching each resource metrics subresource one at a time.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: query
+          required: false
+          description: >
+            Filter by resource kind. May be repeated or comma-separated, and
+            accepts canonical kinds, lowercase singular/plural resource names,
+            or short names from `runtime/api-resources`.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: category
+          in: query
+          required: false
+          description: >
+            Filter by server-advertised runtime API resource category. May be
+            repeated or comma-separated, and values come from
+            `runtime/api-resources[].categories`, such as `runner`, `trial`,
+            `access`, or `access-target`.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: label_selector
+          in: query
+          required: false
+          description: Kubernetes-style label selector applied before metrics are calculated.
+          schema:
+            type: string
+        - name: field_selector
+          in: query
+          required: false
+          description: >
+            Kubernetes-style field selector applied before metrics are calculated.
+            Supports the same paths as runtime resource listing, including
+            `status.access.reachable`, `status.access.port_forward`,
+            `status.access.exec`, and condition paths such as
+            `status.conditions.Ready`.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of resource metric rows to return for this page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+        - name: continue
+          in: query
+          required: false
+          description: >
+            Opaque pagination cursor from metadata.continue on a previous
+            runtime resource metrics list response. Restart the list without
+            continue when the cursor expires.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Runtime resource collection metrics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceMetricsList'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/resources/watch:
+    get:
+      operationId: watchRunRuntimeResources
+      summary: Watch low-level runtime resource changes for a Cloud run.
+      description: >
+        Returns a Kubernetes-style watch snapshot for runtime resources. Clients
+        can pass the last list `metadata.resourceVersion` as `resource_version`
+        to get an empty event list when the filtered collection is unchanged,
+        or pass previously observed resource versions with repeated
+        `known_resource=Kind/name=resourceVersion` query parameters for
+        per-resource ADDED, MODIFIED, and DELETED comparisons. Pass
+        `allow_bookmarks=true` to receive a BOOKMARK event when the filtered
+        collection has no changes but the watch cursor is still valid. The API
+        returns the current resource-version map to use on the next watch
+        request.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: query
+          required: false
+          description: >
+            Filter by resource kind. May be repeated or comma-separated, and
+            accepts canonical kinds, lowercase singular/plural resource names,
+            or short names from `runtime/api-resources`.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: category
+          in: query
+          required: false
+          description: >
+            Filter by server-advertised runtime API resource category. May be
+            repeated or comma-separated, and values come from
+            `runtime/api-resources[].categories`, such as `runner`, `trial`,
+            `access`, or `access-target`.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: label_selector
+          in: query
+          required: false
+          description: Kubernetes-style label selector applied before watch events are calculated.
+          schema:
+            type: string
+        - name: field_selector
+          in: query
+          required: false
+          description: >
+            Kubernetes-style field selector applied before watch events are
+            calculated. Supports the same paths as runtime resource listing,
+            including operational access paths such as
+            `status.access.reachable`, `status.access.port_forward`,
+            `status.access.exec`, `status.access.runner_instance_id`,
+            `status.access.runner_instance_status`,
+            `status.access.attempt_id`, `status.access.worker_id`, and
+            condition paths such as `status.conditions.Ready` or
+            `status.conditions.ClientReachable.reason`.
+          schema:
+            type: string
+        - name: known_resource
+          in: query
+          required: false
+          description: >
+            Previously observed resource cursor in `Kind/name=resourceVersion`
+            form. Repeat once per known resource.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: resource_version
+          in: query
+          required: false
+          description: >
+            Previously observed RuntimeResourceList `metadata.resourceVersion`.
+            When it matches the current filtered collection and no
+            `known_resource` cursors are supplied, the watch response contains
+            no events unless `allow_bookmarks=true`.
+          schema:
+            type: string
+        - name: allow_bookmarks
+          in: query
+          required: false
+          description: >
+            When true, return a Kubernetes-style BOOKMARK event carrying the
+            current collection `resource_version` when no ADDED, MODIFIED, or
+            DELETED events are available.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Runtime resource watch snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceWatchList'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}:
+    get:
+      operationId: describeRunRuntimeResource
+      summary: Read or describe one low-level runtime resource for a Cloud run.
+      description: >
+        By default, returns the selected Kubernetes-shaped runtime resource plus
+        related lifecycle/audit events, similar to `kubectl describe` or
+        `oc describe`. Pass `view=resource` to fetch the raw runtime resource
+        manifest object, matching Kubernetes-style `get` semantics.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: view
+          in: query
+          required: false
+          description: >
+            Response shape. `describe` returns the describe bundle; `resource`
+            returns the raw RuntimeResource object.
+          schema:
+            type: string
+            enum:
+              - describe
+              - resource
+            default: describe
+        - name: event_limit
+          in: query
+          required: false
+          description: Only applies to the default `describe` view.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: Runtime resource manifest or describe detail.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/RuntimeResource'
+                  - $ref: '#/components/schemas/RuntimeResourceDescribe'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+    delete:
+      operationId: deleteRunRuntimeResource
+      summary: Delete a cancelable runtime access resource.
+      description: >
+        Kubernetes-style resource DELETE for runtime access resources. Today
+        this is supported for PortForward and Exec resources and is applied as
+        the audited `actions/cancel` lifecycle operation, so events, resource
+        status, and describe output remain consistent with the action API.
+        Other resource kinds return Conflict.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - resource_version
+              properties:
+                reason:
+                  type: string
+                  nullable: true
+                resource_version:
+                  type: string
+                  minLength: 1
+                  description: Required reviewed precondition from runtime operation review; missing fails with Precondition Required and stale values fail with Conflict.
+      responses:
+        '200':
+          description: Updated runtime resource detail with the cancel event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceDescribe'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+        '428':
+          $ref: './common.yaml#/components/responses/PreconditionRequired'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/status:
+    get:
+      operationId: getRunRuntimeResourceStatus
+      summary: Read the lifecycle status for one runtime resource.
+      description: >
+        Returns the status subresource for a Kubernetes-shaped runtime resource.
+        This is the compact lifecycle view for scripts and UI polling: identity,
+        generation/resourceVersion freshness markers, top-level phase/reason/message,
+        conditions, available lifecycle actions, and the raw status object.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Runtime resource status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceStatus'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/operations/{operation}:
+    get:
+      operationId: reviewRunRuntimeResourceOperation
+      summary: Review whether one runtime resource operation is currently supported.
+      description: >
+        Returns the server-derived yes/no review for a selected runtime resource
+        operation, using the same object-scoped operation contract exposed by
+        resource describe. Unsupported operations remain explicit with a
+        machine-readable reason and human-readable message so CLI and GUI
+        clients do not need to infer why a low-level action is unavailable.
+        Operation review also covers status-subresource wait checks, so clients
+        can confirm a `buc runs wait` command before polling the status
+        subresource.
+        Slash-qualified operation labels such as `logs/stdout` or
+        `watch/not-ready` are one operation name and must be percent-encoded in
+        this path segment, for example `logs%2Fstdout`.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: operation
+          in: path
+          required: true
+          description: Operation label such as describe, list/name, wait, top, metrics, events, audit, logs, logs/stdout, watch/not-ready, port-forward, exec, delete, cancel, cordon, drain, or uncordon. Slash-qualified labels must be percent-encoded as one path segment.
+          schema:
+            type: string
+          examples:
+            logsStdout:
+              value: logs%2Fstdout
+              summary: Encoded logs/stdout operation label.
+      responses:
+        '200':
+          description: Runtime resource operation review.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceOperationReview'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/metrics:
+    get:
+      operationId: getRunRuntimeResourceMetrics
+      summary: Read observability metrics for one runtime resource.
+      description: >
+        Returns source-labeled resource metrics derived from owned runtime
+        facts: lifecycle freshness, condition counts, access readiness, related
+        runtime event counts, and bounded numeric spec/status fields. This is a
+        Kubernetes-style metrics subresource for scripts and GUI panels; it does
+        not fabricate provider CPU or memory telemetry when the runtime has not
+        reported it.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Runtime resource observability metrics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceMetrics'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/events:
+    get:
+      operationId: listRunRuntimeResourceEvents
+      summary: List lifecycle and audit events for one runtime resource.
+      description: >
+        Returns the resource-scoped event stream for a Kubernetes-shaped runtime
+        resource, similar to looking up Events involved with an object in
+        Kubernetes or OpenShift. This subresource preserves the same event
+        filters as the run-level runtime event stream while resolving involved
+        object references from the selected resource.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
         - name: limit
           in: query
           required: false
@@ -357,63 +1103,432 @@ paths:
             type: integer
             minimum: 1
             maximum: 1000
-            default: 50
+            default: 100
+        - name: after_row_seq
+          in: query
+          required: false
+          description: >
+            Numeric event row cursor for manual debugging/backfill. Prefer
+            `continue` for paged clients and `metadata.resourceVersion` for
+            follow/watch cursors. The server rejects requests that provide both
+            `after_row_seq` and `continue`.
+          schema:
+            type: integer
+            minimum: 0
+        - name: continue
+          in: query
+          required: false
+          description: >
+            Event-list cursor returned as `metadata.continue` or
+            `metadata.resourceVersion`. Current cursors use
+            `event-row-seq:<row_seq>`; clients should still treat the value as
+            opaque and pass it back unchanged.
+          schema:
+            type: string
+        - name: event_type
+          in: query
+          required: false
+          description: >
+            Filter by event type. May be repeated or comma-separated. Runtime
+            audit event types include low-level access lifecycle rows,
+            operation reviews, raw log/content reads, and
+            `runtime.api_resources.read` / `runtime.api_resources.read.failed`
+            catalog discovery reads, plus
+            `runtime.inspect.bundle.read` / `runtime.inspect.bundle.read.failed`
+            support-bundle reads.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: source
+          in: query
+          required: false
+          description: Filter by normalized event source.
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: resource_kind
+          in: query
+          required: false
+          description: Additional involved-resource kind filter.
+          schema:
+            type: string
+        - name: resource_name
+          in: query
+          required: false
+          description: Additional involved-resource name filter.
+          schema:
+            type: string
+        - name: trial_id
+          in: query
+          required: false
+          description: Filter by trial id.
+          schema:
+            type: string
+        - name: task_id
+          in: query
+          required: false
+          description: Filter by task id.
+          schema:
+            type: string
       responses:
         '200':
-          description: Runtime results.
+          description: Runtime resource event stream.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RuntimeResults'
+                $ref: '#/components/schemas/RuntimeResourceEventList'
         '400':
           $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
-  /v1/runs/{run_id}/runtime/artifacts/{trial_id}/{role}:
-    get:
-      operationId: downloadRunRuntimeArtifact
-      summary: Download persisted runtime artifact content for a trial.
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/cordon:
+    post:
+      operationId: cordonRunRuntimeRunnerInstance
+      summary: Cordon a runtime RunnerInstance resource.
       description: >
-        Streams first-class artifact bytes uploaded by a worker for a completed
-        or running Cloud run. Authorization follows the owning run; private
-        object-storage paths are resolved server-side and are not exposed to the
-        caller.
+        Marks the selected RunnerInstance as cordoned so it stops accepting new
+        work while preserving current low-level access for any active attempt.
+        The action is owner-scoped through the Cloud run and emits an audited
+        runtime event that appears in runtime events and resource describe
+        output. Other resource kinds return Conflict.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
-        - name: run_id
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+            enum:
+              - RunnerInstance
+        - name: name
           in: path
           required: true
           schema:
             type: string
-            format: uuid
-        - name: trial_id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - resource_version
+              properties:
+                reason:
+                  type: string
+                  nullable: true
+                resource_version:
+                  type: string
+                  minLength: 1
+                  description: Required reviewed precondition from runtime operation review; missing fails with Precondition Required and stale values fail with Conflict.
+      responses:
+        '200':
+          description: Updated runtime resource detail with the cordon event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceDescribe'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+        '428':
+          $ref: './common.yaml#/components/responses/PreconditionRequired'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/drain:
+    post:
+      operationId: drainRunRuntimeRunnerInstance
+      summary: Drain a runtime RunnerInstance resource.
+      description: >
+        Marks the selected RunnerInstance as draining so it stops accepting new
+        work while preserving the current attempt for inspection. The action is
+        owner-scoped through the Cloud run and emits an audited runtime event
+        that appears in runtime events and resource describe output. Other
+        resource kinds return Conflict.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+            enum:
+              - RunnerInstance
+        - name: name
           in: path
           required: true
           schema:
             type: string
-            minLength: 1
-        - name: role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - resource_version
+              properties:
+                reason:
+                  type: string
+                  nullable: true
+                resource_version:
+                  type: string
+                  minLength: 1
+                  description: Required reviewed precondition from runtime operation review; missing fails with Precondition Required and stale values fail with Conflict.
+      responses:
+        '200':
+          description: Updated runtime resource detail with the drain event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceDescribe'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+        '428':
+          $ref: './common.yaml#/components/responses/PreconditionRequired'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/uncordon:
+    post:
+      operationId: uncordonRunRuntimeRunnerInstance
+      summary: Uncordon a runtime RunnerInstance resource.
+      description: >
+        Marks a cordoned or draining RunnerInstance online again so it can
+        accept new work. The action is owner-scoped through the Cloud run and
+        emits an audited runtime event that appears in runtime events and
+        resource describe output. Other resource kinds return Conflict, and
+        offline or unhealthy runners are not revived by this action.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+            enum:
+              - RunnerInstance
+        - name: name
           in: path
           required: true
           schema:
             type: string
-            pattern: '^[a-z][a-z0-9_]{0,63}$'
-        - name: attempt
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - resource_version
+              properties:
+                reason:
+                  type: string
+                  nullable: true
+                resource_version:
+                  type: string
+                  minLength: 1
+                  description: Required reviewed precondition from runtime operation review; missing fails with Precondition Required and stale values fail with Conflict.
+      responses:
+        '200':
+          description: Updated runtime resource detail with the uncordon event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceDescribe'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+        '428':
+          $ref: './common.yaml#/components/responses/PreconditionRequired'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/cancel:
+    post:
+      operationId: cancelRunRuntimeAccessResource
+      summary: Cancel a runtime PortForward or Exec resource.
+      description: >
+        Cancels an active runtime access resource through the same resource
+        action plane used for other runtime lifecycle operations. The action is
+        owner-scoped through the Cloud run and emits an audited runtime access
+        event that appears in runtime events and resource describe output.
+        Other resource kinds return Conflict.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+            enum:
+              - PortForward
+              - Exec
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - resource_version
+              properties:
+                reason:
+                  type: string
+                  nullable: true
+                resource_version:
+                  type: string
+                  minLength: 1
+                  description: Required reviewed precondition from runtime operation review; missing fails with Precondition Required and stale values fail with Conflict.
+      responses:
+        '200':
+          description: Updated runtime resource detail with the cancel event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceDescribe'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+        '428':
+          $ref: './common.yaml#/components/responses/PreconditionRequired'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/actions/complete:
+    post:
+      operationId: completeRunRuntimePortForward
+      summary: Mark an active runtime PortForward resource completed.
+      description: >
+        Records a clean PortForward closeout through the runtime resource action
+        plane. This is the audited lifecycle transition for a tunnel that was
+        active and then ended normally, distinct from DELETE/actions/cancel.
+        Other resource kinds return Conflict.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+            enum:
+              - PortForward
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - resource_version
+              properties:
+                reason:
+                  type: string
+                  nullable: true
+                resource_version:
+                  type: string
+                  minLength: 1
+                  description: Required reviewed precondition from runtime operation review; missing fails with Precondition Required and stale values fail with Conflict.
+      responses:
+        '200':
+          description: Updated runtime resource detail with the completed event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResourceDescribe'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+        '428':
+          $ref: './common.yaml#/components/responses/PreconditionRequired'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/logs:
+    get:
+      operationId: getRunRuntimeResourceLogs
+      summary: Fetch stdout or stderr logs for a log-capable runtime resource.
+      description: >
+        Serves stdout/stderr through a resource identity, similar to `kubectl
+        logs`. RunnerInstance and RunnerAttempt resources map to bounded worker
+        control-plane event tails; Trial, TrialContainer, and assigned
+        ScheduleSlot resources map to Core attempt objects. Unsupported
+        resource kinds return Conflict instead of pretending logs exist.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: stream
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - stdout
+              - stderr
+            default: stdout
+        - name: tail_lines
           in: query
           required: false
           schema:
             type: integer
             minimum: 0
-        - name: core_run_id
-          in: query
-          required: false
-          schema:
-            type: string
-            pattern: '^run_[A-Za-z0-9_.-]+$'
+            maximum: 10000
       responses:
         '200':
-          description: Runtime artifact bytes.
+          description: Runtime resource logs.
           headers:
+            X-Bucephalus-Run-Id:
+              schema:
+                type: string
+            X-Bucephalus-Resource-Kind:
+              schema:
+                type: string
+            X-Bucephalus-Resource-Name:
+              schema:
+                type: string
+            X-Bucephalus-Resource-Version:
+              schema:
+                type: string
+            X-Bucephalus-Log-Stream:
+              schema:
+                type: string
+                enum:
+                  - stdout
+                  - stderr
             X-Bucephalus-Core-Run-Id:
               schema:
                 type: string
@@ -426,10 +1541,80 @@ paths:
             X-Bucephalus-Object-Ref:
               schema:
                 type: string
-            X-Bucephalus-Sha256:
+            X-Bucephalus-Artifact-Sha256:
               schema:
                 $ref: './common.yaml#/components/schemas/Digest'
           content:
+            text/plain:
+              schema:
+                type: string
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/content:
+    get:
+      operationId: getRunRuntimeResourceContent
+      summary: Download content for a content-capable runtime resource.
+      description: >
+        Serves artifact bytes through a first-class runtime resource identity.
+        Today this subresource is advertised for TrialArtifact resources, so
+        clients can list/filter/describe the artifact and then download the same
+        object via `TrialArtifact/{name}/content` without falling back to
+        trial-id/role selectors.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery. For artifact bytes this should resolve to TrialArtifact.
+          schema:
+            type: string
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Runtime resource content bytes.
+          headers:
+            X-Bucephalus-Run-Id:
+              schema:
+                type: string
+            X-Bucephalus-Resource-Kind:
+              schema:
+                type: string
+            X-Bucephalus-Resource-Name:
+              schema:
+                type: string
+            X-Bucephalus-Resource-Version:
+              schema:
+                type: string
+            X-Bucephalus-Core-Run-Id:
+              schema:
+                type: string
+            X-Bucephalus-Trial-Id:
+              schema:
+                type: string
+            X-Bucephalus-Artifact-Role:
+              schema:
+                type: string
+            X-Bucephalus-Object-Ref:
+              schema:
+                type: string
+            X-Bucephalus-Artifact-Sha256:
+              schema:
+                $ref: './common.yaml#/components/schemas/Digest'
+          content:
+            text/plain:
+              schema:
+                type: string
             application/json:
               schema:
                 type: string
@@ -437,64 +1622,114 @@ paths:
             application/x-ndjson:
               schema:
                 type: string
-                format: binary
-            text/plain:
-              schema:
-                type: string
-                format: binary
-            text/x-diff:
-              schema:
-                type: string
-                format: binary
             application/octet-stream:
               schema:
                 type: string
                 format: binary
-        '400':
-          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
-  /v1/runs/{run_id}/runtime/kv/{key}:
-    get:
-      operationId: getRunRuntimeKv
-      summary: Fetch live runtime values by key for a Cloud run.
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/port-forward:
+    post:
+      operationId: createRunRuntimeResourcePortForward
+      summary: Create a port-forward request for a concrete runtime resource.
+      description: >
+        Creates an audited PortForward resource through the selected runtime
+        resource path, similar to `kubectl port-forward` targeting a concrete
+        object. The path resource is authoritative; clients must not send
+        `resource_kind` or `resource_name` in the body.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
-        - name: run_id
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+        - name: name
           in: path
           required: true
           schema:
             type: string
-            format: uuid
-        - name: key
-          in: path
-          required: true
-          schema:
-            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRuntimeResourcePortForwardRequest'
       responses:
-        '200':
-          description: Runtime values for the requested key.
+        '201':
+          description: PortForward runtime resource accepted.
           content:
             application/json:
               schema:
                 type: object
                 additionalProperties: false
                 required:
-                  - cloud_run_id
-                  - key
-                  - values
+                  - resource
                 properties:
-                  cloud_run_id:
-                    type: string
-                    format: uuid
-                  key:
-                    type: string
-                  values:
-                    type: array
-                    items:
-                      $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                  resource:
+                    $ref: '#/components/schemas/RuntimeResource'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+        '428':
+          $ref: './common.yaml#/components/responses/PreconditionRequired'
+  /v1/runs/{run_id}/runtime/resources/{kind}/{name}/exec:
+    post:
+      operationId: createRunRuntimeResourceExec
+      summary: Create an exec request for a concrete runtime resource.
+      description: >
+        Creates an audited Exec resource through the selected runtime resource
+        path, similar to `kubectl exec` targeting a concrete object. The path
+        resource is authoritative; clients must not send `resource_kind` or
+        `resource_name` in the body.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/RunId'
+        - name: kind
+          in: path
+          required: true
+          description: Canonical runtime kind, lowercase singular/plural resource name, or short name from runtime API discovery.
+          schema:
+            type: string
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRuntimeResourceExecRequest'
+      responses:
+        '201':
+          description: Exec runtime resource accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - resource
+                properties:
+                  resource:
+                    $ref: '#/components/schemas/RuntimeResource'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+        '428':
+          $ref: './common.yaml#/components/responses/PreconditionRequired'
   /v1/worker/runs/claim:
     post:
       operationId: claimRun
@@ -797,7 +2032,7 @@ paths:
                   - artifact
                 properties:
                   artifact:
-                    $ref: '#/components/schemas/RuntimeAttemptObject'
+                    $ref: './common.yaml#/components/schemas/AnyJsonObject'
         '400':
           $ref: './common.yaml#/components/responses/BadRequest'
         '401':
@@ -870,23 +2105,191 @@ paths:
                 $ref: '#/components/schemas/RunClaim'
         '401':
           $ref: './common.yaml#/components/responses/Unauthorized'
+  /v1/worker/run-attempts/{attempt_id}/runtime/resources/PortForward:
+    get:
+      operationId: listWorkerRunAttemptPortForwardResources
+      summary: List active PortForward resources assigned to a worker attempt.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+        - name: runner_instance_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Port-forward access requests for the attempt.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - resources
+                properties:
+                  resources:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RuntimeResource'
+  /v1/worker/run-attempts/{attempt_id}/runtime/resources/PortForward/{access_request_id}/{action}:
+    post:
+      operationId: updateWorkerRunAttemptPortForwardResource
+      summary: Advance port-forward lifecycle from a worker attempt.
+      description: >
+        Worker-authenticated lifecycle update for an assigned PortForward
+        resource. The control plane enforces ordered transitions: a request
+        must be accepted before it can become active; completed is allowed only
+        from active; failed and expired updates are allowed from any live phase;
+        terminal or out-of-order updates return a conflict and do not write audit
+        events.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+        - name: access_request_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: action
+          in: path
+          required: true
+          schema:
+            type: string
+            enum:
+              - accept
+              - accepted
+              - active
+              - complete
+              - completed
+              - fail
+              - failed
+              - expire
+              - expired
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRuntimePortForwardRequest'
+      responses:
+        '200':
+          description: Updated PortForward runtime resource.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - resource
+                properties:
+                  resource:
+                    $ref: '#/components/schemas/RuntimeResource'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+  /v1/worker/run-attempts/{attempt_id}/runtime/resources/Exec:
+    get:
+      operationId: listWorkerRunAttemptExecResources
+      summary: List active Exec resources assigned to a worker attempt.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+        - name: runner_instance_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Runtime exec access requests for the attempt.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - resources
+                properties:
+                  resources:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RuntimeResource'
+  /v1/worker/run-attempts/{attempt_id}/runtime/resources/Exec/{access_request_id}/{action}:
+    post:
+      operationId: updateWorkerRunAttemptExecResource
+      summary: Advance runtime exec lifecycle from a worker attempt.
+      description: >
+        Worker-authenticated lifecycle update for an assigned Exec resource. The
+        control plane enforces ordered transitions: a request must be accepted
+        before it can become active or completed; failed and expired updates are
+        allowed from any live phase; terminal or out-of-order updates return a
+        conflict and do not write audit events.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+        - name: access_request_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: action
+          in: path
+          required: true
+          schema:
+            type: string
+            enum:
+              - accept
+              - accepted
+              - active
+              - complete
+              - completed
+              - fail
+              - failed
+              - expire
+              - expired
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRuntimeExecRequest'
+      responses:
+        '200':
+          description: Updated Exec runtime resource.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - resource
+                properties:
+                  resource:
+                    $ref: '#/components/schemas/RuntimeResource'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
   /v1/worker/runs/expire-leases:
     post:
       operationId: expireRunLeases
-      summary: Expire stale worker leases and requeue their runs.
+      summary: Expire stale worker leases, requeue runs, and expire runtime access TTLs.
       security:
         - workerBearerAuth: []
         - workerTokenHeader: []
       description: >
         Timer-driven queue maintenance owned by the Cloud API. Runners call this
         endpoint as a worker maintenance action; they do not connect to Postgres
-        for queue wakeups. Requires the Cloud worker service token, either as a
-        bearer token or X-Bucephalus-Worker-Token.
+        for queue wakeups. This also expires live PortForward and Exec resources
+        whose control-plane ttl has elapsed. Requires the Cloud worker service
+        token, either as a bearer token or X-Bucephalus-Worker-Token.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
       responses:
         '200':
-          description: Expired attempts.
+          description: Expired attempts and runtime access resources.
           content:
             application/json:
               schema:
@@ -894,11 +2297,16 @@ paths:
                 additionalProperties: false
                 required:
                   - expired
+                  - expired_access_resources
                 properties:
                   expired:
                     type: array
                     items:
                       $ref: '#/components/schemas/RunClaim'
+                  expired_access_resources:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RuntimeResource'
         '401':
           $ref: './common.yaml#/components/responses/Unauthorized'
   /v1/runner-pools:
@@ -1249,6 +2657,13 @@ components:
     runnerAdminTokenHeader:
       $ref: './common.yaml#/components/securitySchemes/runnerAdminTokenHeader'
   parameters:
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      description: Opaque Cloud run identifier assigned by the control plane. This is not a UUID.
+      schema:
+        $ref: '#/components/schemas/CloudRunId'
     AttemptId:
       name: attempt_id
       in: path
@@ -1271,6 +2686,13 @@ components:
         type: string
         format: uuid
   schemas:
+    CloudRunId:
+      type: string
+      description: Opaque Cloud run identifier assigned by the control plane. Clients must treat it as a string, not as a UUID.
+      minLength: 1
+      examples:
+        - run_00sonnet46
+        - run-1
     WorkerLeaseRequest:
       type: object
       additionalProperties: false
@@ -1286,6 +2708,35 @@ components:
           minimum: 5
           maximum: 3600
           default: 30
+    RuntimeResourceMutationRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        resource_version:
+          type:
+            - string
+            - 'null'
+          description: Resource version precondition from a prior describe/can-i response.
+        reason:
+          type:
+            - string
+            - 'null'
+          description: Human-readable reason recorded in runtime audit events.
+    WorkerRuntimeAccessUpdate:
+      type: object
+      additionalProperties: false
+      required:
+        - runner_instance_id
+      properties:
+        runner_instance_id:
+          type: string
+          minLength: 1
+        connection:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        error_message:
+          type:
+            - string
+            - 'null'
     RunClaim:
       type: object
       additionalProperties: false
@@ -1409,8 +2860,7 @@ components:
         - updated_at
       properties:
         run_id:
-          type: string
-          format: uuid
+          $ref: '#/components/schemas/CloudRunId'
         package_digest:
           $ref: './common.yaml#/components/schemas/Digest'
         experiment_name:
@@ -1562,154 +3012,1771 @@ components:
           type: string
         source_content_digest:
           $ref: './common.yaml#/components/schemas/Digest'
-    RuntimeSummary:
+    RuntimeResourceList:
       type: object
       additionalProperties: false
       required:
+        - apiVersion
+        - kind
+        - metadata
         - cloud_run_id
         - core_run_ids
-        - runtime_snapshots
-        - run_controls
-        - schedule_progress
-        - active_slots
-        - recent_events
+        - resources
       properties:
-        cloud_run_id:
+        apiVersion:
           type: string
-          format: uuid
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeResourceList
+        metadata:
+          $ref: '#/components/schemas/RuntimeResourceListMeta'
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
         core_run_ids:
           type: array
           items:
             type: string
-        runtime_snapshots:
-          type: array
-          description: >
-            Worker-persisted Core runtime JSON mirrors, appended through the
-            Cloud API before attempt cleanup.
-          items:
-            $ref: '#/components/schemas/RuntimeSnapshot'
-        run_controls:
+        resources:
           type: array
           items:
-            $ref: './common.yaml#/components/schemas/AnyJsonObject'
-        schedule_progress:
-          type: array
-          items:
-            $ref: './common.yaml#/components/schemas/AnyJsonObject'
-        active_slots:
-          type: array
-          items:
-            $ref: '#/components/schemas/RuntimeSlot'
-        recent_events:
-          type: array
-          items:
-            $ref: '#/components/schemas/RuntimeEvent'
-    RuntimeSnapshot:
+            $ref: '#/components/schemas/RuntimeResource'
+    RuntimeResourceListMeta:
       type: object
       additionalProperties: false
       required:
-        - core_run_id
-        - run_dir_name
-        - runtime_values
-        - trial_summaries
-        - evidence_records
-        - omitted
+        - resourceVersion
+        - continue
+        - remainingItemCount
+        - total
+        - returned
       properties:
-        core_run_id:
+        resourceVersion:
           type: string
-        run_dir_name:
+          description: Deterministic collection resource version for the full filtered runtime resource list.
+        continue:
+          type:
+            - string
+            - 'null'
+          description: Opaque pagination continuation token when more filtered resources remain.
+        remainingItemCount:
+          type: integer
+          minimum: 0
+          description: Number of additional filtered resources after the current page.
+        total:
+          type: integer
+          minimum: 0
+          description: Total number of resources in the filtered collection before pagination.
+        returned:
+          type: integer
+          minimum: 0
+          description: Number of resources returned in this page.
+    RuntimeResourceWatchList:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - cloud_run_id
+        - generated_at
+        - core_run_ids
+        - resource_versions
+        - events
+        - resource_inventory
+      properties:
+        apiVersion:
           type: string
-          description: Relative Core run directory name, never an absolute worker path.
-        runtime_values:
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeResourceWatchList
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+        core_run_ids:
+          type: array
+          items:
+            type: string
+        resource_versions:
           type: object
           additionalProperties:
-            $ref: './common.yaml#/components/schemas/AnyJsonObject'
-        trial_summaries:
+            type: string
+          description: Current watch cursor map keyed by lowercase `kind/name`.
+        events:
           type: array
+          items:
+            $ref: '#/components/schemas/RuntimeResourceWatchEvent'
+        resource_inventory:
+          $ref: '#/components/schemas/RuntimeResourceList'
+    RuntimeResourceWatchEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - resource_ref
+      properties:
+        type:
+          type: string
+          enum:
+            - ADDED
+            - MODIFIED
+            - DELETED
+            - BOOKMARK
+        resource_ref:
+          $ref: '#/components/schemas/RuntimeResourceWatchRef'
+        resource_version:
+          type: string
+        previous_resource_version:
+          type: string
+        resource:
+          $ref: '#/components/schemas/RuntimeResource'
+    RuntimeResourceWatchRef:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - name
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+        name:
+          type: string
+        uid:
+          type: string
+    RuntimeResourceHealth:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - cloud_run_id
+        - generated_at
+        - core_run_ids
+        - summary
+        - resources
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeResourceHealth
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+        core_run_ids:
+          type: array
+          items:
+            type: string
+        summary:
+          $ref: '#/components/schemas/RuntimeResourceHealthSummary'
+        resources:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeResourceHealthRow'
+    RuntimeResourceHealthSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - total
+        - ready
+        - degraded
+        - problem
+        - unknown
+        - access_targets
+        - reachable_access_targets
+        - port_forward_ready
+        - exec_ready
+        - actions_available
+        - observed_resources
+        - observed_current
+        - observed_stale
+        - observed_unknown
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        ready:
+          type: integer
+          minimum: 0
+        degraded:
+          type: integer
+          minimum: 0
+        problem:
+          type: integer
+          minimum: 0
+        unknown:
+          type: integer
+          minimum: 0
+        access_targets:
+          type: integer
+          minimum: 0
+          description: Resources with a `status.access` object.
+        reachable_access_targets:
+          type: integer
+          minimum: 0
+          description: Resources whose `status.access.reachable` is true.
+        port_forward_ready:
+          type: integer
+          minimum: 0
+          description: Resources whose `status.access.port_forward` is true.
+        exec_ready:
+          type: integer
+          minimum: 0
+          description: Resources whose `status.access.exec` is true.
+        actions_available:
+          type: integer
+          minimum: 0
+          description: Resources with advertised `status.actions[]`.
+        observed_resources:
+          type: integer
+          minimum: 0
+          description: Resources with comparable `metadata.generation` and `status.observedGeneration`.
+        observed_current:
+          type: integer
+          minimum: 0
+          description: Resources whose `status.observedGeneration` has caught up to `metadata.generation`.
+        observed_stale:
+          type: integer
+          minimum: 0
+          description: Resources whose `status.observedGeneration` is behind `metadata.generation`.
+        observed_unknown:
+          type: integer
+          minimum: 0
+          description: Resources without enough generation data to determine observed status freshness.
+    RuntimeResourceAccessStatus:
+      type: object
+      additionalProperties: true
+      description: >
+        Normalized low-level access status derived from a runtime resource's
+        target binding and runner capabilities. Access target resources expose
+        this object under `status.access`; runtime health rows return the same
+        shape as `access` so CLI and GUI clients can filter, summarize, and
+        explain low-level access readiness without parsing arbitrary status
+        payloads.
+      properties:
+        reachable:
+          type: boolean
+          description: Whether the resource is currently reachable for low-level runtime access.
+        reason:
+          type: string
+          description: Machine-readable reachability reason, or `reachable` when the target is usable.
+        port_forward:
+          type: boolean
+          description: Whether the resource can be targeted by a port-forward request.
+        exec:
+          type: boolean
+          description: Whether the resource can be targeted by a runtime exec request.
+        runner_instance_id:
+          type: string
+          description: Runner instance currently backing this access target.
+        runner_instance_status:
+          type: string
+          description: Status of the runner instance currently backing this access target.
+        attempt_id:
+          type: string
+          description: Runner attempt currently backing this access target.
+        worker_id:
+          type: string
+          description: Worker id currently backing this access target.
+    RuntimeResourceHealthRow:
+      type: object
+      additionalProperties: false
+      required:
+        - resource
+        - resource_ref
+        - health
+        - observed
+        - phase
+        - ready
+        - reason
+        - message
+        - condition_summary
+        - degraded_conditions
+        - actions
+        - access
+        - access_summary
+        - source
+        - updated_at
+        - resource_version
+      properties:
+        resource:
+          type: string
+          description: Canonical `Kind/name` resource identity.
+        resource_ref:
+          $ref: '#/components/schemas/RuntimeResourceWatchRef'
+        health:
+          type: string
+          enum:
+            - ready
+            - degraded
+            - problem
+            - unknown
+        observed:
+          type: string
+          enum:
+            - current
+            - stale
+            - unknown
+          description: Freshness state derived from `metadata.generation` and `status.observedGeneration`.
+        phase:
+          type:
+            - string
+            - 'null'
+        ready:
+          anyOf:
+            - $ref: '#/components/schemas/RuntimeResourceCondition'
+            - type: 'null'
+        reason:
+          type:
+            - string
+            - 'null'
+        message:
+          type:
+            - string
+            - 'null'
+        condition_summary:
+          type:
+            - string
+            - 'null'
+        degraded_conditions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeResourceCondition'
+        actions:
+          type: array
+          items:
+            type: string
+        access:
+          $ref: '#/components/schemas/RuntimeResourceAccessStatus'
+        access_summary:
+          type:
+            - string
+            - 'null'
+        source:
+          type:
+            - string
+            - 'null'
+        updated_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        resource_version:
+          type:
+            - string
+            - 'null'
+    RuntimeResourceCondition:
+      type: object
+      additionalProperties: true
+      required:
+        - type
+        - status
+        - reason
+        - message
+      properties:
+        type:
+          type: string
+        status:
+          type: string
+          enum:
+            - 'True'
+            - 'False'
+            - Unknown
+        reason:
+          type: string
+        message:
+          type: string
+        lastTransitionTime:
+          type: string
+          format: date-time
+    RuntimeApiResourceList:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - cloud_run_id
+        - generated_at
+        - core_run_ids
+        - resources
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeApiResourceList
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+          description: Server time when this runtime API discovery snapshot was generated.
+        core_run_ids:
+          type: array
+          description: Core run ids represented by the resource inventory used to compute live discovery counts.
+          items:
+            type: string
+        resources:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeApiResource'
+    RuntimeApiResource:
+      type: object
+      additionalProperties: false
+      required:
+        - cloud_run_id
+        - generated_at
+        - core_run_ids
+        - group
+        - version
+        - name
+        - singularName
+        - namespaced
+        - scope
+        - kind
+        - shortNames
+        - categories
+        - verbs
+        - subresources
+        - actions
+        - access
+        - supports
+        - pathTemplates
+        - exampleCommands
+        - printerColumns
+        - fieldSelectors
+        - labelSelectors
+        - labelSelector
+        - count
+        - description
+      properties:
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+          description: Server time when this runtime API resource discovery snapshot was generated.
+        core_run_ids:
+          type: array
+          description: Core run ids represented by the resource inventory used to compute this kind's live count.
+          items:
+            type: string
+        group:
+          type: string
+          enum:
+            - bucephalus.dev
+          description: Runtime API group for this resource kind.
+        version:
+          type: string
+          enum:
+            - v1alpha1
+          description: Runtime API version for this resource kind.
+        name:
+          type: string
+          description: Lowercase plural resource name, similar to Kubernetes APIResource.name. Accepted anywhere a runtime resource kind is requested.
+        singularName:
+          type: string
+          description: Lowercase singular resource name accepted as a kind alias.
+        namespaced:
+          type: boolean
+          enum:
+            - false
+        scope:
+          type: string
+          enum:
+            - run
+          description: Runtime resources are scoped to one Cloud run.
+        kind:
+          type: string
+          description: Canonical PascalCase runtime resource kind.
+        shortNames:
+          type: array
+          items:
+            type: string
+          description: Short aliases accepted anywhere a runtime resource kind is requested.
+        categories:
+          type: array
+          items:
+            type: string
+        verbs:
+          type: array
+          description: Supported collection/resource verbs such as list, get, watch, describe, create, and delete.
+          items:
+            type: string
+        subresources:
+          type: array
+          description: >
+            Supported subresources such as logs, actions/cordon,
+            actions/cancel, or actions/complete.
+          items:
+            type: string
+        actions:
+          type: array
+          description: Supported lifecycle actions exposed through resource action subresources.
+          items:
+            type: string
+        access:
+          type: array
+          description: Low-level runtime access and observability operations this kind can target, such as logs, port-forward, or exec.
+          items:
+            type: string
+        supports:
+          $ref: '#/components/schemas/RuntimeApiResourceSupports'
+        pathTemplates:
+          $ref: '#/components/schemas/RuntimeApiResourcePathTemplates'
+        exampleCommands:
+          type: array
+          description: CLI command templates for common operator workflows, using `{run_id}` and `{name}` placeholders.
+          items:
+            $ref: '#/components/schemas/RuntimeApiResourceExampleCommand'
+        printerColumns:
+          type: array
+          description: Kubernetes-style printer column hints for list/watch/resource tables.
+          items:
+            $ref: '#/components/schemas/RuntimeApiResourcePrinterColumn'
+        fieldSelectors:
+          type: array
+          description: >
+            Concrete field selector paths supported by the runtime resource
+            list/watch/inspect endpoints for this kind. Clients should use the
+            advertised paths instead of parsing payload JSON; for example Event
+            resources advertise involved-object selectors such as
+            `spec.involved_object.kind`, `spec.involved_object.name`,
+            `status.involved`, and `status.involved_uid`.
+          items:
+            type: string
+        labelSelectors:
+          type: array
+          description: Label selector keys stamped on this resource kind and supported by the runtime resource list endpoint.
+          items:
+            type: string
+        labelSelector:
+          type: boolean
+          enum:
+            - true
+        count:
+          type: integer
+          minimum: 0
+          description: Current number of visible resources of this kind in the run inventory.
+        description:
+          type: string
+    RuntimeApiResourceSupports:
+      type: object
+      additionalProperties: false
+      required:
+        - list
+        - get
+        - watch
+        - describe
+        - create
+        - delete
+        - actions
+        - access
+        - labelSelector
+        - fieldSelector
+      properties:
+        list:
+          type: boolean
+        get:
+          type: boolean
+        watch:
+          type: boolean
+        describe:
+          type: boolean
+        create:
+          type: boolean
+        delete:
+          type: boolean
+        actions:
+          type: boolean
+        access:
+          type: boolean
+        labelSelector:
+          type: boolean
+          enum:
+            - true
+        fieldSelector:
+          type: boolean
+          enum:
+            - true
+    RuntimeApiResourcePathTemplates:
+      type: object
+      additionalProperties: false
+      required:
+        - collection
+        - resource
+        - describe
+        - operationReview
+        - watch
+        - subresources
+      properties:
+        collection:
+          type: string
+          description: Template for listing this kind, with `{run_id}` as a placeholder.
+        resource:
+          type: string
+          description: Template for raw resource get operations, with `{run_id}` and `{name}` placeholders.
+        describe:
+          type: string
+          description: Template for resource describe operations, with `{run_id}` and `{name}` placeholders.
+        operationReview:
+          type: string
+          description: Template for operation support review, with `{run_id}`, `{name}`, and `{operation}` placeholders.
+        watch:
+          type: string
+          description: Template for watching this kind, with `{run_id}` as a placeholder.
+        create:
+          type: string
+          description: Template for resource create operations when the kind advertises the create verb. Runtime access resources use `{target_kind}` and `{target_name}` placeholders because they are created through the selected target resource subresource.
+        delete:
+          type: string
+          description: Template for resource DELETE operations when the kind advertises the delete verb, with `{run_id}` and `{name}` placeholders.
+        subresources:
+          type: object
+          additionalProperties:
+            type: string
+          description: Templates keyed by subresource name, with `{run_id}` and `{name}` placeholders.
+    RuntimeApiResourceExampleCommand:
+      type: object
+      additionalProperties: false
+      required:
+        - purpose
+        - command
+      properties:
+        purpose:
+          type: string
+          description: "Short label for the operation, such as describe, logs/stdout, port-forward, exec, or cordon."
+        command:
+          type: string
+          description: "bucephalus-cloud command template using `{run_id}` and, for resource-scoped operations, `{name}` placeholders."
+    RuntimeApiResourcePrinterColumn:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - type
+        - jsonPath
+        - description
+        - priority
+      properties:
+        name:
+          type: string
+          description: Column label for CLI and GUI resource table views.
+        type:
+          type: string
+          enum:
+            - string
+            - integer
+            - number
+            - boolean
+            - date
+          description: Value type expected at the JSON path.
+        jsonPath:
+          type: string
+          description: JSONPath-like expression rooted at the runtime resource object.
+        description:
+          type: string
+        priority:
+          type: integer
+          minimum: 0
+          description: Zero-priority columns should be shown in compact output; higher values are wider/detail columns.
+    RuntimeInspectBundle:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - cloud_run_id
+        - generated_at
+        - resource_filter
+        - api_resources
+        - resource_inventory
+        - resource_health
+        - resource_metrics
+        - event_list
+        - log_refs
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeInspectBundle
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+        resource_filter:
+          $ref: '#/components/schemas/RuntimeInspectBundleFilter'
+        api_resources:
+          $ref: '#/components/schemas/RuntimeApiResourceList'
+        resource_inventory:
+          $ref: '#/components/schemas/RuntimeResourceList'
+        resource_health:
+          $ref: '#/components/schemas/RuntimeResourceHealth'
+        resource_metrics:
+          $ref: '#/components/schemas/RuntimeResourceMetricsList'
+        event_list:
+          description: Full event-list envelope for the bounded recent events captured in this bundle.
+          $ref: '#/components/schemas/RuntimeEventList'
+        log_refs:
+          type: array
+          description: Log subresource references for resources that support stdout/stderr logs.
           items:
             type: object
             additionalProperties: false
             required:
-              - trial_id
-              - summary
+              - resource
+              - streams
+              - urls
             properties:
-              trial_id:
-                type: string
-              summary:
-                $ref: './common.yaml#/components/schemas/AnyJsonObject'
-              contract_trace:
-                $ref: './common.yaml#/components/schemas/AnyJsonObject'
-              trial_events:
+              resource:
+                type: object
+                additionalProperties: false
+                required:
+                  - apiVersion
+                  - kind
+                  - name
+                properties:
+                  apiVersion:
+                    type: string
+                    enum:
+                      - bucephalus.dev/v1alpha1
+                  kind:
+                    type: string
+                  name:
+                    type: string
+                  uid:
+                    type: string
+              streams:
                 type: array
                 items:
-                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
-        evidence_records:
-          type: array
-          items:
-            $ref: './common.yaml#/components/schemas/AnyJsonObject'
-        omitted:
-          type: array
-          items:
-            type: string
-        seq:
-          type: integer
-        created_at:
-          type: string
-          format: date-time
-    RuntimeSlot:
+                  type: string
+                  enum:
+                    - stdout
+                    - stderr
+              urls:
+                type: object
+                additionalProperties: false
+                required:
+                  - stdout
+                  - stderr
+                properties:
+                  stdout:
+                    type: string
+                  stderr:
+                    type: string
+    RuntimeInspectBundleFilter:
       type: object
       additionalProperties: false
       required:
-        - core_run_id
-        - schedule_idx
-        - state
-        - trial_id
-        - attempt
-        - worker_id
-        - owner_id
-        - lease_expires_at
-        - slot_commit_id
-        - slot_status
-        - slot
+        - kinds
+        - categories
+        - label_selector
+        - field_selector
       properties:
-        core_run_id:
+        kinds:
+          type: array
+          items:
+            type: string
+        categories:
+          type: array
+          items:
+            type: string
+        label_selector:
           type: string
-        schedule_idx:
-          type: integer
-        state:
+          nullable: true
+        field_selector:
           type: string
+          nullable: true
+    RuntimeResourceDescribe:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - cloud_run_id
+        - generated_at
+        - core_run_ids
+        - resource
+        - operations
+        - related_resources
+        - event_list
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeResourceDescribe
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+          description: Server timestamp for the runtime resource describe snapshot.
+        core_run_ids:
+          type: array
+          items:
+            type: string
+        resource:
+          $ref: '#/components/schemas/RuntimeResource'
+        operations:
+          type: array
+          description: >
+            Object-scoped operations advertised for this resource. Unsupported
+            entries remain visible with a reason so clients do not need to guess
+            why a low-level action is unavailable.
+          items:
+            $ref: '#/components/schemas/RuntimeResourceOperation'
+        related_resources:
+          type: array
+          description: >
+            Direct graph neighbors for the described resource. `owner` entries
+            are resources referenced by `metadata.ownerReferences`; `dependent`
+            entries are resources that point back to the described resource.
+          items:
+            $ref: '#/components/schemas/RuntimeRelatedResource'
+        event_list:
+          $ref: '#/components/schemas/RuntimeResourceEventList'
+    RuntimeResourceOperation:
+      type: object
+      additionalProperties: false
+      required:
+        - purpose
+        - command
+        - supported
+        - reason
+        - message
+        - verb
+        - subresource
+        - action
+        - requires_running_run
+      properties:
+        purpose:
+          type: string
+          description: Short operation label, such as describe, logs/stdout, port-forward, exec, or cordon.
+        command:
+          type: string
+          description: Materialized bucephalus-cloud command for this run and resource.
+        supported:
+          type: boolean
+          description: Whether this operation is currently available for the selected resource.
+        reason:
+          type: string
+          nullable: true
+          description: Machine-readable reason when supported is false.
+        message:
+          type: string
+          nullable: true
+          description: Human-readable explanation when supported is false.
+        verb:
+          type: string
+          nullable: true
+          description: Resource verb represented by the operation when applicable.
+        subresource:
+          type: string
+          nullable: true
+          description: Resource subresource represented by the operation when applicable.
+        action:
+          type: string
+          nullable: true
+          description: Lifecycle action represented by the operation when applicable.
+        requires_running_run:
+          type: boolean
+          description: Whether the operation requires a currently running Cloud run.
+    RuntimeResourceOperationReview:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - cloud_run_id
+        - generated_at
+        - core_run_ids
+        - resource_ref
+        - resource_version
+        - resource_generation
+        - observed_generation
+        - operation
+        - matched_operation
+        - supported
+        - reason
+        - message
+        - command
+        - verb
+        - subresource
+        - action
+        - requires_running_run
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeResourceOperationReview
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+          description: Server timestamp for the resource snapshot used to calculate this operation decision.
+        core_run_ids:
+          type: array
+          items:
+            type: string
+          description: Core run identifiers represented by the runtime snapshot used for this operation decision.
+        resource_ref:
+          $ref: '#/components/schemas/RuntimeResourceWatchRef'
+        resource_version:
+          type: string
+          description: Runtime resource version the server used when calculating this operation decision.
+        resource_generation:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+          description: Desired-state metadata.generation the server used when calculating this operation decision.
+        observed_generation:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+          description: Status observedGeneration the server used when calculating this operation decision.
+        operation:
+          type: string
+          description: Operation label requested by the client.
+        matched_operation:
+          type: string
+          nullable: true
+          description: Server-advertised operation that matched the request, such as logs/stdout for a logs query.
+        supported:
+          type: boolean
+          description: Whether the matched operation is currently available for the selected resource.
+        reason:
+          type: string
+          nullable: true
+          description: Machine-readable reason when supported is false.
+        message:
+          type: string
+          nullable: true
+          description: Human-readable explanation when supported is false.
+        command:
+          type: string
+          nullable: true
+          description: Materialized bucephalus-cloud command when the operation is advertised.
+        verb:
+          type: string
+          nullable: true
+          description: Resource verb represented by the matched operation when applicable.
+        subresource:
+          type: string
+          nullable: true
+          description: Resource subresource represented by the matched operation when applicable.
+        action:
+          type: string
+          nullable: true
+          description: Lifecycle action represented by the matched operation when applicable.
+        requires_running_run:
+          type: boolean
+          nullable: true
+          description: Whether the matched operation requires a currently running Cloud run.
+    RuntimeEventList:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - cloud_run_id
+        - generated_at
+        - event_filter
+        - metadata
+        - events
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeEventList
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+        event_filter:
+          $ref: '#/components/schemas/RuntimeEventListFilter'
+        metadata:
+          $ref: '#/components/schemas/RuntimeEventListMetadata'
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeEvent'
+    RuntimeEventListFilter:
+      type: object
+      additionalProperties: false
+      required:
+        - event_types
+        - sources
+        - resource_kind
+        - resource_name
+        - trial_id
+        - task_id
+      properties:
+        event_types:
+          type: array
+          items:
+            type: string
+        sources:
+          type: array
+          items:
+            type: string
+        resource_kind:
+          type: string
+          nullable: true
+        resource_name:
+          type: string
+          nullable: true
         trial_id:
-          type:
-            - string
-            - 'null'
-        attempt:
+          type: string
+          nullable: true
+        task_id:
+          type: string
+          nullable: true
+    RuntimeEventListMetadata:
+      type: object
+      additionalProperties: false
+      required:
+        - resourceVersion
+        - continue
+        - remainingItemCount
+        - limit
+        - returned
+        - after_row_seq
+        - next_after_row_seq
+      properties:
+        resourceVersion:
+          type: string
+          description: >
+            Event stream version suitable as a follow/watch cursor. Current
+            values use `event-row-seq:<row_seq>`; clients should pass the value
+            back through `continue` unchanged.
+        continue:
+          type: string
+          nullable: true
+          description: >
+            Cursor for the next event page when another page is known. Current
+            values use `event-row-seq:<row_seq>`; clients should pass the value
+            back through `continue` unchanged.
+        remainingItemCount:
           type: integer
-        worker_id:
+          nullable: true
+          minimum: 0
+          description: Remaining event count when known; null means the server did not compute it.
+        limit:
+          type: integer
+          minimum: 1
+        returned:
+          type: integer
+          minimum: 0
+        after_row_seq:
+          type: integer
+          nullable: true
+          minimum: 0
+          description: Input cursor row sequence after normalizing either `after_row_seq` or `continue`.
+        next_after_row_seq:
+          type: integer
+          nullable: true
+          minimum: 0
+          description: Highest row sequence returned in this page; also the value encoded in `metadata.resourceVersion`.
+    RuntimeResourceEventList:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - cloud_run_id
+        - generated_at
+        - core_run_ids
+        - resource
+        - event_filter
+        - metadata
+        - events
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeResourceEventList
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+        core_run_ids:
+          type: array
+          items:
+            type: string
+        resource:
+          $ref: '#/components/schemas/RuntimeResource'
+        event_filter:
+          $ref: '#/components/schemas/RuntimeEventListFilter'
+        metadata:
+          $ref: '#/components/schemas/RuntimeEventListMetadata'
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeEvent'
+    RuntimeResourceMetrics:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - cloud_run_id
+        - generated_at
+        - core_run_ids
+        - resource_ref
+        - resource_version
+        - phase
+        - summary
+        - metrics
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeResourceMetrics
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+        core_run_ids:
+          type: array
+          items:
+            type: string
+        resource_ref:
+          $ref: '#/components/schemas/RuntimeResourceWatchRef'
+        resource_version:
           type:
             - string
             - 'null'
-        owner_id:
+        phase:
           type:
             - string
             - 'null'
-        lease_expires_at:
+        summary:
+          $ref: '#/components/schemas/RuntimeResourceMetricsSummary'
+        metrics:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeResourceMetric'
+    RuntimeResourceMetricsList:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - cloud_run_id
+        - generated_at
+        - core_run_ids
+        - metadata
+        - summary
+        - resources
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeResourceMetricsList
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+        core_run_ids:
+          type: array
+          items:
+            type: string
+        metadata:
+          type: object
+          additionalProperties: false
+          required:
+            - resourceVersion
+            - continue
+            - remainingItemCount
+            - total
+            - returned
+          properties:
+            resourceVersion:
+              type: string
+              description: Deterministic resource version for the full filtered runtime resource inventory.
+            continue:
+              type: string
+              nullable: true
+              description: Opaque cursor for the next page of resource metric rows, or null when this page is complete.
+            remainingItemCount:
+              type: integer
+              minimum: 0
+              description: Number of filtered resources remaining after this metrics page.
+            total:
+              type: integer
+              minimum: 0
+              description: Number of resources matching the metrics filters before pagination is applied.
+            returned:
+              type: integer
+              minimum: 0
+              description: Number of resource metric rows returned.
+        summary:
+          $ref: '#/components/schemas/RuntimeResourceMetricsListSummary'
+        resources:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeResourceMetrics'
+    RuntimeResourceMetricsListSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - resources_total
+        - resources_returned
+        - metrics_total
+        - lifecycle_metrics
+        - condition_metrics
+        - access_metrics
+        - event_metrics
+        - numeric_spec_metrics
+        - numeric_status_metrics
+        - events_total
+      properties:
+        resources_total:
+          type: integer
+          minimum: 0
+        resources_returned:
+          type: integer
+          minimum: 0
+        metrics_total:
+          type: integer
+          minimum: 0
+        lifecycle_metrics:
+          type: integer
+          minimum: 0
+        condition_metrics:
+          type: integer
+          minimum: 0
+        access_metrics:
+          type: integer
+          minimum: 0
+        event_metrics:
+          type: integer
+          minimum: 0
+        numeric_spec_metrics:
+          type: integer
+          minimum: 0
+        numeric_status_metrics:
+          type: integer
+          minimum: 0
+        events_total:
+          type: integer
+          minimum: 0
+    RuntimeResourceMetricsSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - metrics_total
+        - lifecycle_metrics
+        - condition_metrics
+        - access_metrics
+        - event_metrics
+        - numeric_spec_metrics
+        - numeric_status_metrics
+        - events_total
+      properties:
+        metrics_total:
+          type: integer
+          minimum: 0
+        lifecycle_metrics:
+          type: integer
+          minimum: 0
+        condition_metrics:
+          type: integer
+          minimum: 0
+        access_metrics:
+          type: integer
+          minimum: 0
+        event_metrics:
+          type: integer
+          minimum: 0
+        numeric_spec_metrics:
+          type: integer
+          minimum: 0
+        numeric_status_metrics:
+          type: integer
+          minimum: 0
+        events_total:
+          type: integer
+          minimum: 0
+    RuntimeResourceMetric:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - value
+        - unit
+        - source
+        - description
+        - labels
+      properties:
+        name:
+          type: string
+        value:
+          type: number
+        unit:
           type:
             - string
             - 'null'
-        slot_commit_id:
+        source:
+          type: string
+          enum:
+            - lifecycle
+            - condition
+            - access
+            - event
+            - spec
+            - status
+        description:
+          type: string
+        labels:
+          type: object
+          additionalProperties: true
+    RuntimeResourceStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - cloud_run_id
+        - generated_at
+        - core_run_ids
+        - resource_ref
+        - generation
+        - observedGeneration
+        - resourceVersion
+        - deletionTimestamp
+        - phase
+        - reason
+        - message
+        - conditions
+        - actions
+        - status
+        - audit
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          enum:
+            - RuntimeResourceStatus
+        cloud_run_id:
+          $ref: '#/components/schemas/CloudRunId'
+        generated_at:
+          type: string
+          format: date-time
+          description: Server timestamp for the runtime status snapshot.
+        core_run_ids:
+          type: array
+          items:
+            type: string
+        resource_ref:
+          $ref: '#/components/schemas/RuntimeResourceWatchRef'
+        generation:
+          type: integer
+          minimum: 1
+        observedGeneration:
+          type: integer
+          minimum: 1
+        resourceVersion:
+          type: string
+          minLength: 1
+        deletionTimestamp:
           type:
             - string
             - 'null'
-        slot_status:
+          format: date-time
+          description: >
+            Kubernetes-style deletion timestamp when a resource-level delete
+            has been acknowledged but the audited runtime resource remains
+            visible for lifecycle history.
+        phase:
           type:
             - string
             - 'null'
-        slot:
+        reason:
+          type:
+            - string
+            - 'null'
+        message:
+          type:
+            - string
+            - 'null'
+        conditions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeResourceCondition'
+        actions:
+          type: array
+          items:
+            type: string
+        status:
           $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        audit:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    RuntimeRelatedResource:
+      type: object
+      additionalProperties: false
+      required:
+        - relationship
+        - resource
+      properties:
+        relationship:
+          type: string
+          enum:
+            - owner
+            - dependent
+        resource:
+          $ref: '#/components/schemas/RuntimeResource'
+    RuntimeResource:
+      type: object
+      additionalProperties: false
+      required:
+        - apiVersion
+        - kind
+        - metadata
+        - spec
+        - status
+        - audit
+      properties:
+        apiVersion:
+          type: string
+          enum:
+            - bucephalus.dev/v1alpha1
+        kind:
+          type: string
+          description: >
+            Resource kind such as Run, CoreRun, Package, RunnerShape,
+            CapabilityRequirement, ImagePull, SecretBinding, NetworkPerimeter,
+            RunnerPool, RunnerInstance, RunnerAttempt, RunnerProvisionRequest,
+            Trial, ScheduleSlot, RunManifest, MetricDefinition, SlotCommit,
+            PendingTrialCompletion, VariantSnapshot, EvidenceRecord,
+            ChainState, TrialConclusion, LineageVersion, LineageHead,
+            TrialContainer, TrialStage, RuntimeValue, MetricObservation,
+            PerformanceSample, RuntimeOperation, TrialArtifact,
+            RuntimeSnapshot, Event, PortForward, or Exec.
+        metadata:
+          type: object
+          additionalProperties: false
+          required:
+            - name
+            - uid
+            - generation
+            - resourceVersion
+            - labels
+            - annotations
+            - ownerReferences
+          properties:
+            name:
+              type: string
+            uid:
+              type: string
+              minLength: 1
+              description: >
+                Stable `RuntimeResource.metadata.uid` for this visible runtime
+                resource. Generated resources receive a deterministic UID so
+                tree views, owner references, selectors, events, and mutation
+                preconditions can rely on a Kubernetes-style identity.
+            generation:
+              type: integer
+              minimum: 1
+              description: >
+                Kubernetes-style desired-state generation for the rendered
+                resource. For generated runtime resources this is a deterministic
+                integer derived from the resource identity, labels, owner
+                references, and spec.
+            resourceVersion:
+              type: string
+              minLength: 1
+              description: >
+                Opaque Kubernetes-style change token for the rendered runtime
+                resource. Changes whenever the visible resource spec, status,
+                metadata, or audit payload changes.
+            creationTimestamp:
+              type: string
+              format: date-time
+              description: >
+                Kubernetes-style creation timestamp for the rendered resource.
+                Preserved alongside the compatibility `created_at` field when
+                the source runtime row has creation time evidence.
+            deletionTimestamp:
+              type: string
+              format: date-time
+              description: >
+                Kubernetes-style deletion timestamp. Runtime access resources
+                retain this marker after an audited delete/cancel so operators
+                can keep inspecting the lifecycle object while wait/delete
+                clients observe deletion acknowledgement.
+            labels:
+              type: object
+              additionalProperties:
+                type: string
+            annotations:
+              type: object
+              description: >
+                Kubernetes-style annotations for operational/audit metadata
+                that should travel with the resource manifest without becoming
+                label-selector state. Examples include audit source, visible
+                phase, access target, access target UID/resourceVersion,
+                requester, and request reason.
+              additionalProperties:
+                type: string
+            ownerReferences:
+              type: array
+              description: >
+                Kubernetes-style references to parent or related runtime
+                resources, such as the owning Run, RunnerPool, RunnerInstance,
+                RunnerAttempt, ScheduleSlot, or runtime access target.
+              items:
+                type: object
+                additionalProperties: false
+                required:
+                  - apiVersion
+                  - kind
+                  - name
+                properties:
+                  apiVersion:
+                    type: string
+                    enum:
+                      - bucephalus.dev/v1alpha1
+                  kind:
+                    type: string
+                  name:
+                    type: string
+                  uid:
+                    type: string
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+        spec:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        status:
+          allOf:
+            - $ref: './common.yaml#/components/schemas/AnyJsonObject'
+          description: >
+            Resource status. Every runtime resource includes `phase` when known,
+            a top-level Kubernetes-style `reason` and `message` summary derived
+            from the most operationally relevant condition, an
+            `observedGeneration` freshness marker showing which
+            `metadata.generation` the status reflects, and a Kubernetes-style
+            `conditions[]` array with entries shaped as
+            `{type,status,reason,message,lastTransitionTime}`. Resources with
+            currently available lifecycle verbs also include `actions[]`, for
+            example `cordon`, `drain`, `uncordon`, `cancel`, or `complete`.
+            Runtime access target resources also include `status.access`, a
+            normalized object with machine-readable reachability and data-plane
+            capability fields:
+            `reachable`, `reason`, `port_forward`, `exec`,
+            `runner_instance_id`, `runner_instance_status`, `attempt_id`, and
+            `worker_id`. PortForward and Exec access resources include
+            `spec.target_ref` with the persisted target kind/name/uid/resourceVersion
+            when known, plus `status.runner_binding` for the runner instance,
+            attempt, and worker assigned to the request. Event resources include
+            `status.involved`, `status.involved_kind`, `status.involved_name`,
+            `status.involved_uid`, and `status.involved_count` so clients can
+            list and field-select audit/lifecycle Events by the primary
+            involved `Kind/name` object without parsing raw payload JSON.
+        audit:
+          allOf:
+            - $ref: './common.yaml#/components/schemas/AnyJsonObject'
+          description: >
+            Resource audit payload. PortForward and Exec resources retain the
+            persisted target reference, target resourceVersion, requester, and
+            runner binding so a later resource read can prove which reviewed
+            object and worker-backed runner lifecycle were used without requiring
+            a separate event query.
+    CreateRuntimeResourcePortForwardRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - target_port
+        - resource_version
+      properties:
+        target_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        local_port:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+          maximum: 65535
+          description: Requested local client port for audit and UX; the runner data plane still owns actual tunnel activation.
+        protocol:
+          type: string
+          enum:
+            - tcp
+          default: tcp
+        ttl_seconds:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          description: >
+            Optional audited control-plane lifetime for the live PortForward
+            request. The API stores `expires_at` and worker maintenance marks
+            non-terminal requests expired after this TTL; client wait timeouts
+            are separate.
+        reason:
+          type:
+            - string
+            - 'null'
+        resource_version:
+          type: string
+          minLength: 1
+          description: Required reviewed precondition from runtime operation review; missing fails with Precondition Required and stale values fail with Conflict.
+    UpdateRuntimePortForwardRequest:
+      type: object
+      additionalProperties: false
+      description: >
+        Worker-side lifecycle update for a PortForward resource. Active updates
+        must include a non-empty connection handle so the audited resource is
+        not published as a dead active resource. Completed updates close a
+        previously active PortForward without implying cancellation. CLI wait
+        treats an active PortForward as locally usable only when the connection also reports a
+        client-reachable data plane, for example
+        `connection.client_reachable=true`, `connection.client_endpoint`,
+        or `connection.client_listen`. Provider tunnel descriptors such as
+        `connection.provider_tunnel_url` prove an auditable active resource, not
+        a client-reachable local endpoint.
+      required:
+        - runner_instance_id
+      properties:
+        runner_instance_id:
+          type: string
+          format: uuid
+        connection:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+          description: >
+            Provider-specific connection details. For `active` updates this
+            object must include an auditable provider handle. Set
+            `client_reachable=true` or a client endpoint/listener field only
+            when a user-side client can actually connect to the tunnel; a
+            runner-local `local_port` by itself is lifecycle evidence, not a
+            successful local port-forward. Provider descriptors such as
+            `provider_tunnel_url` and `tunnel` are retained for audit/debugging
+            without implying that the user has a reachable local socket.
+        error_message:
+          type:
+            - string
+            - 'null'
+    CreateRuntimeResourceExecRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - command
+        - resource_version
+      properties:
+        command:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            minLength: 1
+        ttl_seconds:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          description: >
+            Optional audited control-plane lifetime for the live Exec request.
+            The API stores `expires_at` and worker maintenance marks
+            non-terminal requests expired after this TTL; client wait timeouts
+            are separate.
+        reason:
+          type:
+            - string
+            - 'null'
+        resource_version:
+          type: string
+          minLength: 1
+          description: Required reviewed precondition from runtime operation review; missing fails with Precondition Required and stale values fail with Conflict.
+    UpdateRuntimeExecRequest:
+      type: object
+      additionalProperties: false
+      description: >
+        Worker-side lifecycle update for an Exec resource. Completed updates
+        must include `connection.exit_code`; otherwise the control plane rejects
+        the update instead of publishing a fake successful command result.
+      required:
+        - runner_instance_id
+      properties:
+        runner_instance_id:
+          type: string
+          format: uuid
+        connection:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+          description: >
+            Provider-specific execution details. For `complete`/`completed`
+            updates this object must include numeric `exit_code`; stdout/stderr
+            tail fields are optional but recommended for CLI and GUI inspection.
+        error_message:
+          type:
+            - string
+            - 'null'
     RuntimeEvent:
       type: object
       additionalProperties: false
       required:
+        - source
         - core_run_id
         - trial_id
         - schedule_idx
@@ -1722,25 +4789,13 @@ components:
         - seq
         - event_type
         - ts
+        - resource_refs
         - payload
         - row
       properties:
         source:
           type: string
-          enum:
-            - trial
-            - worker
-          description: >
-            trial rows come from trial trajectories; worker rows are harness
-            lifecycle markers (materializing, core starting, ...).
-        event_id:
-          type: string
-          description: Stable unique id for the event within the run stream.
-        recorded_at:
-          type:
-            - string
-            - 'null'
-          description: Event timestamp when the producer reported one.
+          description: Event source, such as cloud.run_events, runtime.event_rows, or worker_runtime_snapshot.
         core_run_id:
           type: string
         trial_id:
@@ -1767,237 +4822,42 @@ components:
           type:
             - string
             - 'null'
+        resource_refs:
+          type: array
+          description: >
+            Kubernetes-style involved-object references for resources affected
+            by this event, ordered with the primary involved runtime object
+            first. Clients should use this field for audit targets and resource
+            correlation instead of parsing event-specific payload fields.
+          items:
+            $ref: '#/components/schemas/RuntimeResourceWatchRef'
         payload:
+          description: >
+            Event-specific payload retained for detailed audit evidence.
+            Involved runtime objects are normalized in `resource_refs`. Runtime
+            access audit events also retain structured refs such as
+            `access_resource_ref`, `target_ref`, `resolved_target`,
+            `runner_binding`, and `resource_version_precondition` so operators
+            can see which target object, runner instance, attempt, worker, and
+            reviewed resourceVersion produced the lifecycle transition.
+            `runtime.inspect.bundle.read` payloads retain the requester,
+            `Run/<run_id>` resource ref, applied resource filters, event limit,
+            inventory and event resourceVersion cursors, returned counts,
+            health and metrics summaries, and log-reference count for
+            support-bundle audit review. Failed inspect-bundle read payloads
+            use `runtime.inspect.bundle.read.failed` and retain the same
+            `Run/<run_id>` resource ref plus requester, filters, event limit,
+            error code, HTTP status, and error message when the runtime audit
+            store is reachable.
+            `runtime.api_resources.read` payloads retain the requester,
+            `Run/<run_id>` resource ref, catalog resource counts, selected kind,
+            verbs, categories, subresources, actions, access verbs, and
+            represented Core run ids. Failed catalog discovery reads use
+            `runtime.api_resources.read.failed` with the selected kind, error
+            code, HTTP status, and error message.
           $ref: './common.yaml#/components/schemas/AnyJsonObject'
         row:
           $ref: './common.yaml#/components/schemas/AnyJsonObject'
-    RuntimeResults:
-      type: object
-      additionalProperties: false
-      required:
-        - cloud_run_id
-        - core_run_ids
-        - trial_results
-        - metric_observations
-        - contract_stages
-        - attempt_objects
-      properties:
-        cloud_run_id:
-          type: string
-          format: uuid
-        core_run_ids:
-          type: array
-          items:
-            type: string
-        trial_results:
-          type: array
-          items:
-            $ref: '#/components/schemas/RuntimeTrialResult'
-        metric_observations:
-          type: array
-          items:
-            $ref: '#/components/schemas/RuntimeMetricObservation'
-        contract_stages:
-          type: array
-          items:
-            $ref: '#/components/schemas/RuntimeContractStage'
-        attempt_objects:
-          type: array
-          items:
-            $ref: '#/components/schemas/RuntimeAttemptObject'
-    RuntimeTrialResult:
-      type: object
-      additionalProperties: false
-      required:
-        - core_run_id
-        - trial_id
-        - schedule_idx
-        - attempt
-        - row_seq
-        - variant_id
-        - task_id
-        - repl_idx
-        - outcome
-        - primary_metric_name
-        - primary_metric_value
-        - metrics
-        - bindings
-        - events_total
-        - has_events
-        - row
-      properties:
-        core_run_id:
-          type: string
-        trial_id:
-          type: string
-        schedule_idx:
-          type: integer
-        attempt:
-          type: integer
-        row_seq:
-          type: integer
-        variant_id:
-          type: string
-        task_id:
-          type: string
-        repl_idx:
-          type: integer
-        outcome:
-          type: string
-        primary_metric_name:
-          type: string
-        primary_metric_value:
-          $ref: './common.yaml#/components/schemas/AnyJson'
-        metrics:
-          $ref: './common.yaml#/components/schemas/AnyJson'
-        bindings:
-          $ref: './common.yaml#/components/schemas/AnyJson'
-        events_total:
-          type: integer
-        has_events:
-          type: boolean
-        row:
-          $ref: './common.yaml#/components/schemas/AnyJsonObject'
-    RuntimeMetricObservation:
-      type: object
-      additionalProperties: false
-      required:
-        - core_run_id
-        - trial_id
-        - schedule_idx
-        - attempt
-        - row_seq
-        - variant_id
-        - task_id
-        - repl_idx
-        - outcome
-        - metric_name
-        - metric_value
-        - metric_source
-        - row
-      properties:
-        core_run_id:
-          type: string
-        trial_id:
-          type: string
-        schedule_idx:
-          type: integer
-        attempt:
-          type: integer
-        row_seq:
-          type: integer
-        variant_id:
-          type: string
-        task_id:
-          type: string
-        repl_idx:
-          type: integer
-        outcome:
-          type: string
-        metric_name:
-          type: string
-        metric_value:
-          $ref: './common.yaml#/components/schemas/AnyJson'
-        metric_source:
-          type:
-            - string
-            - 'null'
-        row:
-          $ref: './common.yaml#/components/schemas/AnyJsonObject'
-    RuntimeContractStage:
-      type: object
-      additionalProperties: false
-      required:
-        - core_run_id
-        - trial_id
-        - schedule_idx
-        - attempt
-        - row_seq
-        - variant_id
-        - task_id
-        - repl_idx
-        - stage
-        - status
-        - recorded_at
-        - detail
-        - row
-      properties:
-        core_run_id:
-          type: string
-        trial_id:
-          type: string
-        schedule_idx:
-          type: integer
-        attempt:
-          type: integer
-        row_seq:
-          type: integer
-        variant_id:
-          type: string
-        task_id:
-          type: string
-        repl_idx:
-          type: integer
-        stage:
-          type: string
-        status:
-          type: string
-        recorded_at:
-          type: string
-        detail:
-          $ref: './common.yaml#/components/schemas/AnyJson'
-        row:
-          $ref: './common.yaml#/components/schemas/AnyJsonObject'
-    RuntimeAttemptObject:
-      type: object
-      additionalProperties: false
-      required:
-        - core_run_id
-        - trial_id
-        - schedule_idx
-        - attempt
-        - role
-        - object_ref
-        - metadata
-        - recorded_at_ms
-      properties:
-        core_run_id:
-          type: string
-        trial_id:
-          type: string
-        schedule_idx:
-          type: integer
-        attempt:
-          type: integer
-        role:
-          type: string
-        object_ref:
-          type: string
-        metadata:
-          $ref: './common.yaml#/components/schemas/AnyJson'
-        recorded_at_ms:
-          type: integer
-        content_available:
-          type: boolean
-          description: True when this object ref has persisted bytes available through the runtime artifact download endpoint.
-        media_type:
-          type:
-            - string
-            - 'null'
-        byte_size:
-          type:
-            - integer
-            - 'null'
-          minimum: 0
-        sha256:
-          type:
-            - string
-            - 'null'
-          pattern: '^sha256:[0-9a-f]{64}$'
-        relative_path:
-          type:
-            - string
-            - 'null'
     RunAttempt:
       type: object
       additionalProperties: false
@@ -2017,8 +4877,7 @@ components:
           type: string
           format: uuid
         run_id:
-          type: string
-          format: uuid
+          $ref: '#/components/schemas/CloudRunId'
         worker_id:
           type: string
         runner_instance_id:
@@ -2051,15 +4910,6 @@ components:
           type:
             - string
             - 'null'
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
-        attempt_token:
-          type: string
-          description: Present only in worker claim responses.
     WorkerCapabilities:
       type: object
       additionalProperties: false
@@ -2105,16 +4955,14 @@ components:
     CloudRuntimeOptions:
       type: object
       additionalProperties: false
+      description: >
+        Explicit hosted Cloud runtime knobs. Placement is intentionally
+        scheduler-owned, so this schema does not include region, runtime_region,
+        placement, or zone. Legacy aliases such as executor and cpu are also
+        omitted and rejected by the API. Unknown keys are rejected so typos
+        cannot silently fall back to default runner resources.
       properties:
         backend:
-          type: string
-          enum:
-            - runner-docker
-            - runner_docker
-            - local-docker
-            - local_docker
-            - modal
-        executor:
           type: string
           enum:
             - runner-docker
@@ -2130,8 +4978,6 @@ components:
             - arm64
             - aarch64
         cpu_count:
-          $ref: '#/components/schemas/PositiveIntegerLike'
-        cpu:
           $ref: '#/components/schemas/PositiveIntegerLike'
         memory_mb:
           $ref: '#/components/schemas/PositiveIntegerLike'
@@ -2180,9 +5026,6 @@ components:
           items:
             type: string
             minLength: 1
-      description: >
-        Hosted Cloud runtime overrides. Unknown keys are rejected by the API so
-        typos cannot silently fall back to default runner resources.
     PositiveIntegerLike:
       anyOf:
         - type: integer
@@ -2441,10 +5284,9 @@ components:
           type: string
           format: uuid
         run_id:
-          type:
-            - string
-            - 'null'
-          format: uuid
+          oneOf:
+            - $ref: '#/components/schemas/CloudRunId'
+            - type: 'null'
         status:
           type: string
           enum:
@@ -2497,8 +5339,7 @@ components:
           type: string
           format: uuid
         run_id:
-          type: string
-          format: uuid
+          $ref: '#/components/schemas/CloudRunId'
         attempt_id:
           type:
             - string

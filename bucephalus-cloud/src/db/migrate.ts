@@ -5,6 +5,10 @@ import type { Sql } from "./client";
 
 const defaultMigrationsDir = new URL("../../db/migrations", import.meta.url).pathname;
 const runtimeSchemas = ["registry", "fact", "ingest", "cloud", "bucephalus_runtime"];
+const renamedMigrationAliases: Record<string, string[]> = {
+  "0023_runtime_access_requests.sql": ["0018_runtime_access_requests.sql"],
+  "0024_runner_instance_cordoned.sql": ["0019_runner_instance_cordoned.sql"],
+};
 
 export interface MigrationOptions {
   databaseUrl?: string;
@@ -55,6 +59,10 @@ export async function migrationFiles(migrationsDir = defaultMigrationsDir): Prom
     .sort();
 }
 
+export function migrationAliases(file: string): string[] {
+  return renamedMigrationAliases[file] ?? [];
+}
+
 export async function runMigrations(options: MigrationOptions = {}): Promise<void> {
   const migrationsDir = options.migrationsDir ?? defaultMigrationsDir;
   const runtimeRoleName = Object.hasOwn(options, "runtimeRoleName")
@@ -80,6 +88,25 @@ export async function runMigrations(options: MigrationOptions = {}): Promise<voi
       if (existing.length > 0) {
         console.log(`migration already applied: ${file}`);
         continue;
+      }
+
+      const aliases = migrationAliases(file);
+      if (aliases.length > 0) {
+        const aliasRows = await sql`
+          select migration_name
+          from cloud_schema_migrations
+          where migration_name in ${sql(aliases)}
+          limit 1
+        `;
+        if (aliasRows.length > 0) {
+          await sql`
+            insert into cloud_schema_migrations (migration_name)
+            values (${file})
+            on conflict (migration_name) do nothing
+          `;
+          console.log(`migration already applied via alias: ${file}`);
+          continue;
+        }
       }
 
       const body = await readFile(join(migrationsDir, file), "utf8");
