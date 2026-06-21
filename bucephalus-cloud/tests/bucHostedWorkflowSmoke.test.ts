@@ -233,14 +233,11 @@ describeSmoke("buc hosted workflow smoke", () => {
           && pointer(event, "/payload/metric_value") === 1
       )).toBe(true);
 
-      const runtime = await runBucJson(buc, apiUrl, ["runs", "runtime", String(run.run_id), "--json"]);
-      expect(requireJsonArray(pointer(runtime, "/core_run_ids"), "/core_run_ids")).toContain(coreRunId);
-      expect(requireJsonArray(pointer(runtime, "/recent_events"), "/recent_events").some((event) =>
+      const runtime = await runBucJson(buc, apiUrl, ["runs", "inspect", String(run.run_id), "--json"]);
+      expect(requireJsonArray(pointer(runtime, "/resource_inventory/core_run_ids"), "/resource_inventory/core_run_ids")).toContain(coreRunId);
+      expect(requireJsonArray(pointer(runtime, "/event_list/events"), "/event_list/events").some((event) =>
         pointer(event, "/event_type") === "metric.observed"
       )).toBe(true);
-
-      const results = await runBucJson(buc, apiUrl, ["runs", "results", String(run.run_id), "--json"]);
-      expect(requireJsonArray(pointer(results, "/core_run_ids"), "/core_run_ids")).toContain(coreRunId);
 
       const inspectedPackage = await runBucJson(buc, apiUrl, ["packages", "inspect", packageDigest, "--json"]);
       expect(inspectedPackage.package_digest).toBe(packageDigest);
