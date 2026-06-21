@@ -6680,8 +6680,8 @@ mod tests {
             msg
         );
         assert!(
-            msg.contains("/stages/agent") && msg.contains("command") && msg.contains("adapter"),
-            "missing agent launch contract should use public path and name command/adapter: {}",
+            msg.contains("/stages/agent/command"),
+            "missing agent launch contract should use public command path: {}",
             msg
         );
         assert!(
@@ -6723,13 +6723,13 @@ mod tests {
         let msg = err.to_string();
 
         assert!(
-            msg.contains("/ephemerals/cache/image is required"),
-            "ephemeral declaration error should use public path: {}",
+            msg.contains("/services/cache/image is required"),
+            "service declaration error should use public path: {}",
             msg
         );
         assert!(
             !msg.contains("/sidecars") && !msg.contains("sidecar"),
-            "ephemeral declaration error should not leak sidecar wording: {}",
+            "service declaration error should not leak sidecar wording: {}",
             msg
         );
     }
@@ -6764,13 +6764,13 @@ mod tests {
         let msg = err.to_string();
 
         assert!(
-            msg.contains("/stages/agent/ephemerals/0 references unknown ephemeral 'cache'"),
-            "stage ephemeral error should use public path: {}",
+            msg.contains("/stages/agent/services/0 references unknown service 'cache'"),
+            "stage service error should use public path: {}",
             msg
         );
         assert!(
             !msg.contains("/trial_runtime") && !msg.contains("sidecar"),
-            "stage ephemeral error should not leak resolved wording: {}",
+            "stage service error should not leak resolved wording: {}",
             msg
         );
     }
@@ -18129,13 +18129,13 @@ mod tests {
             .expect_err("duplicate stage ephemeral refs should fail before sealing");
         let msg = err.to_string();
         assert!(
-            msg.contains("/stages/agent/ephemerals must reference each ephemeral at most once")
+            msg.contains("/stages/agent/services must reference each service at most once")
                 && msg.contains("duplicates: cache"),
             "unexpected error: {msg}"
         );
         assert!(
             !msg.contains("sidecar"),
-            "authoring error should use ephemeral wording: {msg}"
+            "authoring error should use service wording: {msg}"
         );
     }
 
@@ -18173,7 +18173,7 @@ mod tests {
             .expect_err("duplicate ephemeral exposed env should fail before sealing");
         let msg = err.to_string();
         assert!(
-            msg.contains("/stages/agent/ephemerals expose duplicate env names")
+            msg.contains("/stages/agent/services expose duplicate env names")
                 && msg.contains("SERVICE_URL")
                 && msg.contains("cache")
                 && msg.contains("proxy"),
@@ -18181,7 +18181,7 @@ mod tests {
         );
         assert!(
             !msg.contains("sidecar"),
-            "authoring error should use ephemeral wording: {msg}"
+            "authoring error should use service wording: {msg}"
         );
     }
 
