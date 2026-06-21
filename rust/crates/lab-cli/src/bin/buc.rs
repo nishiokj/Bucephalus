@@ -843,9 +843,18 @@ fn run_create(context: CliContext) -> Result<()> {
 }
 
 fn run_list(context: CliContext) -> Result<()> {
-    reject_unknown_options(&context.args, &["--limit"], &["--json"])?;
+    reject_unknown_options(&context.args, &["--limit", "--output"], &["--json"])?;
     reject_no_positionals(&context.args, "buc runs list")?;
     let limit = bounded_number_option_string(&context.args, "--limit", 200)?;
+    let output = option_value_alias(&context.args, "--output", "-o")?;
+    if let Some(ref value) = output {
+        if value != "id" {
+            bail!("--output supports only id for runs list; use --json for other formats");
+        }
+        if json_requested(&context.args) {
+            bail!("--output id cannot be combined with --json");
+        }
+    }
     ensure_api_configured(&context)?;
     let runs = cloud_fetch(
         &context,
@@ -856,6 +865,8 @@ fn run_list(context: CliContext) -> Result<()> {
     )?;
     if json_requested(&context.args) {
         print_json(&runs)
+    } else if output.as_deref() == Some("id") {
+        print_run_id_list(&runs)
     } else {
         print_run_list_summary(&runs)
     }
@@ -6859,12 +6870,27 @@ fn print_run_list_summary(value: &Value) -> Result<()> {
             .and_then(Value::as_str)
             .unwrap_or("");
         if label.is_empty() {
-            lines.push(format!("  - {run_id} [{status}] {digest}"));
+            lines.push(format!("{run_id}  [{status}]  {digest}"));
         } else {
-            lines.push(format!("  - {run_id} [{status}] {digest} label={label}"));
+            lines.push(format!("{run_id}  [{status}]  {digest}  label={label}"));
         }
     }
     println!("{}", lines.join("\n"));
+    Ok(())
+}
+
+fn print_run_id_list(value: &Value) -> Result<()> {
+    let runs = value
+        .get("runs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    for run in runs {
+        if let Some(id) = run.get("run_id").and_then(Value::as_str) {
+            println!("{id}");
+        }
+    }
     Ok(())
 }
 
@@ -10189,7 +10215,7 @@ const RUNS_HELP: &str = r#"buc runs
 Hosted run commands.
 
 Usage:
-  buc runs list [--limit N] [--json]
+  buc runs list [--limit N] [--output id|-o id] [--json]
   buc runs create <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--label TEXT] [--json]
   buc runs get <run-id> [--json]
   buc runs get <run-id> [kind|--kind KIND|--category CATEGORY] [--label-selector EXPR] [--field-selector EXPR] [--limit N] [--continue TOKEN] [--wide|--output name|-o name] [--json]
@@ -10230,7 +10256,11 @@ const RUNS_LIST_HELP: &str = r#"buc runs list
 List recent hosted run records visible to the authenticated user.
 
 Usage:
-  buc runs list [--limit N] [--json]
+  buc runs list [--limit N] [--output id|-o id] [--json]
+
+Options:
+  --output id, -o id
+            Print one run id per line for scripts and shell pipelines.
 "#;
 
 const RUNS_CREATE_HELP: &str = r#"buc runs create
