@@ -20164,12 +20164,14 @@ mod tests {
                 "event_list": { "events": [] }
             }),
             ("GET", "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/status") => json!({
+                "cloud_run_id": "run-1",
                 "resource_ref": { "apiVersion": "bucephalus.dev/v1alpha1", "kind": "RunnerInstance", "name": "runner-1" },
                 "phase": "Running",
                 "reason": null,
                 "actions": ["cordon"]
             }),
             ("GET", "/v1/runs/run%2D1/runtime/resources/RunnerInstance/runner%2D1/operations/port%2Dforward") => json!({
+                "cloud_run_id": "run-1",
                 "resource_ref": { "apiVersion": "bucephalus.dev/v1alpha1", "kind": "RunnerInstance", "name": "runner-1" },
                 "operation": "port-forward",
                 "supported": true,
