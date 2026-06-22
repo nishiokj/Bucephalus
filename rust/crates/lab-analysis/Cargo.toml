@@ -16,4 +16,5 @@ hex.workspace = true
 include_dir.workspace = true
 lab-core.workspace = true
 rusqlite.workspace = true
+serde = { workspace = true }
 serde_json.workspace = true

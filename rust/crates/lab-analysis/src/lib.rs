@@ -8,6 +8,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod stats;
+pub mod verdict;
+
 static VIEW_BUNDLES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/views");
 
 const BUCEPHALUS_DB_ENV: &str = "BUCEPHALUS_DB";
@@ -63,13 +66,13 @@ struct ExperimentDesign {
 }
 
 #[derive(Debug, Clone)]
-struct RunAnalysisContext {
-    account_id: String,
-    run_id: String,
-    db_path: PathBuf,
-    comparison_policy: String,
-    scheduling_policy: String,
-    view_set: ViewSet,
+pub(crate) struct RunAnalysisContext {
+    pub(crate) account_id: String,
+    pub(crate) run_id: String,
+    pub(crate) db_path: PathBuf,
+    pub(crate) comparison_policy: String,
+    pub(crate) scheduling_policy: String,
+    pub(crate) view_set: ViewSet,
 }
 
 #[derive(Debug, Clone)]
@@ -265,7 +268,7 @@ pub fn query_trend(
     execute_select_query(&conn, &sql)
 }
 
-fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
+pub(crate) fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
     let canonical = run_dir
         .canonicalize()
         .unwrap_or_else(|_| run_dir.to_path_buf());
@@ -405,7 +408,7 @@ fn load_view_bundle_sql(view_set: ViewSet) -> Result<Option<String>> {
     Ok(Some(content.to_string()))
 }
 
-fn open_account_db(db_path: &Path) -> Result<Connection> {
+pub(crate) fn open_account_db(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -460,7 +463,7 @@ fn normalize_view_sql_for_sqlite(sql: &str) -> String {
         .replace("first(", "min(")
 }
 
-fn register_views(conn: &Connection, context: &RunAnalysisContext) -> Result<()> {
+pub(crate) fn register_views(conn: &Connection, context: &RunAnalysisContext) -> Result<()> {
     let account_id = sql_literal(&context.account_id);
     let run_id = sql_literal(&context.run_id);
     let mut sql = build_fact_views_sql(&account_id, Some(run_id.as_str()));
@@ -571,6 +574,94 @@ SELECT
     json_extract(row_json, '$.bindings') AS bindings
 FROM filtered;
 
+CREATE OR REPLACE VIEW ab_variant_roles AS
+WITH baseline AS (
+    SELECT min(baseline_id) AS baseline_id FROM trials
+),
+treatments AS (
+    SELECT DISTINCT t.variant_id
+    FROM trials t, baseline b
+    WHERE t.variant_id <> b.baseline_id
+    ORDER BY t.variant_id
+)
+SELECT
+    b.baseline_id,
+    (SELECT variant_id FROM treatments LIMIT 1) AS treatment_id,
+    (SELECT count(*) FROM treatments) AS treatment_variant_count,
+    b.baseline_id AS variant_a_id,
+    (SELECT variant_id FROM treatments LIMIT 1) AS variant_b_id
+FROM baseline b;
+
+CREATE OR REPLACE VIEW paired_outcomes AS
+SELECT
+    b.run_id,
+    b.task_id,
+    b.repl_idx,
+    b.trial_id AS baseline_trial_id,
+    t.trial_id AS treatment_trial_id,
+    b.outcome AS baseline_outcome,
+    t.outcome AS treatment_outcome,
+    try_cast(b.primary_metric_value AS DOUBLE) AS baseline_metric,
+    try_cast(t.primary_metric_value AS DOUBLE) AS treatment_metric,
+    try_cast(t.primary_metric_value AS DOUBLE) - try_cast(b.primary_metric_value AS DOUBLE) AS metric_delta,
+    CASE
+        WHEN b.outcome = t.outcome THEN 'same'
+        WHEN b.outcome = 'success' AND t.outcome <> 'success' THEN 'regression'
+        WHEN b.outcome <> 'success' AND t.outcome = 'success' THEN 'improvement'
+        ELSE 'changed'
+    END AS delta_type
+FROM trials b
+JOIN ab_variant_roles roles ON b.variant_id = roles.baseline_id
+JOIN trials t
+    ON t.task_id = b.task_id
+   AND t.repl_idx = b.repl_idx
+   AND t.variant_id = roles.treatment_id;
+
+CREATE OR REPLACE VIEW trial_grader_identity AS
+WITH raw AS (
+    SELECT row_json
+    FROM account_db.trial_conclusion_rows
+    WHERE {filter}
+),
+filtered AS (
+    SELECT row_json
+    FROM raw
+    WHERE (
+        (
+            json_extract_string(row_json, '$.slot_commit_id') IS NULL
+            OR try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) IS NULL
+        )
+        AND (SELECT committed_count FROM committed_slot_guard) = 0
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM committed_slot_publications c
+        WHERE c.slot_commit_id = json_extract_string(row_json, '$.slot_commit_id')
+          AND c.schedule_idx = try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT)
+    )
+)
+SELECT
+    json_extract_string(row_json, '$.run_id') AS run_id,
+    try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) AS schedule_idx,
+    try_cast(json_extract(row_json, '$.attempt') AS BIGINT) AS attempt,
+    try_cast(json_extract(row_json, '$.row_seq') AS BIGINT) AS row_seq,
+    json_extract_string(row_json, '$.grader.name') AS grader_name,
+    json_extract_string(row_json, '$.grader.strategy') AS grader_strategy,
+    json_extract_string(row_json, '$.grader.digest') AS grader_digest,
+    json_extract_string(row_json, '$.grader.version') AS grader_version
+FROM filtered;
+
+CREATE OR REPLACE VIEW flaky_tasks AS
+SELECT
+    task_id,
+    count(*) AS n_replications,
+    sum(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS passes,
+    sum(CASE WHEN outcome <> 'success' THEN 1 ELSE 0 END) AS failures,
+    round(avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END), 4) AS pass_rate
+FROM trials
+GROUP BY task_id
+HAVING count(DISTINCT outcome) > 1;
+
 CREATE OR REPLACE VIEW metrics_long AS
 WITH raw AS (
     SELECT account_id, run_id, metric_name, row_json
@@ -603,6 +694,7 @@ SELECT
     try_cast(json_extract(f.row_json, '$.row_seq') AS BIGINT) AS row_seq,
     json_extract_string(f.row_json, '$.variant_id') AS variant_id,
     json_extract_string(f.row_json, '$.task_id') AS task_id,
+    try_cast(json_extract(f.row_json, '$.repl_idx') AS BIGINT) AS repl_idx,
     json_extract_string(f.row_json, '$.metric_name') AS metric_name,
     json_extract_string(f.row_json, '$.metric_value') AS metric_value,
     d.semantic_key,
@@ -1369,7 +1461,7 @@ fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn sql_literal(value: &str) -> String {
+pub(crate) fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 

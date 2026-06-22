@@ -496,6 +496,12 @@ enum Commands {
         #[arg(long)]
         html: bool,
     },
+    #[command(about = "Adjudicate a run: did it hold, regress, or improve against its baseline?")]
+    Verdict {
+        run: String,
+        #[arg(long)]
+        json: bool,
+    },
     Query {
         run: String,
         sql: String,
@@ -6918,6 +6924,19 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 "tip: use `bucephalus query <run> \"SELECT * FROM <raw_view>\"` for raw internals"
             );
         }
+        Commands::Verdict { run, json } => {
+            let run_dir = resolve_run_dir_arg(&run)?;
+            let verdict = analysis::verdict::compute_verdict(&run_dir)?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "verdict",
+                    "run_dir": run_dir.display().to_string(),
+                    "result": serde_json::to_value(&verdict)?,
+                })));
+            }
+            print_verdict(&verdict);
+        }
         Commands::Query {
             run,
             sql,
@@ -7130,6 +7149,7 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Scores { json, .. }
         | Commands::ExplainMetrics { json, .. }
         | Commands::Views { json, .. }
+        | Commands::Verdict { json, .. }
         | Commands::Query { json, .. }
         | Commands::Runs { json, .. }
         | Commands::SchemaValidate { json, .. }
@@ -8994,6 +9014,176 @@ fn elide_constant_columns(
         },
         elided,
     )
+}
+
+fn print_verdict(verdict: &analysis::verdict::Verdict) {
+    println!("run: {}", verdict.run_id);
+    println!("design: {}", verdict.view_set);
+    println!(
+        "baseline: {} | treatment: {}",
+        verdict.baseline_variant,
+        verdict.treatment_variants.join(", ")
+    );
+    println!(
+        "trials: {} total, {} paired | flaky tasks: {}",
+        verdict.total_trials, verdict.paired_trials, verdict.flaky_task_count
+    );
+
+    // Grader pinning
+    if verdict.grader_pinned {
+        if let Some(digest) = &verdict.grader_digest {
+            println!("grader: pinned ({})", &digest[..16]);
+        } else {
+            println!("grader: not pinned (no digest in ledger)");
+        }
+    } else {
+        println!(
+            "grader: DRIFTED ({} distinct digests: {})",
+            verdict.grader_digests_seen.len(),
+            verdict
+                .grader_digests_seen
+                .iter()
+                .map(|d| &d[..16])
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    if verdict.metric_verdicts.is_empty() {
+        println!("\nNo metrics to adjudicate.");
+        return;
+    }
+
+    println!("\n--- verdicts ---");
+    for mv in &verdict.metric_verdicts {
+        let icon = match mv.classification {
+            analysis::verdict::Classification::Held => "HELD",
+            analysis::verdict::Classification::Regressed => "REGRESSED",
+            analysis::verdict::Classification::Improved => "IMPROVED",
+            analysis::verdict::Classification::Underpowered => "UNDERPOWERED",
+        };
+        let direction = match mv.direction {
+            analysis::verdict::MetricDirection::Maximize => "↑",
+            analysis::verdict::MetricDirection::Minimize => "↓",
+            analysis::verdict::MetricDirection::Unknown => "?",
+        };
+        let p_str = match mv.p_value {
+            Some(p) if p < 0.001 => "p<0.001".to_string(),
+            Some(p) => format!("p={:.3}", p),
+            None => "p=n/a".to_string(),
+        };
+        let effect_str = match (&mv.effect_size, &mv.effect_label) {
+            (Some(e), Some(lbl)) => format!("d={:.3} ({})", e, lbl),
+            (Some(e), None) => format!("d={:.3}", e),
+            _ => String::new(),
+        };
+        let delta_pct = mv
+            .delta_pct
+            .map(|p| format!(" ({:+.1}%)", p))
+            .unwrap_or_default();
+        println!(
+            "  [{}] {} {}  {:.4} → {:.4} ({:+.4}{})  n={}  {}  {}",
+            icon,
+            mv.metric_name,
+            direction,
+            mv.baseline_mean,
+            mv.treatment_mean,
+            mv.delta,
+            delta_pct,
+            mv.n_paired,
+            p_str,
+            effect_str,
+        );
+
+        if !mv.moved_cases.is_empty() {
+            let regressions = mv
+                .moved_cases
+                .iter()
+                .filter(|c| {
+                    let delta = c.delta.unwrap_or(0.0);
+                    match mv.direction {
+                        analysis::verdict::MetricDirection::Maximize => delta < 0.0,
+                        analysis::verdict::MetricDirection::Minimize => delta > 0.0,
+                        analysis::verdict::MetricDirection::Unknown => false,
+                    }
+                })
+                .count();
+            let improvements = mv
+                .moved_cases
+                .iter()
+                .filter(|c| {
+                    let delta = c.delta.unwrap_or(0.0);
+                    match mv.direction {
+                        analysis::verdict::MetricDirection::Maximize => delta > 0.0,
+                        analysis::verdict::MetricDirection::Minimize => delta < 0.0,
+                        analysis::verdict::MetricDirection::Unknown => false,
+                    }
+                })
+                .count();
+            if regressions > 0 || improvements > 0 {
+                println!(
+                    "    moved cases (top {}): {} regressions, {} improvements",
+                    mv.moved_cases.len(),
+                    regressions,
+                    improvements,
+                );
+                for case in mv.moved_cases.iter().take(5) {
+                    let bv = case
+                        .baseline_value
+                        .map(|v| format!("{:.4}", v))
+                        .unwrap_or("—".to_string());
+                    let tv = case
+                        .treatment_value
+                        .map(|v| format!("{:.4}", v))
+                        .unwrap_or("—".to_string());
+                    let d = case
+                        .delta
+                        .map(|v| format!("{:+.4}", v))
+                        .unwrap_or("—".to_string());
+                    println!(
+                        "    {} repl={}  {} → {}  Δ{}",
+                        case.task_id, case.repl_idx, bv, tv, d
+                    );
+                }
+                if mv.moved_cases.len() > 5 {
+                    println!("    ... and {} more", mv.moved_cases.len() - 5);
+                }
+            }
+        }
+    }
+
+    // Summary line
+    let held = verdict
+        .metric_verdicts
+        .iter()
+        .filter(|m| m.classification == analysis::verdict::Classification::Held)
+        .count();
+    let regressed = verdict
+        .metric_verdicts
+        .iter()
+        .filter(|m| m.classification == analysis::verdict::Classification::Regressed)
+        .count();
+    let improved = verdict
+        .metric_verdicts
+        .iter()
+        .filter(|m| m.classification == analysis::verdict::Classification::Improved)
+        .count();
+    let underpowered = verdict
+        .metric_verdicts
+        .iter()
+        .filter(|m| m.classification == analysis::verdict::Classification::Underpowered)
+        .count();
+    println!(
+        "\nsummary: {} held, {} regressed, {} improved, {} underpowered",
+        held, regressed, improved, underpowered
+    );
+    if regressed > 0 {
+        println!("verdict: REGRESSION DETECTED");
+    } else if underpowered > 0 && held == 0 {
+        println!("verdict: UNDERPOWERED — collect more data");
+    } else {
+        println!("verdict: HELD — no regression detected");
+    }
 }
 
 fn print_query_table(table: &analysis::QueryTable) {
@@ -13282,5 +13472,392 @@ runtime:
             err
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    // -----------------------------------------------------------------------
+    // Verdict engine integration tests
+    // -----------------------------------------------------------------------
+
+    /// Create a synthetic A/B run with paired trials and known outcomes.
+    fn seed_ab_test_run(
+        run_dir: &Path,
+        baseline_outcomes: &[&str],
+        treatment_outcomes: &[&str],
+        baseline_metrics: &[f64],
+        treatment_metrics: &[f64],
+        grader_digests: &[Option<&str>],
+    ) {
+        let sqlite_path = configure_test_account_db(run_dir);
+        let account_id = lab_runner::active_account_id().expect("active account id");
+        let run_id = run_dir
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("run")
+            .to_string();
+
+        let conn = SqliteConnection::open(&sqlite_path).expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE runs(account_id TEXT NOT NULL, run_id TEXT NOT NULL, experiment_id TEXT, run_dir TEXT NOT NULL);
+             CREATE TABLE trial_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
+             CREATE TABLE metric_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, metric_name TEXT NOT NULL, row_json TEXT NOT NULL);
+             CREATE TABLE metric_definitions(
+                 account_id TEXT NOT NULL, experiment_id TEXT NOT NULL, metric_id TEXT NOT NULL,
+                 semantic_key TEXT, label TEXT, value_type TEXT, unit TEXT, direction TEXT,
+                 source_type TEXT NOT NULL, source_pointer TEXT, required INTEGER NOT NULL,
+                 primary_metric INTEGER NOT NULL, definition_json TEXT NOT NULL
+             );
+             CREATE TABLE trial_conclusion_rows(
+                 account_id TEXT NOT NULL, run_id TEXT NOT NULL, schedule_idx INTEGER NOT NULL,
+                 attempt INTEGER NOT NULL, row_seq INTEGER NOT NULL, slot_commit_id TEXT NOT NULL,
+                 row_json TEXT NOT NULL
+             );
+             CREATE TABLE slot_commit_records(
+                 account_id TEXT NOT NULL, run_id TEXT NOT NULL, schedule_idx INTEGER NOT NULL,
+                 slot_commit_id TEXT NOT NULL, attempt INTEGER NOT NULL, record_type TEXT NOT NULL,
+                 record_json TEXT NOT NULL
+             );
+             CREATE TABLE runtime_kv(
+                 account_id TEXT NOT NULL, run_id TEXT NOT NULL, key TEXT NOT NULL,
+                 value_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL
+             );",
+        )
+        .expect("create sqlite schema");
+
+        conn.execute(
+            "INSERT INTO runs(account_id, run_id, experiment_id, run_dir) VALUES (?1, ?2, ?3, ?4)",
+            (
+                &account_id,
+                &run_id,
+                "exp_ab",
+                run_dir.display().to_string(),
+            ),
+        )
+        .expect("insert run");
+
+        // Write resolved_experiment.json for A/B test design
+        fs::write(
+            run_dir.join("resolved_experiment.json"),
+            json!({
+                "experiment": { "id": "exp_ab" },
+                "design": {
+                    "comparison": "paired",
+                    "policies": { "comparison": "paired", "scheduling": "paired_interleaved" }
+                },
+                "baseline": { "variant_id": "baseline" },
+                "variant_plan": [{ "variant_id": "treatment" }]
+            })
+            .to_string(),
+        )
+        .expect("write resolved experiment");
+
+        let n = baseline_outcomes.len();
+        for i in 0..n {
+            let task_id = format!("task_{}", i);
+            let slot_commit = format!("slot_{}", i);
+
+            // Insert slot commit record
+            conn.execute(
+                "INSERT INTO slot_commit_records(account_id, run_id, schedule_idx, slot_commit_id, attempt, record_type, record_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (&account_id, &run_id, i as i64, &slot_commit, 0_i64, "commit",
+                 format!(r#"{{"record_type":"commit","schedule_idx":{},"slot_commit_id":"{}","attempt":0}}"#, i, slot_commit)),
+            )
+            .expect("insert slot commit");
+
+            // Baseline trial
+            let base_trial_id = format!("trial_{}_base", i);
+            conn.execute(
+                "INSERT INTO trial_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
+                (&account_id, &run_id,
+                 format!(r#"{{"run_id":"{}","trial_id":"{}","variant_id":"baseline","baseline_id":"baseline","task_id":"{}","repl_idx":0,"outcome":"{}","success":{},"slot_commit_id":"{}","schedule_idx":{},"primary_metric_name":"score","primary_metric_value":{}}}"#,
+                    run_id, base_trial_id, task_id, baseline_outcomes[i],
+                    if baseline_outcomes[i] == "success" { "true" } else { "false" },
+                    slot_commit, i, baseline_metrics[i])),
+            )
+            .expect("insert baseline trial");
+
+            // Treatment trial
+            let treat_trial_id = format!("trial_{}_treat", i);
+            conn.execute(
+                "INSERT INTO trial_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
+                (&account_id, &run_id,
+                 format!(r#"{{"run_id":"{}","trial_id":"{}","variant_id":"treatment","baseline_id":"baseline","task_id":"{}","repl_idx":0,"outcome":"{}","success":{},"slot_commit_id":"{}","schedule_idx":{},"primary_metric_name":"score","primary_metric_value":{}}}"#,
+                    run_id, treat_trial_id, task_id, treatment_outcomes[i],
+                    if treatment_outcomes[i] == "success" { "true" } else { "false" },
+                    slot_commit, i, treatment_metrics[i])),
+            )
+            .expect("insert treatment trial");
+
+            // Metric rows for both variants
+            conn.execute(
+                "INSERT INTO metric_rows(account_id, run_id, metric_name, row_json) VALUES (?1, ?2, ?3, ?4)",
+                (&account_id, &run_id, "score",
+                 format!(r#"{{"run_id":"{}","trial_id":"{}","variant_id":"baseline","task_id":"{}","repl_idx":0,"metric_name":"score","metric_value":{},"slot_commit_id":"{}","schedule_idx":{}}}"#,
+                    run_id, base_trial_id, task_id, baseline_metrics[i], slot_commit, i)),
+            )
+            .expect("insert baseline metric");
+            conn.execute(
+                "INSERT INTO metric_rows(account_id, run_id, metric_name, row_json) VALUES (?1, ?2, ?3, ?4)",
+                (&account_id, &run_id, "score",
+                 format!(r#"{{"run_id":"{}","trial_id":"{}","variant_id":"treatment","task_id":"{}","repl_idx":0,"metric_name":"score","metric_value":{},"slot_commit_id":"{}","schedule_idx":{}}}"#,
+                    run_id, treat_trial_id, task_id, treatment_metrics[i], slot_commit, i)),
+            )
+            .expect("insert treatment metric");
+
+            // Trial conclusion row with grader digest
+            let digest_json = match grader_digests.get(i).and_then(|d| *d) {
+                Some(d) => format!(r#","digest":"{}""#, d),
+                None => String::new(),
+            };
+            conn.execute(
+                "INSERT INTO trial_conclusion_rows(account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (&account_id, &run_id, i as i64, 0_i64, 0_i64, &slot_commit,
+                 format!(r#"{{"schema_version":"trial_conclusion_v1","run_id":"{}","schedule_idx":{},"attempt":0,"row_seq":0,"slot_commit_id":"{}","grader":{{"name":"test_grader","strategy":"in_task_runtime"{} }}}}"#,
+                    run_id, i, slot_commit, digest_json)),
+            )
+            .expect("insert trial conclusion");
+        }
+
+        // Insert metric definition for "score" with direction "maximize"
+        conn.execute(
+            "INSERT INTO metric_definitions(account_id, experiment_id, metric_id, semantic_key, label, value_type, unit, direction, source_type, source_pointer, required, primary_metric, definition_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            (&account_id, "exp_ab", "score", "capability", "Score", "number", "", "maximize", "grader_output", "/score", 1_i64, 1_i64, r#"{"id":"score"}"#),
+        )
+        .expect("insert metric definition");
+    }
+
+    #[test]
+    fn verdict_detects_regression_when_treatment_fails_more() {
+        let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
+        let run_dir = temp_dir("verdict_regression");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+
+        // 30 paired tasks: baseline passes all, treatment fails 10
+        let baseline: Vec<&str> = (0..30).map(|_| "success").collect();
+        let treatment: Vec<&str> = (0..30)
+            .map(|i| if i < 10 { "failure" } else { "success" })
+            .collect();
+        let baseline_metrics: Vec<f64> = (0..30).map(|i| if i < 10 { 0.0 } else { 1.0 }).collect();
+        let treatment_metrics: Vec<f64> = (0..30).map(|i| if i < 10 { 0.0 } else { 1.0 }).collect();
+        let digests: Vec<Option<&str>> = (0..30)
+            .map(|_| {
+                Some("sha256:aaaa0000000000000000000000000000000000000000000000000000000000aa")
+            })
+            .collect();
+
+        seed_ab_test_run(
+            &run_dir,
+            &baseline,
+            &treatment,
+            &baseline_metrics,
+            &treatment_metrics,
+            &digests,
+        );
+
+        let verdict = analysis::verdict::compute_verdict(&run_dir).expect("verdict");
+        assert_eq!(verdict.baseline_variant, "baseline");
+        assert_eq!(verdict.treatment_variants, vec!["treatment".to_string()]);
+        assert!(verdict.grader_pinned, "grader should be pinned");
+
+        // pass_rate should be REGRESSED (baseline 100% → treatment 66.7%)
+        let pass_rate_verdict = verdict
+            .metric_verdicts
+            .iter()
+            .find(|m| m.metric_name == "pass_rate")
+            .expect("pass_rate verdict");
+        assert_eq!(
+            pass_rate_verdict.classification,
+            analysis::verdict::Classification::Regressed,
+            "pass_rate should be REGRESSED"
+        );
+        assert!(pass_rate_verdict.p_value.unwrap() < 0.05);
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn verdict_detects_held_when_no_change() {
+        let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
+        let run_dir = temp_dir("verdict_held");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+
+        // 30 paired tasks: both variants pass all
+        let baseline: Vec<&str> = (0..30).map(|_| "success").collect();
+        let treatment: Vec<&str> = (0..30).map(|_| "success").collect();
+        let baseline_metrics: Vec<f64> = (0..30).map(|i| 1.0 + i as f64 * 0.01).collect();
+        let treatment_metrics: Vec<f64> = (0..30).map(|i| 1.0 + i as f64 * 0.01).collect();
+        let digests: Vec<Option<&str>> = (0..30)
+            .map(|_| {
+                Some("sha256:bbbb0000000000000000000000000000000000000000000000000000000000bb")
+            })
+            .collect();
+
+        seed_ab_test_run(
+            &run_dir,
+            &baseline,
+            &treatment,
+            &baseline_metrics,
+            &treatment_metrics,
+            &digests,
+        );
+
+        let verdict = analysis::verdict::compute_verdict(&run_dir).expect("verdict");
+
+        // pass_rate should be HELD (both 100%)
+        let pass_rate_verdict = verdict
+            .metric_verdicts
+            .iter()
+            .find(|m| m.metric_name == "pass_rate")
+            .expect("pass_rate verdict");
+        assert_eq!(
+            pass_rate_verdict.classification,
+            analysis::verdict::Classification::Held,
+            "pass_rate should be HELD"
+        );
+
+        // score should also be HELD (identical metrics)
+        let score_verdict = verdict
+            .metric_verdicts
+            .iter()
+            .find(|m| m.metric_name == "score")
+            .expect("score verdict");
+        assert_eq!(
+            score_verdict.classification,
+            analysis::verdict::Classification::Held,
+            "score should be HELD"
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn verdict_detects_underpowered_with_small_sample() {
+        let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
+        let run_dir = temp_dir("verdict_underpowered");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+
+        // 5 paired tasks: both pass all, but too few for a confident "held"
+        let baseline: Vec<&str> = (0..5).map(|_| "success").collect();
+        let treatment: Vec<&str> = (0..5).map(|_| "success").collect();
+        let baseline_metrics: Vec<f64> = vec![1.0, 1.0, 1.0, 1.0, 1.0];
+        let treatment_metrics: Vec<f64> = vec![1.0, 1.0, 1.0, 1.0, 1.0];
+        let digests: Vec<Option<&str>> = (0..5)
+            .map(|_| {
+                Some("sha256:cccc0000000000000000000000000000000000000000000000000000000000cc")
+            })
+            .collect();
+
+        seed_ab_test_run(
+            &run_dir,
+            &baseline,
+            &treatment,
+            &baseline_metrics,
+            &treatment_metrics,
+            &digests,
+        );
+
+        let verdict = analysis::verdict::compute_verdict(&run_dir).expect("verdict");
+
+        // pass_rate: no discordant pairs, n=5 < MIN_PAIRED_FOR_HELD → UNDERPOWERED
+        let pass_rate_verdict = verdict
+            .metric_verdicts
+            .iter()
+            .find(|m| m.metric_name == "pass_rate")
+            .expect("pass_rate verdict");
+        assert_eq!(
+            pass_rate_verdict.classification,
+            analysis::verdict::Classification::Underpowered,
+            "pass_rate should be UNDERPOWERED with n=5"
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn verdict_detects_grader_drift_with_multiple_digests() {
+        let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
+        let run_dir = temp_dir("verdict_grader_drift");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+
+        // 30 tasks, but with two different grader digests
+        let baseline: Vec<&str> = (0..30).map(|_| "success").collect();
+        let treatment: Vec<&str> = (0..30).map(|_| "success").collect();
+        let baseline_metrics: Vec<f64> = (0..30).map(|_| 1.0).collect();
+        let treatment_metrics: Vec<f64> = (0..30).map(|_| 1.0).collect();
+        let digests: Vec<Option<&str>> = (0..30)
+            .map(|i| {
+                if i < 15 {
+                    Some("sha256:dddd0000000000000000000000000000000000000000000000000000000000dd")
+                } else {
+                    Some("sha256:eeee0000000000000000000000000000000000000000000000000000000000ee")
+                }
+            })
+            .collect();
+
+        seed_ab_test_run(
+            &run_dir,
+            &baseline,
+            &treatment,
+            &baseline_metrics,
+            &treatment_metrics,
+            &digests,
+        );
+
+        let verdict = analysis::verdict::compute_verdict(&run_dir).expect("verdict");
+        assert!(
+            !verdict.grader_pinned,
+            "grader should NOT be pinned (drift)"
+        );
+        assert_eq!(verdict.grader_digests_seen.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn verdict_detects_improvement_when_treatment_passes_more() {
+        let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
+        let run_dir = temp_dir("verdict_improvement");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+
+        // 30 paired tasks: baseline fails 10, treatment passes all
+        let baseline: Vec<&str> = (0..30)
+            .map(|i| if i < 10 { "failure" } else { "success" })
+            .collect();
+        let treatment: Vec<&str> = (0..30).map(|_| "success").collect();
+        let baseline_metrics: Vec<f64> = (0..30).map(|i| if i < 10 { 0.0 } else { 1.0 }).collect();
+        let treatment_metrics: Vec<f64> = (0..30).map(|_| 1.0).collect();
+        let digests: Vec<Option<&str>> = (0..30)
+            .map(|_| {
+                Some("sha256:ffff0000000000000000000000000000000000000000000000000000000000ff")
+            })
+            .collect();
+
+        seed_ab_test_run(
+            &run_dir,
+            &baseline,
+            &treatment,
+            &baseline_metrics,
+            &treatment_metrics,
+            &digests,
+        );
+
+        let verdict = analysis::verdict::compute_verdict(&run_dir).expect("verdict");
+
+        let pass_rate_verdict = verdict
+            .metric_verdicts
+            .iter()
+            .find(|m| m.metric_name == "pass_rate")
+            .expect("pass_rate verdict");
+        assert_eq!(
+            pass_rate_verdict.classification,
+            analysis::verdict::Classification::Improved,
+            "pass_rate should be IMPROVED"
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 }

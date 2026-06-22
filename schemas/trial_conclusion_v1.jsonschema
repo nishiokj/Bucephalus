@@ -36,14 +36,15 @@
     "grader": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "strategy"],
+      "required": ["name", "strategy", "digest"],
       "properties": {
         "name": { "type": "string", "minLength": 1 },
         "strategy": {
           "type": "string",
           "enum": ["in_task_runtime", "injected", "separate", "host"]
         },
-        "version": { "type": "string", "minLength": 1 }
+        "version": { "type": "string", "minLength": 1 },
+        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
       }
     }
   }

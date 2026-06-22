@@ -322,6 +322,7 @@ export async function handleRunRoute(
       runtime.eventRows(runtimeRoute.runId, {
         limit,
         afterRowSeq: afterRowSeq ?? undefined,
+        sources: ["runtime.event_rows", "worker_runtime_snapshot"],
       }),
       runtime.workerLifecycleEvents(runtimeRoute.runId, { limit, afterRowSeq: afterRowSeq ?? undefined }),
     ]);

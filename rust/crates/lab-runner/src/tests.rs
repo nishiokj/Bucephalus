@@ -11542,7 +11542,7 @@ mod tests {
             "payload": { "resolved": 1.0 },
             "reported_outcome": "success",
             "primary_metric": { "name": "resolved", "value": 1.0 },
-            "grader": { "name": "test_grader", "strategy": "in_task_runtime" }
+            "grader": { "name": "test_grader", "strategy": "in_task_runtime", "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000" }
         }));
 
         let mut run_sink = BufferedRunSink::default();
@@ -22051,7 +22051,7 @@ mod tests {
                 "payload": { "resolved": 1.0 },
                 "reported_outcome": "success",
                 "primary_metric": { "name": "resolved", "value": 1.0 },
-                "grader": { "name": "test_grader", "strategy": "in_task_runtime" }
+                "grader": { "name": "test_grader", "strategy": "in_task_runtime", "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000" }
             }),
         )
         .expect("mapped output");
