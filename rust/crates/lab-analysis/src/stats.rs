@@ -286,13 +286,20 @@ pub fn welch_t_test(a: &[f64], b: &[f64]) -> Option<(f64, f64, f64, f64, f64, f6
         return if delta == 0.0 {
             Some((mean_a, mean_b, delta, 0.0, (na + nb - 2) as f64, 1.0))
         } else {
-            Some((mean_a, mean_b, delta, f64::INFINITY, (na + nb - 2) as f64, 0.0))
+            Some((
+                mean_a,
+                mean_b,
+                delta,
+                f64::INFINITY,
+                (na + nb - 2) as f64,
+                0.0,
+            ))
         };
     }
     let t = (mean_b - mean_a) / se;
     // Welch-Satterthwaite degrees of freedom.
-    let df = (se_a + se_b).powi(2)
-        / (se_a.powi(2) / (na - 1) as f64 + se_b.powi(2) / (nb - 1) as f64);
+    let df =
+        (se_a + se_b).powi(2) / (se_a.powi(2) / (na - 1) as f64 + se_b.powi(2) / (nb - 1) as f64);
     let p = t_sf_two_tailed(t, df);
     Some((mean_a, mean_b, mean_b - mean_a, t, df, p))
 }

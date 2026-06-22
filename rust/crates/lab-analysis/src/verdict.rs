@@ -141,12 +141,14 @@ pub fn compute_verdict(run_dir: &std::path::Path) -> Result<Verdict> {
     let metric_defs = load_metric_definitions(&conn)?;
     let grader_info = check_grader_pinning(&conn)?;
     let flaky_count = count_flaky_tasks(&conn)?;
-    let (total_trials, paired_trials) = count_trials(&conn, &baseline_variant, &treatment_variants)?;
+    let (total_trials, paired_trials) =
+        count_trials(&conn, &baseline_variant, &treatment_variants)?;
 
     let mut metric_verdicts = Vec::new();
 
     // Primary outcome (binary pass/fail) — always adjudicated first.
-    let outcome_verdict = adjudicate_primary_outcome(&conn, &baseline_variant, &treatment_variants)?;
+    let outcome_verdict =
+        adjudicate_primary_outcome(&conn, &baseline_variant, &treatment_variants)?;
     if let Some(v) = outcome_verdict {
         metric_verdicts.push(v);
     }
@@ -156,12 +158,9 @@ pub fn compute_verdict(run_dir: &std::path::Path) -> Result<Verdict> {
         if def.id == "pass_rate" || def.id == "success" {
             continue; // already handled as primary outcome
         }
-        if let Some(v) = adjudicate_continuous_metric(
-            &conn,
-            def,
-            &baseline_variant,
-            &treatment_variants,
-        )? {
+        if let Some(v) =
+            adjudicate_continuous_metric(&conn, def, &baseline_variant, &treatment_variants)?
+        {
             metric_verdicts.push(v);
         }
     }
@@ -186,9 +185,7 @@ pub fn compute_verdict(run_dir: &std::path::Path) -> Result<Verdict> {
 // ---------------------------------------------------------------------------
 
 fn resolve_variants(conn: &Connection) -> Result<(String, Vec<String>)> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT variant_id FROM trials ORDER BY variant_id",
-    )?;
+    let mut stmt = conn.prepare("SELECT DISTINCT variant_id FROM trials ORDER BY variant_id")?;
     let variants: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .filter_map(|r| r.ok())
@@ -208,10 +205,7 @@ fn resolve_variants(conn: &Connection) -> Result<(String, Vec<String>)> {
         .ok()
         .unwrap_or_else(|| variants.first().cloned().unwrap_or_default());
 
-    let treatment: Vec<String> = variants
-        .into_iter()
-        .filter(|v| v != &baseline)
-        .collect();
+    let treatment: Vec<String> = variants.into_iter().filter(|v| v != &baseline).collect();
 
     Ok((baseline, treatment))
 }
@@ -313,9 +307,7 @@ fn count_trials(
 
     let paired: i64 = conn
         .query_row(
-            &format!(
-                "SELECT count(*) FROM paired_outcomes"
-            ),
+            &format!("SELECT count(*) FROM paired_outcomes"),
             [],
             |row| row.get(0),
         )
@@ -344,9 +336,7 @@ fn adjudicate_primary_outcome(
          FROM paired_outcomes",
     )?;
     let (base_only, treat_only): (i64, i64) = stmt
-        .query_row([], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
+        .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap_or((0, 0));
 
     let n_discordant = (base_only + treat_only) as usize;
@@ -429,9 +419,7 @@ fn count_trials_for_variant(conn: &Connection, variant: &str) -> usize {
 
 fn count_paired_outcomes(conn: &Connection) -> usize {
     let count: i64 = conn
-        .query_row("SELECT count(*) FROM paired_outcomes", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT count(*) FROM paired_outcomes", [], |row| row.get(0))
         .unwrap_or(0);
     count as usize
 }
@@ -454,18 +442,9 @@ fn get_moved_outcome_cases(conn: &Connection) -> Result<Vec<MovedCase>> {
             let repl_idx: i64 = row.get(1)?;
             let baseline_trial_id: String = row.get(2)?;
             let treatment_trial_id: String = row.get(3)?;
-            let baseline_value: Option<f64> = row
-                .get::<_, Option<f64>>(4)
-                .ok()
-                .flatten();
-            let treatment_value: Option<f64> = row
-                .get::<_, Option<f64>>(5)
-                .ok()
-                .flatten();
-            let delta: Option<f64> = row
-                .get::<_, Option<f64>>(6)
-                .ok()
-                .flatten();
+            let baseline_value: Option<f64> = row.get::<_, Option<f64>>(4).ok().flatten();
+            let treatment_value: Option<f64> = row.get::<_, Option<f64>>(5).ok().flatten();
+            let delta: Option<f64> = row.get::<_, Option<f64>>(6).ok().flatten();
             Ok(MovedCase {
                 task_id,
                 repl_idx,
@@ -539,10 +518,7 @@ fn adjudicate_continuous_metric(
         return adjudicate_unpaired_metric(conn, def, baseline, treatment);
     }
 
-    let deltas: Vec<f64> = paired_rows
-        .iter()
-        .map(|r| r.5 - r.4)
-        .collect();
+    let deltas: Vec<f64> = paired_rows.iter().map(|r| r.5 - r.4).collect();
 
     let n_paired = deltas.len();
     let baseline_vals: Vec<f64> = paired_rows.iter().map(|r| r.4).collect();
@@ -638,8 +614,16 @@ fn adjudicate_unpaired_metric(
         .filter_map(|r| r.ok())
         .collect();
 
-    let baseline_vals: Vec<f64> = rows.iter().filter(|r| r.0 == baseline).map(|r| r.1).collect();
-    let treatment_vals: Vec<f64> = rows.iter().filter(|r| r.0 == treatment).map(|r| r.1).collect();
+    let baseline_vals: Vec<f64> = rows
+        .iter()
+        .filter(|r| r.0 == baseline)
+        .map(|r| r.1)
+        .collect();
+    let treatment_vals: Vec<f64> = rows
+        .iter()
+        .filter(|r| r.0 == treatment)
+        .map(|r| r.1)
+        .collect();
 
     if baseline_vals.is_empty() || treatment_vals.is_empty() {
         return Ok(None);
@@ -650,13 +634,19 @@ fn adjudicate_unpaired_metric(
             Some((mean_a, mean_b, d, _, _, p)) => {
                 let pooled_std = {
                     let var_a = if baseline_vals.len() > 1 {
-                        baseline_vals.iter().map(|x| (x - mean_a).powi(2)).sum::<f64>()
+                        baseline_vals
+                            .iter()
+                            .map(|x| (x - mean_a).powi(2))
+                            .sum::<f64>()
                             / (baseline_vals.len() - 1) as f64
                     } else {
                         0.0
                     };
                     let var_b = if treatment_vals.len() > 1 {
-                        treatment_vals.iter().map(|x| (x - mean_b).powi(2)).sum::<f64>()
+                        treatment_vals
+                            .iter()
+                            .map(|x| (x - mean_b).powi(2))
+                            .sum::<f64>()
                             / (treatment_vals.len() - 1) as f64
                     } else {
                         0.0

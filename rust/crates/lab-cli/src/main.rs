@@ -9040,7 +9040,12 @@ fn print_verdict(verdict: &analysis::verdict::Verdict) {
         println!(
             "grader: DRIFTED ({} distinct digests: {})",
             verdict.grader_digests_seen.len(),
-            verdict.grader_digests_seen.iter().map(|d| &d[..16]).collect::<Vec<_>>().join(", ")
+            verdict
+                .grader_digests_seen
+                .iter()
+                .map(|d| &d[..16])
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
@@ -9072,7 +9077,10 @@ fn print_verdict(verdict: &analysis::verdict::Verdict) {
             (Some(e), None) => format!("d={:.3}", e),
             _ => String::new(),
         };
-        let delta_pct = mv.delta_pct.map(|p| format!(" ({:+.1}%)", p)).unwrap_or_default();
+        let delta_pct = mv
+            .delta_pct
+            .map(|p| format!(" ({:+.1}%)", p))
+            .unwrap_or_default();
         println!(
             "  [{}] {} {}  {:.4} → {:.4} ({:+.4}{})  n={}  {}  {}",
             icon,
@@ -9120,10 +9128,22 @@ fn print_verdict(verdict: &analysis::verdict::Verdict) {
                     improvements,
                 );
                 for case in mv.moved_cases.iter().take(5) {
-                    let bv = case.baseline_value.map(|v| format!("{:.4}", v)).unwrap_or("—".to_string());
-                    let tv = case.treatment_value.map(|v| format!("{:.4}", v)).unwrap_or("—".to_string());
-                    let d = case.delta.map(|v| format!("{:+.4}", v)).unwrap_or("—".to_string());
-                    println!("    {} repl={}  {} → {}  Δ{}", case.task_id, case.repl_idx, bv, tv, d);
+                    let bv = case
+                        .baseline_value
+                        .map(|v| format!("{:.4}", v))
+                        .unwrap_or("—".to_string());
+                    let tv = case
+                        .treatment_value
+                        .map(|v| format!("{:.4}", v))
+                        .unwrap_or("—".to_string());
+                    let d = case
+                        .delta
+                        .map(|v| format!("{:+.4}", v))
+                        .unwrap_or("—".to_string());
+                    println!(
+                        "    {} repl={}  {} → {}  Δ{}",
+                        case.task_id, case.repl_idx, bv, tv, d
+                    );
                 }
                 if mv.moved_cases.len() > 5 {
                     println!("    ... and {} more", mv.moved_cases.len() - 5);
@@ -9133,10 +9153,26 @@ fn print_verdict(verdict: &analysis::verdict::Verdict) {
     }
 
     // Summary line
-    let held = verdict.metric_verdicts.iter().filter(|m| m.classification == analysis::verdict::Classification::Held).count();
-    let regressed = verdict.metric_verdicts.iter().filter(|m| m.classification == analysis::verdict::Classification::Regressed).count();
-    let improved = verdict.metric_verdicts.iter().filter(|m| m.classification == analysis::verdict::Classification::Improved).count();
-    let underpowered = verdict.metric_verdicts.iter().filter(|m| m.classification == analysis::verdict::Classification::Underpowered).count();
+    let held = verdict
+        .metric_verdicts
+        .iter()
+        .filter(|m| m.classification == analysis::verdict::Classification::Held)
+        .count();
+    let regressed = verdict
+        .metric_verdicts
+        .iter()
+        .filter(|m| m.classification == analysis::verdict::Classification::Regressed)
+        .count();
+    let improved = verdict
+        .metric_verdicts
+        .iter()
+        .filter(|m| m.classification == analysis::verdict::Classification::Improved)
+        .count();
+    let underpowered = verdict
+        .metric_verdicts
+        .iter()
+        .filter(|m| m.classification == analysis::verdict::Classification::Underpowered)
+        .count();
     println!(
         "\nsummary: {} held, {} regressed, {} improved, {} underpowered",
         held, regressed, improved, underpowered
@@ -13489,7 +13525,12 @@ runtime:
 
         conn.execute(
             "INSERT INTO runs(account_id, run_id, experiment_id, run_dir) VALUES (?1, ?2, ?3, ?4)",
-            (&account_id, &run_id, "exp_ab", run_dir.display().to_string()),
+            (
+                &account_id,
+                &run_id,
+                "exp_ab",
+                run_dir.display().to_string(),
+            ),
         )
         .expect("insert run");
 
@@ -13593,10 +13634,16 @@ runtime:
 
         // 30 paired tasks: baseline passes all, treatment fails 10
         let baseline: Vec<&str> = (0..30).map(|_| "success").collect();
-        let treatment: Vec<&str> = (0..30).map(|i| if i < 10 { "failure" } else { "success" }).collect();
+        let treatment: Vec<&str> = (0..30)
+            .map(|i| if i < 10 { "failure" } else { "success" })
+            .collect();
         let baseline_metrics: Vec<f64> = (0..30).map(|i| if i < 10 { 0.0 } else { 1.0 }).collect();
         let treatment_metrics: Vec<f64> = (0..30).map(|i| if i < 10 { 0.0 } else { 1.0 }).collect();
-        let digests: Vec<Option<&str>> = (0..30).map(|_| Some("sha256:aaaa0000000000000000000000000000000000000000000000000000000000aa")).collect();
+        let digests: Vec<Option<&str>> = (0..30)
+            .map(|_| {
+                Some("sha256:aaaa0000000000000000000000000000000000000000000000000000000000aa")
+            })
+            .collect();
 
         seed_ab_test_run(
             &run_dir,
@@ -13640,7 +13687,11 @@ runtime:
         let treatment: Vec<&str> = (0..30).map(|_| "success").collect();
         let baseline_metrics: Vec<f64> = (0..30).map(|i| 1.0 + i as f64 * 0.01).collect();
         let treatment_metrics: Vec<f64> = (0..30).map(|i| 1.0 + i as f64 * 0.01).collect();
-        let digests: Vec<Option<&str>> = (0..30).map(|_| Some("sha256:bbbb0000000000000000000000000000000000000000000000000000000000bb")).collect();
+        let digests: Vec<Option<&str>> = (0..30)
+            .map(|_| {
+                Some("sha256:bbbb0000000000000000000000000000000000000000000000000000000000bb")
+            })
+            .collect();
 
         seed_ab_test_run(
             &run_dir,
@@ -13692,7 +13743,11 @@ runtime:
         let treatment: Vec<&str> = (0..5).map(|_| "success").collect();
         let baseline_metrics: Vec<f64> = vec![1.0, 1.0, 1.0, 1.0, 1.0];
         let treatment_metrics: Vec<f64> = vec![1.0, 1.0, 1.0, 1.0, 1.0];
-        let digests: Vec<Option<&str>> = (0..5).map(|_| Some("sha256:cccc0000000000000000000000000000000000000000000000000000000000cc")).collect();
+        let digests: Vec<Option<&str>> = (0..5)
+            .map(|_| {
+                Some("sha256:cccc0000000000000000000000000000000000000000000000000000000000cc")
+            })
+            .collect();
 
         seed_ab_test_run(
             &run_dir,
@@ -13752,7 +13807,10 @@ runtime:
         );
 
         let verdict = analysis::verdict::compute_verdict(&run_dir).expect("verdict");
-        assert!(!verdict.grader_pinned, "grader should NOT be pinned (drift)");
+        assert!(
+            !verdict.grader_pinned,
+            "grader should NOT be pinned (drift)"
+        );
         assert_eq!(verdict.grader_digests_seen.len(), 2);
 
         let _ = std::fs::remove_dir_all(&run_dir);
@@ -13766,11 +13824,17 @@ runtime:
         std::fs::create_dir_all(&run_dir).expect("run dir");
 
         // 30 paired tasks: baseline fails 10, treatment passes all
-        let baseline: Vec<&str> = (0..30).map(|i| if i < 10 { "failure" } else { "success" }).collect();
+        let baseline: Vec<&str> = (0..30)
+            .map(|i| if i < 10 { "failure" } else { "success" })
+            .collect();
         let treatment: Vec<&str> = (0..30).map(|_| "success").collect();
         let baseline_metrics: Vec<f64> = (0..30).map(|i| if i < 10 { 0.0 } else { 1.0 }).collect();
         let treatment_metrics: Vec<f64> = (0..30).map(|_| 1.0).collect();
-        let digests: Vec<Option<&str>> = (0..30).map(|_| Some("sha256:ffff0000000000000000000000000000000000000000000000000000000000ff")).collect();
+        let digests: Vec<Option<&str>> = (0..30)
+            .map(|_| {
+                Some("sha256:ffff0000000000000000000000000000000000000000000000000000000000ff")
+            })
+            .collect();
 
         seed_ab_test_run(
             &run_dir,
