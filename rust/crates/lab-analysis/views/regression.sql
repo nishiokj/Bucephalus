@@ -8,18 +8,6 @@ FROM trials
 GROUP BY run_id, variant_id
 ORDER BY run_id, variant_id;
 
-CREATE OR REPLACE VIEW flaky_tasks AS
-SELECT
-    task_id,
-    count(*) AS n_replications,
-    sum(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS passes,
-    sum(CASE WHEN outcome <> 'success' THEN 1 ELSE 0 END) AS failures,
-    round(avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END), 4) AS pass_rate
-FROM trials
-GROUP BY task_id
-HAVING count(DISTINCT outcome) > 1
-ORDER BY pass_rate ASC, n_replications DESC, task_id;
-
 CREATE OR REPLACE VIEW failure_clusters AS
 SELECT
     CASE

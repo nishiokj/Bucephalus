@@ -1750,6 +1750,7 @@ export class RuntimeRepository {
       from cloud.run_events
       where run_id = ${cloudRunId}
         and seq > ${input?.afterRowSeq ?? -1}
+        and event_type like 'worker.%'
       order by seq
       limit ${limit}
     `;

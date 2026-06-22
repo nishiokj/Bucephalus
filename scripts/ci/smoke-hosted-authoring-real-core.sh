@@ -15,8 +15,9 @@ require_command() {
 require_command cargo
 require_command bun
 
-cargo build -p bucephalus-cli --bin bucephalus
+cargo build -p bucephalus-cli --bin bucephalus --bin bucephalus-worker-runner
 
 BUCEPHALUS_CLOUD_REAL_CORE_SMOKE=1 \
 BUCEPHALUS_CLOUD_CORE_CLI="${ROOT_DIR}/target/debug/bucephalus" \
+BUCEPHALUS_CLOUD_WORKER_RUNNER_CLI="${ROOT_DIR}/target/debug/bucephalus-worker-runner" \
 bun test bucephalus-cloud/tests/hostedAuthoringRealCore.test.ts

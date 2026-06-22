@@ -1216,6 +1216,7 @@ dependencies = [
  "include_dir",
  "lab-core",
  "rusqlite",
+ "serde",
  "serde_json",
 ]
 

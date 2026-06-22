@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use lab_core::{
-    ensure_dir, sha256_file, BUCEPHALUS_CONTRACT_EVENTS_DIR, BUCEPHALUS_CONTRACT_IN_DIR,
-    BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
+    canonical_json_digest, ensure_dir, sha256_file, BUCEPHALUS_CONTRACT_EVENTS_DIR,
+    BUCEPHALUS_CONTRACT_IN_DIR, BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
     BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH, BUCEPHALUS_ENV_RESULT_PATH,
     BUCEPHALUS_ENV_TRAJECTORY_PATH, BUCEPHALUS_ENV_TRIAL_INPUT_PATH,
     BUCEPHALUS_EVENTS_DURABLE_PATH,
@@ -857,6 +857,9 @@ fn synthesize_grader_trial_conclusion(
         GradingStrategy::Separate => "separate",
         GradingStrategy::Host => "host",
     };
+    let grader_config_value = serde_json::to_value(grader)
+        .context("failed to serialize GradingConfig for grader digest")?;
+    let grader_digest = canonical_json_digest(&grader_config_value);
     let mut row = serde_json::Map::from_iter([
         ("schema_version".to_string(), json!("trial_conclusion_v1")),
         ("payload".to_string(), Value::Object(payload)),
@@ -865,7 +868,8 @@ fn synthesize_grader_trial_conclusion(
             "grader".to_string(),
             json!({
                 "name": "runtime_transport",
-                "strategy": strategy
+                "strategy": strategy,
+                "digest": grader_digest
             }),
         ),
     ]);

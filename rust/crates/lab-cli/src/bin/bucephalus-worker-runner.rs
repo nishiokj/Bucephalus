@@ -30,6 +30,8 @@ struct Args {
     #[arg(long)]
     run_dangerously: bool,
     #[arg(long)]
+    validate_only: bool,
+    #[arg(long)]
     json: bool,
 }
 
@@ -114,14 +116,13 @@ fn parse_args() -> Args {
 }
 
 fn run(args: Args) -> Result<Value> {
-    if args.smoke_test && args.run_dangerously {
+    let modes = [args.smoke_test, args.run_dangerously, args.validate_only]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count();
+    if modes != 1 {
         return Err(anyhow!(
-            "--smoke-test and --run-dangerously are mutually exclusive"
-        ));
-    }
-    if !args.smoke_test && !args.run_dangerously {
-        return Err(anyhow!(
-            "worker runner requires either --smoke-test or --run-dangerously"
+            "worker runner requires exactly one of --smoke-test, --run-dangerously, or --validate-only"
         ));
     }
     if experiment_input_path(&args.package)?.is_some() {
@@ -142,6 +143,20 @@ fn run(args: Args) -> Result<Value> {
     let package_dir = package_directory_for_input(&args.package);
     let mut validation = lab_runner::register_experiment_bundle(&package_dir)?;
     let summary = lab_runner::experiment_summary_with_options(&package_dir, &execution)?;
+
+    if args.validate_only {
+        return Ok(json!({
+            "ok": true,
+            "command": "run",
+            "mode": "validate_only",
+            "input": "package",
+            "package_dir": package_dir.display().to_string(),
+            "summary": summary_to_json(&summary),
+            "executor": execution.executor.map(|e| e.as_str()),
+            "materialize": execution.materialize.map(|m| m.as_str()),
+            "validation": experiment_bundle_validation_to_json(&validation),
+        }));
+    }
 
     if args.smoke_test {
         let result = lab_runner::run_smoke_test_with_options(&package_dir, execution.clone())?;

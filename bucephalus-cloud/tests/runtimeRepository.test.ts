@@ -10108,6 +10108,39 @@ describe("runtime repository worker snapshots", () => {
     ]));
   });
 
+  test("worker lifecycle event reads exclude resource query audit noise", async () => {
+    const observed: { query: string; values: unknown[] } = {
+      query: "",
+      values: [],
+    };
+    const sql = ((strings: TemplateStringsArray, ...values: unknown[]) => {
+      observed.query = strings.raw.join(" ");
+      observed.values = values;
+      return Promise.resolve([
+        {
+          event_id: "event-1",
+          seq: 12,
+          event_type: "worker.core.failed",
+          payload: {},
+          created_at: "2026-06-04T00:00:12Z",
+        },
+      ]);
+    }) as any;
+
+    const events = await RuntimeRepository.prototype.workerLifecycleEvents.call({ sql }, "run-1", {
+      limit: 25,
+      afterRowSeq: 7,
+    });
+
+    expect(observed.query).toContain("event_type like 'worker.%'");
+    expect(observed.values).toEqual(["run-1", 7, 25]);
+    expect(events).toEqual([expect.objectContaining({
+      event_id: "event-1",
+      seq: 12,
+      event_type: "worker.core.failed",
+    })]);
+  });
+
   test("pushes cloud control-plane event type filters into the SQL read", async () => {
     const observed: { query: string; values: unknown[] } = {
       query: "",

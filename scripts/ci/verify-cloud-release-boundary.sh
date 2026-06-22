@@ -2528,6 +2528,16 @@ if (cloudPackageScripts["test:smoke:hosted-workflow"] !== "../scripts/ci/smoke-b
 if (!read("scripts/ci/smoke-buc-hosted-workflow.sh").includes("bun run check:postgres")) {
   fail("scripts/ci/smoke-buc-hosted-workflow.sh must preflight Postgres readiness before building/running the hosted workflow smoke");
 }
+const hostedRealCoreSmokeScript = read("scripts/ci/smoke-hosted-authoring-real-core.sh");
+if (!hostedRealCoreSmokeScript.includes("--bin bucephalus-worker-runner") || !hostedRealCoreSmokeScript.includes("BUCEPHALUS_CLOUD_WORKER_RUNNER_CLI")) {
+  fail("scripts/ci/smoke-hosted-authoring-real-core.sh must build and pass the worker runner binary so hosted packages are validated against the promoted runner contract");
+}
+const hostedRealCoreSmokeTest = read("bucephalus-cloud/tests/hostedAuthoringRealCore.test.ts");
+for (const requiredFragment of ["readiness:", "http:", "adapter:", "--validate-only", "BUCEPHALUS_CLOUD_WORKER_RUNNER_CLI"]) {
+  if (!hostedRealCoreSmokeTest.includes(requiredFragment)) {
+    fail(`bucephalus-cloud/tests/hostedAuthoringRealCore.test.ts must keep real-Core/worker-runner schema skew coverage for ${requiredFragment}`);
+  }
+}
 const hostedWorkflowSmokeTest = read("bucephalus-cloud/tests/bucHostedWorkflowSmoke.test.ts");
 for (const requiredFragment of [
   "\"build\"",

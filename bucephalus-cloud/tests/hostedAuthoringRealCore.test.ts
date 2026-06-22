@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { cp, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as tar from "tar";
@@ -41,6 +42,65 @@ describe("hosted authoring real Core smoke", () => {
         "      - \"**\"",
         "targets:",
         "  hosted_cloud: {}",
+        "",
+      ].join("\n"));
+      await writeFile(join(sourceDir, "experiment.yaml"), [
+        "experiment:",
+        "  id: cookbook_agent_eval",
+        "  name: Cookbook Agent Eval",
+        "  mode: answer",
+        "matrix:",
+        "  variants:",
+        "    - id: balanced",
+        "      baseline: true",
+        "      config:",
+        "        profile: balanced",
+        "        provider: smoke",
+        "        model: smoke-model",
+        "  cases:",
+        "    source: file",
+        "    path: cases.jsonl",
+        "stages:",
+        "  case:",
+        "    interface: writable_workspace",
+        "    workspace:",
+        "      source: container_image",
+        "      image: { from: case_row }",
+        "      workdir: { from: case_row }",
+        "  agent:",
+        "    image: node:20-alpine",
+        "    mount:",
+        "      source: ./agent",
+        "      mount:",
+        "        path: /opt/agent",
+        "        read_only: true",
+        "    services: [pg-data-api]",
+        "    adapter:",
+        "      executable: node",
+        "      result: structured_json",
+        "      args: [\"/opt/agent/run.js\", \"--profile\", \"$profile\"]",
+        "  grader:",
+        "    strategy: none",
+        "services:",
+        "  pg-data-api:",
+        "    image: python:3.11-slim",
+        "    lifecycle: trial",
+        "    readiness:",
+        "      http:",
+        "        url: http://127.0.0.1:9757",
+        "        method: POST",
+        "        json:",
+        "          case_id: pg_001",
+        "          command: overview",
+        "      timeout_ms: 10000",
+        "metrics:",
+        "  - id: resolved",
+        "    from: result.metrics.resolved",
+        "    direction: maximize",
+        "    primary: true",
+        "policy:",
+        "  timeout_ms: 120000",
+        "  sanitization_profile: hermetic_functional",
         "",
       ].join("\n"));
       const sourceArchive = join(root, "agent-eval-authoring.tgz");
@@ -114,6 +174,9 @@ describe("hosted authoring real Core smoke", () => {
       expect(resolvedExperiment.experiment).toEqual(expect.objectContaining({
         id: "cookbook_agent_eval",
       }));
+      expect(pointer(resolvedExperiment, "/sidecars/pg-data-api/readiness/http/method")).toBe("POST");
+      expect(pointer(resolvedExperiment, "/trial_runtime/agent/adapter/result")).toBe("structured_json");
+      await validateWithWorkerRunner(root, packages.artifact?.storage_path);
       expect(body.cloud_readiness.status).toBe("cloud_blocked");
       expect(body.cloud_readiness.checks).toContainEqual(expect.objectContaining({
         name: "runtime_contract",
@@ -128,6 +191,57 @@ describe("hosted authoring real Core smoke", () => {
     }
   });
 });
+
+async function validateWithWorkerRunner(root: string, packageArchivePath: unknown): Promise<void> {
+  const workerRunner = resolve(process.env.BUCEPHALUS_CLOUD_WORKER_RUNNER_CLI ?? "target/debug/bucephalus-worker-runner");
+  expect(existsSync(workerRunner), `worker runner binary is required at ${workerRunner}`).toBe(true);
+  expect(typeof packageArchivePath).toBe("string");
+  const packageDir = join(root, "worker-runner-package");
+  await mkdir(packageDir, { recursive: true });
+  await tar.x({ file: packageArchivePath as string, cwd: packageDir });
+  const result = await runProcess(workerRunner, [
+    packageDir,
+    "--validate-only",
+    "--materialize",
+    "none",
+    "--json",
+  ]);
+  if (result.exitCode !== 0) {
+    console.error(result.stdout);
+    console.error(result.stderr);
+  }
+  expect(result.exitCode).toBe(0);
+  const payload = JSON.parse(result.stdout) as JsonObject;
+  expect(payload.ok).toBe(true);
+  expect(payload.mode).toBe("validate_only");
+}
+
+async function runProcess(command: string, args: string[]): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
+  return await new Promise((resolvePromise, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (exitCode) => {
+      resolvePromise({ exitCode, stdout, stderr });
+    });
+  });
+}
+
+function pointer(value: unknown, path: string): unknown {
+  return path.split("/").slice(1).reduce<unknown>((current, segment) => {
+    if (!current || typeof current !== "object") return undefined;
+    return (current as Record<string, unknown>)[segment];
+  }, value);
+}
 
 function capturingImportRepository(sourceArchivePath: string): Pick<ImportRepository, "getUpload" | "createUpload" | "markUploaded" | "completeUpload" | "createImportJob" | "updateImportInspection" | "getImportJob"> {
   const state: {

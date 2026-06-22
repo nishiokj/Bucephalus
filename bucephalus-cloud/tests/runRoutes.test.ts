@@ -493,7 +493,11 @@ describe("Cloud run routes", () => {
     );
 
     const body = await response!.json();
-    expect(observed.eventInput).toMatchObject({ limit: 1, afterRowSeq: 7 });
+    expect(observed.eventInput).toMatchObject({
+      limit: 1,
+      afterRowSeq: 7,
+      sources: ["runtime.event_rows", "worker_runtime_snapshot"],
+    });
     expect(observed.workerInput).toMatchObject({ limit: 1, afterRowSeq: 7 });
     expect(body.metadata).toMatchObject({
       resourceVersion: "event-row-seq:8",
