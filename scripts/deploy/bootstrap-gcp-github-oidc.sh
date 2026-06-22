@@ -326,6 +326,7 @@ deploy_roles=(
   roles/artifactregistry.reader
   roles/cloudsql.admin
   roles/compute.networkAdmin
+  roles/compute.securityAdmin
   roles/iam.serviceAccountAdmin
   roles/iam.serviceAccountUser
   roles/monitoring.admin
