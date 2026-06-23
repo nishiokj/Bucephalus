@@ -340,7 +340,7 @@ function provisionFailureConfig(provisionCommand: string[]) {
     apiUrl: "https://api.example",
     workerToken: "worker",
     runnerPoolId: "pool-1",
-    provider: "exec",
+    provider: "exec" as const,
     provisionCommand,
     reapCommand: ["true"],
     configuredPoolCapabilities: poolRecord().capabilities,
