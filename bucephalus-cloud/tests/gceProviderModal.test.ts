@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 // @ts-ignore: provider scripts are shipped as runtime JavaScript deploy assets.
-import { renderStartupScript, validateRequest, workerImageForRequest } from "../deploy/provider/gcp/provision-runner-vm.js";
+import { renderStartupScript, runtimeImageRefsFromRequest, validateRequest, workerImageForRequest } from "../deploy/provider/gcp/provision-runner-vm.js";
 
 describe("GCE runner provider Modal bridge", () => {
   test("rejects modal provisioning when Modal config is disabled", () => {
@@ -87,6 +87,61 @@ describe("GCE runner provider Modal bridge", () => {
     expect(() => workerImageForRequest({}, { workerImageFallback: "" } as any))
       .toThrow("provision request requires /worker_image or BUCEPHALUS_GCP_RUNNER_IMAGE");
   });
+
+  test("extracts runtime image refs from run requirements", () => {
+    const refs = runtimeImageRefsFromRequest({
+      run_requirements: {
+        image_refs: [
+          "us-central1-docker.pkg.dev/project/repo/runtime@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "us-central1-docker.pkg.dev/project/repo/runtime@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "us-central1-docker.pkg.dev/project/repo/runtime@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        ],
+      },
+    });
+    expect(refs).toEqual([
+      "us-central1-docker.pkg.dev/project/repo/runtime@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "us-central1-docker.pkg.dev/project/repo/runtime@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    ]);
+  });
+
+  test("returns empty array when run requirements have no image refs", () => {
+    expect(runtimeImageRefsFromRequest({ run_requirements: {} })).toEqual([]);
+    expect(runtimeImageRefsFromRequest({})).toEqual([]);
+  });
+
+  test("rejects non-digest-pinned runtime image refs", () => {
+    expect(() => runtimeImageRefsFromRequest({
+      run_requirements: {
+        image_refs: ["us-central1-docker.pkg.dev/project/repo/runtime:latest"],
+      },
+    })).toThrow("must be a real digest-addressed image ref");
+  });
+
+  test("startup script pre-pulls runtime images in parallel with the worker image", () => {
+    const runtimeRef1 = "us-central1-docker.pkg.dev/project/repo/runtime@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const runtimeRef2 = "us-central1-docker.pkg.dev/project/repo/runtime@sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const script = renderStartupScript({
+      ...startupConfig(),
+      runtimeImageRefs: [runtimeRef1, runtimeRef2],
+    });
+
+    expect(script).toContain(`docker pull '${runtimeRef1}' &`);
+    expect(script).toContain(`docker pull '${runtimeRef2}' &`);
+    expect(script).toContain('docker pull "${WORKER_IMAGE}" &');
+    expect(script).toContain("worker_pull_pid=$!");
+    expect(script).toContain('runtime_pull_pids+=($!)');
+    expect(script).toContain('wait "$pid" || exit 1');
+    expect(script).toContain('wait "$worker_pull_pid" || exit 1');
+  });
+
+  test("startup script without runtime images still pulls the worker image", () => {
+    const script = renderStartupScript(startupConfig());
+
+    expect(script).toContain('docker pull "${WORKER_IMAGE}" &');
+    expect(script).toContain("worker_pull_pid=$!");
+    expect(script).toContain('wait "$worker_pull_pid" || exit 1');
+    expect(script).not.toContain("runtime_pull_pids+=");
+  });
 });
 
 function startupConfig() {
@@ -103,6 +158,7 @@ function startupConfig() {
     workerTokenSecret: "worker-token",
     workerTokenSecretVersion: "1",
     registryHost: "us-central1-docker.pkg.dev",
+    runtimeImageRefs: [],
     modal: {
       enabled: true,
       appName: "bucephalus-prod",

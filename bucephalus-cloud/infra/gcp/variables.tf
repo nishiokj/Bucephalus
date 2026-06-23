@@ -502,7 +502,7 @@ variable "runner_gce_boot_disk_size_gb" {
 }
 
 variable "runner_gce_boot_image" {
-  description = "GCE source image used for per-run Docker runner VMs. Defaults to Container-Optimized OS so Docker is preinstalled and startup avoids apt-installing the runtime."
+  description = "GCE source image used for per-run Docker runner VMs. Defaults to Container-Optimized OS so Docker is preinstalled and startup avoids apt-installing the runtime. Set to a custom image built by deploy/provider/gcp/build-runner-image.sh to pre-cache runtime Docker images and eliminate cold registry pulls from the run critical path."
   type        = string
   default     = "projects/cos-cloud/global/images/family/cos-stable"
 

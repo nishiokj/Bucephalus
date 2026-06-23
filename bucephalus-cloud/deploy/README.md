@@ -120,6 +120,15 @@ Runner provisioning for Path 1 is GCE per-run worker VMs:
   (`projects/cos-cloud/global/images/family/cos-stable`) so Docker is already
   present at boot; the startup script only falls back to apt-based installation
   when an overridden boot image does not provide Docker
+- the startup script pre-pulls runtime images declared in the run's
+  `image_refs` in parallel with the worker image so the Docker cache is warm
+  before the worker claims the run; the worker's `prePullRunImages` becomes a
+  no-op digest cache hit instead of a cold registry pull in the run critical
+  path
+- for stable runtime image sets, `deploy/provider/gcp/build-runner-image.sh`
+  builds a custom COS image with runtime images pre-cached in the Docker layer
+  store; set `runner_gce_boot_image` in Terraform to the resulting image path
+  to eliminate the startup-script pull entirely
 - when `modal_backend_enabled=true`, the same worker VM path fetches Modal and
   S3/R2 sync credentials from Secret Manager and advertises the `modal`
   executor; the worker image contains the packaged `bucephalus-modal-launcher`

@@ -233,13 +233,13 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
 
   try {
     try {
-      await appendEvent(config, claim, "worker.materializing", {
+      appendEvent(config, claim, "worker.materializing", {
         package_digest: claim.run.package_digest,
         has_env: Object.keys(claim.run.env).length > 0,
         secret_ref_names: Object.keys(claim.run.secret_refs),
       });
       materialized = await materializePackage(config, claim);
-      await appendEvent(config, claim, "worker.materialized", {
+      appendEvent(config, claim, "worker.materialized", {
         workspace_dir: materialized.workspaceDir,
         package_archive_path: materialized.packageArchivePath,
         extracted_dir: materialized.extractedDir,
@@ -247,7 +247,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         manifest_experiment_id: stringAt(materialized.manifestJson, "/resolved_experiment/experiment/id"),
       });
       for (const secretId of Object.keys(claim.run.secret_refs).sort()) {
-        await appendEvent(config, claim, "worker.runtime.secret_binding.materialized", {
+        appendEvent(config, claim, "worker.runtime.secret_binding.materialized", {
           resource_kind: "SecretBinding",
           resource_name: runtimeDeclaredResourceName(secretId),
           secret_id: secretId,
@@ -280,7 +280,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
       // outranks the core outcome.
       try {
         const stats = await evidencePump.stop();
-        await appendEvent(config, claim, "worker.runtime.live_evidence_summary", { ...stats });
+        appendEvent(config, claim, "worker.runtime.live_evidence_summary", { ...stats });
       } catch (error) {
         logError("worker.evidence_pump_stop_failed", runContext, { error: errorMessage(error) });
       }
@@ -290,12 +290,10 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
     if (materialized) {
       try {
         const uploadSummary = await uploadRuntimeArtifacts(config, claim, materialized);
-        await appendEvent(config, claim, "worker.runtime.artifacts_uploaded", uploadSummary);
+        appendEvent(config, claim, "worker.runtime.artifacts_uploaded", uploadSummary);
       } catch (error) {
-        await appendEvent(config, claim, "worker.runtime.artifact_upload_failed", {
+        appendEvent(config, claim, "worker.runtime.artifact_upload_failed", {
           error: errorMessage(error),
-        }).catch((eventError) => {
-          logError("worker.artifact_upload_failure_event_failed", runContext, { error: errorMessage(eventError) });
         });
         if (!coreError) {
           coreError = error;
@@ -306,10 +304,8 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
       try {
         await uploadRuntimeSnapshots(config, claim, materialized);
       } catch (error) {
-        await appendEvent(config, claim, "worker.runtime.snapshot_failed", {
+        appendEvent(config, claim, "worker.runtime.snapshot_failed", {
           error: errorMessage(error),
-        }).catch((eventError) => {
-          logError("worker.snapshot_failure_event_failed", runContext, { error: errorMessage(eventError) });
         });
         if (!coreError) {
           coreError = error;
@@ -332,6 +328,8 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
     } catch (error) {
       cleanupError = error;
     }
+
+    await flushPendingEvents();
 
     if (cleanupError) {
       const message = `runner cleanup failed after run ${runId} attempt ${attemptId}: ${errorMessage(cleanupError)}`;
@@ -367,7 +365,7 @@ async function executeCoreRun(
   context: TraceContext,
 ): Promise<void> {
   const command = coreRunnerCommand(config, claim, materialized);
-  await appendEvent(config, claim, "worker.core.starting", {
+  appendEvent(config, claim, "worker.core.starting", {
     command: command.redactedArgs,
     workspace_dir: materialized.workspaceDir,
     run_root_dir: materialized.runRootDir,
@@ -397,20 +395,20 @@ async function executeCoreRun(
     stderr_tail: tail(result.stderr, 16_000),
   };
   if (result.completedByProgressWatchdog) {
-    await appendEvent(config, claim, "worker.core.completed_after_progress_watchdog", eventPayload);
+    appendEvent(config, claim, "worker.core.completed_after_progress_watchdog", eventPayload);
     return;
   }
   if (result.timedOut) {
-    await appendEvent(config, claim, "worker.core.timed_out", eventPayload);
+    appendEvent(config, claim, "worker.core.timed_out", eventPayload);
     throw new WorkerError(`Core runner timed out after ${coreRunTimeoutMs(config, claim)} ms`);
   }
   if (result.exitCode !== 0) {
-    await appendEvent(config, claim, "worker.core.failed", eventPayload);
+    appendEvent(config, claim, "worker.core.failed", eventPayload);
     throw new WorkerError(
       coreRunnerFailureMessage(result.exitCode, result.stdout, result.stderr),
     );
   }
-  await appendEvent(config, claim, "worker.core.completed", eventPayload);
+  appendEvent(config, claim, "worker.core.completed", eventPayload);
 }
 
 export function coreRunnerFailureMessage(exitCode: number, stdout: string, stderr: string): string {
@@ -477,7 +475,7 @@ async function uploadRuntimeSnapshots(
   }
   for (const coreRunId of coreRunIds) {
     const snapshot = await collectRuntimeSnapshot(materialized.runRootDir, coreRunId);
-    await appendEvent(config, claim, RUNTIME_SNAPSHOT_EVENT_TYPE, snapshot);
+    appendEvent(config, claim, RUNTIME_SNAPSHOT_EVENT_TYPE, snapshot);
   }
 }
 
@@ -1361,23 +1359,25 @@ export async function applyRuntimeNetworkPolicyWithAudit(
     agent: networkPerimeter.agent,
     egress_hosts: networkPerimeter.egress_hosts,
   });
-  await appendEvent(config, claim, "worker.runtime.network_perimeter.applying", {
+  appendEvent(config, claim, "worker.runtime.network_perimeter.applying", {
     ...eventPayload(),
     status: "applying",
   });
   try {
-    await applyRuntimeNetworkPolicy(config, claim, materialized);
-  } catch (error) {
-    await appendEvent(config, claim, "worker.runtime.network_perimeter.failed", {
-      ...eventPayload(),
-      status: "failed",
-      error: errorMessage(error),
-    }).catch((eventError) => {
-      logError("worker.runtime_network_policy_failure_event_failed", context, { error: errorMessage(eventError) });
-    });
-    throw error;
+    try {
+      await applyRuntimeNetworkPolicy(config, claim, materialized);
+    } catch (error) {
+      appendEvent(config, claim, "worker.runtime.network_perimeter.failed", {
+        ...eventPayload(),
+        status: "failed",
+        error: errorMessage(error),
+      });
+      throw error;
+    }
+    appendEvent(config, claim, "worker.runtime.network_perimeter.applied", eventPayload());
+  } finally {
+    await flushPendingEvents();
   }
-  await appendEvent(config, claim, "worker.runtime.network_perimeter.applied", eventPayload());
 }
 
 export async function processPortForwardRequests(
@@ -2408,34 +2408,36 @@ export async function prePullRunImagesWithAudit(
   const imageRefs = Array.isArray(claim.run.run_requirements.image_refs)
     ? claim.run.run_requirements.image_refs.filter((item): item is string => typeof item === "string")
     : [];
-  for (const imageRef of [...new Set(imageRefs)]) {
-    const eventPayload = () => ({
-      resource_kind: "ImagePull",
-      resource_name: runtimeDeclaredResourceName(imageRef),
-      image_ref: imageRef,
-      status: "pulled",
-      attempt_id: claim.attempt.attempt_id,
-      run_id: claim.run.run_id,
-      runner_instance_id: requireRunnerInstanceId(config),
-      worker_id: config.workerId,
-    });
-    await appendEvent(config, claim, "worker.runtime.image_pull.pulling", {
-      ...eventPayload(),
-      status: "pulling",
-    });
-    try {
-      await pullImage(imageRef);
-    } catch (error) {
-      await appendEvent(config, claim, "worker.runtime.image_pull.failed", {
-        ...eventPayload(),
-        status: "failed",
-        error: errorMessage(error),
-      }).catch((eventError) => {
-        logError("worker.runtime_image_pull_failure_event_failed", context, { error: errorMessage(eventError) });
+  try {
+    for (const imageRef of [...new Set(imageRefs)]) {
+      const eventPayload = () => ({
+        resource_kind: "ImagePull",
+        resource_name: runtimeDeclaredResourceName(imageRef),
+        image_ref: imageRef,
+        status: "pulled",
+        attempt_id: claim.attempt.attempt_id,
+        run_id: claim.run.run_id,
+        runner_instance_id: requireRunnerInstanceId(config),
+        worker_id: config.workerId,
       });
-      throw error;
+      appendEvent(config, claim, "worker.runtime.image_pull.pulling", {
+        ...eventPayload(),
+        status: "pulling",
+      });
+      try {
+        await pullImage(imageRef);
+      } catch (error) {
+        appendEvent(config, claim, "worker.runtime.image_pull.failed", {
+          ...eventPayload(),
+          status: "failed",
+          error: errorMessage(error),
+        });
+        throw error;
+      }
+      appendEvent(config, claim, "worker.runtime.image_pull.pulled", eventPayload());
     }
-    await appendEvent(config, claim, "worker.runtime.image_pull.pulled", eventPayload());
+  } finally {
+    await flushPendingEvents();
   }
 }
 
@@ -2451,35 +2453,37 @@ export async function validateSidecarRequirementsWithAudit(
   const sidecars = Array.isArray(claim.run.run_requirements.sidecars)
     ? claim.run.run_requirements.sidecars.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
     : [];
-  for (const sidecar of [...new Set(sidecars)].sort()) {
-    const requiredCapability = `sidecar:${sidecar}`;
-    const eventPayload = () => ({
-      resource_kind: "SidecarRequirement",
-      resource_name: runtimeDeclaredResourceName(sidecar),
-      sidecar,
-      required_capability: requiredCapability,
-      status: "available",
-      attempt_id: claim.attempt.attempt_id,
-      run_id: claim.run.run_id,
-      runner_instance_id: requireRunnerInstanceId(config),
-      worker_id: config.workerId,
-    });
-    await appendEvent(config, claim, "worker.runtime.sidecar_requirement.checking", {
-      ...eventPayload(),
-      status: "checking",
-    });
-    if (!config.capabilities.resources.includes(requiredCapability)) {
-      const message = `Runner worker does not advertise required ${requiredCapability}`;
-      await appendEvent(config, claim, "worker.runtime.sidecar_requirement.failed", {
-        ...eventPayload(),
-        status: "failed",
-        error: message,
-      }).catch((eventError) => {
-        logError("worker.runtime_sidecar_requirement_failure_event_failed", context, { error: errorMessage(eventError) });
+  try {
+    for (const sidecar of [...new Set(sidecars)].sort()) {
+      const requiredCapability = `sidecar:${sidecar}`;
+      const eventPayload = () => ({
+        resource_kind: "SidecarRequirement",
+        resource_name: runtimeDeclaredResourceName(sidecar),
+        sidecar,
+        required_capability: requiredCapability,
+        status: "available",
+        attempt_id: claim.attempt.attempt_id,
+        run_id: claim.run.run_id,
+        runner_instance_id: requireRunnerInstanceId(config),
+        worker_id: config.workerId,
       });
-      throw new WorkerError(message);
+      appendEvent(config, claim, "worker.runtime.sidecar_requirement.checking", {
+        ...eventPayload(),
+        status: "checking",
+      });
+      if (!config.capabilities.resources.includes(requiredCapability)) {
+        const message = `Runner worker does not advertise required ${requiredCapability}`;
+        appendEvent(config, claim, "worker.runtime.sidecar_requirement.failed", {
+          ...eventPayload(),
+          status: "failed",
+          error: message,
+        });
+        throw new WorkerError(message);
+      }
+      appendEvent(config, claim, "worker.runtime.sidecar_requirement.available", eventPayload());
     }
-    await appendEvent(config, claim, "worker.runtime.sidecar_requirement.available", eventPayload());
+  } finally {
+    await flushPendingEvents();
   }
 }
 
@@ -2495,35 +2499,37 @@ export async function validateAcceleratorRequirementsWithAudit(
   const accelerators = Array.isArray(claim.run.run_requirements.accelerators)
     ? claim.run.run_requirements.accelerators.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
     : [];
-  for (const accelerator of [...new Set(accelerators)].sort()) {
-    const requiredCapability = `accelerator:${accelerator}`;
-    const eventPayload = () => ({
-      resource_kind: "AcceleratorRequirement",
-      resource_name: runtimeDeclaredResourceName(accelerator),
-      accelerator,
-      required_capability: requiredCapability,
-      status: "available",
-      attempt_id: claim.attempt.attempt_id,
-      run_id: claim.run.run_id,
-      runner_instance_id: requireRunnerInstanceId(config),
-      worker_id: config.workerId,
-    });
-    await appendEvent(config, claim, "worker.runtime.accelerator_requirement.checking", {
-      ...eventPayload(),
-      status: "checking",
-    });
-    if (!config.capabilities.resources.includes(requiredCapability)) {
-      const message = `Runner worker does not advertise required ${requiredCapability}`;
-      await appendEvent(config, claim, "worker.runtime.accelerator_requirement.failed", {
-        ...eventPayload(),
-        status: "failed",
-        error: message,
-      }).catch((eventError) => {
-        logError("worker.runtime_accelerator_requirement_failure_event_failed", context, { error: errorMessage(eventError) });
+  try {
+    for (const accelerator of [...new Set(accelerators)].sort()) {
+      const requiredCapability = `accelerator:${accelerator}`;
+      const eventPayload = () => ({
+        resource_kind: "AcceleratorRequirement",
+        resource_name: runtimeDeclaredResourceName(accelerator),
+        accelerator,
+        required_capability: requiredCapability,
+        status: "available",
+        attempt_id: claim.attempt.attempt_id,
+        run_id: claim.run.run_id,
+        runner_instance_id: requireRunnerInstanceId(config),
+        worker_id: config.workerId,
       });
-      throw new WorkerError(message);
+      appendEvent(config, claim, "worker.runtime.accelerator_requirement.checking", {
+        ...eventPayload(),
+        status: "checking",
+      });
+      if (!config.capabilities.resources.includes(requiredCapability)) {
+        const message = `Runner worker does not advertise required ${requiredCapability}`;
+        appendEvent(config, claim, "worker.runtime.accelerator_requirement.failed", {
+          ...eventPayload(),
+          status: "failed",
+          error: message,
+        });
+        throw new WorkerError(message);
+      }
+      appendEvent(config, claim, "worker.runtime.accelerator_requirement.available", eventPayload());
     }
-    await appendEvent(config, claim, "worker.runtime.accelerator_requirement.available", eventPayload());
+  } finally {
+    await flushPendingEvents();
   }
 }
 
@@ -2591,23 +2597,19 @@ async function cleanupClaimWorkspace(
   claim: RunClaim,
   materialized: MaterializedPackage,
 ): Promise<void> {
-  await appendEvent(config, claim, "worker.cleanup.starting", {
+  appendEvent(config, claim, "worker.cleanup.starting", {
     workspace_dir: materialized.workspaceDir,
     run_root_dir: materialized.runRootDir,
     retain_attempt_workspace: config.retainAttemptWorkspaces,
-  }).catch((error) => {
-    logError("worker.cleanup_start_event_failed", workerContext, { error: errorMessage(error) });
   });
 
   const cleanup = await cleanupAttemptWorkspace(config, materialized);
 
-  await appendEvent(config, claim, "worker.cleanup.completed", {
+  appendEvent(config, claim, "worker.cleanup.completed", {
     workspace_dir: materialized.workspaceDir,
     core_run_ids: cleanup.coreRunIds,
     docker_resources_removed: cleanup.dockerResourcesRemoved,
     workspace_removed: cleanup.workspaceRemoved,
-  }).catch((error) => {
-    logError("worker.cleanup_completed_event_failed", workerContext, { error: errorMessage(error) });
   });
 }
 
@@ -2966,8 +2968,14 @@ function startLiveEvidencePump(
         });
       },
       announceCoreRuns: async (coreRunIds) => {
-        await appendEvent(config, claim, "worker.runtime.core_runs_discovered", {
-          core_run_ids: coreRunIds,
+        await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/events`, {
+          method: "POST",
+          authToken: claim.attempt.attempt_token,
+          body: {
+            runner_instance_id: requireRunnerInstanceId(config),
+            event_type: "worker.runtime.core_runs_discovered",
+            payload: { core_run_ids: coreRunIds },
+          },
         });
       },
       onError: (stage, fields) => {
@@ -2981,20 +2989,44 @@ function startLiveEvidencePump(
   );
 }
 
-async function appendEvent(
+class EventFlusher {
+  private chain: Promise<void> = Promise.resolve();
+
+  enqueue(post: () => Promise<void>): void {
+    this.chain = this.chain
+      .then(post)
+      .catch((error) => {
+        logError("worker.event_post_failed", workerContext, { error: errorMessage(error) });
+      });
+  }
+
+  async flush(): Promise<void> {
+    await this.chain;
+  }
+}
+
+let eventFlusher = new EventFlusher();
+
+export async function flushPendingEvents(): Promise<void> {
+  await eventFlusher.flush();
+}
+
+function appendEvent(
   config: WorkerConfig,
   claim: Pick<RunClaim, "attempt">,
   eventType: string,
   payload: JsonObject,
-): Promise<void> {
-  await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/events`, {
-    method: "POST",
-    authToken: claim.attempt.attempt_token,
-    body: {
-      runner_instance_id: requireRunnerInstanceId(config),
-      event_type: eventType,
-      payload,
-    },
+): void {
+  eventFlusher.enqueue(async () => {
+    await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/events`, {
+      method: "POST",
+      authToken: claim.attempt.attempt_token,
+      body: {
+        runner_instance_id: requireRunnerInstanceId(config),
+        event_type: eventType,
+        payload,
+      },
+    });
   });
 }
 

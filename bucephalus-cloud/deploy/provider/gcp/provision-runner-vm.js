@@ -32,6 +32,7 @@ async function main() {
   assertGcpName(instanceName, "generated instance name");
 
   const providerId = providerInstanceId(config.projectId, config.zone, instanceName);
+  const runtimeImageRefs = runtimeImageRefsFromRequest(input);
   const startupScript = renderStartupScript({
     apiUrl: requiredString(input.api_url, "/api_url"),
     provisionRequestId,
@@ -45,6 +46,7 @@ async function main() {
     workerTokenSecretVersion: config.workerTokenSecretVersion,
     projectId: config.projectId,
     registryHost: registryHost(workerImage),
+    runtimeImageRefs,
     modal: config.modal,
   });
 
@@ -167,6 +169,20 @@ export function workerImageForRequest(input, config = loadConfig()) {
   return workerImage;
 }
 
+export function runtimeImageRefsFromRequest(input) {
+  const requirements = isRecord(input.run_requirements) ? input.run_requirements : {};
+  const refs = Array.isArray(requirements.image_refs) ? requirements.image_refs : [];
+  const valid = [];
+  for (const ref of refs) {
+    if (typeof ref !== "string" || ref.trim() === "") {
+      continue;
+    }
+    assertDigestRef(ref, "/run_requirements/image_refs");
+    valid.push(ref.trim());
+  }
+  return [...new Set(valid)];
+}
+
 export function validateRequest(input, config = loadConfig()) {
   const requirements = isRecord(input.run_requirements) ? input.run_requirements : {};
   if (requirements.executor !== undefined && requirements.executor !== "runner-docker" && requirements.executor !== "modal") {
@@ -202,7 +218,7 @@ function runnerIsolation(input) {
 
 export function renderStartupScript(config) {
   for (const [name, value] of Object.entries(config)) {
-    if (name === "modal") {
+    if (name === "modal" || name === "runtimeImageRefs") {
       continue;
     }
     if (String(value) === "") {
@@ -483,7 +499,14 @@ chmod 0700 /var/lib/bucephalus/docker-config
 if [[ -f /var/lib/bucephalus/docker-config/config.json ]]; then
   chmod 0600 /var/lib/bucephalus/docker-config/config.json
 fi
-docker pull "\${WORKER_IMAGE}"
+docker pull "\${WORKER_IMAGE}" &
+worker_pull_pid=$!
+runtime_pull_pids=()
+${config.runtimeImageRefs.map((ref) => `docker pull ${shellQuote(ref)} &\nruntime_pull_pids+=($!)`).join("\n")}
+for pid in "\${runtime_pull_pids[@]}"; do
+  wait "\$pid" || exit 1
+done
+wait "\$worker_pull_pid" || exit 1
 docker rm -f bucephalus-worker >/dev/null 2>&1 || true
 docker run -d \\
   --name bucephalus-worker \\
