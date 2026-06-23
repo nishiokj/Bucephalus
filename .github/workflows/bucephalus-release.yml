@@ -553,6 +553,12 @@ jobs:
       apply: true
       github_environment: bucephalus-dev
       release_version: ${{ needs.publish-github-release.outputs.version }}
+      # Consume the promotion evidence this very run just built, instead of
+      # resolving a past completed+successful release run. The resolver cannot
+      # see the current run (it is still in progress and only concludes success
+      # after this deploy), so the chained deploy must be handed its own run id.
+      promotion_run_id: ${{ github.run_id }}
+      promotion_artifact_name: cloud-release-promotion-${{ needs.publish-github-release.outputs.version }}
     secrets: inherit
 
   deploy-prod:
@@ -570,4 +576,6 @@ jobs:
       apply: true
       github_environment: bucephalus
       release_version: ${{ needs.publish-github-release.outputs.version }}
+      promotion_run_id: ${{ github.run_id }}
+      promotion_artifact_name: cloud-release-promotion-${{ needs.publish-github-release.outputs.version }}
     secrets: inherit
