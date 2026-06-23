@@ -652,9 +652,13 @@ describe("Cloud run routes", () => {
         observed.token = input.token;
         observed.attemptId = input.attemptId;
         observed.runnerInstanceId = input.runnerInstanceId;
+        return { runId: "run-1", ownerKey: null, packageDigest: runRecord().package_digest };
       },
       async heartbeatAttempt() {
         return attemptRecord();
+      },
+      async getRun() {
+        return runRecord();
       },
     };
 
@@ -2954,6 +2958,104 @@ describe("Cloud run routes", () => {
       "worker-token",
       authContext("user-a"),
     )).rejects.toThrow("has no active worker image promoted");
+  });
+
+  test("owner cancel marks the run cancelled scoped to the caller's owner key", async () => {
+    const observed: { runId?: string; ownerKey?: string | undefined; reason?: string | null | undefined } = {};
+    const runs = {
+      async cancelRun(input: { runId: string; ownerKey?: string | undefined; reason?: string | null | undefined }) {
+        observed.runId = input.runId;
+        observed.ownerKey = input.ownerKey;
+        observed.reason = input.reason;
+        return { ...runRecord(), status: "cancelled", error_message: "cancelled by owner: stop it" };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/cancel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: "stop it" }),
+      }),
+      new URL("https://cloud.example/v1/runs/run-1/cancel"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtimeProgress([]) as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(response).not.toBeNull();
+    const body = await response!.json();
+    expect(body.status).toBe("cancelled");
+    expect(observed).toEqual({ runId: "run-1", ownerKey: "issuer:user-a", reason: "stop it" });
+  });
+
+  test("cancel-action subroutes are not captured by the run-level cancel route", async () => {
+    // The resource cancel-action URL also ends in /cancel; it must reach the
+    // runtime resource handler, not the run-level cancelRun.
+    const runs = {
+      async getRun() {
+        return runRecord();
+      },
+      async cancelRun() {
+        throw new Error("run-level cancelRun must not handle resource cancel-action subroutes");
+      },
+    };
+    const runtime = {
+      async cancelRuntimeAccessResource() {
+        return { resource: { kind: "Exec", metadata: { name: "exec-1" } } };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs/run-1/runtime/resources/Exec/exec-1/actions/cancel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ resource_version: "rv-exec-1", reason: "stop" }),
+      }),
+      new URL("https://cloud.example/v1/runs/run-1/runtime/resources/Exec/exec-1/actions/cancel"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      runtime as unknown as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(await response!.json()).toEqual({ resource: { kind: "Exec", metadata: { name: "exec-1" } } });
+  });
+
+  test("heartbeat reports cancel_requested when the run has been cancelled", async () => {
+    const runs = {
+      async verifyAttemptToken() {
+        return { runId: "run-1", ownerKey: null, packageDigest: runRecord().package_digest };
+      },
+      async heartbeatAttempt() {
+        return attemptRecord();
+      },
+      async getRun() {
+        return { ...runRecord(), status: "cancelled" };
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/worker/run-attempts/attempt-1/heartbeat", {
+        method: "POST",
+        headers: { authorization: "Bearer attempt-token", "content-type": "application/json" },
+        body: JSON.stringify({ runner_instance_id: "runner-instance-1" }),
+      }),
+      new URL("https://cloud.example/v1/worker/run-attempts/attempt-1/heartbeat"),
+      {} as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+    );
+
+    expect(response).not.toBeNull();
+    expect((await response!.json()).cancel_requested).toBe(true);
   });
 });
 

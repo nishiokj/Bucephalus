@@ -21,6 +21,7 @@ import {
   processPortForwardRequests,
   processExecRequests,
   resolveRuntimeExecCommandTarget,
+  runProcess,
   validateAcceleratorRequirementsWithAudit,
   validateSidecarRequirementsWithAudit,
 } from "../src/worker";
@@ -877,6 +878,7 @@ describe("worker lifecycle cleanup helpers", () => {
           leaseSeconds: 30,
           pollMs: 1000,
           heartbeatMs: 1000,
+          heartbeatRetryMs: 500,
           sweeperMs: 1000,
           dataDir: root,
           coreRunnerCommand: "bucephalus",
@@ -958,6 +960,7 @@ describe("worker lifecycle cleanup helpers", () => {
           leaseSeconds: 30,
           pollMs: 1000,
           heartbeatMs: 1000,
+          heartbeatRetryMs: 500,
           sweeperMs: 1000,
           dataDir: root,
           coreRunnerCommand: "bucephalus",
@@ -1042,6 +1045,7 @@ describe("worker lifecycle cleanup helpers", () => {
           leaseSeconds: 30,
           pollMs: 1000,
           heartbeatMs: 1000,
+          heartbeatRetryMs: 500,
           sweeperMs: 1000,
           dataDir: root,
           coreRunnerCommand: "bucephalus",
@@ -1206,6 +1210,7 @@ describe("worker lifecycle cleanup helpers", () => {
           leaseSeconds: 30,
           pollMs: 1000,
           heartbeatMs: 1000,
+          heartbeatRetryMs: 500,
           sweeperMs: 1000,
           dataDir: root,
           coreRunnerCommand: "bucephalus",
@@ -1438,6 +1443,7 @@ describe("worker lifecycle cleanup helpers", () => {
           leaseSeconds: 30,
           pollMs: 1000,
           heartbeatMs: 1000,
+          heartbeatRetryMs: 500,
           sweeperMs: 1000,
           dataDir: root,
           coreRunnerCommand: "bucephalus",
@@ -1912,6 +1918,7 @@ describe("worker lifecycle cleanup helpers", () => {
           leaseSeconds: 30,
           pollMs: 1000,
           heartbeatMs: 1000,
+          heartbeatRetryMs: 500,
           sweeperMs: 1000,
           dataDir: root,
           coreRunnerCommand: "bucephalus",
@@ -2033,6 +2040,7 @@ describe("worker lifecycle cleanup helpers", () => {
           leaseSeconds: 30,
           pollMs: 1000,
           heartbeatMs: 1000,
+          heartbeatRetryMs: 500,
           sweeperMs: 1000,
           dataDir: root,
           coreRunnerCommand: "bucephalus",
@@ -2245,6 +2253,7 @@ describe("worker lifecycle cleanup helpers", () => {
       leaseSeconds: 30,
       pollMs: 1000,
       heartbeatMs: 1000,
+      heartbeatRetryMs: 500,
       sweeperMs: 1000,
       dataDir: root,
       coreRunnerCommand: "bucephalus",
@@ -2520,6 +2529,7 @@ function runtimeAccessWorkerConfig(
     leaseSeconds: 30,
     pollMs: 1000,
     heartbeatMs: 1000,
+    heartbeatRetryMs: 500,
     sweeperMs: 1000,
     dataDir: root,
     coreRunnerCommand: "bucephalus",
@@ -2718,3 +2728,53 @@ function restoreEnv(previous: Record<string, string | undefined>): void {
     }
   }
 }
+
+describe("runProcess lease-loss abort", () => {
+  // Regression for the cloud doom loop: when the heartbeat loop detects the
+  // lease is lost it aborts the in-flight core run instead of letting it grind
+  // to its full timeout on a run the worker no longer owns. runProcess must
+  // honor the AbortSignal by terminating the child and reporting aborted=true.
+  test("aborting the signal terminates a long-running child and reports aborted", async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    const promise = runProcess("sleep", ["600"], {
+      cwd: tmpdir(),
+      env: process.env,
+      timeoutMs: 600_000,
+      abortSignal: controller.signal,
+    });
+    // Let the child actually start before we revoke the lease.
+    await new Promise((r) => setTimeout(r, 100));
+    controller.abort();
+    const result = await promise;
+    expect(result.aborted).toBe(true);
+    expect(result.timedOut).toBe(false);
+    expect(result.completedByProgressWatchdog).toBe(false);
+    // It must die promptly on abort, not run anywhere near the 600s timeout.
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
+
+  test("an already-aborted signal never lets the child run to completion", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const result = await runProcess("sleep", ["600"], {
+      cwd: tmpdir(),
+      env: process.env,
+      timeoutMs: 600_000,
+      abortSignal: controller.signal,
+    });
+    expect(result.aborted).toBe(true);
+  });
+
+  test("a process that exits on its own is not reported as aborted", async () => {
+    const controller = new AbortController();
+    const result = await runProcess("true", [], {
+      cwd: tmpdir(),
+      env: process.env,
+      timeoutMs: 600_000,
+      abortSignal: controller.signal,
+    });
+    expect(result.aborted).toBe(false);
+    expect(result.exitCode).toBe(0);
+  });
+});

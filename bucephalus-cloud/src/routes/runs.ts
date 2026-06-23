@@ -214,6 +214,20 @@ export async function handleRunRoute(
     return createRun(request, packages, runs, runners, ownerKey, secrets);
   }
 
+  if (request.method === "POST" && url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/cancel")) {
+    const runIdPath = url.pathname.slice("/v1/runs/".length, -"/cancel".length);
+    // Only a single-segment run id is a run-level cancel. Anything with further
+    // path segments (e.g. a runtime resource cancel-action subroute) must fall
+    // through to the runtime resource handler below — do not claim it here.
+    if (runIdPath && !runIdPath.includes("/")) {
+      const runId = decodeURIComponent(runIdPath);
+      const body = await optionalJsonBody(request);
+      const reason = body ? optionalString(body.reason, "/reason") : null;
+      const run = await runs.cancelRun({ runId, ownerKey, reason });
+      return jsonResponse(runToWire(run));
+    }
+  }
+
   if (request.method === "GET" && url.pathname === "/v1/runs") {
     const limit = limitFromUrl(url);
     const packageDigest = optionalPackageDigestFromUrl(url);
@@ -486,13 +500,17 @@ async function heartbeatAttempt(
   const body = await readJsonObject(request);
   const attemptId = attemptIdFromWorkerPath(url.pathname, "/heartbeat");
   const runnerInstanceId = requireString(body.runner_instance_id, "/runner_instance_id");
-  await requireAttemptToken(request, runs, { attemptId, runnerInstanceId });
+  const { runId } = await requireAttemptToken(request, runs, { attemptId, runnerInstanceId });
   const attempt = await runs.heartbeatAttempt({
     attemptId,
     runnerInstanceId,
     leaseSeconds: leaseSecondsFromBody(body.lease_seconds),
   });
-  return jsonResponse({ attempt: attemptToWire(attempt) });
+  // Piggyback the cancellation signal on the heartbeat the worker already
+  // makes every few seconds: an owner cancel marks the run cancelled, and the
+  // worker aborts its in-flight core run the moment it sees this flag.
+  const run = await runs.getRun(runId);
+  return jsonResponse({ attempt: attemptToWire(attempt), cancel_requested: run?.status === "cancelled" });
 }
 
 async function appendRunEvent(
