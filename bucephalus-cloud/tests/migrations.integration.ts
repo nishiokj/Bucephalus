@@ -185,7 +185,7 @@ describe("cloud SQL migrations", () => {
           memory_mb: 4096,
           disk_mb: 32768,
           isolation: "reusable_vm",
-          timeout_ms: null,
+          timeout_ms: 15 * 60 * 1000,
           max_parallel_trials: 1,
         };
         const unpromotedPool = await runnerRepository.createPool({

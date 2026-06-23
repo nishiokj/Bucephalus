@@ -528,7 +528,7 @@ pub(crate) fn finalize_scheduled_trial(
     let chain_state_record = json!({
         "schema_version": "task_chain_state_v1",
         "ts": Utc::now().to_rfc3339(),
-        "run_id": request.run_id,       
+        "run_id": request.run_id,
         "chain_id": prepared.chain_key.as_str(),
         "task_model": prepared.effective_policy.task_model.as_str(),
         "step_index": prepared.chain_step_index,

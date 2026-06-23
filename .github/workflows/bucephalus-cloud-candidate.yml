@@ -359,8 +359,8 @@ jobs:
             --image-manifest "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build-manifest.json"
             --out "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/gcp-image-digests.tfvars"
           )
-          if [[ -f "dist/latest-release-evidence/cloud-image-promotion-evidence.json" ]]; then
-            args+=(--fallback-manifest "dist/latest-release-evidence/cloud-image-promotion-evidence.json")
+          if [[ -f "dist/latest-release-evidence/cloud-image-build-manifest.json" ]]; then
+            args+=(--fallback-manifest "dist/latest-release-evidence/cloud-image-build-manifest.json")
           fi
           scripts/release/write-gcp-image-tfvars.sh "${args[@]}"
 

@@ -284,7 +284,7 @@ export interface RunRequirements {
   memory_mb: number;
   disk_mb: number;
   isolation: "reusable_vm" | "single_use_vm";
-  timeout_ms: number | null;
+  timeout_ms: number;
   max_parallel_trials: number;
 }
 

@@ -36,7 +36,7 @@ jobs:
             echo "cargo_toml_changed=false" >> "${GITHUB_OUTPUT}"
           fi
 
-      - name: Bump version in Cargo.toml
+      - name: Bump version in Cargo.toml and Cargo.lock
         if: ${{ steps.check_change.outputs.cargo_toml_changed == 'false' }}
         run: |
           bun -e '
@@ -56,6 +56,34 @@ jobs:
               `$1${nextVersion}`
             );
             await Bun.write(file, content);
+
+            // Resolve workspace member package names from member paths
+            const membersMatch = content.match(/members\s*=\s*\[([^\]]+)\]/);
+            const memberPaths = membersMatch[1].match(/"([^"]+)"/g).map((s) => s.replace(/"/g, ""));
+            const memberNames = [];
+            for (const path of memberPaths) {
+              const memberToml = await Bun.file(`${path}/Cargo.toml`).text();
+              const nameMatch = memberToml.match(/\[package\][^]*?name\s*=\s*"([^"]+)"/);
+              if (nameMatch) memberNames.push(nameMatch[1]);
+            }
+
+            // Bump version for workspace member packages in Cargo.lock
+            const lockFile = "Cargo.lock";
+            const lockLines = (await Bun.file(lockFile).text()).split("\n");
+            let currentName = null;
+            for (let i = 0; i < lockLines.length; i++) {
+              const nameMatch = lockLines[i].match(/^name = "(.+)"/);
+              if (nameMatch) {
+                currentName = nameMatch[1];
+                continue;
+              }
+              const versionMatch = lockLines[i].match(/^(version = )"([^"]+)"/);
+              if (versionMatch && currentName && memberNames.includes(currentName)) {
+                lockLines[i] = `${versionMatch[1]}"${nextVersion}"`;
+              }
+            }
+            await Bun.write(lockFile, lockLines.join("\n"));
+
             console.log(`Bumped version from ${currentVersion} to ${nextVersion}`);
           '
 

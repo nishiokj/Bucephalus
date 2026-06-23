@@ -10712,7 +10712,7 @@ function cloudRunRecord() {
       memory_mb: 8192,
       disk_mb: 32768,
       isolation: "reusable_vm" as const,
-      timeout_ms: null,
+      timeout_ms: 15 * 60 * 1000,
       max_parallel_trials: 4,
     },
     created_at: "2026-06-04T00:00:00Z",
