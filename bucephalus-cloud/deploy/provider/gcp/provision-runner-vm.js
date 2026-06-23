@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import {
+  PERMANENT_PROVISION_EXIT_CODE,
   ProviderError,
   assertDigestRef,
   assertGcpName,
@@ -598,6 +599,6 @@ function boolEnv(name, fallback) {
 if (import.meta.main) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
-    process.exit(1);
+    process.exit(error instanceof ProviderError ? PERMANENT_PROVISION_EXIT_CODE : 1);
   });
 }

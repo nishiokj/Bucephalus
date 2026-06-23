@@ -7,6 +7,13 @@ export class ProviderError extends Error {
   }
 }
 
+// Exit code the per-run provider uses to signal a PERMANENT (non-retryable)
+// provisioning failure: a structurally invalid request (bad isolation, egress
+// policy, unsupported executor, etc.) that will fail identically on every
+// retry. The pool controller dead-letters the run instead of looping forever.
+// Mirrored as PERMANENT_PROVISION_EXIT_CODE in src/poolController.ts.
+export const PERMANENT_PROVISION_EXIT_CODE = 78;
+
 export async function readJsonStdin() {
   const text = await new Response(Bun.stdin.stream()).text();
   if (text.trim().length === 0) {
