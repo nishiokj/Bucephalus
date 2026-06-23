@@ -251,7 +251,110 @@ describe("pool controller matching", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test("dead-letters the run when the provider reports a permanent failure", async () => {
+    const failedProvisionRequests: any[] = [];
+    const failedRuns: any[] = [];
+    const runners = provisionFailureRunners(failedProvisionRequests, failedRuns);
+
+    // exit 78 == PERMANENT_PROVISION_EXIT_CODE
+    await reconcileOnce(provisionFailureConfig(["bun", "-e", "process.exit(78)"]), runners as any);
+
+    expect(failedRuns).toEqual([
+      { runId: "run-1", message: expect.stringContaining("permanently failed") },
+    ]);
+    expect(failedProvisionRequests[0].metadata.failure_kind).toBe("permanent");
+  });
+
+  test("does not dead-letter the run on a transient provider failure", async () => {
+    const failedProvisionRequests: any[] = [];
+    const failedRuns: any[] = [];
+    const runners = provisionFailureRunners(failedProvisionRequests, failedRuns);
+
+    await reconcileOnce(provisionFailureConfig(["bun", "-e", "process.exit(1)"]), runners as any);
+
+    expect(failedRuns).toEqual([]);
+    expect(failedProvisionRequests[0].metadata.failure_kind).toBeUndefined();
+  });
 });
+
+function provisionFailureRunners(failedProvisionRequests: any[], failedRuns: any[]) {
+  return {
+    markStaleInstancesOffline: async () => [],
+    failStaleUnacceptedProvisionRequests: async () => [],
+    listReapableProvisionRequests: async () => [],
+    listIdleCompletedRunProvisionRequests: async () => [],
+    listClaimableInstances: async () => [],
+    listOpenProvisionRequests: async () => [],
+    async getPool() {
+      return poolRecord();
+    },
+    async listQueuedDemand() {
+      return [{
+        run_id: "run-1",
+        run_requirements: {
+          executor: "runner-docker",
+          requires: ["core_runner"],
+          image_refs: [],
+          isolation: "reusable_vm",
+        },
+        created_at: "2026-06-09T00:00:00Z",
+      }];
+    },
+    async getActiveWorkerImageForPool() {
+      return workerImageRecord();
+    },
+    async createProvisionRequest(input: any) {
+      return {
+        provision_request_id: "provision-1",
+        runner_pool_id: "pool-1",
+        run_id: "run-1",
+        status: "requested",
+        provider: "exec",
+        provider_instance_id: null,
+        instance_name: null,
+        runner_instance_id: null,
+        requirements: input.requirements,
+        metadata: input.metadata,
+        error_message: null,
+        created_at: "2026-06-09T00:00:00Z",
+        updated_at: "2026-06-09T00:00:00Z",
+      };
+    },
+    async markProvisioning() {
+      return {};
+    },
+    async failProvisionRequest(input: any) {
+      failedProvisionRequests.push(input);
+      return {};
+    },
+    async failQueuedRun(input: any) {
+      failedRuns.push(input);
+      return true;
+    },
+  };
+}
+
+function provisionFailureConfig(provisionCommand: string[]) {
+  return {
+    apiUrl: "https://api.example",
+    workerToken: "worker",
+    runnerPoolId: "pool-1",
+    provider: "exec" as const,
+    provisionCommand,
+    reapCommand: ["true"],
+    configuredPoolCapabilities: poolRecord().capabilities,
+    pollMs: 2000,
+    staleInstanceSeconds: 90,
+    provisioningTimeoutSeconds: 600,
+    providerCommandTimeoutMs: 600000,
+    demandLimit: 50,
+    reapIdleCompletedRunners: true,
+    idleReapDelaySeconds: 0,
+    healthHost: "127.0.0.1",
+    healthPort: 0,
+  };
+}
 
 function poolRecord() {
   return {
