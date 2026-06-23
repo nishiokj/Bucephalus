@@ -374,20 +374,8 @@ describe("worker lifecycle cleanup helpers", () => {
     expect(config.apiUrl).toBe("https://cloud.example");
     expect(config.runnerPoolId).toBe("pool-1");
     expect(config.workerImageRef).toBe("us-central1-docker.pkg.dev/project/repo/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    expect(config.coreTimeoutMs).toBe(15 * 60 * 1000);
     expect(config.coreCompletionGraceMs).toBe(120_000);
     expect(config.capabilities.resources).not.toContain("network_perimeter");
-  });
-
-  test("runner config allows an explicit Core process timeout", () => {
-    const config = loadWorkerConfig({
-      BUCEPHALUS_CLOUD_API_URL: "https://cloud.example",
-      BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
-      BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
-      BUCEPHALUS_WORKER_CORE_TIMEOUT_MS: "12345",
-    });
-
-    expect(config.coreTimeoutMs).toBe(12345);
   });
 
   test("runner config requires an explicit Cloud API URL", () => {
@@ -905,7 +893,6 @@ describe("worker lifecycle cleanup helpers", () => {
           workerImageRef: null,
           liveEvidence: true,
           evidenceIntervalMs: 2000,
-          coreTimeoutMs: 15 * 60 * 1000,
           coreCompletionGraceMs: 120_000,
           apiRequestTimeoutMs: 30_000,
         },
@@ -987,7 +974,6 @@ describe("worker lifecycle cleanup helpers", () => {
           workerImageRef: null,
           liveEvidence: true,
           evidenceIntervalMs: 2000,
-          coreTimeoutMs: 15 * 60 * 1000,
           coreCompletionGraceMs: 120_000,
           apiRequestTimeoutMs: 30_000,
         },
@@ -1072,7 +1058,6 @@ describe("worker lifecycle cleanup helpers", () => {
           workerImageRef: null,
           liveEvidence: true,
           evidenceIntervalMs: 2000,
-          coreTimeoutMs: 15 * 60 * 1000,
           coreCompletionGraceMs: 120_000,
           apiRequestTimeoutMs: 30_000,
         },
@@ -1237,7 +1222,6 @@ describe("worker lifecycle cleanup helpers", () => {
           workerImageRef: null,
           liveEvidence: true,
           evidenceIntervalMs: 2000,
-          coreTimeoutMs: 15 * 60 * 1000,
           coreCompletionGraceMs: 120_000,
           apiRequestTimeoutMs: 30_000,
         },
@@ -1470,7 +1454,6 @@ describe("worker lifecycle cleanup helpers", () => {
           workerImageRef: null,
           liveEvidence: true,
           evidenceIntervalMs: 2000,
-          coreTimeoutMs: 15 * 60 * 1000,
           coreCompletionGraceMs: 120_000,
           apiRequestTimeoutMs: 30_000,
         },
@@ -1945,7 +1928,6 @@ describe("worker lifecycle cleanup helpers", () => {
           workerImageRef: null,
           liveEvidence: true,
           evidenceIntervalMs: 2000,
-          coreTimeoutMs: 15 * 60 * 1000,
           coreCompletionGraceMs: 120_000,
           apiRequestTimeoutMs: 30_000,
         },
@@ -2067,7 +2049,6 @@ describe("worker lifecycle cleanup helpers", () => {
           workerImageRef: null,
           liveEvidence: true,
           evidenceIntervalMs: 2000,
-          coreTimeoutMs: 15 * 60 * 1000,
           coreCompletionGraceMs: 120_000,
           apiRequestTimeoutMs: 30_000,
         },
@@ -2280,7 +2261,6 @@ describe("worker lifecycle cleanup helpers", () => {
       workerImageRef: null,
       liveEvidence: true,
       evidenceIntervalMs: 2000,
-      coreTimeoutMs: 15 * 60 * 1000,
       coreCompletionGraceMs: 120_000,
       apiRequestTimeoutMs: 30_000,
     };
@@ -2556,7 +2536,6 @@ function runtimeAccessWorkerConfig(
     workerImageRef: null,
     liveEvidence: true,
     evidenceIntervalMs: 2000,
-    coreTimeoutMs: 15 * 60 * 1000,
     coreCompletionGraceMs: 120_000,
     apiRequestTimeoutMs: 30_000,
     ...overrides,

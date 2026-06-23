@@ -41,6 +41,7 @@ import { SECRET_NAME_PATTERN } from "../secrets/store";
 
 const HOSTED_SECRET_REF_PREFIX = "bucephalus://";
 const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const DEFAULT_RUN_TIMEOUT_MS = 15 * 60 * 1000;
 
 interface CloudSecretRequirement {
   id: string;
@@ -1638,7 +1639,7 @@ export function runRequirementsForArtifact(
     isolation: networkPerimeter.egress_hosts.length > 0
       ? "single_use_vm"
       : requestedIsolation ?? "reusable_vm",
-    timeout_ms: positiveInt(runtimeOptions.timeout_ms) ?? positiveInt(packageRuntimeValue(artifact, "timeout_ms")),
+    timeout_ms: positiveInt(runtimeOptions.timeout_ms) ?? positiveInt(packageRuntimeValue(artifact, "timeout_ms")) ?? DEFAULT_RUN_TIMEOUT_MS,
     max_parallel_trials: positiveInt(runtimeOptions.max_parallel_trials)
       ?? positiveInt(packageRuntimeValue(artifact, "max_parallel_trials"))
       ?? 1,

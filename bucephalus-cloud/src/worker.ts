@@ -50,7 +50,6 @@ interface WorkerConfig {
   workerImageRef: string | null;
   liveEvidence: boolean;
   evidenceIntervalMs: number;
-  coreTimeoutMs: number;
   coreCompletionGraceMs: number;
   apiRequestTimeoutMs: number;
 }
@@ -383,10 +382,11 @@ async function executeCoreRun(
   env.BUCEPHALUS_SPAN_ID = runnerContext.spanId;
   env.BUCEPHALUS_RUN_ID = claim.run.run_id;
   env.BUCEPHALUS_ATTEMPT_ID = claim.attempt.attempt_id;
+  const timeoutMs = coreRunTimeoutMs(claim);
   const result = await runProcess(command.executable, command.args, {
     cwd: materialized.workspaceDir,
     env,
-    timeoutMs: coreRunTimeoutMs(config, claim),
+    timeoutMs,
     completionGraceMs: config.coreCompletionGraceMs,
   });
   const eventPayload = {
@@ -402,7 +402,7 @@ async function executeCoreRun(
   }
   if (result.timedOut) {
     await appendEvent(config, claim, "worker.core.timed_out", eventPayload);
-    throw new WorkerError(`Core runner timed out after ${coreRunTimeoutMs(config, claim)} ms`);
+    throw new WorkerError(`Core runner timed out after ${timeoutMs} ms`);
   }
   if (result.exitCode !== 0) {
     await appendEvent(config, claim, "worker.core.failed", eventPayload);
@@ -1061,11 +1061,16 @@ async function runProcess(
   });
 }
 
-function coreRunTimeoutMs(config: WorkerConfig, claim: RunClaim): number {
+function coreRunTimeoutMs(claim: RunClaim): number {
   const requirementTimeout = claim.run.run_requirements.timeout_ms;
-  return typeof requirementTimeout === "number" && requirementTimeout > 0
-    ? requirementTimeout
-    : config.coreTimeoutMs;
+  if (typeof requirementTimeout !== "number" || requirementTimeout <= 0) {
+    throw new WorkerError(
+      `Run ${claim.run.run_id} has no usable run_requirements.timeout_ms; ` +
+      `the run was created without a timeout and cannot be executed. ` +
+      `Recreate the run with an explicit timeout_ms.`,
+    );
+  }
+  return requirementTimeout;
 }
 
 export function coreProgressCompleted(text: string): boolean {
@@ -3148,7 +3153,6 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
     workerImageRef: env.BUCEPHALUS_WORKER_IMAGE_REF?.trim() || null,
     liveEvidence: booleanEnv(env.BUCEPHALUS_WORKER_LIVE_EVIDENCE, true),
     evidenceIntervalMs: numberEnv(env.BUCEPHALUS_WORKER_EVIDENCE_INTERVAL_MS, 2000),
-    coreTimeoutMs: numberEnv(env.BUCEPHALUS_WORKER_CORE_TIMEOUT_MS, 15 * 60 * 1000),
     coreCompletionGraceMs: numberEnv(env.BUCEPHALUS_WORKER_CORE_COMPLETION_GRACE_MS, 120_000),
     apiRequestTimeoutMs: numberEnv(env.BUCEPHALUS_WORKER_API_REQUEST_TIMEOUT_MS, 30_000),
   };

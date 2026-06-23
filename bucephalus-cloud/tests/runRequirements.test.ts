@@ -45,7 +45,7 @@ describe("Cloud run requirements", () => {
       memory_mb: 1024,
       disk_mb: 20480,
       isolation: "reusable_vm",
-      timeout_ms: null,
+      timeout_ms: 15 * 60 * 1000,
       max_parallel_trials: 1,
     });
   });

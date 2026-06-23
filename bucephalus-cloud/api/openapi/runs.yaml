@@ -5132,9 +5132,7 @@ components:
             - reusable_vm
             - single_use_vm
         timeout_ms:
-          type:
-            - integer
-            - 'null'
+          type: integer
           minimum: 1
         max_parallel_trials:
           type: integer
