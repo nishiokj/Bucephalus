@@ -3,14 +3,18 @@ set -euo pipefail
 
 MANIFEST=""
 OUT_PATH=""
+FALLBACK_MANIFEST=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/release/write-gcp-image-tfvars.sh --image-manifest <cloud-image-build-manifest.json> --out <path>
+Usage: scripts/release/write-gcp-image-tfvars.sh --image-manifest <cloud-image-build-manifest.json> --out <path> [--fallback-manifest <cloud-image-build-manifest.json>]
 
 Writes a Terraform tfvars fragment containing digest-addressed control-plane
 image inputs for bucephalus-cloud/infra/gcp. The source image manifest must be
 pushed and verified; local image-build manifests are inspection evidence only.
+
+If --fallback-manifest is provided, any missing components in the primary image-manifest
+are filled from the fallback manifest.
 USAGE
 }
 
@@ -22,6 +26,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --out)
       OUT_PATH="${2:-}"
+      shift 2
+      ;;
+    --fallback-manifest)
+      FALLBACK_MANIFEST="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -52,7 +60,11 @@ if ! command -v bun >/dev/null 2>&1; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-"${ROOT_DIR}/scripts/release/verify-cloud-image-build-manifest.sh" "${MANIFEST}"
+"${ROOT_DIR}/scripts/release/verify-cloud-image-build-manifest.sh" "${MANIFEST}" --allow-partial
+
+if [[ -n "${FALLBACK_MANIFEST}" && -f "${FALLBACK_MANIFEST}" ]]; then
+  "${ROOT_DIR}/scripts/release/verify-cloud-image-build-manifest.sh" "${FALLBACK_MANIFEST}" --allow-partial
+fi
 
 mkdir -p "$(dirname "${OUT_PATH}")"
 WORK_DIR="$(mktemp -d)"
@@ -66,6 +78,19 @@ const manifest = JSON.parse(await Bun.file(process.env.MANIFEST).text());
 if (manifest.pushed !== true) {
   console.error("image manifest must be pushed=true to produce deploy tfvars");
   process.exit(1);
+}
+
+// Load and merge fallback manifest if specified
+if (process.env.FALLBACK_MANIFEST && await Bun.file(process.env.FALLBACK_MANIFEST).exists()) {
+  const fallback = JSON.parse(await Bun.file(process.env.FALLBACK_MANIFEST).text());
+  const existingComponents = new Set(manifest.images.map((img) => img.component));
+  for (const fallbackImg of fallback.images) {
+    if (!existingComponents.has(fallbackImg.component)) {
+      manifest.images.push(fallbackImg);
+    }
+  }
+  // Write the merged manifest back to the primary manifest path
+  await Bun.write(process.env.MANIFEST, JSON.stringify(manifest, null, 2));
 }
 
 const byComponent = new Map(manifest.images.map((image) => [image.component, image]));
@@ -120,7 +145,7 @@ lines.push("");
 await Bun.write(process.env.OUT_PATH, lines.join("\n"));
 console.log(`tfvars=${process.env.OUT_PATH}`);
 JS
-MANIFEST="${MANIFEST}" OUT_PATH="${OUT_PATH}" bun "${WRITE_JS}"
+MANIFEST="${MANIFEST}" OUT_PATH="${OUT_PATH}" FALLBACK_MANIFEST="${FALLBACK_MANIFEST:-}" bun "${WRITE_JS}"
 "${ROOT_DIR}/scripts/release/verify-gcp-image-tfvars.sh" \
   --image-manifest "${MANIFEST}" \
   --tfvars "${OUT_PATH}"

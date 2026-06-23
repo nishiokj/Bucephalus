@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - Cargo.toml
 
 permissions:
   contents: write
@@ -18,12 +16,60 @@ concurrency:
 
 jobs:
   tag-release:
-    name: Tag and dispatch release on version bump
+    name: Tag and dispatch release on push
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Resolve version from Cargo.toml
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Check if Cargo.toml was changed
+        id: check_change
+        run: |
+          if git diff-tree --no-commit-id --name-only -r -m HEAD | grep -q "^Cargo.toml$"; then
+            echo "cargo_toml_changed=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "cargo_toml_changed=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Bump version in Cargo.toml
+        if: ${{ steps.check_change.outputs.cargo_toml_changed == 'false' }}
+        run: |
+          bun -e '
+            const file = "Cargo.toml";
+            let content = await Bun.file(file).text();
+            const match = content.match(/\[workspace\.package\][^]*?version\s*=\s*"([^"]+)"/);
+            if (!match) {
+              console.error("Could not find workspace package version in Cargo.toml");
+              process.exit(1);
+            }
+            const currentVersion = match[1];
+            const parts = currentVersion.split(".");
+            parts[2] = String(Number(parts[2]) + 1);
+            const nextVersion = parts.join(".");
+            content = content.replace(
+              /(\[workspace\.package\][^]*?version\s*=\s*")[^"]+/,
+              `$1${nextVersion}`
+            );
+            await Bun.write(file, content);
+            console.log(`Bumped version from ${currentVersion} to ${nextVersion}`);
+          '
+
+      - name: Commit and push version bump
+        if: ${{ steps.check_change.outputs.cargo_toml_changed == 'false' }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          new_version=$(scripts/release/resolve-release-version.sh --github-output /dev/stdout | grep version= | cut -d= -f2)
+          git commit -m "bump: release v${new_version}"
+          git push origin main
+
+      - name: Resolve version
         id: version
         run: |
           scripts/release/resolve-release-version.sh \
@@ -37,7 +83,7 @@ jobs:
             echo "${tag} already exists; nothing to release"
             echo "created=false" >> "${GITHUB_OUTPUT}"
           else
-            git tag "${tag}" "${GITHUB_SHA}"
+            git tag "${tag}" HEAD
             git push origin "refs/tags/${tag}"
             echo "created=true" >> "${GITHUB_OUTPUT}"
           fi

@@ -109,6 +109,12 @@ add_reason() {
   esac
 }
 
+api_affected="false"
+pool_controller_affected="false"
+migrations_affected="false"
+worker_affected="false"
+all_components_affected="false"
+
 for file in "${changed_files[@]}"; do
   case "${file}" in
     docs/*|README.md|bucephalus-cloud/README.md|bucephalus-cloud/deploy/*.md|bucephalus-cloud/infra/gcp/*.md|bucephalus-cloud/infra/gcp/environments/*.example|bucephalus-cloud/tests/*|rust/crates/*/tests/*|cookbook/*)
@@ -139,6 +145,35 @@ for file in "${changed_files[@]}"; do
       # Unknown files are treated as runtime-affecting so new source roots do
       # not accidentally skip Cloud validation after being introduced.
       add_reason runtime "${file}"
+      ;;
+  esac
+
+  # Classify files to components
+  case "${file}" in
+    bucephalus-cloud/api/openapi/*|bucephalus-cloud/images/Dockerfile.api|bucephalus-cloud/src/routes/*|bucephalus-cloud/src/server.ts|bucephalus-cloud/src/http.ts)
+      api_affected="true"
+      ;;
+    bucephalus-cloud/images/Dockerfile.pool-controller|bucephalus-cloud/src/poolController.ts|bucephalus-cloud/deploy/provider/*)
+      pool_controller_affected="true"
+      ;;
+    bucephalus-cloud/images/Dockerfile.migrations|bucephalus-cloud/src/db/migrate.ts|bucephalus-cloud/src/db/promoteWorkerImage.ts|bucephalus-cloud/db/*)
+      migrations_affected="true"
+      ;;
+    bucephalus-cloud/images/Dockerfile.worker|bucephalus-cloud/src/worker.ts|bucephalus-cloud/src/secretResolver.ts|bucephalus-cloud/src/networkPolicyClient.ts|modal-launcher/*)
+      worker_affected="true"
+      ;;
+    docs/*|README.md|bucephalus-cloud/README.md|bucephalus-cloud/deploy/*.md|bucephalus-cloud/infra/gcp/*.md|bucephalus-cloud/infra/gcp/environments/*.example|bucephalus-cloud/tests/*|rust/crates/*/tests/*|cookbook/*)
+      # Docs / tests
+      ;;
+    bucephalus-cloud/infra/gcp/*|scripts/deploy/*|.github/workflows/bucephalus-gcp-deploy.yml|.github/workflows/bucephalus-gcp-cleanup.yml)
+      # Infra only
+      ;;
+    .github/workflows/*|scripts/ci/*)
+      # Pipeline only
+      ;;
+    *)
+      # Any other file is shared runtime and affects all components
+      all_components_affected="true"
       ;;
   esac
 done
@@ -181,6 +216,23 @@ join_csv() {
   printf '%s' "$*"
 }
 
+if [[ "${runtime_changed}" == "true" ]]; then
+  if [[ "${all_components_affected}" == "true" ]]; then
+    api_affected="true"
+    pool_controller_affected="true"
+    migrations_affected="true"
+    worker_affected="true"
+  fi
+  affected_list=()
+  if [[ "${api_affected}" == "true" ]]; then affected_list+=("api"); fi
+  if [[ "${pool_controller_affected}" == "true" ]]; then affected_list+=("pool-controller"); fi
+  if [[ "${migrations_affected}" == "true" ]]; then affected_list+=("migrations"); fi
+  if [[ "${worker_affected}" == "true" ]]; then affected_list+=("worker"); fi
+  affected_components="$(join_csv "${affected_list[@]}")"
+else
+  affected_components=""
+fi
+
 emit_outputs() {
   echo "base=${BASE}"
   echo "head=${HEAD}"
@@ -193,6 +245,7 @@ emit_outputs() {
   echo "build_candidate=${build_candidate}"
   echo "auto_deploy=${auto_deploy}"
   echo "plan_services=${plan_services}"
+  echo "affected_components=${affected_components}"
   echo "runtime_reasons=$(join_csv "${runtime_reasons[@]}")"
   echo "infra_reasons=$(join_csv "${infra_reasons[@]}")"
   echo "pipeline_reasons=$(join_csv "${pipeline_reasons[@]}")"

@@ -477,6 +477,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -537,3 +539,35 @@ jobs:
             dist/cloud-assets/bucephalus-*.tar.gz.sha256
             dist/cloud-assets/bucephalus-*.provenance.json
           generate_release_notes: true
+
+  deploy-dev:
+    name: Deploy release to dev
+    needs: publish-github-release
+    uses: ./.github/workflows/bucephalus-gcp-deploy.yml
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    with:
+      deployment_stage: services
+      apply: true
+      github_environment: bucephalus-dev
+      release_version: ${{ needs.publish-github-release.outputs.version }}
+    secrets: inherit
+
+  deploy-prod:
+    name: Deploy release to prod
+    needs:
+      - publish-github-release
+      - deploy-dev
+    uses: ./.github/workflows/bucephalus-gcp-deploy.yml
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    with:
+      deployment_stage: services
+      apply: true
+      github_environment: bucephalus
+      release_version: ${{ needs.publish-github-release.outputs.version }}
+    secrets: inherit

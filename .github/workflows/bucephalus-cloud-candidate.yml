@@ -59,6 +59,7 @@ jobs:
       build_candidate: ${{ steps.classify.outputs.build_candidate }}
       auto_deploy: ${{ steps.classify.outputs.auto_deploy }}
       plan_services: ${{ steps.classify.outputs.plan_services }}
+      affected_components: ${{ steps.classify.outputs.affected_components }}
     steps:
       - name: Download triggering Cloud CI source metadata
         if: ${{ github.event_name == 'workflow_run' }}
@@ -307,6 +308,25 @@ jobs:
       - name: Set up Docker Buildx for image cache
         uses: docker/setup-buildx-action@v3
 
+      - name: Resolve latest release promotion evidence
+        id: latest_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/release/resolve-cloud-release-artifacts.sh \
+            --latest \
+            --need promotion \
+            --github-output "${GITHUB_OUTPUT}" || echo "No previous promotion evidence found"
+
+      - name: Download latest release promotion evidence
+        if: ${{ steps.latest_release.outputs.promotion_artifact_name != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.latest_release.outputs.promotion_artifact_name }}
+          run-id: ${{ steps.latest_release.outputs.promotion_run_id }}
+          github-token: ${{ github.token }}
+          path: dist/latest-release-evidence
+
       - name: Build and inspect Cloud images
         env:
           RELEASE_TARGET: ${{ env.RELEASE_TARGET }}
@@ -321,6 +341,9 @@ jobs:
             --out "dist/releases/cloud-image-build-${RELEASE_TARGET}"
             --push
           )
+          if [[ -n "${{ needs.classify.outputs.affected_components }}" ]]; then
+            args+=(--components "${{ needs.classify.outputs.affected_components }}")
+          fi
           scripts/release/build-cloud-images.sh "${args[@]}"
 
       - name: Write image build provenance
@@ -331,10 +354,15 @@ jobs:
           --out "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build.provenance.json"
 
       - name: Write GCP image tfvars
-        run: >-
-          scripts/release/write-gcp-image-tfvars.sh
-          --image-manifest "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build-manifest.json"
-          --out "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/gcp-image-digests.tfvars"
+        run: |
+          args=(
+            --image-manifest "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/cloud-image-build-manifest.json"
+            --out "dist/releases/cloud-image-build-${{ env.RELEASE_TARGET }}/gcp-image-digests.tfvars"
+          )
+          if [[ -f "dist/latest-release-evidence/cloud-image-promotion-evidence.json" ]]; then
+            args+=(--fallback-manifest "dist/latest-release-evidence/cloud-image-promotion-evidence.json")
+          fi
+          scripts/release/write-gcp-image-tfvars.sh "${args[@]}"
 
       - name: Verify GCP image promotion evidence
         run: >-
