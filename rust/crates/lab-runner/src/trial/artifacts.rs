@@ -80,26 +80,41 @@ pub(crate) fn normalize_agent_result_adapter(
 }
 
 fn normalize_structured_json_result(raw: &Value) -> Result<Value> {
-    let response = raw
-        .get("response")
-        .ok_or_else(|| anyhow!("adapter result missing /response"))?;
-    let mut artifact = parse_response_artifact(response)?;
     let usage = normalized_usage(raw);
-    artifact.insert("usage".to_string(), usage.clone());
-    let mut metadata = Map::new();
-    if let Some(raw_object) = raw.as_object() {
-        for (key, value) in raw_object {
-            if key != "response" {
-                metadata.insert(key.clone(), value.clone());
+    let (artifact, metadata) = match raw.get("response") {
+        Some(response) => {
+            let mut artifact = parse_response_artifact(response)?;
+            artifact.insert("usage".to_string(), usage.clone());
+            let mut metadata = Map::new();
+            if let Some(raw_object) = raw.as_object() {
+                for (key, value) in raw_object {
+                    if key != "response" {
+                        metadata.insert(key.clone(), value.clone());
+                    }
+                }
             }
+            metadata.insert("metrics".to_string(), normalized_metrics(raw, &usage));
+            (Value::Object(artifact), Value::Object(metadata))
         }
-    }
-    metadata.insert("metrics".to_string(), normalized_metrics(raw, &usage));
+        None => {
+            let artifact = match raw {
+                Value::Object(object) => {
+                    let mut artifact = object.clone();
+                    artifact.insert("usage".to_string(), usage.clone());
+                    Value::Object(artifact)
+                }
+                other => other.clone(),
+            };
+            let mut metadata = Map::new();
+            metadata.insert("metrics".to_string(), normalized_metrics(raw, &usage));
+            (artifact, Value::Object(metadata))
+        }
+    };
     Ok(json!({
         "schema_version": "artifact_envelope_v1",
         "artifact_type": "structured_json",
-        "artifact": Value::Object(artifact),
-        "metadata": Value::Object(metadata),
+        "artifact": artifact,
+        "metadata": metadata,
     }))
 }
 

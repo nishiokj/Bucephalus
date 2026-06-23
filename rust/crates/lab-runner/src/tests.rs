@@ -9748,6 +9748,69 @@ mod tests {
     }
 
     #[test]
+    fn result_adapter_normalizes_direct_artifact_without_response_wrapper() {
+        let root = TempDirGuard::new("bucephalus_result_adapter_direct");
+        let result_path = root.path.join("result.json");
+        fs::write(
+            &result_path,
+            serde_json::to_vec_pretty(&json!({
+                "answer": {"summary": "Processed case."},
+                "metrics": {"resolved": 1.0, "keyword_hits": 3},
+                "usage": {
+                    "latency_ms": 500,
+                    "model_calls": 1,
+                    "tokens_in": 5,
+                    "tokens_out": 15,
+                    "tool_calls": 2
+                }
+            }))
+            .expect("raw direct artifact"),
+        )
+        .expect("write raw direct artifact");
+        let runtime_experiment = json!({
+            "trial_runtime": {
+                "agent": {
+                    "adapter": {
+                        "executable": "/usr/local/bin/myagent",
+                        "result": "structured_json"
+                    }
+                }
+            }
+        });
+
+        crate::trial::artifacts::normalize_agent_result_adapter(&runtime_experiment, &result_path)
+            .expect("normalize direct artifact");
+
+        let normalized: Value =
+            serde_json::from_slice(&fs::read(&result_path).expect("normalized result bytes"))
+                .expect("normalized result JSON");
+        assert_eq!(
+            normalized.pointer("/schema_version"),
+            Some(&json!("artifact_envelope_v1"))
+        );
+        assert_eq!(
+            normalized.pointer("/artifact_type"),
+            Some(&json!("structured_json"))
+        );
+        assert_eq!(
+            normalized.pointer("/artifact/answer/summary"),
+            Some(&json!("Processed case."))
+        );
+        assert_eq!(
+            normalized.pointer("/artifact/metrics/resolved"),
+            Some(&json!(1.0))
+        );
+        assert_eq!(
+            normalized.pointer("/artifact/usage/tool_calls"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            normalized.pointer("/metadata/metrics/turn_count"),
+            Some(&json!(1))
+        );
+    }
+
+    #[test]
     fn p6_run_control_writer_emits_active_trials_without_legacy_mirrors() {
         let (_root, run_dir) = create_run_dir("bucephalus_run_control_writer", "run_1");
         write_test_run_control(&run_dir, "run_1", "running", Some("trial_1"), None);
