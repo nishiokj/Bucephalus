@@ -937,6 +937,174 @@ describe("worker lifecycle cleanup helpers", () => {
     }
   });
 
+  test("materializePackage creates env file for env-based runtime secrets", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-env-secret-"));
+    const serverState = {
+      packageBytes: new Uint8Array(),
+    };
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        if (new URL(request.url).pathname.startsWith("/v1/packages/")) {
+          return new Response(serverState.packageBytes, {
+            headers: {
+              "content-type": "application/gzip",
+            },
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      const resolvedExperiment = currentResolvedExperiment([
+        { name: "OPENAI_API_KEY", from: "env" },
+      ]);
+      const { archivePath, packageDigest } = await writeSealedPackage(root, resolvedExperiment);
+      serverState.packageBytes = await readFile(archivePath);
+
+      const materialized = await materializePackage(
+        {
+          apiUrl: server.url.href.replace(/\/+$/, ""),
+          workerId: "worker-1",
+          runnerPoolId: "pool-1",
+          runnerInstanceId: "runner-instance-1",
+          leaseSeconds: 30,
+          pollMs: 1000,
+          heartbeatMs: 1000,
+          sweeperMs: 1000,
+          dataDir: root,
+          coreRunnerCommand: "bucephalus",
+          workerToken: "worker-token",
+          secretResolverCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/secretResolver.ts")],
+          networkPolicyCommand: null,
+          portForwardCommand: null,
+          execCommand: null,
+          capabilities: { executors: [], resources: [] },
+          minFreeBytes: 0,
+          retainAttemptWorkspaces: true,
+          provisionRequestId: null,
+          providerInstanceId: null,
+          workerImageRef: null,
+          liveEvidence: true,
+          evidenceIntervalMs: 2000,
+          coreTimeoutMs: 15 * 60 * 1000,
+          coreCompletionGraceMs: 120_000,
+          apiRequestTimeoutMs: 30_000,
+        },
+        {
+          claimed: true,
+          run: {
+            run_id: "run-1",
+            package_digest: packageDigest,
+            env: {},
+            secret_refs: { OPENAI_API_KEY: "secret-manager/projects/dev/openai" },
+            runtime_options: {},
+            run_requirements: {
+              executor: "runner-docker",
+              requires: [],
+              image_refs: [],
+            },
+          },
+          attempt: {
+            attempt_id: "attempt-1",
+            attempt_token: "attempt-token",
+          },
+        },
+      );
+
+      expect(materialized.secretEnvFile).not.toBeNull();
+      expect(materialized.secretFiles).toEqual({});
+      const envFileContent = await readFile(materialized.secretEnvFile!, "utf8");
+      expect(envFileContent).toBe("OPENAI_API_KEY=resolved:secret-manager/projects/dev/openai\n");
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("materializePackage keeps file-based runtime secrets in secretFiles", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-file-secret-"));
+    const serverState = {
+      packageBytes: new Uint8Array(),
+    };
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        if (new URL(request.url).pathname.startsWith("/v1/packages/")) {
+          return new Response(serverState.packageBytes, {
+            headers: {
+              "content-type": "application/gzip",
+            },
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      const resolvedExperiment = currentResolvedExperiment([
+        { name: "OPENAI_API_KEY", from: "file", mount: { target: "/run/secrets/openai" } },
+      ]);
+      const { archivePath, packageDigest } = await writeSealedPackage(root, resolvedExperiment);
+      serverState.packageBytes = await readFile(archivePath);
+
+      const materialized = await materializePackage(
+        {
+          apiUrl: server.url.href.replace(/\/+$/, ""),
+          workerId: "worker-1",
+          runnerPoolId: "pool-1",
+          runnerInstanceId: "runner-instance-1",
+          leaseSeconds: 30,
+          pollMs: 1000,
+          heartbeatMs: 1000,
+          sweeperMs: 1000,
+          dataDir: root,
+          coreRunnerCommand: "bucephalus",
+          workerToken: "worker-token",
+          secretResolverCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/secretResolver.ts")],
+          networkPolicyCommand: null,
+          portForwardCommand: null,
+          execCommand: null,
+          capabilities: { executors: [], resources: [] },
+          minFreeBytes: 0,
+          retainAttemptWorkspaces: true,
+          provisionRequestId: null,
+          providerInstanceId: null,
+          workerImageRef: null,
+          liveEvidence: true,
+          evidenceIntervalMs: 2000,
+          coreTimeoutMs: 15 * 60 * 1000,
+          coreCompletionGraceMs: 120_000,
+          apiRequestTimeoutMs: 30_000,
+        },
+        {
+          claimed: true,
+          run: {
+            run_id: "run-1",
+            package_digest: packageDigest,
+            env: {},
+            secret_refs: { OPENAI_API_KEY: "secret-manager/projects/dev/openai" },
+            runtime_options: {},
+            run_requirements: {
+              executor: "runner-docker",
+              requires: [],
+              image_refs: [],
+            },
+          },
+          attempt: {
+            attempt_id: "attempt-1",
+            attempt_token: "attempt-token",
+          },
+        },
+      );
+
+      expect(materialized.secretEnvFile).toBeNull();
+      expect(Object.keys(materialized.secretFiles)).toEqual(["OPENAI_API_KEY"]);
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("network perimeter capability requires an explicit policy command", () => {
     const config = loadWorkerConfig({
       BUCEPHALUS_CLOUD_API_URL: "https://cloud.example",
@@ -2443,9 +2611,12 @@ function claim(overrides: {
 }
 
 async function writeMinimalSealedPackage(root: string): Promise<{ archivePath: string; packageDigest: string }> {
+  return writeSealedPackage(root, currentResolvedExperiment());
+}
+
+async function writeSealedPackage(root: string, resolvedExperiment: JsonObject): Promise<{ archivePath: string; packageDigest: string }> {
   const packageDir = join(root, "sealed-package");
   await mkdir(packageDir, { recursive: true });
-  const resolvedExperiment = currentResolvedExperiment();
   await writeFile(join(packageDir, "resolved_experiment.json"), JSON.stringify(resolvedExperiment));
   await writeFile(join(packageDir, "staging_manifest.json"), JSON.stringify({
     schema_version: "runtime_path_staging_manifest_v1",
@@ -2506,16 +2677,20 @@ async function checksumsForPackage(packageDir: string): Promise<{ schema_version
   };
 }
 
-function currentResolvedExperiment(): JsonObject {
+function currentResolvedExperiment(secrets?: JsonObject[]): JsonObject {
+  const runtime: JsonObject = {
+    compute: { backend: "local-docker" },
+    storage: { backend: "local-fs" },
+  };
+  if (secrets && secrets.length > 0) {
+    runtime.secrets = secrets;
+  }
   return {
     experiment: {
       id: "current_exp",
       name: "Current Experiment",
     },
-    runtime: {
-      compute: { backend: "local-docker" },
-      storage: { backend: "local-fs" },
-    },
+    runtime,
     matrix: {
       variants: [{ id: "baseline", baseline: true, config: { model: "gpt-5" } }],
       cases: { source: "file", path: "cases.jsonl" },

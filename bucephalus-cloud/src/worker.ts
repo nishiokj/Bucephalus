@@ -327,6 +327,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         runRootDir: join(workspaceDir, "run-root"),
         manifestJson: {},
         secretFiles: {},
+        secretEnvFile: null,
       });
     } catch (error) {
       cleanupError = error;
@@ -913,6 +914,10 @@ function coreRunnerCommand(
   }
 
   const redactedArgs = [...args];
+  if (materialized.secretEnvFile) {
+    args.push("--env-file", materialized.secretEnvFile);
+    redactedArgs.push("--env-file", "<secret-env-file>");
+  }
   for (const [id, secretPath] of Object.entries(materialized.secretFiles)) {
     args.push("--secret-file", `${id}=${secretPath}`);
     redactedArgs.push("--secret-file", `${id}=<secret:${claim.run.secret_refs[id] ?? "redacted"}>`);
@@ -1172,6 +1177,11 @@ export async function materializePackage(
     }, null, 2)}\n`,
   );
   const secretFiles = await materializeAttemptSecrets(config, claim, workspaceDir);
+  const secretFromTypes = runtimeSecretFromTypes(inspection.manifestJson);
+  const secretEnvFile = await buildSecretEnvFile(workspaceDir, secretFiles, secretFromTypes);
+  const fileOnlySecretFiles = Object.fromEntries(
+    Object.entries(secretFiles).filter(([id]) => secretFromTypes.get(id) === "file"),
+  );
 
   return {
     workspaceDir,
@@ -1179,7 +1189,8 @@ export async function materializePackage(
     extractedDir,
     runRootDir,
     manifestJson: inspection.manifestJson,
-    secretFiles,
+    secretFiles: fileOnlySecretFiles,
+    secretEnvFile,
   };
 }
 
@@ -1238,6 +1249,61 @@ export async function materializeAttemptSecrets(
     throw new WorkerError(`Secret resolver did not materialize required secret id(s): ${missing.join(", ")}`);
   }
   return files;
+}
+
+function runtimeSecretFromTypes(manifestJson: JsonObject): Map<string, "env" | "file"> {
+  const out = new Map<string, "env" | "file">();
+  const resolved = manifestJson.resolved_experiment;
+  if (!isRecord(resolved)) {
+    return out;
+  }
+  const runtime = resolved.runtime;
+  if (!isRecord(runtime)) {
+    return out;
+  }
+  const secrets = runtime.secrets;
+  if (!Array.isArray(secrets)) {
+    return out;
+  }
+  for (const item of secrets) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    const id = typeof item.name === "string" ? item.name.trim() : "";
+    const from = typeof item.from === "string" ? item.from.trim() : "";
+    if (!id || (from !== "env" && from !== "file")) {
+      continue;
+    }
+    out.set(id, from);
+  }
+  return out;
+}
+
+async function buildSecretEnvFile(
+  workspaceDir: string,
+  secretFiles: Record<string, string>,
+  fromTypes: Map<string, "env" | "file">,
+): Promise<string | null> {
+  const envIds = Object.keys(secretFiles).filter((id) => fromTypes.get(id) === "env");
+  if (envIds.length === 0) {
+    return null;
+  }
+  const envFilePath = join(workspaceDir, "run-secrets.env");
+  const lines: string[] = [];
+  for (const id of envIds.sort()) {
+    const secretPath = secretFiles[id];
+    if (!secretPath) {
+      continue;
+    }
+    const content = await readFile(secretPath, "utf8");
+    const value = content.replace(/\r?\n$/, "");
+    lines.push(`${id}=${value}`);
+  }
+  if (lines.length === 0) {
+    return null;
+  }
+  await writeFile(envFilePath, `${lines.join("\n")}\n`, { mode: 0o600 });
+  return envFilePath;
 }
 
 export async function applyRuntimeNetworkPolicy(
@@ -3486,6 +3552,7 @@ interface MaterializedPackage {
   runRootDir: string;
   manifestJson: JsonObject;
   secretFiles: Record<string, string>;
+  secretEnvFile: string | null;
 }
 
 interface DockerCleanupSummary {
