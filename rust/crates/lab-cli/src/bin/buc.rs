@@ -276,6 +276,7 @@ fn run(argv: Vec<String>) -> Result<()> {
         (Some("build"), _) => experiment_build(alias_args(&context, 1)),
         (Some("doctor"), _) => experiment_doctor(alias_args(&context, 1)),
         (Some("run"), _) => run_create(alias_args(&context, 1)),
+        (Some("cancel"), _) => run_cancel(alias_args(&context, 1)),
         (Some("inspect"), _) => package_inspect(alias_args(&context, 1)),
         (Some("author"), Some("canonicalize")) | (Some("drafts"), Some("canonicalize")) => {
             draft_canonicalize(with_args(&context, rest))
@@ -359,7 +360,7 @@ fn known_hosted_command(group: Option<&str>, command: Option<&str>) -> bool {
         (Some("health"), None)
             | (Some("login" | "logout"), _)
             | (Some("auth"), Some("status"))
-            | (Some("build" | "doctor" | "run" | "inspect"), _)
+            | (Some("build" | "doctor" | "run" | "cancel" | "inspect"), _)
             | (
                 Some("author" | "drafts"),
                 Some(
@@ -424,6 +425,7 @@ fn group_command_without_leaf(group: Option<&str>, command: Option<&str>) -> boo
                 "build"
                     | "doctor"
                     | "run"
+                    | "cancel"
                     | "inspect"
                     | "auth"
                     | "author"
@@ -835,6 +837,29 @@ fn run_create(context: CliContext) -> Result<()> {
         None,
     )?;
     ensure_run_created(&run, &digest)?;
+    if json_requested(&context.args) {
+        print_json(&run)
+    } else {
+        print_run_summary(&run)
+    }
+}
+
+fn run_cancel(context: CliContext) -> Result<()> {
+    reject_unknown_options(&context.args, &["--run-id", "--reason"], &["--json"])?;
+    let run_id = run_id_arg(&context.args)?;
+    let reason = option_value(&context.args, "--reason")?;
+    ensure_api_configured(&context)?;
+    let body = match reason {
+        Some(reason) => json!({ "reason": reason }),
+        None => json!({}),
+    };
+    let run = cloud_fetch(
+        &context,
+        Method::POST,
+        &format!("/v1/runs/{}/cancel", encode_path_segment(&run_id)),
+        Some(body),
+        None,
+    )?;
     if json_requested(&context.args) {
         print_json(&run)
     } else {
@@ -9744,6 +9769,7 @@ Usage:
   buc build <experiment.yaml|package-dir|package.tgz> [--label TEXT] [--json]
   buc doctor <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--json]
   buc run <package-digest> [--secret-ref NAME=REF ...] [--secret-ref-file secrets.yaml] [--label TEXT] [--json]
+  buc cancel <run-id> [--reason TEXT] [--json]
   buc inspect <package-digest> [--json]
   buc author canonicalize <draft.yaml|draft.json> [--json]
   buc author resolve <draft.yaml|draft.json> [--json]
@@ -9851,6 +9877,7 @@ fn command_help_text(group: Option<&str>, command: Option<&str>) -> Option<&'sta
         (Some("build"), _) => Some(BUILD_HELP),
         (Some("doctor"), _) => Some(DOCTOR_HELP),
         (Some("run"), _) => Some(RUN_HELP),
+        (Some("cancel"), _) => Some(CANCEL_HELP),
         (Some("inspect"), _) => Some(INSPECT_HELP),
         (Some("author"), None) | (Some("author"), Some("--help" | "-h")) => Some(AUTHOR_HELP),
         (Some("author"), Some("canonicalize")) => Some(AUTHOR_CANONICALIZE_HELP),
@@ -10007,6 +10034,16 @@ Secrets:
   Then pass:
     --secret-ref NAME=bucephalus://NAME
   Secret ref files must be YAML/JSON maps of NAME: bucephalus://NAME.
+"#;
+
+const CANCEL_HELP: &str = r#"buc cancel
+
+Cancel a hosted run. The run is marked cancelled so the scheduler will not
+claim it again; a worker already executing it aborts on its next heartbeat.
+Already-completed or already-failed runs cannot be cancelled.
+
+Usage:
+  buc cancel <run-id> [--reason TEXT] [--json]
 "#;
 
 const INSPECT_HELP: &str = r#"buc inspect

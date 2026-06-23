@@ -34,6 +34,7 @@ interface WorkerConfig {
   leaseSeconds: number;
   pollMs: number;
   heartbeatMs: number;
+  heartbeatRetryMs: number;
   sweeperMs: number;
   dataDir: string;
   coreRunnerCommand: string;
@@ -206,13 +207,74 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
 
   let heartbeatStop = false;
   let materialized: MaterializedPackage | null = null;
+  // When the lease is genuinely lost (the server has, or is about to, reclaim
+  // this run), abort the in-flight core process: continuing to run it only
+  // burns compute on a run we no longer own and whose results the API will
+  // reject. A transient heartbeat error must NOT trip this — only an actual
+  // lapse of the renewed lease window does.
+  const abortController = new AbortController();
+  let leaseLost = false;
+  let cancelRequested = false;
+  // Local estimate of when the server-side lease expires. Refreshed on every
+  // successful heartbeat; the server sets lease_expires_at = now() +
+  // lease_seconds on each heartbeat it accepts.
+  let leaseDeadlineMs = Date.now() + config.leaseSeconds * 1000;
   const heartbeatLoop = (async () => {
+    let consecutiveFailures = 0;
     while (!heartbeatStop && !shuttingDown) {
-      await sleep(config.heartbeatMs);
+      // After a failure, retry sooner than the normal cadence so transient
+      // blips get several attempts inside the lease window instead of one.
+      await sleep(consecutiveFailures > 0 ? config.heartbeatRetryMs : config.heartbeatMs);
       if (heartbeatStop || shuttingDown) {
         return;
       }
-      await heartbeat(config, claim);
+      try {
+        const { cancelRequested: cancelled } = await heartbeat(config, claim);
+        if (consecutiveFailures > 0) {
+          logInfo("worker.heartbeat_recovered", runContext, {
+            run_id: runId,
+            attempt_id: attemptId,
+            recovered_after_failures: consecutiveFailures,
+          });
+        }
+        consecutiveFailures = 0;
+        leaseDeadlineMs = Date.now() + config.leaseSeconds * 1000;
+        if (cancelled) {
+          // The owner cancelled the run. Stop the in-flight core process now
+          // rather than finishing work whose results the run no longer wants.
+          cancelRequested = true;
+          logInfo("worker.cancel_requested", runContext, {
+            run_id: runId,
+            attempt_id: attemptId,
+          });
+          abortController.abort("cancelled");
+          return;
+        }
+      } catch (error) {
+        // A single failed heartbeat must never kill lease renewal. Log it,
+        // keep retrying, and only give up once the lease window has actually
+        // elapsed with no successful renewal.
+        consecutiveFailures += 1;
+        logError("worker.heartbeat_failed", runContext, {
+          run_id: runId,
+          attempt_id: attemptId,
+          consecutive_failures: consecutiveFailures,
+          ms_until_lease_deadline: leaseDeadlineMs - Date.now(),
+          error: errorMessage(error),
+        });
+        if (Date.now() >= leaseDeadlineMs) {
+          leaseLost = true;
+          logError("worker.lease_lost", runContext, {
+            run_id: runId,
+            attempt_id: attemptId,
+            consecutive_failures: consecutiveFailures,
+            detail: "lease renewal failed past the lease deadline; aborting in-flight core run",
+          });
+          abortController.abort("lease_lost");
+          return;
+        }
+        continue;
+      }
       if (materialized && config.portForwardCommand) {
         await processPortForwardRequests(config, claim, materialized).catch((error) => {
           logError("worker.runtime_port_forward_poll_failed", runContext, { error: errorMessage(error) });
@@ -268,7 +330,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
       if (config.execCommand) {
         await processExecRequests(config, claim, materialized);
       }
-      await executeCoreRun(config, claim, materialized, runContext);
+      await executeCoreRun(config, claim, materialized, runContext, abortController.signal);
     } catch (error) {
       coreError = error;
     }
@@ -332,7 +394,29 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
       cleanupError = error;
     }
 
-    if (cleanupError) {
+    if (cancelRequested) {
+      // The owner cancelled the run; it is already in the terminal 'cancelled'
+      // state. complete()/fail() would 409 and could only mislabel the
+      // outcome, so leave the run as cancelled and free this worker.
+      logInfo("worker.finalize_skipped_cancelled", runContext, {
+        run_id: runId,
+        attempt_id: attemptId,
+        had_core_error: coreError !== null,
+        had_cleanup_error: cleanupError !== null,
+      });
+    } else if (leaseLost) {
+      // The lease lapsed and the server has reclaimed this run for another
+      // attempt. Our attempt token is invalid, so fail()/complete() would 401;
+      // worse, marking the run now could clobber the attempt that now owns it.
+      // Leave the run to its new owner and free this worker for fresh claims.
+      // A cleanup hiccup here is not an instance-health signal — do not poison.
+      logError("worker.finalize_skipped_lease_lost", runContext, {
+        run_id: runId,
+        attempt_id: attemptId,
+        had_core_error: coreError !== null,
+        had_cleanup_error: cleanupError !== null,
+      });
+    } else if (cleanupError) {
       const message = `runner cleanup failed after run ${runId} attempt ${attemptId}: ${errorMessage(cleanupError)}`;
       await fail(config, claim, message).catch((failError) => {
         logError("worker.fail_run_failed", runContext, { error: errorMessage(failError) });
@@ -355,7 +439,11 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
     }
   } finally {
     heartbeatStop = true;
-    await heartbeatLoop.catch(() => undefined);
+    // The loop catches its own errors; a rejection here is unexpected, so
+    // surface it rather than swallowing it silently.
+    await heartbeatLoop.catch((error) => {
+      logError("worker.heartbeat_loop_crashed", runContext, { error: errorMessage(error) });
+    });
   }
 }
 
@@ -364,6 +452,7 @@ async function executeCoreRun(
   claim: RunClaim,
   materialized: MaterializedPackage,
   context: TraceContext,
+  abortSignal: AbortSignal,
 ): Promise<void> {
   const command = coreRunnerCommand(config, claim, materialized);
   await appendEvent(config, claim, "worker.core.starting", {
@@ -388,14 +477,25 @@ async function executeCoreRun(
     env,
     timeoutMs,
     completionGraceMs: config.coreCompletionGraceMs,
+    abortSignal,
   });
   const eventPayload = {
     exit_code: result.exitCode,
     timed_out: result.timedOut,
+    aborted: result.aborted,
     completed_by_progress_watchdog: result.completedByProgressWatchdog,
     stdout_tail: tail(result.stdout, 16_000),
     stderr_tail: tail(result.stderr, 16_000),
   };
+  if (result.aborted) {
+    const reason = typeof abortSignal.reason === "string" ? abortSignal.reason : "aborted";
+    // Best-effort append: on lease loss the token is already invalid (likely
+    // 401); on cancellation the lease is still valid so this is recorded. The
+    // worker-side worker.lease_lost / worker.cancel_requested logs are the
+    // durable signal either way.
+    await appendEvent(config, claim, "worker.core.aborted", { ...eventPayload, reason }).catch(() => undefined);
+    throw new WorkerError(`Core runner aborted: ${reason}`);
+  }
   if (result.completedByProgressWatchdog) {
     await appendEvent(config, claim, "worker.core.completed_after_progress_watchdog", eventPayload);
     return;
@@ -957,11 +1057,11 @@ function assertSecretId(id: string): void {
   }
 }
 
-async function runProcess(
+export async function runProcess(
   executable: string,
   args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs?: number; completionGraceMs?: number },
-): Promise<{ exitCode: number; stdout: string; stderr: string; timedOut: boolean; completedByProgressWatchdog: boolean }> {
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs?: number; completionGraceMs?: number; abortSignal?: AbortSignal },
+): Promise<{ exitCode: number; stdout: string; stderr: string; timedOut: boolean; aborted: boolean; completedByProgressWatchdog: boolean }> {
   return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
       cwd: options.cwd,
@@ -973,6 +1073,7 @@ async function runProcess(
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let timedOut = false;
+    let aborted = false;
     let completedByProgressWatchdog = false;
     let completionGraceTimer: ReturnType<typeof setTimeout> | null = null;
     const clearCompletionGraceTimer = () => {
@@ -1019,6 +1120,26 @@ async function runProcess(
         }, options.timeoutMs)
       : null;
     timeout?.unref();
+    // Lease loss: the heartbeat loop aborts the signal when the run has been
+    // reclaimed. Terminate the child group so we stop burning compute on a run
+    // we no longer own, then escalate to SIGKILL if it ignores SIGTERM.
+    const onAbort = () => {
+      aborted = true;
+      terminateChildProcessGroup("SIGTERM");
+      setTimeout(() => {
+        if (child.exitCode === null) {
+          terminateChildProcessGroup("SIGKILL");
+        }
+      }, 5000).unref();
+    };
+    if (options.abortSignal) {
+      if (options.abortSignal.aborted) {
+        onAbort();
+      } else {
+        options.abortSignal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
+    const detachAbort = () => options.abortSignal?.removeEventListener("abort", onAbort);
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     // The core runner emits its structured JSON logs on stderr (stdout carries
     // the --json result payload). Tee stderr through to the worker's own stderr
@@ -1037,6 +1158,7 @@ async function runProcess(
         clearTimeout(timeout);
       }
       clearCompletionGraceTimer();
+      detachAbort();
       if (activeChild === child) {
         activeChild = null;
       }
@@ -1047,6 +1169,7 @@ async function runProcess(
         clearTimeout(timeout);
       }
       clearCompletionGraceTimer();
+      detachAbort();
       if (activeChild === child) {
         activeChild = null;
       }
@@ -1055,6 +1178,7 @@ async function runProcess(
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
         timedOut,
+        aborted,
         completedByProgressWatchdog,
       });
     });
@@ -1088,16 +1212,17 @@ async function claimRun(config: WorkerConfig): Promise<RunClaim | EmptyClaim> {
   }) as RunClaim | EmptyClaim;
 }
 
-async function heartbeat(config: WorkerConfig, claim: RunClaim): Promise<void> {
+async function heartbeat(config: WorkerConfig, claim: RunClaim): Promise<{ cancelRequested: boolean }> {
   const runnerInstanceId = requireRunnerInstanceId(config);
-  await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/heartbeat`, {
+  const response = await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/heartbeat`, {
     method: "POST",
     authToken: claim.attempt.attempt_token,
     body: {
       runner_instance_id: runnerInstanceId,
       lease_seconds: config.leaseSeconds,
     },
-  });
+  }) as { cancel_requested?: boolean };
+  return { cancelRequested: response?.cancel_requested === true };
 }
 
 async function registerRunnerInstance(config: WorkerConfig): Promise<RunnerInstance> {
@@ -3129,6 +3254,7 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
     leaseSeconds,
     pollMs: numberEnv(env.BUCEPHALUS_WORKER_POLL_MS, 2000),
     heartbeatMs: numberEnv(env.BUCEPHALUS_WORKER_HEARTBEAT_MS, Math.max(1000, Math.floor((leaseSeconds * 1000) / 3))),
+    heartbeatRetryMs: numberEnv(env.BUCEPHALUS_WORKER_HEARTBEAT_RETRY_MS, 2000),
     sweeperMs: numberEnv(env.BUCEPHALUS_WORKER_SWEEPER_MS, 5000),
     dataDir: resolve(env.BUCEPHALUS_CLOUD_DATA_DIR ?? ".data"),
     coreRunnerCommand: env.BUCEPHALUS_CORE_RUNNER_CMD ?? "bucephalus",

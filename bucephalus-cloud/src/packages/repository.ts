@@ -658,6 +658,57 @@ export class RunRepository {
     return rows as unknown as RunAttemptRecord[];
   }
 
+  // Owner-initiated cancellation. Marks the run cancelled so the scheduler will
+  // never claim it again; a worker already executing the run learns of the
+  // cancellation from its next heartbeat (which reports cancel_requested) and
+  // aborts. Attempts are deliberately left untouched here: the active worker
+  // must keep a valid lease long enough to receive the cancel signal, and the
+  // run-status guard on completeAttempt/failAttempt already prevents a stale
+  // worker from resurrecting a cancelled run.
+  async cancelRun(input: {
+    runId: string;
+    ownerKey?: string | undefined;
+    reason?: string | null;
+  }): Promise<CloudRunRecord> {
+    return await this.sql.begin(async (tx) => {
+      const existingRows = await tx`
+        select *
+        from cloud.runs
+        where run_id = ${input.runId}
+          and (${input.ownerKey ?? null}::text is null or owner_key = ${input.ownerKey ?? null})
+        limit 1
+        for update
+      `;
+      const existing = existingRows[0] as CloudRunRecord | undefined;
+      if (!existing) {
+        throw new HttpError(404, "run_not_found", "Run not found");
+      }
+      if (existing.status === "cancelled") {
+        return existing;
+      }
+      if (existing.status === "completed" || existing.status === "failed") {
+        throw new HttpError(
+          409,
+          "run_not_cancelable",
+          `Run is already ${existing.status} and cannot be cancelled`,
+        );
+      }
+      const message = input.reason && input.reason.trim().length > 0
+        ? `cancelled by owner: ${input.reason.trim()}`
+        : "cancelled by owner";
+      const updated = await tx`
+        update cloud.runs
+        set status = 'cancelled',
+            completed_at = now(),
+            updated_at = now(),
+            error_message = ${message}
+        where run_id = ${input.runId}
+        returning *
+      `;
+      return updated[0] as CloudRunRecord;
+    });
+  }
+
   async expireLeases(): Promise<Array<{ run: CloudRunRecord; attempt: RunAttemptRecord }>> {
     return await this.sql.begin(async (tx) => {
       const attempts = await tx`
