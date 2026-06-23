@@ -494,7 +494,7 @@ export class RunnerRepository {
                 jsonb_build_object(
                   'reason', 'heartbeat_stale',
                   'previous_status', candidates.previous_status::text,
-                  'recorded_at', ${recordedAt}
+                  'recorded_at', ${recordedAt}::text
                 )
               ),
               updated_at = now()
@@ -762,6 +762,23 @@ export class RunnerRepository {
       throw new HttpError(404, "provision_request_not_found", "Provision request not found");
     }
     return request;
+  }
+
+  async failQueuedRun(input: {
+    runId: string;
+    message: string;
+  }): Promise<boolean> {
+    const rows = await this.sql`
+      update cloud.runs
+      set status = 'failed',
+          error_message = ${input.message},
+          completed_at = now(),
+          updated_at = now()
+      where run_id = ${input.runId}
+        and status in ('created', 'waiting_for_runner')
+      returning run_id
+    `;
+    return rows.length > 0;
   }
 
   async markProvisionRequestReaped(input: {

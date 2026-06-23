@@ -58,6 +58,20 @@ class PoolControllerError extends Error {
   }
 }
 
+// Mirrors PERMANENT_PROVISION_EXIT_CODE in
+// deploy/provider/gcp/gce-provider-common.js: a provider exit code signalling a
+// structurally invalid request that will fail identically on every retry.
+const PERMANENT_PROVISION_EXIT_CODE = 78;
+
+class ProviderCommandError extends PoolControllerError {
+  readonly exitCode: number;
+  constructor(message: string, exitCode: number) {
+    super(message);
+    this.name = "ProviderCommandError";
+    this.exitCode = exitCode;
+  }
+}
+
 interface PoolControllerHealthState {
   startedAt: string;
   lastReconcileStartedAt: string | null;
@@ -330,18 +344,36 @@ async function provisionRunner(
       provider_instance_id: output.provider_instance_id,
     });
   } catch (error) {
+    const permanent = error instanceof ProviderCommandError
+      && error.exitCode === PERMANENT_PROVISION_EXIT_CODE;
     await runners.failProvisionRequest({
       provisionRequestId: request.provision_request_id,
       message: errorMessage(error),
       metadata: {
         failed_at: new Date().toISOString(),
+        ...(permanent ? { failure_kind: "permanent" } : {}),
       },
     });
-    logError("pool_controller.provision_failed", context, {
-      run_id: run.run_id,
-      provision_request_id: request.provision_request_id,
-      error: errorMessage(error),
-    });
+    if (permanent) {
+      // A structurally invalid request will fail identically forever; dead-letter
+      // the run so it leaves the demand queue instead of looping every reconcile.
+      const deadLettered = await runners.failQueuedRun({
+        runId: run.run_id,
+        message: `runner provisioning permanently failed: ${errorMessage(error)}`,
+      });
+      logError("pool_controller.provision_permanently_failed", context, {
+        run_id: run.run_id,
+        provision_request_id: request.provision_request_id,
+        error: errorMessage(error),
+        run_dead_lettered: deadLettered,
+      });
+    } else {
+      logError("pool_controller.provision_failed", context, {
+        run_id: run.run_id,
+        provision_request_id: request.provision_request_id,
+        error: errorMessage(error),
+      });
+    }
   }
 }
 
@@ -499,7 +531,10 @@ async function runJsonCommand(
     child.stdin.end(`${JSON.stringify(input)}\n`);
   });
   if (result.exitCode !== 0) {
-    throw new PoolControllerError(`${executable} exited ${result.exitCode}: ${tail(result.stderr || result.stdout, 1000)}`);
+    throw new ProviderCommandError(
+      `${executable} exited ${result.exitCode}: ${tail(result.stderr || result.stdout, 1000)}`,
+      result.exitCode,
+    );
   }
   try {
     return JSON.parse(result.stdout);
