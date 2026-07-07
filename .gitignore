@@ -64,3 +64,5 @@ cookbook/peter-gregory-v2/secrets/
 cookbook/peter-gregory-v2
 cookbook/peter-gregory-v2-state-only
 cookbook/peter-gregory-v2-event-only
+
+.devin/

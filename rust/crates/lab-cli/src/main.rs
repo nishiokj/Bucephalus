@@ -999,17 +999,23 @@ fn resolve_experiment_target_for_command(command: &str, target: Option<&Path>) -
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("experiment.yaml"));
     if path.is_dir() {
-        let experiment = path.join("experiment.yaml");
-        if experiment.is_file() {
+        if let Some(experiment) = experiment_file_in_dir(&path)? {
             return Ok(experiment);
         }
         return Err(experiment_target_error(
             command,
             &path,
-            "no experiment.yaml was found in directory",
+            "no experiment.yaml or experiment.yml was found in directory",
         ));
     }
     if path.is_file() {
+        if !is_yaml_file(&path) {
+            return Err(experiment_target_error(
+                command,
+                &path,
+                "file is not an experiment YAML",
+            ));
+        }
         return Ok(path);
     }
     Err(experiment_target_error(
@@ -1017,6 +1023,20 @@ fn resolve_experiment_target_for_command(command: &str, target: Option<&Path>) -
         &path,
         "path does not exist",
     ))
+}
+
+fn experiment_file_in_dir(path: &Path) -> Result<Option<PathBuf>> {
+    let yaml = path.join("experiment.yaml");
+    let yml = path.join("experiment.yml");
+    match (yaml.is_file(), yml.is_file()) {
+        (true, true) => Err(anyhow!(
+            "ambiguous experiment directory {}; both experiment.yaml and experiment.yml exist",
+            path.display()
+        )),
+        (true, false) => Ok(Some(yaml)),
+        (false, true) => Ok(Some(yml)),
+        (false, false) => Ok(None),
+    }
 }
 
 fn is_yaml_file(path: &Path) -> bool {
@@ -5271,11 +5291,11 @@ fn resolve_package_command_target(command: &str, path: &Path) -> Result<PathBuf>
         if looks_like_bucephalus_package_dir(path) {
             return Ok(path.to_path_buf());
         }
-        if path.join("experiment.yaml").is_file() {
+        if experiment_file_in_dir(path)?.is_some() {
             return Err(package_command_target_error(
                 command,
                 path,
-                "directory contains experiment.yaml but no sealed package metadata",
+                "directory contains experiment YAML but no sealed package metadata",
             ));
         }
         return Err(package_command_target_error(
@@ -5324,13 +5344,12 @@ fn experiment_input_path(path: &Path) -> Result<Option<PathBuf>> {
         if looks_like_bucephalus_package_dir(path) {
             return Ok(None);
         }
-        let experiment = path.join("experiment.yaml");
-        if experiment.is_file() {
+        if let Some(experiment) = experiment_file_in_dir(path)? {
             return Ok(Some(experiment));
         }
         return Err(run_input_target_error(
             path,
-            "found neither experiment.yaml nor sealed package metadata",
+            "found neither experiment.yaml, experiment.yml, nor sealed package metadata",
         ));
     }
     if path.is_file() && is_yaml_file(path) {
@@ -5370,20 +5389,29 @@ fn resolve_doctor_target(target: Option<&Path>) -> Result<DoctorTarget> {
         if looks_like_bucephalus_package_dir(path) {
             return Ok(DoctorTarget::Package(path.to_path_buf()));
         }
-        let experiment = path.join("experiment.yaml");
-        if experiment.is_file() {
+        if let Some(experiment) = experiment_file_in_dir(path)? {
             return Ok(DoctorTarget::Experiment(experiment));
         }
         return Err(doctor_target_error(
             path,
-            "found neither experiment.yaml nor sealed package metadata",
+            "found neither experiment.yaml, experiment.yml, nor sealed package metadata",
         ));
     }
     if path.is_file() {
         if is_yaml_file(path) {
             return Ok(DoctorTarget::Experiment(path.to_path_buf()));
         }
-        return Ok(DoctorTarget::Package(path.to_path_buf()));
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "manifest.json")
+        {
+            return Ok(DoctorTarget::Package(path.to_path_buf()));
+        }
+        return Err(doctor_target_error(
+            path,
+            "file is not an experiment YAML or manifest.json",
+        ));
     }
     Err(doctor_target_error(path, "path does not exist"))
 }
@@ -5923,6 +5951,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             overrides,
             json,
         } => {
+            let experiment = resolve_experiment_target_for_command("build", Some(&experiment))?;
             if !json {
                 eprintln!("building package from: {}", experiment.display());
             }
@@ -6073,6 +6102,8 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             run_dangerously,
             json,
         } => {
+            let experiment =
+                resolve_experiment_target_for_command("build-run", Some(&experiment))?;
             if !json {
                 eprintln!("building package from: {}", experiment.display());
             }
@@ -7497,9 +7528,25 @@ fn print_package_check_report(report: &Value) {
 fn resolve_run_dir_arg(run: &str) -> Result<PathBuf> {
     let raw = PathBuf::from(run);
     if raw.exists() {
-        return raw
-            .canonicalize()
-            .map_err(|_| anyhow::anyhow!(format!("run path not found: {}", raw.display())));
+        if !raw.is_dir() {
+            return Err(anyhow::anyhow!(
+                "run path is not a directory: {}\n\nNext steps:\n  bucephalus runs\n  bucephalus views <run_id> run_progress",
+                raw.display()
+            ));
+        }
+        return raw.canonicalize().map_err(|err| {
+            anyhow::anyhow!(
+                "run path is not accessible: {} ({})",
+                raw.display(),
+                err
+            )
+        });
+    }
+    if raw.components().count() > 1 || raw.is_absolute() {
+        return Err(anyhow::anyhow!(
+            "run path does not exist: {}\n\nNext steps:\n  bucephalus runs\n  bucephalus views <run_id> run_progress",
+            raw.display()
+        ));
     }
 
     let cwd = std::env::current_dir()?;
@@ -7515,7 +7562,7 @@ fn resolve_run_dir_arg(run: &str) -> Result<PathBuf> {
     }
 
     Err(anyhow::anyhow!(format!(
-        "run '{}' not found in the configured runtime store",
+        "run '{}' not found in the configured runtime store\n\nNext steps:\n  bucephalus runs\n  bucephalus views <run_id> run_progress",
         run
     )))
 }
@@ -11969,6 +12016,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_run_dir_arg_rejects_existing_file() {
+        let root = temp_dir("run_arg_existing_file");
+        std::fs::create_dir_all(&root).expect("root dir");
+        let file = root.join("not-a-run.txt");
+        std::fs::write(&file, "not a run\n").expect("write file");
+
+        let err = resolve_run_dir_arg(file.to_str().expect("utf8 path"))
+            .expect_err("file path should not resolve as run directory")
+            .to_string();
+
+        assert!(err.contains("run path is not a directory"));
+        assert!(err.contains("bucephalus runs"));
+        assert!(err.contains("bucephalus views <run_id> run_progress"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_run_dir_arg_reports_missing_path_without_store_lookup() {
+        let root = temp_dir("run_arg_missing_path");
+        let missing = root.join("missing-run");
+
+        let err = resolve_run_dir_arg(missing.to_str().expect("utf8 path"))
+            .expect_err("missing path-like run arg should fail as path")
+            .to_string();
+
+        assert!(err.contains("run path does not exist"));
+        assert!(err.contains("bucephalus runs"));
+        assert!(err.contains("bucephalus views <run_id> run_progress"));
+    }
+
+    #[test]
     fn latest_agent_output_view_reads_agent_result_file() {
         let run_dir = temp_dir("latest_agent_output");
         let trial_dir = run_dir.join("trials").join("trial_1");
@@ -12936,6 +13014,53 @@ mod tests {
     }
 
     #[test]
+    fn resolve_experiment_target_accepts_yml_directory_default() {
+        let root = unique_test_dir("resolve_experiment_yml_directory");
+        fs::create_dir_all(&root).expect("test dir");
+        let experiment = root.join("experiment.yml");
+        fs::write(&experiment, "experiment:\n  id: smoke\n").expect("experiment yml");
+
+        let resolved = resolve_experiment_target(Some(&root)).expect("resolved experiment");
+
+        assert_eq!(resolved, experiment);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn resolve_experiment_target_rejects_ambiguous_directory_defaults() {
+        let root = unique_test_dir("resolve_experiment_ambiguous_directory");
+        fs::create_dir_all(&root).expect("test dir");
+        fs::write(root.join("experiment.yaml"), "experiment:\n  id: smoke\n")
+            .expect("experiment yaml");
+        fs::write(root.join("experiment.yml"), "experiment:\n  id: smoke\n")
+            .expect("experiment yml");
+
+        let err = resolve_experiment_target(Some(&root))
+            .expect_err("ambiguous experiment defaults should fail")
+            .to_string();
+
+        assert!(err.contains("ambiguous experiment directory"));
+        assert!(err.contains("both experiment.yaml and experiment.yml exist"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn resolve_experiment_target_rejects_non_yaml_file() {
+        let root = unique_test_dir("resolve_experiment_non_yaml_file");
+        fs::create_dir_all(&root).expect("test dir");
+        let readme = root.join("README.md");
+        fs::write(&readme, "# not an experiment\n").expect("readme");
+
+        let err = resolve_experiment_target_for_command("build", Some(&readme))
+            .expect_err("non-yaml authoring input should fail early")
+            .to_string();
+
+        assert!(err.contains("build expected an experiment YAML"));
+        assert!(err.contains("file is not an experiment YAML"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn resolve_experiment_target_error_points_to_authoring_next_steps() {
         let root = unique_test_dir("resolve_experiment_missing");
         fs::create_dir_all(&root).expect("test dir");
@@ -12945,6 +13070,7 @@ mod tests {
             .to_string();
 
         assert!(err.contains("dev expected an experiment YAML"));
+        assert!(err.contains("no experiment.yaml or experiment.yml"));
         assert!(err.contains("bucephalus init <new-eval-dir>"));
         assert!(err.contains("bucephalus dev <new-eval-dir>"));
         assert!(err.contains("bucephalus doctor"));
@@ -13164,6 +13290,19 @@ runtime:
     }
 
     #[test]
+    fn experiment_input_path_accepts_yml_directory() {
+        let root = unique_test_dir("experiment_input_yml_directory");
+        fs::create_dir_all(&root).expect("test dir");
+        let experiment = root.join("experiment.yml");
+        fs::write(&experiment, "experiment:\n  id: smoke\n").expect("experiment yml");
+
+        let resolved = experiment_input_path(&root).expect("input classification");
+
+        assert_eq!(resolved, Some(experiment));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn experiment_input_path_error_explains_run_input_modes() {
         let root = unique_test_dir("experiment_input_missing");
         let missing = root.join("missing-target");
@@ -13226,7 +13365,7 @@ runtime:
             .to_string();
 
         assert!(err.contains("check-package expected a sealed package"));
-        assert!(err.contains("directory contains experiment.yaml"));
+        assert!(err.contains("directory contains experiment YAML"));
         assert!(err.contains("bucephalus check-package <package-dir>"));
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -13279,6 +13418,22 @@ runtime:
         assert!(err.contains("doctor expected an experiment YAML or sealed package"));
         assert!(err.contains("bucephalus doctor experiment.yaml"));
         assert!(err.contains("bucephalus doctor <package-dir>"));
+    }
+
+    #[test]
+    fn resolve_doctor_target_rejects_non_manifest_file() {
+        let root = unique_test_dir("doctor_target_non_manifest");
+        fs::create_dir_all(&root).expect("test dir");
+        let file = root.join("notes.txt");
+        fs::write(&file, "not a package\n").expect("notes");
+
+        let err = resolve_doctor_target(Some(&file))
+            .expect_err("doctor should reject unrelated files")
+            .to_string();
+
+        assert!(err.contains("doctor expected an experiment YAML or sealed package"));
+        assert!(err.contains("file is not an experiment YAML or manifest.json"));
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
