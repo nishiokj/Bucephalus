@@ -1,0 +1,241 @@
+name: Bucephalus GCP Teardown
+
+on:
+  workflow_dispatch:
+    inputs:
+      github_environment:
+        description: "Deployment environment"
+        required: true
+        default: "bucephalus"
+        type: choice
+        options:
+          - bucephalus
+      apply:
+        description: "Delete remaining billed GCP resources"
+        required: true
+        default: false
+        type: boolean
+
+run-name: >-
+  GCP teardown ${{ inputs.apply && 'apply' || 'inventory' }}
+  for ${{ inputs.github_environment }}
+
+permissions:
+  contents: read
+  actions: read
+  id-token: none
+
+jobs:
+  teardown-gcp:
+    name: Inventory and optionally delete remaining GCP resources
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.github_environment }}
+    concurrency:
+      group: bucephalus-gcp-state-${{ inputs.github_environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve GCP teardown config
+        env:
+          BUCEPHALUS_GCP_PROJECT_ID: ${{ vars.BUCEPHALUS_GCP_PROJECT_ID }}
+          BUCEPHALUS_GCP_REGION: ${{ vars.BUCEPHALUS_GCP_REGION }}
+          BUCEPHALUS_DEPLOYMENT_ENVIRONMENT: ${{ vars.BUCEPHALUS_DEPLOYMENT_ENVIRONMENT || inputs.github_environment }}
+          BUCEPHALUS_GCP_RESOURCE_PREFIX: ${{ vars.BUCEPHALUS_GCP_RESOURCE_PREFIX }}
+          BUCEPHALUS_TERRAFORM_BACKEND_BUCKET: ${{ vars.BUCEPHALUS_TERRAFORM_BACKEND_BUCKET }}
+        run: |
+          missing=()
+          for name in \
+            BUCEPHALUS_GCP_PROJECT_ID \
+            BUCEPHALUS_GCP_REGION \
+            BUCEPHALUS_DEPLOYMENT_ENVIRONMENT \
+            BUCEPHALUS_GCP_RESOURCE_PREFIX; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("${name}")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            printf 'missing GitHub Environment teardown config: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+          {
+            echo "BUCEPHALUS_GCP_PROJECT_ID=${BUCEPHALUS_GCP_PROJECT_ID}"
+            echo "BUCEPHALUS_GCP_REGION=${BUCEPHALUS_GCP_REGION}"
+            echo "BUCEPHALUS_DEPLOYMENT_ENVIRONMENT=${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}"
+            echo "BUCEPHALUS_GCP_RESOURCE_PREFIX=${BUCEPHALUS_GCP_RESOURCE_PREFIX}"
+            echo "BUCEPHALUS_TERRAFORM_BACKEND_BUCKET=${BUCEPHALUS_TERRAFORM_BACKEND_BUCKET}"
+            echo "NAME_PREFIX=${BUCEPHALUS_GCP_RESOURCE_PREFIX}-${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Resolve GCP CI/CD auth secret for teardown
+        id: gcp_deploy_auth
+        env:
+          BUC_CI_CD: ${{ secrets.BUC_CI_CD }}
+          BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT }}
+          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_SERVICE_ACCOUNT }}
+        run: scripts/deploy/resolve-gcp-cicd-secret.sh --mode deploy
+
+      - name: Authenticate to Google Cloud for teardown
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ steps.gcp_deploy_auth.outputs.workload_identity_provider }}
+          service_account: ${{ steps.gcp_deploy_auth.outputs.service_account }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 363.0.0"
+
+      - name: Inventory remaining billed resources
+        run: |
+          set -euo pipefail
+          project="${BUCEPHALUS_GCP_PROJECT_ID}"
+          region="${BUCEPHALUS_GCP_REGION}"
+          prefix="${NAME_PREFIX}"
+          {
+            echo "## Remaining GCP resources"
+            echo
+            echo "project=\`${project}\` region=\`${region}\` prefix=\`${prefix}\`"
+            echo
+            echo "### Cloud SQL"
+            gcloud sql instances list --project "${project}" --format='table(name,region,settings.tier,settings.activationPolicy,state)' || true
+            echo
+            echo "### Cloud Run services"
+            gcloud run services list --project "${project}" --region "${region}" --format='table(metadata.name,status.url,status.conditions[0].status)' || true
+            echo
+            echo "### Cloud Run jobs"
+            gcloud run jobs list --project "${project}" --region "${region}" --format='table(metadata.name)' || true
+            echo
+            echo "### GCE VMs"
+            gcloud compute instances list --project "${project}" --format='table(name,zone,machineType,status)' || true
+            echo
+            echo "### VPC connectors"
+            gcloud compute networks vpc-access connectors list --project "${project}" --region "${region}" --format='table(name,state,network)' || true
+            echo
+            echo "### NATs"
+            gcloud compute routers nats list --project "${project}" --router="${prefix}-router" --region "${region}" --format='table(name)' || true
+            echo
+            echo "### Artifact Registry"
+            gcloud artifacts repositories list --project "${project}" --location "${region}" --format='table(name,format)' || true
+            echo
+            echo "### GCS"
+            gcloud storage buckets list --project "${project}" --format='value(name)' || true
+          } | tee "${RUNNER_TEMP}/teardown-inventory.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Delete remaining billed resources
+        if: ${{ inputs.apply }}
+        env:
+          APPLY: "true"
+        run: |
+          set -euo pipefail
+          project="${BUCEPHALUS_GCP_PROJECT_ID}"
+          region="${BUCEPHALUS_GCP_REGION}"
+          prefix="${NAME_PREFIX}"
+          zone="${region}-a"
+          state_bucket="${BUCEPHALUS_TERRAFORM_BACKEND_BUCKET}"
+
+          run() {
+            printf '+'
+            printf ' %q' "$@"
+            printf '\n'
+            "$@"
+          }
+
+          ignore() {
+            printf '+'
+            printf ' %q' "$@"
+            printf '\n'
+            "$@" || true
+          }
+
+          echo "Deleting Cloud Run services/jobs"
+          for svc in "${prefix}-api" "${prefix}-pool-controller"; do
+            ignore gcloud run services delete "${svc}" --project "${project}" --region "${region}" --quiet
+          done
+          for job in "${prefix}-migrations" "${prefix}-worker-image-promotion"; do
+            ignore gcloud run jobs delete "${job}" --project "${project}" --region "${region}" --quiet
+          done
+
+          echo "Deleting leftover runner VMs"
+          mapfile -t instances < <(gcloud compute instances list --project "${project}" --filter="name~^${prefix}-" --format='value(name,zone)' || true)
+          for row in "${instances[@]+"${instances[@]}"}"; do
+            [[ -z "${row}" ]] && continue
+            name="${row%%$'\t'*}"
+            inst_zone="${row#*$'\t'}"
+            ignore gcloud compute instances delete "${name}" --project "${project}" --zone "${inst_zone}" --quiet
+          done
+
+          echo "Deleting Cloud SQL (already stopped; do not restart)"
+          if gcloud sql instances describe "${prefix}-postgres" --project "${project}" >/dev/null 2>&1; then
+            ignore gcloud sql instances patch "${prefix}-postgres" --project "${project}" --no-deletion-protection --quiet
+            run gcloud sql instances delete "${prefix}-postgres" --project "${project}" --quiet
+          else
+            echo "Cloud SQL instance ${prefix}-postgres already absent"
+          fi
+
+          echo "Deleting VPC connector, NAT, router, firewall, subnets, peering, VPC"
+          ignore gcloud compute networks vpc-access connectors delete "${prefix}-run-vpc" --project "${project}" --region "${region}" --quiet
+          ignore gcloud compute routers nats delete "${prefix}-runner-nat" --router "${prefix}-router" --project "${project}" --region "${region}" --quiet
+          ignore gcloud compute routers delete "${prefix}-router" --project "${project}" --region "${region}" --quiet
+          ignore gcloud compute firewall-rules delete "${prefix}-runner-iap-ssh" --project "${project}" --quiet
+          ignore gcloud services vpc-peerings delete --service=servicenetworking.googleapis.com --network="${prefix}-control-plane" --project "${project}" --quiet
+          ignore gcloud compute addresses delete "${prefix}-private-services" --project "${project}" --global --quiet
+          ignore gcloud compute networks subnets delete "${prefix}-run-vpc-connector" --project "${project}" --region "${region}" --quiet
+          ignore gcloud compute networks subnets delete "${prefix}-control-plane" --project "${project}" --region "${region}" --quiet
+          ignore gcloud compute networks delete "${prefix}-control-plane" --project "${project}" --quiet
+
+          echo "Deleting Artifact Registry"
+          ignore gcloud artifacts repositories delete "${prefix}-cloud" --project "${project}" --location "${region}" --quiet
+
+          echo "Deleting object buckets"
+          for bucket in "${project}-${prefix}-objects" "${project}-${prefix}-objects-logs"; do
+            if gcloud storage buckets describe "gs://${bucket}" --project "${project}" >/dev/null 2>&1; then
+              ignore gcloud storage rm --recursive "gs://${bucket}/**"
+              ignore gcloud storage buckets delete "gs://${bucket}" --project "${project}" --quiet
+            fi
+          done
+
+          echo "Deleting leftover Secret Manager containers"
+          mapfile -t secrets < <(gcloud secrets list --project "${project}" --filter="name~/${prefix}-" --format='value(name)' || true)
+          for secret in "${secrets[@]+"${secrets[@]}"}"; do
+            [[ -z "${secret}" ]] && continue
+            ignore gcloud secrets delete "${secret}" --project "${project}" --quiet
+          done
+
+          echo "Leaving Terraform state bucket ${state_bucket:-unset} in place"
+          echo "Leaving GitHub/OIDC service accounts and Workload Identity pool in place"
+
+      - name: Confirm remaining billed resources
+        if: ${{ inputs.apply }}
+        run: |
+          set -euo pipefail
+          project="${BUCEPHALUS_GCP_PROJECT_ID}"
+          region="${BUCEPHALUS_GCP_REGION}"
+          prefix="${NAME_PREFIX}"
+          {
+            echo
+            echo "## After teardown"
+            echo
+            echo "### Cloud SQL"
+            gcloud sql instances list --project "${project}" --format='table(name,region,settings.tier,settings.activationPolicy,state)' || true
+            echo
+            echo "### Cloud Run services"
+            gcloud run services list --project "${project}" --region "${region}" --format='table(metadata.name,status.url)' || true
+            echo
+            echo "### GCE VMs"
+            gcloud compute instances list --project "${project}" --format='table(name,zone,status)' || true
+            echo
+            echo "### VPC connectors"
+            gcloud compute networks vpc-access connectors list --project "${project}" --region "${region}" --format='table(name,state)' || true
+            echo
+            echo "### Artifact Registry"
+            gcloud artifacts repositories list --project "${project}" --location "${region}" --format='table(name)' || true
+            echo
+            echo "### GCS"
+            gcloud storage buckets list --project "${project}" --format='value(name)' || true
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
