@@ -195,14 +195,18 @@ jobs:
 
           echo "Deleting Artifact Registry"
           ignore gcloud artifacts repositories delete "${prefix}-cloud" --project "${project}" --location "${region}" --quiet
+          ignore gcloud artifacts repositories delete "buc-runners" --project "${project}" --location "${region}" --quiet
 
           echo "Deleting object buckets"
-          for bucket in "${project}-${prefix}-objects" "${project}-${prefix}-objects-logs"; do
+          for bucket in "${project}-${prefix}-objects" "${project}-${prefix}-objects-logs" "buc-releases-${project}"; do
             if gcloud storage buckets describe "gs://${bucket}" --project "${project}" >/dev/null 2>&1; then
               ignore gcloud storage rm --recursive "gs://${bucket}/**"
               ignore gcloud storage buckets delete "gs://${bucket}" --project "${project}" --quiet
             fi
           done
+
+          echo "Retrying leftover Service Networking peering"
+          ignore gcloud services vpc-peerings delete --service=servicenetworking.googleapis.com --network="${prefix}-control-plane" --project "${project}" --quiet
 
           echo "Deleting leftover Secret Manager containers"
           mapfile -t secrets < <(gcloud secrets list --project "${project}" --filter="name~/${prefix}-" --format='value(name)' || true)
